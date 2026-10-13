@@ -3,7 +3,7 @@
  * Ported to GLSL from astc_enc.slang and astc_pack.slang of leegao/etc2_encode (commit a32883c;
  * "Realtime rgba8 -> astc/etc2/etc1 encoder as a compute shader"), whose licence follows. Kept from
  * it: endpoints from the principal axis (power iteration on the covariance), the blue-contraction
- * swap, the block mode and BISE packing, and its trit and quint tables. Changed: float32 instead of half
+ * swap, the block mode and BISE packing. Changed: float32 instead of half
  * arithmetic; weights picked by the error against the quantized endpoints as a decoder expands
  * them; one least-squares refit of the endpoints to those weights; up to two weight / endpoint
  * precisions tried per block, the second only when the first is not good enough (2-bit weights with
@@ -36,34 +36,6 @@
  *
  * Input: g_px[16] (row-major texels, 8-bit RGBA). Output: the 128-bit block, little-endian words.
  */
-
-const uint ASTC_TRITS[243] = uint[243](
-    0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u, 16u, 17u, 18u, 20u, 21u, 22u, 24u,
-    25u, 26u, 3u, 7u, 15u, 19u, 23u, 27u, 12u, 13u, 14u, 32u, 33u, 34u, 36u, 37u,
-    38u, 40u, 41u, 42u, 48u, 49u, 50u, 52u, 53u, 54u, 56u, 57u, 58u, 35u, 39u, 47u,
-    51u, 55u, 59u, 44u, 45u, 46u, 64u, 65u, 66u, 68u, 69u, 70u, 72u, 73u, 74u, 80u,
-    81u, 82u, 84u, 85u, 86u, 88u, 89u, 90u, 67u, 71u, 79u, 83u, 87u, 91u, 76u, 77u,
-    78u, 128u, 129u, 130u, 132u, 133u, 134u, 136u, 137u, 138u, 144u, 145u, 146u, 148u, 149u, 150u,
-    152u, 153u, 154u, 131u, 135u, 143u, 147u, 151u, 155u, 140u, 141u, 142u, 160u, 161u, 162u, 164u,
-    165u, 166u, 168u, 169u, 170u, 176u, 177u, 178u, 180u, 181u, 182u, 184u, 185u, 186u, 163u, 167u,
-    175u, 179u, 183u, 187u, 172u, 173u, 174u, 192u, 193u, 194u, 196u, 197u, 198u, 200u, 201u, 202u,
-    208u, 209u, 210u, 212u, 213u, 214u, 216u, 217u, 218u, 195u, 199u, 207u, 211u, 215u, 219u, 204u,
-    205u, 206u, 96u, 97u, 98u, 100u, 101u, 102u, 104u, 105u, 106u, 112u, 113u, 114u, 116u, 117u,
-    118u, 120u, 121u, 122u, 99u, 103u, 111u, 115u, 119u, 123u, 108u, 109u, 110u, 224u, 225u, 226u,
-    228u, 229u, 230u, 232u, 233u, 234u, 240u, 241u, 242u, 244u, 245u, 246u, 248u, 249u, 250u, 227u,
-    231u, 239u, 243u, 247u, 251u, 236u, 237u, 238u, 28u, 29u, 30u, 60u, 61u, 62u, 92u, 93u,
-    94u, 156u, 157u, 158u, 188u, 189u, 190u, 220u, 221u, 222u, 31u, 63u, 127u, 159u, 191u, 255u,
-    252u, 253u, 254u);
-
-const uint ASTC_QUINTS[125] = uint[125](
-    0u, 1u, 2u, 3u, 4u, 8u, 9u, 10u, 11u, 12u, 16u, 17u, 18u, 19u, 20u, 24u,
-    25u, 26u, 27u, 28u, 5u, 13u, 21u, 29u, 6u, 32u, 33u, 34u, 35u, 36u, 40u, 41u,
-    42u, 43u, 44u, 48u, 49u, 50u, 51u, 52u, 56u, 57u, 58u, 59u, 60u, 37u, 45u, 53u,
-    61u, 14u, 64u, 65u, 66u, 67u, 68u, 72u, 73u, 74u, 75u, 76u, 80u, 81u, 82u, 83u,
-    84u, 88u, 89u, 90u, 91u, 92u, 69u, 77u, 85u, 93u, 22u, 96u, 97u, 98u, 99u, 100u,
-    104u, 105u, 106u, 107u, 108u, 112u, 113u, 114u, 115u, 116u, 120u, 121u, 122u, 123u, 124u, 101u,
-    109u, 117u, 125u, 30u, 102u, 103u, 70u, 71u, 38u, 110u, 111u, 78u, 79u, 46u, 118u, 119u,
-    86u, 87u, 54u, 126u, 127u, 94u, 95u, 62u, 39u, 47u, 55u, 63u, 31u);
 
 /* Candidates (4x4 weights; bits: 17 header, 2 more for the plane selector, 29 with 2 partitions):
  *   CEM 8 (RGB):   2-bit weights + 8-bit endpoints (32 + 48), 3-bit + 8-bit (48 + 48), 4-bit + QUANT_192 (64 + 46)
@@ -174,50 +146,47 @@ void astc_put(inout uvec4 b, uint pos, uint n, uint v)
     if (o + n > 32u) b[w + 1u] |= v >> (32u - o);
 }
 
+/* 5 trits as the 8 bits T of the specification's integer sequence encoding, 3 quints as its 7 bits
+ * Q (its decoding procedures inverted; where bits are free they are 0). */
+uint astc_trits(uint t0, uint t1, uint t2, uint t3, uint t4)
+{
+    uint c = t2 == 2u ? (t1 == 2u ? 12u | t0 : (t1 << 4) | (t0 << 2) | 3u) : (t2 << 4) | (t1 << 2) | t0;
+    if (t3 == 2u && t4 == 2u) return ((c >> 2) << 5) | 0x1cu | (c & 3u);
+    return t4 == 2u ? (t3 << 7) | 0x60u | c : (t4 << 7) | (t3 << 5) | c;
+}
+
+uint astc_quints(uint q0, uint q1, uint q2)
+{
+    if (q1 == 4u && q0 == 4u) return 6u | (q2 == 4u ? 1u : ((q2 >> 1) << 4) | ((q2 & 1u) << 3));
+    uint c = q1 == 4u ? (q0 << 3) | 5u : (q1 << 3) | q0;
+    return q2 == 4u ? (c & 0x18u) | ((~(c >> 1) & 3u) << 5) | 6u | (c & 1u) : (q2 << 5) | c;
+}
+
 /* Endpoints in BISE: 8 bits each, quints (QUANT_40: 3 bits) in groups of 3, or trits (QUANT_48:
- * 4 bits, QUANT_192: 6 bits) in groups of 5. */
+ * 4 bits, QUANT_192: 6 bits) in groups of 5, each value's bits followed by its share of the group's
+ * Q (3, 2, 2 bits) or T (2, 2, 1, 2, 1). */
 uint astc_ise(inout uvec4 b, uint pos, uint q, uint v[16], uint n)
 {
     if (q == 256u) {
         for (uint i = 0u; i < n; i++) astc_put(b, pos + 8u * i, 8u, v[i]);
         return pos + 8u * n;
     }
-    if (q == 40u) {
-        for (uint g = 0u; g < n; g += 3u) {
-            uint x0 = v[g], x1 = g + 1u < n ? v[g + 1u] : 0u, x2 = g + 2u < n ? v[g + 2u] : 0u;
-            uint Q = ASTC_QUINTS[(x2 >> 3) * 25u + (x1 >> 3) * 5u + (x0 >> 3)];
-            const uint qb[3] = uint[3](3u, 2u, 2u), qs[3] = uint[3](0u, 3u, 5u);
-            uint xs[3] = uint[3](x0, x1, x2);
-            for (uint j = 0u; j < 3u && g + j < n; j++) {
-                astc_put(b, pos, 3u, xs[j]);
-                pos += 3u;
-                astc_put(b, pos, qb[j], Q >> qs[j]);
-                pos += qb[j];
-            }
-        }
-        return pos;
-    }
-    uint nb = q == 48u ? 4u : 6u;
-    for (uint g = 0u; g < n; g += 5u) {
-        uint t[5], m[5];
-        for (uint j = 0u; j < 5u; j++) {
-            uint x = g + j < n ? v[g + j] : 0u;
-            m[j] = x & ((1u << nb) - 1u);
-            t[j] = x >> nb;
-        }
-        uint T = ASTC_TRITS[t[4] * 81u + t[3] * 27u + t[2] * 9u + t[1] * 3u + t[0]];
-        const uint tb[5] = uint[5](2u, 2u, 1u, 2u, 1u), ts[5] = uint[5](0u, 2u, 4u, 5u, 7u);
-        for (uint j = 0u; j < 5u && g + j < n; j++) {
-            astc_put(b, pos, nb, m[j]);
+    uint nb = q == 40u ? 3u : (q == 48u ? 4u : 6u), gs = q == 40u ? 3u : 5u;
+    for (uint g = 0u; g < n; g += gs) {
+        uint x[5];
+        for (uint j = 0u; j < 5u; j++) x[j] = g + j < n ? v[g + j] >> nb : 0u;
+        uint tq = q == 40u ? astc_quints(x[0], x[1], x[2]) : astc_trits(x[0], x[1], x[2], x[3], x[4]);
+        for (uint j = 0u; j < gs && g + j < n; j++) {
+            astc_put(b, pos, nb, v[g + j]);
             pos += nb;
-            astc_put(b, pos, tb[j], T >> ts[j]);
-            pos += tb[j];
+            uint k = q == 40u ? (j == 0u ? 3u : 2u) : (j == 2u || j == 4u ? 1u : 2u);
+            uint sh = q == 40u ? (j == 0u ? 0u : 2u * j + 1u) : 2u * j - (j >= 3u ? 1u : 0u);
+            astc_put(b, pos, k, tq >> sh);
+            pos += k;
         }
     }
     return pos;
 }
-
-uint g_aw[32]; /* the candidate's weight indices (interleaved by plane when dual) */
 
 /* The level of a b-bit weight range nearest t (0..1): the levels lie within half a step of uniform,
  * so it is the rounded index or its neighbour on t's side. */
@@ -230,63 +199,81 @@ uint astc_wq(uint b, float t)
     return abs(astc_w(b, k2) - t) < abs(wk - t) ? k2 : k;
 }
 
+/* n bits of v at bit pos of a 64-bit field. */
+void astc_put64(inout uvec2 w, uint pos, uint n, uint v)
+{
+    if (pos >= 32u) {
+        w.y |= v << (pos - 32u);
+    } else {
+        w.x |= v << pos;
+        if (pos + n > 32u) w.y |= v >> (32u - pos);
+    }
+}
+
 /* Weights for decoded endpoints d0, d1 per partition (plane 0 over the channels in m, plane 1 alpha
- * when dual): the error of the block, the chosen weights (0..1) in wf / wa, their indices in g_aw. A texel's error is quadratic in the weight along the endpoints' line, so its best level
- * is the one nearest its projection on the line. */
-float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, out float wf[16], out float wa[16])
+ * when dual): the error of the block and the weight indices in wi (in texel order, interleaved by
+ * plane when dual: at most 64 bits). A texel's error is quadratic in the weight along the
+ * endpoints' line, so its best level is the one nearest its projection on the line. Also, in r0 /
+ * r1, the endpoints refitted to those weights by least squares (d0 / d1 where that is singular). */
+float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, out uvec2 wi, out vec4 r0[2], out vec4 r1[2])
 {
     float e = 0.0;
     vec4 rest = vec4(1.0) - m;
     if (dual) rest.a = 0.0;
-    vec4 ax[2];
+    vec4 ax[2], s0[2], s1[2];
+    float sa[2], sb[2], sc[2];
     for (uint k = 0u; k < 2u; k++) {
         ax[k] = (d1[k] - d0[k]) * m;
         float l = dot(ax[k], ax[k]);
         ax[k] *= l > 0.0 ? 1.0 / l : 0.0;
+        s0[k] = s1[k] = vec4(0.0);
+        sa[k] = sb[k] = sc[k] = 0.0;
     }
     float ra = d1[0].a - d0[0].a;
     ra = ra != 0.0 ? 1.0 / ra : 0.0;
+    vec4 al = vec4(0.0); /* dual: alpha's sums (y * y, y * x, x * x, y * a), x * a in a1 */
+    float a1 = 0.0;
+    wi = uvec2(0u);
+    uint pos = 0u;
     for (uint p = 0u; p < 16u; p++) {
         uint part = (g_apart >> p) & 1u;
         vec4 v = vec4(g_px[p]), a = d0[part], b = d1[part];
         uint k = astc_wq(wb, dot((v - a) * m, ax[part]));
-        float w = astc_w(wb, k) / 64.0;
-        vec4 d = (v - mix(a, b, w)) * m + (v - a) * rest;
+        float x = astc_w(wb, k) / 64.0, y = 1.0 - x;
+        vec4 d = (v - mix(a, b, x)) * m + (v - a) * rest;
         e += dot(d, d);
-        wf[p] = w;
+        sa[part] += y * y;
+        sb[part] += y * x;
+        sc[part] += x * x;
+        s0[part] += y * v;
+        s1[part] += x * v;
+        astc_put64(wi, pos, wb, k);
+        pos += wb;
         if (dual) {
             uint ka = astc_wq(wb, (v.a - a.a) * ra);
-            wa[p] = astc_w(wb, ka) / 64.0;
-            float da = v.a - mix(a.a, b.a, wa[p]);
+            float xa = astc_w(wb, ka) / 64.0, ya = 1.0 - xa;
+            float da = v.a - mix(a.a, b.a, xa);
             e += da * da;
-            g_aw[2u * p] = k;
-            g_aw[2u * p + 1u] = ka;
-        } else {
-            g_aw[p] = k;
+            al += vec4(ya * ya, ya * xa, xa * xa, ya * v.a);
+            a1 += xa * v.a;
+            astc_put64(wi, pos, wb, ka);
+            pos += wb;
         }
     }
-    return e;
-}
-
-/* Least-squares endpoints of partition part for weights w over the channels in m. */
-void astc_refit(vec4 m, uint part, float w[16], inout vec4 e0, inout vec4 e1)
-{
-    float a = 0.0, b = 0.0, c = 0.0;
-    vec4 s0 = vec4(0.0), s1 = vec4(0.0);
-    for (uint p = 0u; p < 16u; p++) {
-        if (!astc_in(p, part)) continue;
-        float x = w[p], y = 1.0 - x;
-        vec4 v = vec4(g_px[p]);
-        a += y * y;
-        b += y * x;
-        c += x * x;
-        s0 += y * v;
-        s1 += x * v;
+    for (uint k = 0u; k < 2u; k++) {
+        r0[k] = d0[k];
+        r1[k] = d1[k];
+        float det = sa[k] * sc[k] - sb[k] * sb[k];
+        if (abs(det) < 1e-3) continue;
+        r0[k] = mix(r0[k], clamp((sc[k] * s0[k] - sb[k] * s1[k]) / det, 0.0, 255.0), m);
+        r1[k] = mix(r1[k], clamp((sa[k] * s1[k] - sb[k] * s0[k]) / det, 0.0, 255.0), m);
     }
-    float det = a * c - b * b;
-    if (abs(det) < 1e-3) return;
-    e0 = mix(e0, clamp((c * s0 - b * s1) / det, 0.0, 255.0), m);
-    e1 = mix(e1, clamp((a * s1 - b * s0) / det, 0.0, 255.0), m);
+    float det = al.x * al.z - al.y * al.y;
+    if (dual && abs(det) >= 1e-3) {
+        r0[0].a = clamp((al.z * al.w - al.y * a1) / det, 0.0, 255.0);
+        r1[0].a = clamp((al.x * a1 - al.y * al.w) / det, 0.0, 255.0);
+    }
+    return e;
 }
 
 /* One candidate from endpoints l0, l1 per partition (a principal axis' extremes; with dual, alpha's
@@ -328,43 +315,30 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec
             }
         }
         if (!two) { d0[1] = d0[0]; d1[1] = d1[0]; }
-        float wf[16], wa[16];
-        float e = astc_weights(d0, d1, m, dual, wb, wf, wa);
+        uvec2 wi;
+        float e = astc_weights(d0, d1, m, dual, wb, wi, e0, e1);
         if (e < best) {
             best = e;
-            {
-                /* block mode: 4x4 weights (A = 2, B = 0), range R/H, D for the second plane */
-                uint r = wb == 2u ? 4u : (wb == 3u ? 7u : 4u), h = wb == 4u ? 1u : 0u;
-                uint bm = ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5) | (h << 9) | ((dual ? 1u : 0u) << 10);
-                uvec4 b = uvec4(0u);
-                astc_put(b, 0u, 11u, bm);
-                if (two) {
-                    astc_put(b, 11u, 2u, 1u);
-                    astc_put(b, 13u, 10u, seed);
-                    astc_put(b, 25u, 4u, rgba ? 12u : 8u); /* bits 23-24 zero: every partition this CEM */
-                    astc_ise(b, 29u, q, v, 2u * nv);
-                } else {
-                    astc_put(b, 13u, 4u, rgba ? 12u : 8u);
-                    astc_ise(b, 17u, q, v, nv);
-                }
-                uint nw = dual ? 32u : 16u, wbits = nw * wb;
-                if (dual) astc_put(b, 128u - wbits - 2u, 2u, 3u); /* plane 2 is alpha */
-                uvec4 w = uvec4(0u);
-                for (uint i = 0u; i < nw; i++) astc_put(w, i * wb, wb, g_aw[i]);
-                /* weights run from the top of the block down */
-                b |= uvec4(bitfieldReverse(w.w), bitfieldReverse(w.z), bitfieldReverse(w.y), bitfieldReverse(w.x));
-                blk = b;
+            /* block mode: 4x4 weights (A = 2, B = 0), range R/H, D for the second plane */
+            uint r = wb == 2u ? 4u : (wb == 3u ? 7u : 4u), h = wb == 4u ? 1u : 0u;
+            uint bm = ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5) | (h << 9) | ((dual ? 1u : 0u) << 10);
+            uvec4 b = uvec4(0u);
+            astc_put(b, 0u, 11u, bm);
+            if (two) {
+                astc_put(b, 11u, 2u, 1u);
+                astc_put(b, 13u, 10u, seed);
+                astc_put(b, 25u, 4u, rgba ? 12u : 8u); /* bits 23-24 zero: every partition this CEM */
+                astc_ise(b, 29u, q, v, 2u * nv);
+            } else {
+                astc_put(b, 13u, 4u, rgba ? 12u : 8u);
+                astc_ise(b, 17u, q, v, nv);
             }
+            if (dual) astc_put(b, 128u - 64u - 2u, 2u, 3u); /* plane 2 is alpha (after 64 weight bits) */
+            /* weights run from the top of the block down */
+            blk = b | uvec4(0u, 0u, bitfieldReverse(wi.y), bitfieldReverse(wi.x));
         }
-        if (pass == 0) {
-            if (e == 0.0) break;
-            for (uint k = 0u; k < np; k++) {
-                e0[k] = d0[k];
-                e1[k] = d1[k];
-                astc_refit(m, k, wf, e0[k], e1[k]);
-            }
-            if (dual) astc_refit(vec4(0.0, 0.0, 0.0, 1.0), 0u, wa, e0[0], e1[0]);
-        }
+        if (pass == 0 && e == 0.0) break;
+        /* pass 1: the endpoints refitted to pass 0's weights (e0 / e1) */
     }
     return best;
 }

@@ -70,7 +70,7 @@ uint bswap32(uint v) { return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xf
 
 #if defined(TRANSCODE)
 ivec4 g_px[16]; /* the block's texels, 8-bit RGBA, for the encoder */
-uint g_bc7_parts, g_bc7_part; /* a BC7 block's subsets and partition */
+uint g_bc7_parts, g_bc7_part, g_bc7_mask; /* a BC7 block's subsets, partition and its subset per texel */
 #if defined(ENC_ETC2)
 #include "etc2_enc.glsl"
 #elif defined(ENC_ASTC)
@@ -373,6 +373,9 @@ void bc7(uvec4 blk)
     uint ib = (mode == 0u || mode == 1u) ? 3u : (mode == 6u ? 4u : 2u);
     uint ib2 = mode == 4u ? 3u : (mode == 5u ? 2u : 0u);
     uint part = nparts == 2u ? BC7_PART2[part_id] : (nparts == 3u ? BC7_PART3[part_id] : 0u);
+#if defined(TRANSCODE)
+    g_bc7_mask = part;
+#endif
     uint anchors = nparts == 2u ? BC7_PART2_ANCHOR[part_id] : (nparts == 3u ? BC7_PART3_ANCHOR[part_id] : 0u);
     uint idx1[16];
     for (uint t = 0u; t < 16u; t++) {
@@ -487,22 +490,25 @@ void main()
 #if defined(ENC_ETC2)
     uvec4 enc = uvec4(etc2_encode((pc.flags & 4u) != 0u), 0u, 0u);
 #elif defined(ENC_ASTC) && defined(FMT_BC7)
-    /* BC7's partition, as the nearest ASTC one; of 3 subsets, the two closest in colour merged */
+    /* BC7's partition, as the nearest ASTC one; of 3 subsets, the two closest in colour merged (one
+     * lookup: a table indexed at run time may be copied whole each time) */
     uint part = ~0u;
-    if (g_bc7_parts == 2u) part = ASTC_BC7P[g_bc7_part];
-    if (g_bc7_parts == 3u) {
-        vec3 sum[3] = vec3[3](vec3(0.0), vec3(0.0), vec3(0.0));
-        float n[3] = float[3](0.0, 0.0, 0.0);
-        uint pm = BC7_PART3[g_bc7_part];
-        for (uint t = 0u; t < 16u; t++) {
-            uint k = (pm >> (2u * t)) & 3u;
-            sum[k] += vec3(g_px[t].rgb);
-            n[k] += 1.0;
+    if (g_bc7_parts > 1u) {
+        uint i = g_bc7_part;
+        if (g_bc7_parts == 3u) {
+            vec3 sum[3] = vec3[3](vec3(0.0), vec3(0.0), vec3(0.0));
+            float n[3] = float[3](0.0, 0.0, 0.0);
+            for (uint t = 0u; t < 16u; t++) {
+                uint k = (g_bc7_mask >> (2u * t)) & 3u;
+                sum[k] += vec3(g_px[t].rgb);
+                n[k] += 1.0;
+            }
+            for (uint k = 0u; k < 3u; k++) sum[k] /= max(n[k], 1.0);
+            float d01 = distance(sum[0], sum[1]), d02 = distance(sum[0], sum[2]), d12 = distance(sum[1], sum[2]);
+            uint alone = d01 <= d02 && d01 <= d12 ? 2u : (d02 <= d12 ? 1u : 0u);
+            i = 64u + g_bc7_part * 3u + alone;
         }
-        for (uint k = 0u; k < 3u; k++) sum[k] /= max(n[k], 1.0);
-        float d01 = distance(sum[0], sum[1]), d02 = distance(sum[0], sum[2]), d12 = distance(sum[1], sum[2]);
-        uint alone = d01 <= d02 && d01 <= d12 ? 2u : (d02 <= d12 ? 1u : 0u);
-        part = ASTC_BC7P[64u + g_bc7_part * 3u + alone];
+        part = ASTC_BC7P[i];
     }
     uvec4 enc = astc_encode(part, true);
 #elif defined(ENC_ASTC)
