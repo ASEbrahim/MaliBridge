@@ -202,7 +202,9 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
 - [bcdec](https://github.com/iOrange/bcdec) by Sergii Kudlai, MIT or Unlicense:
   `third_party/bcdec/bcdec.h` (license at the end of the file). The GPU decoder
   (`shaders/bc_decode.comp`) follows its arithmetic, its BC6H/BC7 tables are generated from it
-  (`shaders/bc_tables.glsl`), and `bcn_check` uses it as the reference decoder.
+  (`shaders/bc_tables.glsl`), and `bcn_check` uses it as the reference decoder. Patched here: its
+  signed BC4/BC5 endpoints are cast to `signed char`, not `char` (unsigned on AArch64, where
+  `bcn_check` built for the guest then expected unsigned endpoints).
 - [etc2_encode](https://github.com/leegao/etc2_encode) by Lee Gao, MIT: the ETC2 and ASTC encoders
   (`shaders/etc2_enc.glsl`, `shaders/astc_enc.glsl`) are ported from its compute shaders and
   extended, with its tables; its licence is in those files and `third_party/etc2_encode/LICENSE`.
