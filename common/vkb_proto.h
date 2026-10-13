@@ -47,6 +47,7 @@ static inline const char *vkb_mem_strategy_name(uint32_t s)
 #define VKB_EMU_TEXEL_ALIGN    (1u << 15)  /* storage texel buffers at any texel offset reported (vkd3d-proton 3) */
 #define VKB_EMU_DESC_LIMITS    (1u << 16)  /* 1M sampled/storage images and storage buffers per stage; cut to the GPU's (vkd3d-proton) */
 #define VKB_EMU_OPAQUE_FD      (1u << 17)  /* OPAQUE_FD external memory as dma-bufs (DXVK shared resources) */
+#define VKB_EMU_MULTI_DRAW     (1u << 18)  /* multiDrawIndirect: an indirect draw of n becomes n single draws (Mali-G57 r32-r38) */
 #define VKB_EMU_ROBUSTNESS2    (1u << 7)   /* VK_EXT_robustness2 reported, not enforced (GameNative's r44 profile) */
 
 /* vkbQueryServer reply (per physical device). */

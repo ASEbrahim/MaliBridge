@@ -89,6 +89,7 @@ Each one turns on only when the GPU lacks the feature.
 - **Vertex attribute divisor**: the binding gets a stride of 0 and is rebound for each run of instances, with draws split to match.
 - **maintenance5 / maintenance6, depth clip enable, load/store op none**: mapped onto what the driver has.
 - **dualSrcBlend, fillModeNonSolid, multiViewport**: reported so that DXVK 3 starts. The rare use is approximated and logged.
+- **multiDrawIndirect** (Mali-G57 on r32/r38): an indirect draw of n commands is recorded as n single indirect draws.
 - **Storage texel buffer alignment**: any texel offset is accepted (vkd3d-proton 3).
 - **Elastic descriptor pools**: allocation past a pool's size, which desktop drivers allow and Mali refuses.
 - **OPAQUE_FD external memory and image dma-buf export**: backed by dma-buf / dma-heap pages.
@@ -174,7 +175,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_SPIRV_FIX=0/1` | server | forces the SPIR-V fixes off or on (default: on for ARM GPUs) |
 | `VKBRIDGE_EMULATE=0` | server | no emulations at all |
 | `VKBRIDGE_EMU_OFF=<hex mask>` | server | turns off chosen emulations for bisecting (bits in `common/vkb_proto.h`) |
-| `VKBRIDGE_EMU_<NAME>=0` | server | turns off one emulation (`BCN`, `PUSH`, `DESCLIMITS`, `ROBUSTNESS2`, ...) |
+| `VKBRIDGE_EMU_<NAME>=0` | server | turns off one emulation (`BCN`, `PUSH`, `DESCLIMITS`, `ROBUSTNESS2`, `MULTIDRAW`, ...) |
 | `VKBRIDGE_BC_TRANSCODE=0` | server | BC textures decoded instead of transcoded to ETC2/EAC/ASTC (`VKBRIDGE_FAKE_MISSING=astchdr`: only BC6H decoded) |
 | `VKBRIDGE_NO_XFB_FOLD=1` | server | turns off the stream output fold |
 | `VKBRIDGE_NO_CRASH_GUARD=1` | server | turns off pipeline crash containment |
@@ -229,7 +230,8 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
 - The Mali compatibility layer (`VK_LAYER_DROIDDECK_mali_compat`) by David Cimo
   ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali)) and The412Banner (DroidDeck branch
   `test/non-adreno-all`), GPL-3.0: the zero-filled null-descriptor buffer and the null push
-  descriptor writes follow its stand-ins.
+  descriptor writes follow its stand-ins, and the multiDrawIndirect emulation
+  (`server/server_emu_compat.c`) follows The412Banner's `draw.c`.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
   (the order of memory-sharing strategies on Mali, the r44 robustness2 profile) informed the
   server. No code from either project is included.

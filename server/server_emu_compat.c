@@ -14,6 +14,10 @@
  *    1.0 forms (per bind point named by the stage flags). Exact.
  *  - VK_KHR_load_store_op_none (VKB_EMU_LOADSTORE_NONE): the driver's VK_EXT_load_store_op_none,
  *    same enumerants (server_instance.c enables it). Exact.
+ *  - multiDrawIndirect (VKB_EMU_MULTI_DRAW): vkCmdDraw(Indexed)Indirect with drawCount > 1 is
+ *    recorded as drawCount single indirect draws at offset + i * stride. Exact, a little more CPU
+ *    work per draw. Mali-G57 (r32p1, r38p1) lacks the feature and DXVK needs it. The DroidDeck Mali
+ *    compatibility layer (The412Banner, GPL-3.0) emulates it the same way.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -29,6 +33,8 @@ typedef struct compat_state {
     PFN_vkCmdSetScissor set_scissor;
     PFN_vkCmdSetViewportWithCount set_viewport_count;
     PFN_vkCmdSetScissorWithCount set_scissor_count;
+    PFN_vkCmdDrawIndirect draw_indirect;
+    PFN_vkCmdDrawIndexedIndirect draw_indexed_indirect;
 } compat_state;
 
 static compat_state *states[4096];
@@ -128,10 +134,36 @@ static void VKAPI_CALL c_CmdPushConstants2(VkCommandBuffer cb, const VkPushConst
     st()->push(cb, i->layout, i->stageFlags, i->offset, i->size, i->pValues);
 }
 
+static int told_multidraw;
+#define TELL_MULTIDRAW() \
+    do { if (!told_multidraw) once(&told_multidraw, "indirect draws split into single draws (no multiDrawIndirect)"); } while (0)
+
+static void VKAPI_CALL c_CmdDrawIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, uint32_t n, uint32_t stride)
+{
+    compat_state *s = st();
+    if (n <= 1) {
+        s->draw_indirect(cb, buf, off, n, stride);
+        return;
+    }
+    TELL_MULTIDRAW();
+    for (uint32_t i = 0; i < n; i++) s->draw_indirect(cb, buf, off + (VkDeviceSize)i * stride, 1, stride);
+}
+
+static void VKAPI_CALL c_CmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, uint32_t n, uint32_t stride)
+{
+    compat_state *s = st();
+    if (n <= 1) {
+        s->draw_indexed_indirect(cb, buf, off, n, stride);
+        return;
+    }
+    TELL_MULTIDRAW();
+    for (uint32_t i = 0; i < n; i++) s->draw_indexed_indirect(cb, buf, off + (VkDeviceSize)i * stride, 1, stride);
+}
+
 void vkb_emu_compat_install(vkb_srv_table *dev)
 {
     vkb_emu_device *e = dev->emu;
-    if (!(e->flags & (VKB_EMU_MULTI_VIEWPORT | VKB_EMU_MAINT6)) || dev->id >= 4096) return;
+    if (!(e->flags & (VKB_EMU_MULTI_VIEWPORT | VKB_EMU_MAINT6 | VKB_EMU_MULTI_DRAW)) || dev->id >= 4096) return;
     compat_state *s = calloc(1, sizeof(*s));
     if (!s) return;
     vkb_dispatch *dt = &dev->dt;
@@ -142,6 +174,12 @@ void vkb_emu_compat_install(vkb_srv_table *dev)
     s->set_scissor = dt->vkCmdSetScissor;
     s->set_viewport_count = dt->vkCmdSetViewportWithCount;
     s->set_scissor_count = dt->vkCmdSetScissorWithCount;
+    s->draw_indirect = dt->vkCmdDrawIndirect;
+    s->draw_indexed_indirect = dt->vkCmdDrawIndexedIndirect;
+    if (e->flags & VKB_EMU_MULTI_DRAW) {
+        if (s->draw_indirect) dt->vkCmdDrawIndirect = c_CmdDrawIndirect;
+        if (s->draw_indexed_indirect) dt->vkCmdDrawIndexedIndirect = c_CmdDrawIndexedIndirect;
+    }
     if (e->flags & VKB_EMU_MULTI_VIEWPORT) {
         if (s->set_viewport) dt->vkCmdSetViewport = c_CmdSetViewport;
         if (s->set_scissor) dt->vkCmdSetScissor = c_CmdSetScissor;
@@ -164,6 +202,8 @@ void vkb_emu_compat_uninstall(vkb_srv_table *dev)
     if (dt->vkCmdSetScissor == c_CmdSetScissor) dt->vkCmdSetScissor = s->set_scissor;
     if (dt->vkCmdSetViewportWithCount == c_CmdSetViewportWithCount) dt->vkCmdSetViewportWithCount = s->set_viewport_count;
     if (dt->vkCmdSetScissorWithCount == c_CmdSetScissorWithCount) dt->vkCmdSetScissorWithCount = s->set_scissor_count;
+    if (dt->vkCmdDrawIndirect == c_CmdDrawIndirect) dt->vkCmdDrawIndirect = s->draw_indirect;
+    if (dt->vkCmdDrawIndexedIndirect == c_CmdDrawIndexedIndirect) dt->vkCmdDrawIndexedIndirect = s->draw_indexed_indirect;
     if (dt->vkCmdBindDescriptorSets2 == c_CmdBindDescriptorSets2) dt->vkCmdBindDescriptorSets2 = NULL;
     if (dt->vkCmdPushConstants2 == c_CmdPushConstants2) dt->vkCmdPushConstants2 = NULL;
     states[dev->id] = NULL;

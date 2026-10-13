@@ -66,6 +66,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (token(fake, "dualsrc")) f.dualSrcBlend = VK_FALSE;
         if (token(fake, "fillmode")) f.fillModeNonSolid = VK_FALSE;
         if (token(fake, "multiviewport")) f.multiViewport = VK_FALSE;
+        if (token(fake, "multidraw")) f.multiDrawIndirect = VK_FALSE;
         if (token(fake, "maint6")) maint6 = 0;
         if (token(fake, "push")) push = 0;
     }
@@ -114,6 +115,9 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (!f.dualSrcBlend && !env_off("VKBRIDGE_EMU_DUALSRC")) emu |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid && !env_off("VKBRIDGE_EMU_FILLMODE")) emu |= VKB_EMU_FILL_MODE;
     if (!f.multiViewport && !env_off("VKBRIDGE_EMU_MULTIVIEWPORT")) emu |= VKB_EMU_MULTI_VIEWPORT;
+    /* DXVK refuses a device without multiDrawIndirect; Mali-G57 on r32p1/r38p1 has none (Lee Gao's
+     * compat_layer README). Indirect draws are split into single ones (server_emu_compat.c). */
+    if (!f.multiDrawIndirect && !env_off("VKBRIDGE_EMU_MULTIDRAW")) emu |= VKB_EMU_MULTI_DRAW;
     if (!maint6 && (props.apiVersion < VK_API_VERSION_1_4 || (fake && token(fake, "maint6"))) && !env_off("VKBRIDGE_EMU_MAINT6"))
         emu |= VKB_EMU_MAINT6;
     if (!lson_khr && lson_ext) emu |= VKB_EMU_LOADSTORE_NONE;
@@ -156,6 +160,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (!f.dualSrcBlend) miss |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid) miss |= VKB_EMU_FILL_MODE;
     if (!f.multiViewport) miss |= VKB_EMU_MULTI_VIEWPORT;
+    if (!f.multiDrawIndirect) miss |= VKB_EMU_MULTI_DRAW;
     if (emu & VKB_EMU_MAINT6) miss |= VKB_EMU_MAINT6;
     if (emu & VKB_EMU_PUSH_DESC) miss |= VKB_EMU_PUSH_DESC;
     if (!texel_single) miss |= VKB_EMU_TEXEL_ALIGN;

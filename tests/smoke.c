@@ -45,6 +45,7 @@ static I(vkCmdDraw); static I(vkCreateSemaphore); static I(vkSignalSemaphore); s
 static I(vkGetSemaphoreCounterValue); static I(vkDestroyDevice); static I(vkFlushMappedMemoryRanges);
 static I(vkInvalidateMappedMemoryRanges); static I(vkCmdSetViewport); static I(vkCmdSetScissor);
 static I(vkCreateFence); static I(vkWaitForFences); static I(vkCmdCopyBufferToImage);
+static I(vkCmdDrawIndirect); static I(vkCmdDrawIndexedIndirect); static I(vkCmdBindIndexBuffer);
 #undef I
 
 static void check(int ok, const char *what, const char *detail)
@@ -460,16 +461,38 @@ static void test_image_clear(void)
     check(ok && bad < 0, "image clear/upload/readback", d);
 }
 
-static void test_draw(void)
+/* indirect: 0 vkCmdDraw; 1 vkCmdDrawIndirect and 2 vkCmdDrawIndexedIndirect with two commands 32 bytes
+ * apart, the first drawing no instances (multiDrawIndirect; the bridge splits them where the GPU
+ * lacks it). Either way the left half is drawn green. */
+static int has_mdi;
+static void test_draw(int indirect)
 {
+    static const char *const names[3] = {"draw", "multi-draw indirect", "multi-draw indexed indirect"};
+    const char *name = names[indirect];
+    if (indirect && !has_mdi) {
+        check(1, name, "skipped (no multiDrawIndirect)");
+        return;
+    }
     const uint32_t w = 128, h = 96;
     VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
     VkImage img = make_image(fmt, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     buffer rb;
-    if (!img || !make_buffer(&rb, w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-        check(0, "draw", "setup");
+    buffer ib;
+    if (!img || !make_buffer(&rb, w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+        !make_buffer(&ib, 256, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        check(0, name, "setup");
         return;
     }
+    /* At 0 and 32: the commands (indexed: count, instances, first index, vertex offset, first instance;
+     * plain: count, instances, first vertex, first instance); at 128: the indices 0, 1, 2. */
+    uint32_t *cmd = ib.ptr;
+    memset(cmd, 0, 256);
+    uint32_t c0[5] = {3, 0, 0, 0, 0}, c1[5] = {3, 1, 0, 0, 0};
+    memcpy(cmd, c0, sizeof(c0));
+    memcpy(cmd + 8, c1, sizeof(c1));
+    uint16_t *idx = (uint16_t *)((uint8_t *)ib.ptr + 128);
+    idx[0] = 0, idx[1] = 1, idx[2] = 2;
+    sync_to_gpu(&ib);
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img, VK_IMAGE_VIEW_TYPE_2D, fmt, {0},
                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VkImageView view;
@@ -515,7 +538,7 @@ static void test_draw(void)
                                          pl, rp, 0, VK_NULL_HANDLE, -1};
     VkPipeline pipe;
     if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe)) {
-        check(0, "graphics pipeline", "creation failed");
+        check(0, name, "graphics pipeline creation failed");
         return;
     }
     VkCommandBuffer cb = begin();
@@ -530,7 +553,14 @@ static void test_draw(void)
     vkCmdSetScissor(cb, 0, 1, &sc);
     float color[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, color);
-    vkCmdDraw(cb, 3, 1, 0, 0);
+    if (indirect == 1) {
+        vkCmdDrawIndirect(cb, ib.buf, 0, 2, 32);
+    } else if (indirect == 2) {
+        vkCmdBindIndexBuffer(cb, ib.buf, 128, VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexedIndirect(cb, ib.buf, 0, 2, 32);
+    } else {
+        vkCmdDraw(cb, 3, 1, 0, 0);
+    }
     vkCmdEndRenderPass(cb);
     /* Belt and braces with the dependency above (tablet run 7: Mali's copy job ran ahead of its
      * fragment job and read zeros; RADV happened to order them). */
@@ -552,7 +582,7 @@ static void test_draw(void)
     char d[128];
     snprintf(d, sizeof(d), bad < 0 ? "render pass + pipeline + scissor exact (%ux%u)" : "pixel %d = 0x%08x", bad < 0 ? w : (unsigned)bad,
              bad < 0 ? h : p[bad]);
-    check(ok && bad < 0, "draw", d);
+    check(ok && bad < 0, name, d);
 }
 
 static void test_timeline(void)
@@ -676,7 +706,10 @@ int main(int argc, char **argv)
         r2.pNext = chain;
         chain = &r2;
     }
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, chain, 0, 1, &qci, 0, NULL, ndev_exts, dev_exts, NULL};
+    VkPhysicalDeviceFeatures have = {0}, want = {0};
+    vkGetPhysicalDeviceFeatures(pd, &have);
+    want.multiDrawIndirect = has_mdi = have.multiDrawIndirect;
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, chain, 0, 1, &qci, 0, NULL, ndev_exts, dev_exts, &want};
     r = vkCreateDevice(pd, &dci, NULL, &dev);
     check(r == VK_SUCCESS, "device", r ? "vkCreateDevice failed" : "");
     if (r) return 1;
@@ -693,6 +726,7 @@ int main(int argc, char **argv)
     G(vkCreateSemaphore); G(vkSignalSemaphore); G(vkWaitSemaphores); G(vkGetSemaphoreCounterValue); G(vkDestroyDevice);
     G(vkFlushMappedMemoryRanges); G(vkInvalidateMappedMemoryRanges); G(vkCmdSetViewport); G(vkCmdSetScissor);
     G(vkCreateFence); G(vkWaitForFences); G(vkCmdCopyBufferToImage);
+    G(vkCmdDrawIndirect); G(vkCmdDrawIndexedIndirect); G(vkCmdBindIndexBuffer);
 #undef G
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, qfam};
@@ -703,7 +737,9 @@ int main(int argc, char **argv)
     test_push();
     test_pool_growth();
     test_image_clear();
-    test_draw();
+    test_draw(0);
+    test_draw(1);
+    test_draw(2);
     test_timeline();
     test_roundtrip_rate();
 

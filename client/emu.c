@@ -52,6 +52,8 @@ void vkb_emu_patch_limits(vkb_physdev *pd, VkPhysicalDeviceProperties *p)
     /* D3D11 has 16 viewports; with multiViewport emulated, all but the first are dropped. */
     if (EMU(pd, VKB_EMU_MULTI_VIEWPORT) && p->limits.maxViewports < 16) p->limits.maxViewports = 16;
     if (EMU(pd, VKB_EMU_DUAL_SRC) && p->limits.maxFragmentDualSrcAttachments < 1) p->limits.maxFragmentDualSrcAttachments = 1;
+    /* Without multiDrawIndirect the limit is 1; the server splits any count into single draws. */
+    if (EMU(pd, VKB_EMU_MULTI_DRAW)) p->limits.maxDrawIndirectCount = UINT32_MAX;
 }
 
 /* The update-after-bind limits: same member names in VkPhysicalDeviceVulkan12Properties and
@@ -120,6 +122,7 @@ void vkb_emu_patch_features(vkb_physdev *pd, VkPhysicalDeviceFeatures *f)
     set_feature(pd, VKB_EMU_DUAL_SRC, &f->dualSrcBlend);
     set_feature(pd, VKB_EMU_FILL_MODE, &f->fillModeNonSolid);
     set_feature(pd, VKB_EMU_MULTI_VIEWPORT, &f->multiViewport);
+    set_feature(pd, VKB_EMU_MULTI_DRAW, &f->multiDrawIndirect);
 }
 
 void vkb_emu_patch_features_chain(vkb_physdev *pd, VkBaseOutStructure *b)

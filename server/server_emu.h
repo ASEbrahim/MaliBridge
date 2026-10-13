@@ -9,7 +9,7 @@
                              VKB_EMU_DIVISOR | VKB_EMU_DEPTH_CLIP | VKB_EMU_ROBUSTNESS2 | \
                              VKB_EMU_DMABUF_EXPORT | VKB_EMU_DUAL_SRC | VKB_EMU_FILL_MODE | VKB_EMU_MULTI_VIEWPORT | \
                              VKB_EMU_MAINT6 | VKB_EMU_LOADSTORE_NONE | VKB_EMU_PUSH_DESC | VKB_EMU_TEXEL_ALIGN | \
-                             VKB_EMU_DESC_LIMITS | VKB_EMU_OPAQUE_FD)
+                             VKB_EMU_DESC_LIMITS | VKB_EMU_OPAQUE_FD | VKB_EMU_MULTI_DRAW)
 
 #define VKB_EMU_BUCKETS 1024
 
