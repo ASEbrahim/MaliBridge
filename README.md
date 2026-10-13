@@ -54,30 +54,31 @@ Everything here is still work in progress.
 | Dead Cells | runs well |
 | ENDER LILIES | runs well, 42-44 fps |
 | Lethal Company | runs well, 43-45 fps |
-| Subnautica | runs well, 20-24 fps with Detail set to High (~30 fps on Low) |
+| Subnautica | runs well, 20-24 fps with Detail set to High |
 | The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) |
-| Stray | runs, but slowly (13-16 fps, limited by the emulated render thread) |
+| Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) |
 | Deep Rock Galactic | runs, but slowly |
 
 Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples compressed, at the
 size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11,
-BC6H -> ASTC 4x4 HDR where the GPU has `textureCompressionASTC_HDR`; not yet tried on a device).
+BC6H -> ASTC 4x4 HDR where the GPU has `textureCompressionASTC_HDR`, as the G720 does).
 Without ASTC HDR, BC6H is decoded to RGBA16F (8x its compressed size), and so is any texture the
 transcoder cannot take (storage images, uncompressed views in the format list, sizes or types the
 GPU refuses). ASTC HDR has no negative values: BC6H SFLOAT texels below zero become 0.
-Transcoding is lossy: `bcn_check transcode` measures 31-66 dB PSNR against the BC data depending
+Transcoding is lossy: `bcn_check transcode` measures 31-69 dB PSNR against the BC data depending
 on format and content (measured on the Mali-G720: BC1 31-46 dB, BC2/BC3 46-60 dB, BC7 34-56 dB,
-BC4/BC5 44-67 dB; BC6H -> ASTC HDR 67-69 dB in linear values against each image's largest, on
-the desktop, with the blocks decoded on the CPU). It also costs upload time: a 4096x4096x2 BC7 texture takes about 790 ms to
-transcode to ASTC on the G720 where decoding it took about 105 ms, so games that stream many
-large textures load more slowly. In Subnautica with Detail set to High the transcoded textures
-take 2.5 GB where the BC data is 2.4 GB (decoded they reached 4.75 GB and the game was killed).
+BC4/BC5 44-67 dB, BC6H -> ASTC HDR 67-69 dB in linear values against each image's largest).
+It also costs upload time: a 4096x4096x2 BC7 texture takes about 310 ms to transcode to ASTC on
+the G720 where decoding it takes about 105 ms, so games that stream many large textures load
+somewhat more slowly. In Subnautica with Detail set to High the transcoded textures take 2.5 GB
+where the BC data is 2.4 GB (decoded they reached 4.75 GB and the game was killed); Stray's BC
+textures take 288 MB from 287 MB compressed.
 
 ## Mali workarounds
 
 Each one turns on only when the GPU lacks the feature.
 
-- **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`), and where the GPU samples ETC2/EAC/ASTC (Mali does) encoded again into those in the same pass (`shaders/etc2_enc.glsl`, `astc_enc.glsl`, `eac_enc.glsl`; BC6H into ASTC HDR, `astc_hdr_enc.glsl`, where the GPU has it), so the texture stays compressed. Otherwise decoded; BC1 goes to 16-bit where it can.
+- **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`), and where the GPU samples ETC2/EAC/ASTC (Mali does) encoded again into those in the same pass (`shaders/etc2_enc.glsl`, `astc_enc.glsl`, `eac_enc.glsl`; BC6H into ASTC 4x4 HDR, `astc_hdr_enc.glsl`, where the GPU has it), so the texture stays compressed at about its BC size. Otherwise decoded (BC6H to RGBA16F); BC1 goes to 16-bit where it can. `VKBRIDGE_BC_TRANSCODE=0` decodes everything.
 - **Push descriptors** (`VK_KHR_push_descriptor`): emulated with descriptor sets per command buffer. vkd3d-proton will not start without them.
 - **Descriptor limits**: the 1,000,000-per-stage limits vkd3d-proton asks for are reported, and layouts are cut down to what the GPU has (500,000 on r44).
 - **Null descriptors / robustness2**: reported, with null descriptors replaced by dummy resources (the buffer zero-filled; in descriptor set updates, templates, push descriptors and vertex buffer binds), and the driver's own buffer and image robustness turned on.
@@ -179,6 +180,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_BC_TRANSCODE=0` | server | BC textures decoded instead of transcoded to ETC2/EAC/ASTC (`VKBRIDGE_FAKE_MISSING=astchdr`: only BC6H decoded) |
 | `VKBRIDGE_NO_XFB_FOLD=1` | server | turns off the stream output fold |
 | `VKBRIDGE_NO_CRASH_GUARD=1` | server | turns off pipeline crash containment |
+| `VKBRIDGE_NO_FORCED_ROBUSTNESS=1` | server | the robustness2 emulation leaves buffer and image robustness to the app instead of turning them on |
 | `VKBRIDGE_FAKE_MISSING=bc,push,...` | server | pretends the GPU lacks features (host testing, see `host/mali_env.sh`) |
 | `VKBRIDGE_HIDE_EXTS`, `VKBRIDGE_MAX_API` | client | hide extensions or cap the API version reported to apps |
 | `VKBRIDGE_DEBUG=1`, `VKBRIDGE_LOG_LEVEL=<n>` | client | client log verbosity |
@@ -199,7 +201,6 @@ third_party/   Vulkan-Headers 1.4.341, bcdec, etc2_encode's licence (the encoder
 
 ## Roadmap
 
-- Check BC6H -> ASTC HDR on the device (`bcn_check transcode` through the bridge on the tablet).
 - Package the Mali emulations as a standalone Vulkan layer that works without the socket bridge.
 - Test on more devices and driver versions (other Mali generations, newer drivers).
 
