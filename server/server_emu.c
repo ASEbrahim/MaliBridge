@@ -202,6 +202,11 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
             if (want[i] && !have[i]) want[i] = VK_FALSE;
         }
         if (emu & VKB_EMU_BCN) f->shaderStorageImageExtendedFormats = VK_TRUE;
+        /* BC images transcoded to these (server_emu_bcn.c) need them on. */
+        if ((emu & VKB_EMU_BCN) && vkb_emu_bcn_transcode_wanted()) {
+            f->textureCompressionETC2 |= real.textureCompressionETC2;
+            f->textureCompressionASTC_LDR |= real.textureCompressionASTC_LDR;
+        }
         if (emu & VKB_EMU_DEPTH_CLIP) f->depthClamp = VK_TRUE;
     }
     if (emu & VKB_EMU_DIVISOR) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT);

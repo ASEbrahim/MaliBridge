@@ -299,12 +299,12 @@ static void image_account(vkb_emu_device *e, VkDevice device, VkImage img, const
     vkb_emu_real()->vkGetImageMemoryRequirements(device, img, &req);
     int64_t src = 0, ideal = 0;
     if (client_format != ci->format && vkb_is_bc(client_format)) {
-        int64_t block = vkb_bc_block_bytes(client_format), texel = decoded_texel_bytes(ci->format);
+        int64_t block = vkb_bc_block_bytes(client_format), texel = decoded_texel_bytes(ci->format), tx = vkb_tx_block_bytes(ci->format);
         for (uint32_t m = 0; m < ci->mipLevels; m++) {
             uint32_t w = ci->extent.width >> m, h = ci->extent.height >> m, d = ci->extent.depth >> m;
             w = w ? w : 1, h = h ? h : 1, d = d ? d : 1;
             src += (int64_t)((w + 3) / 4) * ((h + 3) / 4) * d * block;
-            ideal += (int64_t)w * h * d * texel;
+            ideal += tx ? (int64_t)((w + 3) / 4) * ((h + 3) / 4) * d * tx : (int64_t)w * h * d * texel; /* transcoded: its blocks */
         }
         src *= ci->arrayLayers, ideal *= ci->arrayLayers;
     } else {

@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "server_emu.h"
+#include "vkb_emu_formats.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -697,7 +698,8 @@ static void check_bind(vkb_hang *h, VkImage img, VkDeviceMemory mem, VkDeviceSiz
     vkb_emu_image *r = h->t->emu ? vkb_emu_find_image(h->t->emu, img) : NULL;
     VKB_ERR("BIND OVERFLOW %d: image %llx%s (%ux%u, format %d, driver format %d) needs %llu bytes at offset %llu of memory %llx "
             "holding %llu: %llu bytes past its end",
-            n, (unsigned long long)(uintptr_t)img, r && r->client_format != r->format ? " (BCn decoded)" : "", r ? r->extent.width : 0,
+            n, (unsigned long long)(uintptr_t)img,
+            r && r->client_format != r->format ? (vkb_tx_block_bytes(r->format) ? " (BCn transcoded)" : " (BCn decoded)") : "", r ? r->extent.width : 0,
             r ? r->extent.height : 0, r ? r->client_format : 0, r ? r->format : 0, (unsigned long long)req.size,
             (unsigned long long)off, (unsigned long long)(uintptr_t)mem, (unsigned long long)m->size,
             (unsigned long long)(off + req.size - m->size));

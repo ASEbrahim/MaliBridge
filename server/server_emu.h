@@ -83,6 +83,8 @@ void vkb_emu_track_image(vkb_emu_device *e, VkImage img, const VkImageCreateInfo
 
 /* feature hooks (server_emu_features.c and friends) */
 int vkb_emu_bcn_supported(const vkb_dispatch *idt, VkPhysicalDevice pd);
+/* BC images transcoded to ETC2 / EAC / ASTC where the GPU has them (VKBRIDGE_BC_TRANSCODE=0: decoded). */
+int vkb_emu_bcn_transcode_wanted(void);
 void vkb_emu_install(vkb_srv_table *dev);
 void vkb_emu_uninstall(vkb_srv_table *dev);
 void vkb_emu_install_features(vkb_srv_table *dev);
