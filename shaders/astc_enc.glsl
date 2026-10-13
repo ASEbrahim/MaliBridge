@@ -5,11 +5,12 @@
  * it: endpoints from the principal axis (power iteration on the covariance), the blue-contraction
  * swap, the block mode and BISE packing, and its trit and quint tables. Changed: float32 instead of half
  * arithmetic; weights picked by the error against the quantized endpoints as a decoder expands
- * them; one least-squares refit of the endpoints to those weights; several weight / endpoint
- * precisions tried per block (2-bit weights with 8-bit endpoints keep BC1/BC3 colour almost
- * exactly), for blocks with alpha a second weight plane for alpha, and for BC7 blocks of 2 or 3
- * subsets 2 partitions with the ASTC partition nearest BC7's (from a 256-entry table instead of
- * upstream's k-means and 48 KB lookup); the lowest error is kept.
+ * them; one least-squares refit of the endpoints to those weights; up to two weight / endpoint
+ * precisions tried per block, the second only when the first is not good enough (2-bit weights with
+ * 8-bit endpoints keep BC1/BC3 colour almost exactly), for blocks with alpha a second weight plane
+ * for alpha, and for BC7 blocks of 2 or 3 subsets 2 partitions with the ASTC partition nearest
+ * BC7's (from a 256-entry table instead of upstream's k-means and 48 KB lookup); the lowest error
+ * is kept. A block of one colour is a void-extent block.
  *
  * MIT License
  *
@@ -66,7 +67,7 @@ const uint ASTC_QUINTS[125] = uint[125](
 
 /* Candidates (4x4 weights; bits: 17 header, 2 more for the plane selector, 29 with 2 partitions):
  *   CEM 8 (RGB):   2-bit weights + 8-bit endpoints (32 + 48), 3-bit + 8-bit (48 + 48), 4-bit + QUANT_192 (64 + 46)
- *   CEM 12 (RGBA): 2-bit + 8-bit (32 + 64), 3-bit + QUANT_192 (48 + 61), 4-bit + QUANT_48 (64 + 45),
+ *   CEM 12 (RGBA): 3-bit + QUANT_192 (48 + 61), 4-bit + QUANT_48 (64 + 45),
  *                  dual plane (alpha its own) 2-bit + QUANT_48 (64 + 45 + 2)
  *   2 partitions, CEM 8: 2-bit weights + QUANT_40 endpoints (32 + 64), where the block was a BC7 block
  *                  of 2 or 3 subsets: the ASTC partition closest to BC7's (gen_astc_tables.py).
@@ -86,8 +87,9 @@ uvec2 astc_rank(uint q, uint r)
 {
     if (q == 256u) return uvec2(r, r);
     bool up = r >= (q >> 1);
-    uint base = q == 40u ? 5u : 3u, rr = up ? q - 1u - r : r;
-    uint t = rr % base, h = rr / base; /* trit / quint, the bits above the low one */
+    uint rr = up ? q - 1u - r : r;
+    /* trit / quint, the bits above the low one (rr / 5 or rr / 3 by multiplication; rr < 96) */
+    uint h = q == 40u ? (rr * 52429u) >> 18 : (rr * 43691u) >> 17, t = rr - h * (q == 40u ? 5u : 3u);
     uint nb, B, C;
     if (q == 192u) { nb = 6u; B = (h << 4) | (h >> 4); C = 5u; }
     else if (q == 48u) { nb = 4u; B = (h << 6) | h; C = 22u; }
@@ -106,12 +108,12 @@ uvec2 astc_ep(uint q, float v)
         return uvec2(u, u);
     }
     uint n = q - 1u, r = uint(v * float(n) / 255.0 + 0.5);
-    uvec2 e = astc_rank(q, r), e2 = astc_rank(q, r > 0u ? r - 1u : 0u);
-    float d = abs(float(e.y) - v);
-    if (abs(float(e2.y) - v) < d) { e = e2; d = abs(float(e2.y) - v); }
-    e2 = astc_rank(q, min(r + 1u, n));
-    if (abs(float(e2.y) - v) < d) e = e2;
-    return e;
+    /* the decoded values grow with the rank and lie within a step of uniform: the nearest is r or its
+     * neighbour on v's side */
+    uvec2 e = astc_rank(q, r);
+    uint r2 = float(e.y) < v ? min(r + 1u, n) : (r > 0u ? r - 1u : 0u);
+    uvec2 e2 = astc_rank(q, r2);
+    return abs(float(e2.y) - v) < abs(float(e.y) - v) ? e2 : e;
 }
 
 /* Weight value (0..64) of index k in a b-bit weight range (bit replication). */
@@ -215,7 +217,7 @@ uint astc_ise(inout uvec4 b, uint pos, uint q, uint v[16], uint n)
     return pos;
 }
 
-uint g_aw[32]; /* the packed candidate's weight indices (interleaved by plane when dual) */
+uint g_aw[32]; /* the candidate's weight indices (interleaved by plane when dual) */
 
 /* The level of a b-bit weight range nearest t (0..1): the levels lie within half a step of uniform,
  * so it is the rounded index or its neighbour on t's side. */
@@ -229,10 +231,9 @@ uint astc_wq(uint b, float t)
 }
 
 /* Weights for decoded endpoints d0, d1 per partition (plane 0 over the channels in m, plane 1 alpha
- * when dual): the error of the block, the chosen weights (0..1) in wf / wa, with pack their indices
- * in g_aw. A texel's error is quadratic in the weight along the endpoints' line, so its best level
+ * when dual): the error of the block, the chosen weights (0..1) in wf / wa, their indices in g_aw. A texel's error is quadratic in the weight along the endpoints' line, so its best level
  * is the one nearest its projection on the line. */
-float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, bool pack, out float wf[16], out float wa[16])
+float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, out float wf[16], out float wa[16])
 {
     float e = 0.0;
     vec4 rest = vec4(1.0) - m;
@@ -258,11 +259,9 @@ float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, bool pack
             wa[p] = astc_w(wb, ka) / 64.0;
             float da = v.a - mix(a.a, b.a, wa[p]);
             e += da * da;
-            if (pack) {
-                g_aw[2u * p] = k;
-                g_aw[2u * p + 1u] = ka;
-            }
-        } else if (pack) {
+            g_aw[2u * p] = k;
+            g_aw[2u * p + 1u] = ka;
+        } else {
             g_aw[p] = k;
         }
     }
@@ -291,9 +290,9 @@ void astc_refit(vec4 m, uint part, float w[16], inout vec4 e0, inout vec4 e1)
 }
 
 /* One candidate from endpoints l0, l1 per partition (a principal axis' extremes; with dual, alpha's
- * extremes in .a): its error, and with pack its block in blk. seed: the partition seed with 2
- * partitions (g_apart set), else ~0u. */
-float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec4 l1[2], bool pack, out uvec4 blk)
+ * extremes in .a): the lower of its error and limit (the best error so far), and its block in blk
+ * where it is the lower. seed: the partition seed with 2 partitions (g_apart set), else ~0u. */
+float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec4 l1[2], float limit, inout uvec4 blk)
 {
     vec4 m = rgba && !dual ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0);
     bool two = seed != ~0u;
@@ -305,8 +304,7 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec
         if (!rgba) e0[k].a = e1[k].a = 255.0;
     }
     uint nv = rgba ? 8u : 6u;
-    float best = 1e30;
-    blk = uvec4(0u);
+    float best = limit;
     for (int pass = 0; pass < 2; pass++) {
         uint v[16];
         vec4 d0[2], d1[2];
@@ -331,10 +329,10 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec
         }
         if (!two) { d0[1] = d0[0]; d1[1] = d1[0]; }
         float wf[16], wa[16];
-        float e = astc_weights(d0, d1, m, dual, wb, pack, wf, wa);
+        float e = astc_weights(d0, d1, m, dual, wb, wf, wa);
         if (e < best) {
             best = e;
-            if (pack) {
+            {
                 /* block mode: 4x4 weights (A = 2, B = 0), range R/H, D for the second plane */
                 uint r = wb == 2u ? 4u : (wb == 3u ? 7u : 4u), h = wb == 4u ? 1u : 0u;
                 uint bm = ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5) | (h << 9) | ((dual ? 1u : 0u) << 10);
@@ -371,9 +369,22 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec
     return best;
 }
 
+/* A block error (squared differences summed over the texels' channels, 8-bit units) good enough to
+ * stop at: about 0.7 a texel, under a decoder's own rounding. */
+const float ASTC_GOOD = 8.0;
+
 /* part: for a BC7 block of 2 or 3 subsets, its entry in ASTC_BC7P (seed << 16 | partition-1
- * texels), else ~0u. Candidates are scored without packing; the best is encoded again, packed. */
-uvec4 astc_encode(uint part)
+ * texels), else ~0u. fine: BC7 (BC2 / BC3 colour is BC1's: 4 shades on a 5:6:5 line, which 2-bit
+ * weights and 8-bit endpoints keep almost exactly).
+ *
+ * Candidates are tried from the one that wins most on such content, until one is good enough; on
+ * bcn_check's images (photo, rough, gradient, soft alpha) each of the others won on few blocks or by
+ * a small margin. Without alpha: BC2 / BC3 2-bit weights and 8-bit endpoints, then 4-bit weights
+ * and QUANT_192; BC7 3-bit and 8-bit, then 4-bit and QUANT_192, or for a BC7 block of 2 or 3 subsets
+ * its 2 partitions first and 4-bit weights only after. With alpha: 3-bit weights and QUANT_192, then
+ * for BC2 / BC3 a second plane for alpha (2-bit, QUANT_48: their alpha seldom follows the colour),
+ * for BC7 4-bit weights and QUANT_48. */
+uvec4 astc_encode(uint part, bool fine)
 {
     bool alpha = false, same = true;
     for (uint p = 0u; p < 16u; p++) {
@@ -390,49 +401,40 @@ uvec4 astc_encode(uint part)
     astc_line(alpha ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0), 0u, s0[0], s1[0]);
     s0[1] = s0[0];
     s1[1] = s1[0];
-    uvec4 blk;
-    float e, e2;
-    uint bwb, bq; /* the best candidate's weight bits and endpoint range */
-    bool bdual = false, btwo = false;
-    if (!alpha) {
-        e = astc_try(false, false, 2u, 256u, ~0u, s0, s1, false, blk); bwb = 2u; bq = 256u;
-        e2 = astc_try(false, false, 3u, 256u, ~0u, s0, s1, false, blk);
-        if (e2 < e) { e = e2; bwb = 3u; bq = 256u; }
-        e2 = astc_try(false, false, 4u, 192u, ~0u, s0, s1, false, blk);
-        if (e2 < e) { e = e2; bwb = 4u; bq = 192u; }
-        if (part != ~0u) {
-            g_apart = part & 0xffffu;
-            vec4 p0[2], p1[2];
-            astc_line(vec4(1.0, 1.0, 1.0, 0.0), 0u, p0[0], p1[0]);
-            astc_line(vec4(1.0, 1.0, 1.0, 0.0), 1u, p0[1], p1[1]);
-            e2 = astc_try(false, false, 2u, 40u, part >> 16, p0, p1, false, blk);
-            if (e2 < e) {
-                astc_try(false, false, 2u, 40u, part >> 16, p0, p1, true, blk);
-                return blk;
-            }
-            g_apart = 0u;
+    uvec4 blk = uvec4(0u);
+    float e;
+    if (alpha) {
+        e = astc_try(true, false, 3u, 192u, ~0u, s0, s1, 1e30, blk);
+        if (e <= ASTC_GOOD) return blk;
+        if (fine) {
+            astc_try(true, false, 4u, 48u, ~0u, s0, s1, e, blk);
+            return blk;
         }
-    } else {
-        e = astc_try(true, false, 2u, 256u, ~0u, s0, s1, false, blk); bwb = 2u; bq = 256u;
-        e2 = astc_try(true, false, 3u, 192u, ~0u, s0, s1, false, blk);
-        if (e2 < e) { e = e2; bwb = 3u; bq = 192u; }
-        e2 = astc_try(true, false, 4u, 48u, ~0u, s0, s1, false, blk);
-        if (e2 < e) { e = e2; bwb = 4u; bq = 48u; }
         /* dual plane: the colour's own line, alpha from its extremes */
         vec4 d0[2], d1[2];
         astc_line(vec4(1.0, 1.0, 1.0, 0.0), 0u, d0[0], d1[0]);
         float amin = 255.0, amax = 0.0;
-        for (uint p = 0u; p < 16u; p++) { amin = min(amin, float(g_px[p].a)); amax = max(amax, float(g_px[p].a)); }
+        for (uint p = 0u; p < 16u; p++) {
+            amin = min(amin, float(g_px[p].a));
+            amax = max(amax, float(g_px[p].a));
+        }
         d0[0].a = amin;
         d1[0].a = amax;
         d0[1] = d0[0];
         d1[1] = d1[0];
-        e2 = astc_try(true, true, 2u, 48u, ~0u, d0, d1, false, blk);
-        if (e2 < e) {
-            astc_try(true, true, 2u, 48u, ~0u, d0, d1, true, blk);
-            return blk;
-        }
+        astc_try(true, true, 2u, 48u, ~0u, d0, d1, e, blk);
+        return blk;
     }
-    astc_try(alpha, false, bwb, bq, ~0u, s0, s1, true, blk);
+    if (part != ~0u) {
+        g_apart = part & 0xffffu;
+        vec4 p0[2], p1[2];
+        astc_line(vec4(1.0, 1.0, 1.0, 0.0), 0u, p0[0], p1[0]);
+        astc_line(vec4(1.0, 1.0, 1.0, 0.0), 1u, p0[1], p1[1]);
+        e = astc_try(false, false, 2u, 40u, part >> 16, p0, p1, 1e30, blk);
+        g_apart = 0u;
+    } else {
+        e = fine ? astc_try(false, false, 3u, 256u, ~0u, s0, s1, 1e30, blk) : astc_try(false, false, 2u, 256u, ~0u, s0, s1, 1e30, blk);
+    }
+    if (e > ASTC_GOOD) astc_try(false, false, 4u, 192u, ~0u, s0, s1, e, blk);
     return blk;
 }

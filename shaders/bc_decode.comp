@@ -504,9 +504,9 @@ void main()
         uint alone = d01 <= d02 && d01 <= d12 ? 2u : (d02 <= d12 ? 1u : 0u);
         part = ASTC_BC7P[64u + g_bc7_part * 3u + alone];
     }
-    uvec4 enc = astc_encode(part);
+    uvec4 enc = astc_encode(part, true);
 #elif defined(ENC_ASTC)
-    uvec4 enc = astc_encode(~0u);
+    uvec4 enc = astc_encode(~0u, false);
 #endif
 #if defined(ENC_ASTC) || defined(FMT_BC5)
     const uint ow = 4u;
