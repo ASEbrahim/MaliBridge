@@ -80,7 +80,7 @@ Each one turns on only when the GPU lacks the feature.
 - **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`), and where the GPU samples ETC2/EAC/ASTC (Mali does) encoded again into those in the same pass (`shaders/etc2_enc.glsl`, `astc_enc.glsl`, `eac_enc.glsl`; BC6H into ASTC HDR, `astc_hdr_enc.glsl`, where the GPU has it), so the texture stays compressed. Otherwise decoded; BC1 goes to 16-bit where it can.
 - **Push descriptors** (`VK_KHR_push_descriptor`): emulated with descriptor sets per command buffer. vkd3d-proton will not start without them.
 - **Descriptor limits**: the 1,000,000-per-stage limits vkd3d-proton asks for are reported, and layouts are cut down to what the GPU has (500,000 on r44).
-- **Null descriptors / robustness2**: reported, with null descriptors replaced by dummy resources, and the driver's own buffer and image robustness turned on.
+- **Null descriptors / robustness2**: reported, with null descriptors replaced by dummy resources (the buffer zero-filled), and the driver's own buffer and image robustness turned on.
 - **vkd3d-proton descriptor set 3 repair**: rebinds the heap set when vkd3d-proton binds a corrupted handle. The corruption comes from a union in vkd3d-proton v2.12-v3.0 and hung the GPU in The Witcher 3.
 - **Stream output fold**: the pass-through geometry shader that DXVK builds for D3D11 stream output is folded into the vertex shader. Mali runs geometry shaders very slowly (Subnautica went from 6 to ~30 fps).
 - **Clip/cull distance**: built-ins turned into varyings, with clipping done in the fragment shader.
@@ -224,7 +224,11 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   (bionic-vulkan-wrapper issue #93). `server/server_spvfix.c` fixes the same pattern.
 - [compat_layer](https://github.com/leegao/compat_layer) by Lee Gao, MIT: turning on image
   robustness alongside buffer robustness for the robustness2 emulation (`server/server_instance.c`)
-  follows its robustness2 emulation. No code is copied; `docs/COMPAT_SURVEY.md` compares the layers.
+  follows its robustness2 emulation, as does zero-filling the null-descriptor stand-in buffer
+  (`server/server_nulldesc.c`). No code is copied; `docs/COMPAT_SURVEY.md` compares the layers.
+- The Mali compatibility layer (`VK_LAYER_DROIDDECK_mali_compat`) by David Cimo
+  ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali)) and The412Banner (DroidDeck branch
+  `test/non-adreno-all`), GPL-3.0: the zero-filled null-descriptor buffer follows its stand-ins.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
   (the order of memory-sharing strategies on Mali, the r44 robustness2 profile) informed the
   server. No code from either project is included.

@@ -6,9 +6,12 @@
  * Zink insist on it), and Zink then writes VK_NULL_HANDLE for unused image views, buffers and
  * texel buffer views, and binds null vertex buffers. Mali dereferences them (tablet run 10: a
  * null read at 0x28 inside its vkUpdateDescriptorSetWithTemplate, as Steam started). Here the
- * nulls become small dummy resources: a 1x1 image view, a buffer, a texel buffer view. Reads of
- * them return whatever the dummy holds (zeros once cleared, not guaranteed), where the extension
- * promises zeros; nothing crashes.
+ * nulls become small dummy resources: a 1x1 image view, a buffer, a texel buffer view. The buffer
+ * (and the texel view on it) is zero-filled where it can be mapped, so null buffer reads return
+ * zeros as the extension promises; reads of the image view return whatever it holds (zeros once
+ * cleared, not guaranteed). Nothing crashes. Zero-filling the stand-in buffer follows the Mali
+ * compatibility layer of David Cimo and The412Banner (DroidDeck, GPL-3.0) and Lee Gao's
+ * compat_layer (MIT).
  *
  * The request's own arrays are patched (they live in the server's receive buffer/arena).
  */
@@ -51,19 +54,46 @@ static vkb_nulldesc *cur(void)
     return t ? t->nulldesc : NULL;
 }
 
-static uint32_t mem_type(vkb_srv_table *t, uint32_t bits)
+/* A memory type the resource accepts, never lazily allocated (Mali's only GPU-only type is):
+ * device-local first, and with `host` host-visible first (device-local and host-visible, then
+ * host-visible, then device-local). */
+static uint32_t mem_type(vkb_srv_table *t, uint32_t bits, int host)
 {
     VkPhysicalDeviceMemoryProperties mp;
     t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
-    /* Not lazily allocated (Mali's only GPU-only type is): any other the resource accepts. */
-    for (int pass = 0; pass < 2; pass++)
+    static const VkMemoryPropertyFlags want[2][3] = {
+        {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 0},
+        {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT},
+    };
+    for (int pass = 0; pass < 4; pass++) {
+        VkMemoryPropertyFlags w = pass < 3 ? want[host != 0][pass] : 0;
         for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
             VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
             if (!(bits & (1u << i)) || (f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)) continue;
-            if (pass == 0 && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+            if ((f & w) != w) continue;
             return i;
         }
+    }
     return UINT32_MAX;
+}
+
+/* Fills a host-visible allocation with zeros; 0 when the memory cannot be mapped. */
+static int zero_fill(vkb_srv_table *t, VkDeviceMemory mem, uint32_t type, VkDeviceSize size)
+{
+    VkPhysicalDeviceMemoryProperties mp;
+    t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+    VkMemoryPropertyFlags f = mp.memoryTypes[type].propertyFlags;
+    void *p = NULL;
+    if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || t->real.vkMapMemory(t->device, mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p)
+        return 0;
+    memset(p, 0, (size_t)size);
+    if (!(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        VkMappedMemoryRange r = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, mem, 0, VK_WHOLE_SIZE};
+        t->real.vkFlushMappedMemoryRanges(t->device, 1, &r);
+    }
+    t->real.vkUnmapMemory(t->device, mem);
+    return 1;
 }
 
 /* The dummies, made on first need (under the lock). 0 when they could not be. */
@@ -82,7 +112,7 @@ static int make_dummies(vkb_nulldesc *n)
     uint32_t type;
     if (r->vkCreateImage(d, &ici, NULL, &n->image) != VK_SUCCESS) goto fail;
     r->vkGetImageMemoryRequirements(d, n->image, &req);
-    if ((type = mem_type(t, req.memoryTypeBits)) == UINT32_MAX) goto fail;
+    if ((type = mem_type(t, req.memoryTypeBits, 0)) == UINT32_MAX) goto fail;
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, type};
     if (r->vkAllocateMemory(d, &ai, NULL, &n->image_mem) != VK_SUCCESS || r->vkBindImageMemory(d, n->image, n->image_mem, 0) != VK_SUCCESS)
         goto fail;
@@ -96,14 +126,16 @@ static int make_dummies(vkb_nulldesc *n)
                               VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (r->vkCreateBuffer(d, &bci, NULL, &n->buffer) != VK_SUCCESS) goto fail;
     r->vkGetBufferMemoryRequirements(d, n->buffer, &req);
-    if ((type = mem_type(t, req.memoryTypeBits)) == UINT32_MAX) goto fail;
+    if ((type = mem_type(t, req.memoryTypeBits, 1)) == UINT32_MAX) goto fail;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = type;
     if (r->vkAllocateMemory(d, &ai, NULL, &n->buffer_mem) != VK_SUCCESS || r->vkBindBufferMemory(d, n->buffer, n->buffer_mem, 0) != VK_SUCCESS)
         goto fail;
+    int zeroed = zero_fill(t, n->buffer_mem, type, req.size);
     VkBufferViewCreateInfo bv = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, n->buffer, VK_FORMAT_R32_UINT, 0, VK_WHOLE_SIZE};
     if (r->vkCreateBufferView(d, &bv, NULL, &n->texel) != VK_SUCCESS) n->texel = VK_NULL_HANDLE; /* texel nulls stay */
-    VKB_INFO("device %u: null descriptors emulated (dummy image view, buffer%s)", t->id, n->texel ? ", texel buffer view" : "");
+    VKB_INFO("device %u: null descriptors emulated (dummy image view, buffer%s%s)", t->id, n->texel ? ", texel buffer view" : "",
+             zeroed ? "; buffer zero-filled" : "; buffer not mappable, contents undefined");
     return 1;
 fail:
     n->failed = 1;
