@@ -1,0 +1,89 @@
+; Geometry shader in glslang's shape: gl_in[3] {Position, PointSize, ClipDistance[2],
+; CullDistance[1]} in, gl_PerVertex {Position, ClipDistance[2]} out; passes each vertex's
+; position and clip distances through (gl_in[i].gl_ClipDistance must reach it from the VS).
+               OpCapability Shader
+               OpCapability Geometry
+               OpCapability ClipDistance
+               OpCapability CullDistance
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Geometry %main "main" %gl_in %out
+               OpExecutionMode %main Triangles
+               OpExecutionMode %main Invocations 1
+               OpExecutionMode %main OutputTriangleStrip
+               OpExecutionMode %main OutputVertices 3
+               OpMemberDecorate %PerVertexIn 0 BuiltIn Position
+               OpMemberDecorate %PerVertexIn 1 BuiltIn PointSize
+               OpMemberDecorate %PerVertexIn 2 BuiltIn ClipDistance
+               OpMemberDecorate %PerVertexIn 3 BuiltIn CullDistance
+               OpDecorate %PerVertexIn Block
+               OpMemberDecorate %PerVertexOut 0 BuiltIn Position
+               OpMemberDecorate %PerVertexOut 1 BuiltIn ClipDistance
+               OpDecorate %PerVertexOut Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %uint = OpTypeInt 32 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+     %float1 = OpTypeArray %float %uint_1
+     %float2 = OpTypeArray %float %uint_2
+%PerVertexIn = OpTypeStruct %v4float %float %float2 %float1
+     %in_arr = OpTypeArray %PerVertexIn %uint_3
+      %in_pv = OpTypePointer Input %in_arr
+      %gl_in = OpVariable %in_pv Input
+%PerVertexOut = OpTypeStruct %v4float %float2
+     %out_pv = OpTypePointer Output %PerVertexOut
+        %out = OpVariable %out_pv Output
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+      %int_2 = OpConstant %int 2
+      %in_v4 = OpTypePointer Input %v4float
+   %in_float = OpTypePointer Input %float
+     %out_v4 = OpTypePointer Output %v4float
+  %out_float = OpTypePointer Output %float
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+       %pp0 = OpAccessChain %in_v4 %gl_in %int_0 %int_0
+        %p0 = OpLoad %v4float %pp0
+       %ca0 = OpAccessChain %in_float %gl_in %int_0 %int_2 %int_0
+        %a0 = OpLoad %float %ca0
+       %cb0 = OpAccessChain %in_float %gl_in %int_0 %int_2 %int_1
+        %b0 = OpLoad %float %cb0
+       %op0 = OpAccessChain %out_v4 %out %int_0
+              OpStore %op0 %p0
+       %oa0 = OpAccessChain %out_float %out %int_1 %int_0
+              OpStore %oa0 %a0
+       %ob0 = OpAccessChain %out_float %out %int_1 %int_1
+              OpStore %ob0 %b0
+              OpEmitVertex
+       %pp1 = OpAccessChain %in_v4 %gl_in %int_1 %int_0
+        %p1 = OpLoad %v4float %pp1
+       %ca1 = OpAccessChain %in_float %gl_in %int_1 %int_2 %int_0
+        %a1 = OpLoad %float %ca1
+       %cb1 = OpAccessChain %in_float %gl_in %int_1 %int_2 %int_1
+        %b1 = OpLoad %float %cb1
+       %op1 = OpAccessChain %out_v4 %out %int_0
+              OpStore %op1 %p1
+       %oa1 = OpAccessChain %out_float %out %int_1 %int_0
+              OpStore %oa1 %a1
+       %ob1 = OpAccessChain %out_float %out %int_1 %int_1
+              OpStore %ob1 %b1
+              OpEmitVertex
+       %pp2 = OpAccessChain %in_v4 %gl_in %int_2 %int_0
+        %p2 = OpLoad %v4float %pp2
+       %ca2 = OpAccessChain %in_float %gl_in %int_2 %int_2 %int_0
+        %a2 = OpLoad %float %ca2
+       %cb2 = OpAccessChain %in_float %gl_in %int_2 %int_2 %int_1
+        %b2 = OpLoad %float %cb2
+       %op2 = OpAccessChain %out_v4 %out %int_0
+              OpStore %op2 %p2
+       %oa2 = OpAccessChain %out_float %out %int_1 %int_0
+              OpStore %oa2 %a2
+       %ob2 = OpAccessChain %out_float %out %int_1 %int_1
+              OpStore %ob2 %b2
+              OpEmitVertex
+              OpReturn
+              OpFunctionEnd

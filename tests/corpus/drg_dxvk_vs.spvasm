@@ -1,0 +1,52 @@
+; Hand-written vertex shader to pair with drg_dxvk_gs.spv (pervertex_pipeline): loose Position
+; (DXVK/Zink style), TEXCOORD (location 0) = (0.25, 0.75), TEXCOORD1 (location 2) = 0 (the layer).
+; A triangle over the middle of the target: the centre is covered, the corners are not.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %vid %pos %tc %tc1
+               OpDecorate %vid BuiltIn VertexIndex
+               OpDecorate %pos BuiltIn Position
+               OpDecorate %tc Location 0
+               OpDecorate %tc1 Location 2
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+        %int = OpTypeInt 32 1
+       %uint = OpTypeInt 32 0
+     %uint_3 = OpConstant %uint 3
+     %uint_0 = OpConstant %uint 0
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+     %arr_v4 = OpTypeArray %v4float %uint_3
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+  %float_n05 = OpConstant %float -0.5
+   %float_05 = OpConstant %float 0.5
+   %float_25 = OpConstant %float 0.25
+   %float_75 = OpConstant %float 0.75
+         %c0 = OpConstantComposite %v4float %float_n05 %float_n05 %float_0 %float_1
+         %c1 = OpConstantComposite %v4float %float_05 %float_n05 %float_0 %float_1
+         %c2 = OpConstantComposite %v4float %float_0 %float_05 %float_0 %float_1
+      %verts = OpConstantComposite %arr_v4 %c0 %c1 %c2
+     %tc_val = OpConstantComposite %v2float %float_25 %float_75
+    %pin_int = OpTypePointer Input %int
+    %pout_v4 = OpTypePointer Output %v4float
+    %pout_v2 = OpTypePointer Output %v2float
+  %pout_uint = OpTypePointer Output %uint
+    %pfn_arr = OpTypePointer Function %arr_v4
+     %pfn_v4 = OpTypePointer Function %v4float
+        %vid = OpVariable %pin_int Input
+        %pos = OpVariable %pout_v4 Output
+         %tc = OpVariable %pout_v2 Output
+        %tc1 = OpVariable %pout_uint Output
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+         %vv = OpVariable %pfn_arr Function %verts
+          %i = OpLoad %int %vid
+          %p = OpAccessChain %pfn_v4 %vv %i
+          %v = OpLoad %v4float %p
+               OpStore %pos %v
+               OpStore %tc %tc_val
+               OpStore %tc1 %uint_0
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,80 @@
+; Tessellation evaluation shader in glslang's shape: gl_in[32] {Position, PointSize,
+; ClipDistance[1], CullDistance[1]} in (one access chain, one whole-array load), gl_PerVertex
+; {Position, PointSize, ClipDistance[1], CullDistance[1]} out; barycentric position and clip.
+               OpCapability Shader
+               OpCapability Tessellation
+               OpCapability ClipDistance
+               OpCapability CullDistance
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint TessellationEvaluation %main "main" %gl_in %out %tc
+               OpExecutionMode %main Triangles
+               OpExecutionMode %main SpacingEqual
+               OpExecutionMode %main VertexOrderCcw
+               OpDecorate %tc BuiltIn TessCoord
+               OpMemberDecorate %PerVertexIn 0 BuiltIn Position
+               OpMemberDecorate %PerVertexIn 1 BuiltIn PointSize
+               OpMemberDecorate %PerVertexIn 2 BuiltIn ClipDistance
+               OpMemberDecorate %PerVertexIn 3 BuiltIn CullDistance
+               OpDecorate %PerVertexIn Block
+               OpMemberDecorate %PerVertexOut 0 BuiltIn Position
+               OpMemberDecorate %PerVertexOut 1 BuiltIn PointSize
+               OpMemberDecorate %PerVertexOut 2 BuiltIn ClipDistance
+               OpMemberDecorate %PerVertexOut 3 BuiltIn CullDistance
+               OpDecorate %PerVertexOut Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %uint = OpTypeInt 32 0
+     %uint_1 = OpConstant %uint 1
+    %uint_32 = OpConstant %uint 32
+     %float1 = OpTypeArray %float %uint_1
+%PerVertexIn = OpTypeStruct %v4float %float %float1 %float1
+     %in_arr = OpTypeArray %PerVertexIn %uint_32
+      %in_pv = OpTypePointer Input %in_arr
+      %gl_in = OpVariable %in_pv Input
+%PerVertexOut = OpTypeStruct %v4float %float %float1 %float1
+     %out_pv = OpTypePointer Output %PerVertexOut
+        %out = OpVariable %out_pv Output
+      %in_v3 = OpTypePointer Input %v3float
+         %tc = OpVariable %in_v3 Input
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+      %int_2 = OpConstant %int 2
+      %int_3 = OpConstant %int 3
+   %in_float = OpTypePointer Input %float
+     %out_v4 = OpTypePointer Output %v4float
+  %out_float = OpTypePointer Output %float
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %t = OpLoad %v3float %tc
+         %t0 = OpCompositeExtract %float %t 0
+         %t1 = OpCompositeExtract %float %t 1
+         %t2 = OpCompositeExtract %float %t 2
+        %all = OpLoad %in_arr %gl_in
+        %ps0 = OpCompositeExtract %v4float %all 0 0
+        %ps1 = OpCompositeExtract %v4float %all 1 0
+        %ps2 = OpCompositeExtract %v4float %all 2 0
+        %w0 = OpVectorTimesScalar %v4float %ps0 %t0
+        %w1 = OpVectorTimesScalar %v4float %ps1 %t1
+        %w2 = OpVectorTimesScalar %v4float %ps2 %t2
+        %s01 = OpFAdd %v4float %w0 %w1
+        %pos = OpFAdd %v4float %s01 %w2
+        %opos = OpAccessChain %out_v4 %out %int_0
+              OpStore %opos %pos
+        %cc1 = OpCompositeExtract %float %all 1 2 0
+        %ca0 = OpAccessChain %in_float %gl_in %int_0 %int_2 %int_0
+         %c0 = OpLoad %float %ca0
+        %c0w = OpFMul %float %c0 %t0
+        %c1w = OpFMul %float %cc1 %t1
+        %clip = OpFAdd %float %c0w %c1w
+         %oc = OpAccessChain %out_float %out %int_2 %int_0
+              OpStore %oc %clip
+        %cu0 = OpAccessChain %in_float %gl_in %int_0 %int_3 %int_0
+        %cu = OpLoad %float %cu0
+        %ocu = OpAccessChain %out_float %out %int_3 %int_0
+              OpStore %ocu %cu
+              OpReturn
+              OpFunctionEnd

@@ -1,0 +1,26 @@
+; A use the rewrite does not know (OpCopyObject of the output Position pointer): the pass must
+; leave the module untouched and say why.
+               OpCapability Shader
+               OpCapability Geometry
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Geometry %main "main" %out_pos
+               OpExecutionMode %main Triangles
+               OpExecutionMode %main Invocations 1
+               OpExecutionMode %main OutputTriangleStrip
+               OpExecutionMode %main OutputVertices 3
+               OpDecorate %out_pos BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+    %float_0 = OpConstant %float 0
+       %zero = OpConstantComposite %v4float %float_0 %float_0 %float_0 %float_0
+   %pout_pos = OpTypePointer Output %v4float
+    %out_pos = OpVariable %pout_pos Output
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+          %c = OpCopyObject %pout_pos %out_pos
+               OpStore %c %zero
+               OpEmitVertex
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,56 @@
+; Tessellation control shader: arrayed input and output Position, both loaded and stored whole
+; (one load with a memory operand), and stores through access chains at InvocationId.
+               OpCapability Shader
+               OpCapability Tessellation
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint TessellationControl %main "main" %in_pos %out_pos %iid %outer %inner
+               OpExecutionMode %main OutputVertices 3
+               OpDecorate %in_pos BuiltIn Position
+               OpDecorate %out_pos BuiltIn Position
+               OpDecorate %iid BuiltIn InvocationId
+               OpDecorate %outer BuiltIn TessLevelOuter
+               OpDecorate %outer Patch
+               OpDecorate %inner BuiltIn TessLevelInner
+               OpDecorate %inner Patch
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+        %int = OpTypeInt 32 1
+       %uint = OpTypeInt 32 0
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+     %uint_4 = OpConstant %uint 4
+    %v4float = OpTypeVector %float 4
+     %arr_v4 = OpTypeArray %v4float %uint_3
+     %arr_f4 = OpTypeArray %float %uint_4
+     %arr_f2 = OpTypeArray %float %uint_2
+    %pin_pos = OpTypePointer Input %arr_v4
+   %pout_pos = OpTypePointer Output %arr_v4
+    %pout_v4 = OpTypePointer Output %v4float
+    %pin_int = OpTypePointer Input %int
+    %pout_f4 = OpTypePointer Output %arr_f4
+    %pout_f2 = OpTypePointer Output %arr_f2
+     %in_pos = OpVariable %pin_pos Input
+    %out_pos = OpVariable %pout_pos Output
+        %iid = OpVariable %pin_int Input
+      %outer = OpVariable %pout_f4 Output
+      %inner = OpVariable %pout_f2 Output
+    %float_1 = OpConstant %float 1
+    %outer_c = OpConstantComposite %arr_f4 %float_1 %float_1 %float_1 %float_1
+    %inner_c = OpConstantComposite %arr_f2 %float_1 %float_1
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+        %all = OpLoad %arr_v4 %in_pos Volatile
+               OpStore %out_pos %all
+          %i = OpLoad %int %iid
+         %pi = OpAccessChain %pout_v4 %out_pos %i
+          %v = OpCompositeExtract %v4float %all 0
+               OpStore %pi %v
+       %back = OpLoad %arr_v4 %out_pos
+         %b2 = OpCompositeExtract %v4float %back 2
+         %p2 = OpAccessChain %pout_v4 %out_pos %i
+               OpStore %p2 %b2
+               OpStore %outer %outer_c
+               OpStore %inner %inner_c
+               OpReturn
+               OpFunctionEnd

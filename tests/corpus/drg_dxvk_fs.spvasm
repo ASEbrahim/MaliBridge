@@ -1,0 +1,26 @@
+; Hand-written fragment shader to pair with drg_dxvk_gs.spv (pervertex_pipeline): colour = (1, TEXCOORD, 1).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %tc %col
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %tc Location 0
+               OpDecorate %col Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %float_1 = OpConstant %float 1
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+     %pin_v2 = OpTypePointer Input %v2float
+    %pout_v4 = OpTypePointer Output %v4float
+         %tc = OpVariable %pin_v2 Input
+        %col = OpVariable %pout_v4 Output
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+          %t = OpLoad %v2float %tc
+          %x = OpCompositeExtract %float %t 0
+          %y = OpCompositeExtract %float %t 1
+          %c = OpCompositeConstruct %v4float %float_1 %x %y %float_1
+               OpStore %col %c
+               OpReturn
+               OpFunctionEnd

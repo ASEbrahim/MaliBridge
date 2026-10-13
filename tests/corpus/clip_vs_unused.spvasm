@@ -1,0 +1,34 @@
+; Vertex shader as glslang emits about every one: gl_PerVertex {Position, PointSize,
+; ClipDistance[1], CullDistance[1]}, no clip/cull capability, only Position written. The unused
+; members must go without a Location output (nobody writes it; the discard must not read it).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %pv %pos_in
+               OpDecorate %pos_in Location 0
+               OpMemberDecorate %PerVertex 0 BuiltIn Position
+               OpMemberDecorate %PerVertex 1 BuiltIn PointSize
+               OpMemberDecorate %PerVertex 2 BuiltIn ClipDistance
+               OpMemberDecorate %PerVertex 3 BuiltIn CullDistance
+               OpDecorate %PerVertex Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %uint = OpTypeInt 32 0
+     %uint_1 = OpConstant %uint 1
+     %float1 = OpTypeArray %float %uint_1
+  %PerVertex = OpTypeStruct %v4float %float %float1 %float1
+     %out_pv = OpTypePointer Output %PerVertex
+         %pv = OpVariable %out_pv Output
+      %in_v4 = OpTypePointer Input %v4float
+     %pos_in = OpVariable %in_v4 Input
+      %int_0 = OpConstant %int 0
+     %out_v4 = OpTypePointer Output %v4float
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %p = OpLoad %v4float %pos_in
+        %pos = OpAccessChain %out_v4 %pv %int_0
+               OpStore %pos %p
+               OpReturn
+               OpFunctionEnd

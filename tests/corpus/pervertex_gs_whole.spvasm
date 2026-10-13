@@ -1,0 +1,55 @@
+; Geometry shader in DXVK's shape with whole-variable accesses: the arrayed inputs loaded whole
+; (Position float4[3], ClipDistance float[2][3]), the outputs stored whole, Position Invariant.
+               OpCapability Shader
+               OpCapability Geometry
+               OpCapability ClipDistance
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Geometry %main "main" %in_pos %in_clip %out_pos %out_clip
+               OpExecutionMode %main Triangles
+               OpExecutionMode %main Invocations 1
+               OpExecutionMode %main OutputTriangleStrip
+               OpExecutionMode %main OutputVertices 3
+               OpDecorate %in_pos BuiltIn Position
+               OpDecorate %in_clip BuiltIn ClipDistance
+               OpDecorate %out_pos BuiltIn Position
+               OpDecorate %out_pos Invariant
+               OpDecorate %out_clip BuiltIn ClipDistance
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %uint = OpTypeInt 32 0
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+    %v4float = OpTypeVector %float 4
+     %arr_v4 = OpTypeArray %v4float %uint_3
+   %clip_arr = OpTypeArray %float %uint_2
+  %arr_clip3 = OpTypeArray %clip_arr %uint_3
+    %pin_pos = OpTypePointer Input %arr_v4
+   %pin_clip = OpTypePointer Input %arr_clip3
+   %pout_pos = OpTypePointer Output %v4float
+  %pout_clip = OpTypePointer Output %clip_arr
+     %in_pos = OpVariable %pin_pos Input
+    %in_clip = OpVariable %pin_clip Input
+    %out_pos = OpVariable %pout_pos Output
+   %out_clip = OpVariable %pout_clip Output
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+       %pos3 = OpLoad %arr_v4 %in_pos
+      %clip3 = OpLoad %arr_clip3 %in_clip
+         %p0 = OpCompositeExtract %v4float %pos3 0
+         %c0 = OpCompositeExtract %clip_arr %clip3 0
+               OpStore %out_pos %p0
+               OpStore %out_clip %c0
+               OpEmitVertex
+         %p1 = OpCompositeExtract %v4float %pos3 1
+         %c1 = OpCompositeExtract %clip_arr %clip3 1
+               OpStore %out_pos %p1
+               OpStore %out_clip %c1
+               OpEmitVertex
+         %p2 = OpCompositeExtract %v4float %pos3 2
+         %c2 = OpCompositeExtract %clip_arr %clip3 2
+               OpStore %out_pos %p2
+               OpStore %out_clip %c2
+               OpEmitVertex
+               OpReturn
+               OpFunctionEnd

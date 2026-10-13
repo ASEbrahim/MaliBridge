@@ -1,0 +1,32 @@
+; Fragment shader reading gl_ClipDistance[2] (a loose built-in input): demoted to a Location
+; input, which the discard then reads too.
+               OpCapability Shader
+               OpCapability ClipDistance
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %col %clip
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %col Location 0
+               OpDecorate %clip BuiltIn ClipDistance
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+       %uint = OpTypeInt 32 0
+     %uint_2 = OpConstant %uint 2
+     %float2 = OpTypeArray %float %uint_2
+   %in_clip = OpTypePointer Input %float2
+       %clip = OpVariable %in_clip Input
+     %out_v4 = OpTypePointer Output %v4float
+        %col = OpVariable %out_v4 Output
+        %int = OpTypeInt 32 1
+      %int_1 = OpConstant %int 1
+   %in_float = OpTypePointer Input %float
+    %float_1 = OpConstant %float 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %cp = OpAccessChain %in_float %clip %int_1
+          %c = OpLoad %float %cp
+          %v = OpCompositeConstruct %v4float %c %c %c %float_1
+               OpStore %col %v
+               OpReturn
+               OpFunctionEnd

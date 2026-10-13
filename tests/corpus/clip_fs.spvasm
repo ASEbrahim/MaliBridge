@@ -1,0 +1,21 @@
+; Fragment shader for the clip draws: constant colour (255, 64, 191, 255 in RGBA8).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %col
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %col Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+     %out_v4 = OpTypePointer Output %v4float
+        %col = OpVariable %out_v4 Output
+    %float_1 = OpConstant %float 1
+    %float_q = OpConstant %float 0.25
+   %float_3q = OpConstant %float 0.75
+          %c = OpConstantComposite %v4float %float_1 %float_q %float_3q %float_1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+               OpStore %col %c
+               OpReturn
+               OpFunctionEnd

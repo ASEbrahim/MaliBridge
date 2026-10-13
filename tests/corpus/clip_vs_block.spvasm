@@ -1,0 +1,64 @@
+; Vertex shader in glslang's shape: gl_PerVertex {Position, PointSize, ClipDistance[2],
+; CullDistance[1]} written member by member. Draws a full-target quad (6 vertices, no vertex
+; buffer) with gl_ClipDistance[0] = x: the left half is clipped (clip_pipeline.c checks it).
+               OpCapability Shader
+               OpCapability ClipDistance
+               OpCapability CullDistance
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %pv %vid
+               OpDecorate %vid BuiltIn VertexIndex
+               OpMemberDecorate %PerVertex 0 BuiltIn Position
+               OpMemberDecorate %PerVertex 1 BuiltIn PointSize
+               OpMemberDecorate %PerVertex 2 BuiltIn ClipDistance
+               OpMemberDecorate %PerVertex 3 BuiltIn CullDistance
+               OpDecorate %PerVertex Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %uint = OpTypeInt 32 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_6 = OpConstant %uint 6
+     %float1 = OpTypeArray %float %uint_1
+     %float2 = OpTypeArray %float %uint_2
+  %PerVertex = OpTypeStruct %v4float %float %float2 %float1
+     %out_pv = OpTypePointer Output %PerVertex
+         %pv = OpVariable %out_pv Output
+     %in_int = OpTypePointer Input %int
+        %vid = OpVariable %in_int Input
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+      %int_2 = OpConstant %int 2
+      %int_3 = OpConstant %int 3
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+   %float_m1 = OpConstant %float -1
+       %quad = OpTypeArray %v4float %uint_6
+         %p0 = OpConstantComposite %v4float %float_m1 %float_m1 %float_0 %float_1
+         %p1 = OpConstantComposite %v4float %float_1 %float_m1 %float_0 %float_1
+         %p2 = OpConstantComposite %v4float %float_1 %float_1 %float_0 %float_1
+         %p3 = OpConstantComposite %v4float %float_m1 %float_1 %float_0 %float_1
+     %quad_c = OpConstantComposite %quad %p0 %p1 %p2 %p0 %p2 %p3
+  %priv_quad = OpTypePointer Private %quad
+     %quad_v = OpVariable %priv_quad Private %quad_c
+    %priv_v4 = OpTypePointer Private %v4float
+     %out_v4 = OpTypePointer Output %v4float
+  %out_float = OpTypePointer Output %float
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %i = OpLoad %int %vid
+         %pp = OpAccessChain %priv_v4 %quad_v %i
+          %p = OpLoad %v4float %pp
+        %pos = OpAccessChain %out_v4 %pv %int_0
+               OpStore %pos %p
+          %x = OpCompositeExtract %float %p 0
+         %c0 = OpAccessChain %out_float %pv %int_2 %int_0
+               OpStore %c0 %x
+         %c1 = OpAccessChain %out_float %pv %int_2 %int_1
+               OpStore %c1 %float_1
+         %cu = OpAccessChain %out_float %pv %int_3 %int_0
+               OpStore %cu %float_1
+               OpReturn
+               OpFunctionEnd

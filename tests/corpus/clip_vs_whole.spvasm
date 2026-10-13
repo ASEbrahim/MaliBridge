@@ -1,0 +1,51 @@
+; Vertex shader writing gl_PerVertex {Position, ClipDistance[1], PointSize} as a whole: one store
+; of a constructed struct, then a whole load stored back. Same quad and clip plane as
+; clip_vs_block.spvasm; ClipDistance not last, so PointSize gets renumbered.
+               OpCapability Shader
+               OpCapability ClipDistance
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %pv %vid
+               OpDecorate %vid BuiltIn VertexIndex
+               OpMemberDecorate %PerVertex 0 BuiltIn Position
+               OpMemberDecorate %PerVertex 1 BuiltIn ClipDistance
+               OpMemberDecorate %PerVertex 2 BuiltIn PointSize
+               OpDecorate %PerVertex Block
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %uint = OpTypeInt 32 0
+     %uint_1 = OpConstant %uint 1
+     %uint_6 = OpConstant %uint 6
+     %float1 = OpTypeArray %float %uint_1
+  %PerVertex = OpTypeStruct %v4float %float1 %float
+     %out_pv = OpTypePointer Output %PerVertex
+         %pv = OpVariable %out_pv Output
+     %in_int = OpTypePointer Input %int
+        %vid = OpVariable %in_int Input
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+   %float_m1 = OpConstant %float -1
+       %quad = OpTypeArray %v4float %uint_6
+         %p0 = OpConstantComposite %v4float %float_m1 %float_m1 %float_0 %float_1
+         %p1 = OpConstantComposite %v4float %float_1 %float_m1 %float_0 %float_1
+         %p2 = OpConstantComposite %v4float %float_1 %float_1 %float_0 %float_1
+         %p3 = OpConstantComposite %v4float %float_m1 %float_1 %float_0 %float_1
+     %quad_c = OpConstantComposite %quad %p0 %p1 %p2 %p0 %p2 %p3
+  %priv_quad = OpTypePointer Private %quad
+     %quad_v = OpVariable %priv_quad Private %quad_c
+    %priv_v4 = OpTypePointer Private %v4float
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %i = OpLoad %int %vid
+         %pp = OpAccessChain %priv_v4 %quad_v %i
+          %p = OpLoad %v4float %pp
+          %x = OpCompositeExtract %float %p 0
+       %clip = OpCompositeConstruct %float1 %x
+          %s = OpCompositeConstruct %PerVertex %p %clip %float_1
+               OpStore %pv %s
+          %l = OpLoad %PerVertex %pv
+               OpStore %pv %l
+               OpReturn
+               OpFunctionEnd
