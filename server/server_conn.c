@@ -179,6 +179,7 @@ static void order_wait(vkb_srv_proc *p, uint64_t barrier)
     if (!p || !barrier) return;
     pthread_mutex_lock(&p->olock);
     int waited = 0;
+    p->owaiters++;
     while (p->watermark < barrier) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -191,6 +192,7 @@ static void order_wait(vkb_srv_proc *p, uint64_t barrier)
             break;
         }
     }
+    p->owaiters--;
     pthread_mutex_unlock(&p->olock);
 }
 
@@ -204,7 +206,9 @@ static void order_done(vkb_srv_proc *p, uint64_t seq)
             p->done[(p->watermark + 1) % VKB_SEQ_RING] = 0;
             p->watermark++;
         }
-        pthread_cond_broadcast(&p->ocond);
+        /* Only when someone waits: bionic's broadcast is a futex syscall even with no waiter, one
+         * per asynchronous message (~75k/s in Subnautica, 2026-10-12). */
+        if (p->owaiters) pthread_cond_broadcast(&p->ocond);
     }
     pthread_mutex_unlock(&p->olock);
 }

@@ -34,6 +34,7 @@ typedef struct vkb_srv_proc {
     uint64_t watermark;            /* every async seq <= this has run */
     uint8_t done[VKB_SEQ_RING];    /* seqs above the watermark that have run */
     int conn_closed;               /* a connection ended (a seq may never arrive) */
+    int owaiters;                  /* threads in order_wait */
 } vkb_srv_proc;
 
 typedef struct vkb_srv_conn {
