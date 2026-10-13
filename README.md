@@ -54,7 +54,7 @@ Everything here is still work in progress.
 | Dead Cells | runs well |
 | ENDER LILIES | runs well, 42-44 fps |
 | Lethal Company | runs well, 43-45 fps |
-| Subnautica | runs well, ~30 fps with Detail set to Low |
+| Subnautica | runs well, 20-24 fps with Detail set to High (~30 fps on Low) |
 | The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) |
 | Stray | runs, but slowly (13-16 fps, limited by the emulated render thread) |
 | Deep Rock Galactic | runs, but slowly |
@@ -63,8 +63,12 @@ Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples com
 size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11).
 BC6H is still decoded to RGBA16F (8x its compressed size), and so is any texture the transcoder
 cannot take (storage images, uncompressed views in the format list, sizes or types the GPU refuses).
-Transcoding is lossy: `bcn_check transcode` measures 31-60 dB PSNR against the BC data depending
-on format and content.
+Transcoding is lossy: `bcn_check transcode` measures 31-66 dB PSNR against the BC data depending
+on format and content (measured on the Mali-G720: BC1 31-46 dB, BC2/BC3 46-60 dB, BC7 34-56 dB,
+BC4/BC5 44-67 dB). It also costs upload time: a 4096x4096x2 BC7 texture takes about 790 ms to
+transcode to ASTC on the G720 where decoding it took about 105 ms, so games that stream many
+large textures load more slowly. In Subnautica with Detail set to High the transcoded textures
+take 2.5 GB where the BC data is 2.4 GB (decoded they reached 4.75 GB and the game was killed).
 
 ## Mali workarounds
 
