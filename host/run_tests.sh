@@ -20,6 +20,12 @@ run_mode() {
   if [ "$mode" = mali ]; then . ./mali_env.sh >/dev/null; else unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API; . ./bridge_env.sh >/dev/null; fi
   timeout 120 ./out/vkbridge-smoke >out/t-smoke.log 2>&1; result $? "smoke ($(tail -1 out/t-smoke.log))"
   if [ "$mode" = mali ]; then
+    # A GPU with push descriptors but not robustness2: nulls in push descriptor writes are replaced too
+    VKB_MISSING=robustness2 . ./mali_env.sh >/dev/null
+    VKBRIDGE_HIDE_EXTS=VK_EXT_robustness2,VK_KHR_robustness2 timeout 120 ./out/vkbridge-smoke >out/t-smoke-push.log 2>&1 &&
+      grep -q "null descriptors in push descriptor writes replaced" out/server.log
+    result $? "smoke, native push descriptors without robustness2 ($(tail -1 out/t-smoke-push.log))"
+    . ./mali_env.sh >/dev/null
     # BC transcoded to ETC2/EAC/ASTC (compared by PSNR), then decoded as the fallback does (exact)
     timeout 180 ./out/bcn_check transcode >out/t-bcn.log 2>&1; result $? "bcn_check, BC transcoded ($(tail -1 out/t-bcn.log))"
     VKB_BC_TRANSCODE=0 . ./mali_env.sh >/dev/null

@@ -13,6 +13,11 @@
  * compatibility layer of David Cimo and The412Banner (DroidDeck, GPL-3.0) and Lee Gao's
  * compat_layer (MIT).
  *
+ * Push descriptor writes are fixed the same way (vkCmdPushDescriptorSet, -2, -WithTemplate), for
+ * drivers that have VK_KHR_push_descriptor but not robustness2; emulated push descriptors reach
+ * vkUpdateDescriptorSets and are fixed there. Lee Gao's compat_layer (MIT) and the DroidDeck Mali
+ * compatibility layer (GPL-3.0) cover push descriptors likewise.
+ *
  * The request's own arrays are patched (they live in the server's receive buffer/arena).
  */
 #define _GNU_SOURCE
@@ -38,6 +43,9 @@ typedef struct vkb_nulldesc {
     PFN_vkDestroyDescriptorUpdateTemplate destroy_template;
     PFN_vkCmdBindVertexBuffers bind_vb;
     PFN_vkCmdBindVertexBuffers2 bind_vb2;
+    PFN_vkCmdPushDescriptorSet push;
+    PFN_vkCmdPushDescriptorSet2 push2;
+    PFN_vkCmdPushDescriptorSetWithTemplate push_template;
     nd_template *templates;
     int made, failed;
     VkImage image;
@@ -202,10 +210,9 @@ static void count(vkb_nulldesc *n, unsigned k)
     if (!before) VKB_INFO("device %u: first null descriptors replaced by dummies", n->t->id);
 }
 
-static void VKAPI_CALL nd_UpdateDescriptorSets(VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc,
-                                               const VkCopyDescriptorSet *cp)
+/* Replaces the null descriptors in a write list; how many there were. */
+static unsigned fix_writes(vkb_nulldesc *n, uint32_t nw, const VkWriteDescriptorSet *w)
 {
-    vkb_nulldesc *n = cur();
     unsigned k = 0;
     int ready = -1;
     for (uint32_t i = 0; i < nw; i++) {
@@ -228,7 +235,14 @@ static void VKAPI_CALL nd_UpdateDescriptorSets(VkDevice device, uint32_t nw, con
             if (ready) k += (unsigned)fix_one(n, ty, p);
         }
     }
-    count(n, k);
+    return k;
+}
+
+static void VKAPI_CALL nd_UpdateDescriptorSets(VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc,
+                                               const VkCopyDescriptorSet *cp)
+{
+    vkb_nulldesc *n = cur();
+    count(n, fix_writes(n, nw, w));
     n->update(device, nw, w, nc, cp);
 }
 
@@ -278,10 +292,9 @@ static void VKAPI_CALL nd_DestroyDescriptorUpdateTemplate(VkDevice device, VkDes
     n->destroy_template(device, tmpl, a);
 }
 
-static void VKAPI_CALL nd_UpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate tmpl,
-                                                          const void *data)
+/* Replaces the null descriptors in a template's data; how many there were. */
+static unsigned fix_template_data(vkb_nulldesc *n, VkDescriptorUpdateTemplate tmpl, const void *data)
 {
-    vkb_nulldesc *n = cur();
     unsigned k = 0;
     int ready = -1;
     pthread_mutex_lock(&n->lock);
@@ -301,8 +314,46 @@ static void VKAPI_CALL nd_UpdateDescriptorSetWithTemplate(VkDevice device, VkDes
         }
     }
     pthread_mutex_unlock(&n->lock);
-    count(n, k);
+    return k;
+}
+
+static void VKAPI_CALL nd_UpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate tmpl,
+                                                          const void *data)
+{
+    vkb_nulldesc *n = cur();
+    count(n, fix_template_data(n, tmpl, data));
     n->update_template(device, set, tmpl, data);
+}
+
+static void count_push(vkb_nulldesc *n, unsigned k)
+{
+    static int told;
+    if (k && !__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED))
+        VKB_INFO("device %u: null descriptors in push descriptor writes replaced by dummies", n->t->id);
+    count(n, k);
+}
+
+static void VKAPI_CALL nd_CmdPushDescriptorSet(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set,
+                                               uint32_t nw, const VkWriteDescriptorSet *w)
+{
+    vkb_nulldesc *n = cur();
+    count_push(n, fix_writes(n, nw, w));
+    n->push(cb, bp, layout, set, nw, w);
+}
+
+static void VKAPI_CALL nd_CmdPushDescriptorSet2(VkCommandBuffer cb, const VkPushDescriptorSetInfo *info)
+{
+    vkb_nulldesc *n = cur();
+    count_push(n, fix_writes(n, info->descriptorWriteCount, info->pDescriptorWrites));
+    n->push2(cb, info);
+}
+
+static void VKAPI_CALL nd_CmdPushDescriptorSetWithTemplate(VkCommandBuffer cb, VkDescriptorUpdateTemplate tmpl, VkPipelineLayout layout,
+                                                           uint32_t set, const void *data)
+{
+    vkb_nulldesc *n = cur();
+    count_push(n, fix_template_data(n, tmpl, data));
+    n->push_template(cb, tmpl, layout, set, data);
 }
 
 static void VKAPI_CALL nd_CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t count_, const VkBuffer *bufs,
@@ -353,6 +404,14 @@ void vkb_nulldesc_device_init(vkb_srv_table *t)
     }
     if (n->bind_vb) dt->vkCmdBindVertexBuffers = nd_CmdBindVertexBuffers;
     if (n->bind_vb2) dt->vkCmdBindVertexBuffers2 = nd_CmdBindVertexBuffers2;
+    n->push = dt->vkCmdPushDescriptorSet;
+    n->push2 = dt->vkCmdPushDescriptorSet2;
+    n->push_template = dt->vkCmdPushDescriptorSetWithTemplate;
+    if (n->push) dt->vkCmdPushDescriptorSet = nd_CmdPushDescriptorSet;
+    if (n->push2) dt->vkCmdPushDescriptorSet2 = nd_CmdPushDescriptorSet2;
+    /* Template data is read through the templates this layer saw created. */
+    if (n->push_template && dt->vkCreateDescriptorUpdateTemplate == nd_CreateDescriptorUpdateTemplate)
+        dt->vkCmdPushDescriptorSetWithTemplate = nd_CmdPushDescriptorSetWithTemplate;
     t->nulldesc = n;
 }
 
@@ -369,6 +428,9 @@ void vkb_nulldesc_device_destroy(vkb_srv_table *t)
     }
     if (n->bind_vb) dt->vkCmdBindVertexBuffers = n->bind_vb;
     if (n->bind_vb2) dt->vkCmdBindVertexBuffers2 = n->bind_vb2;
+    if (dt->vkCmdPushDescriptorSet == nd_CmdPushDescriptorSet) dt->vkCmdPushDescriptorSet = n->push;
+    if (dt->vkCmdPushDescriptorSet2 == nd_CmdPushDescriptorSet2) dt->vkCmdPushDescriptorSet2 = n->push2;
+    if (dt->vkCmdPushDescriptorSetWithTemplate == nd_CmdPushDescriptorSetWithTemplate) dt->vkCmdPushDescriptorSetWithTemplate = n->push_template;
     const vkb_dispatch *r = &t->real;
     VkDevice d = t->device;
     if (n->texel) r->vkDestroyBufferView(d, n->texel, NULL);

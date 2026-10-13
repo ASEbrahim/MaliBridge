@@ -242,7 +242,7 @@ static void test_compute(void)
 
 /* The compute check again with its two buffers pushed (VK_KHR_push_descriptor: native, or the
  * bridge's emulation on Mali), once by writes and once by a template. Needed by vkd3d-proton. */
-static int has_push;
+static int has_push, has_null; /* has_null: robustness2's nullDescriptor enabled */
 static void test_push(void)
 {
     char d[160];
@@ -267,10 +267,14 @@ static void test_push(void)
     }
     for (uint32_t i = 0; i < n; i++) ((uint32_t *)in.ptr)[i] = i;
     sync_to_gpu(&in);
-    VkDescriptorSetLayoutBinding binds[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-                                             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    /* With nullDescriptor, binding 2 (which the shader does not use) is pushed as a null buffer:
+     * the bridge replaces nulls in push descriptor writes where the GPU lacks robustness2. */
+    uint32_t nb = has_null ? 3 : 2;
+    VkDescriptorSetLayoutBinding binds[3] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                             {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL,
-                                           VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 2, binds};
+                                           VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, nb, binds};
     VkDescriptorSetLayout dsl;
     if (vkCreateDescriptorSetLayout(dev, &lci, NULL, &dsl)) {
         check(0, "push descriptors", "push set layout refused");
@@ -289,10 +293,11 @@ static void test_push(void)
         check(0, "push descriptors", "pipeline");
         return;
     }
-    VkDescriptorBufferInfo bi[2] = {{in.buf, 0, VK_WHOLE_SIZE}, {out.buf, 0, VK_WHOLE_SIZE}};
-    VkDescriptorUpdateTemplateEntry te[2] = {{0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, sizeof(bi[0])},
-                                             {1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sizeof(bi[0]), sizeof(bi[0])}};
-    VkDescriptorUpdateTemplateCreateInfo tci = {VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO, NULL, 0, 2, te,
+    VkDescriptorBufferInfo bi[3] = {{in.buf, 0, VK_WHOLE_SIZE}, {out.buf, 0, VK_WHOLE_SIZE}, {VK_NULL_HANDLE, 0, VK_WHOLE_SIZE}};
+    VkDescriptorUpdateTemplateEntry te[3] = {{0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, sizeof(bi[0])},
+                                             {1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sizeof(bi[0]), sizeof(bi[0])},
+                                             {2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * sizeof(bi[0]), sizeof(bi[0])}};
+    VkDescriptorUpdateTemplateCreateInfo tci = {VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO, NULL, 0, nb, te,
                                                 VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR, VK_NULL_HANDLE,
                                                 VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0};
     VkDescriptorUpdateTemplate tmpl;
@@ -307,10 +312,11 @@ static void test_push(void)
         VkCommandBuffer cb = begin();
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         if (pass == 0) {
-            VkWriteDescriptorSet w[2] = {
+            VkWriteDescriptorSet w[3] = {
                 {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[0], NULL},
-                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[1], NULL}};
-            push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 2, w);
+                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[1], NULL},
+                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[2], NULL}};
+            push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, nb, w);
         } else {
             push_t(cb, tmpl, pl, 0, bi);
         }
@@ -325,7 +331,8 @@ static void test_push(void)
                 break;
             }
     }
-    snprintf(d, sizeof(d), bad < 0 ? "writes and template, %u invocations correct" : "element %d wrong", bad < 0 ? n : (unsigned)bad);
+    if (bad < 0) snprintf(d, sizeof(d), "writes and template%s, %u invocations correct", has_null ? " with a null buffer" : "", n);
+    else snprintf(d, sizeof(d), "element %d wrong", bad);
     check(ok && bad < 0, "push descriptors", d);
 }
 
@@ -637,20 +644,39 @@ int main(int argc, char **argv)
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, qfam, 1, &prio};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.timelineSemaphore = VK_TRUE;
-    const char *dev_exts[1];
+    VkPhysicalDeviceRobustness2FeaturesEXT r2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    const char *dev_exts[2];
     uint32_t ndev_exts = 0;
     {
         uint32_t ne = 0;
         enum_exts(pd, NULL, &ne, NULL);
         VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof(*ep));
         enum_exts(pd, NULL, &ne, ep);
-        for (uint32_t i = 0; i < ne; i++)
+        int has_robust2 = 0;
+        for (uint32_t i = 0; i < ne; i++) {
             if (!strcmp(ep[i].extensionName, "VK_KHR_push_descriptor")) has_push = 1;
+            if (!strcmp(ep[i].extensionName, "VK_EXT_robustness2")) has_robust2 = 1;
+        }
         free(ep);
         if (has_push) dev_exts[ndev_exts++] = "VK_KHR_push_descriptor";
+        if (has_robust2) {
+            PFN_vkGetPhysicalDeviceFeatures2 gf2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2");
+            VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &r2};
+            if (gf2) gf2(pd, &q);
+            if (r2.nullDescriptor) {
+                has_null = 1;
+                r2 = (VkPhysicalDeviceRobustness2FeaturesEXT){VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+                r2.nullDescriptor = VK_TRUE;
+                dev_exts[ndev_exts++] = "VK_EXT_robustness2";
+            }
+        }
     }
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, props.apiVersion >= VK_API_VERSION_1_2 ? &f12 : NULL, 0, 1, &qci, 0, NULL,
-                              ndev_exts, dev_exts, NULL};
+    void *chain = props.apiVersion >= VK_API_VERSION_1_2 ? (void *)&f12 : NULL;
+    if (has_null) {
+        r2.pNext = chain;
+        chain = &r2;
+    }
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, chain, 0, 1, &qci, 0, NULL, ndev_exts, dev_exts, NULL};
     r = vkCreateDevice(pd, &dci, NULL, &dev);
     check(r == VK_SUCCESS, "device", r ? "vkCreateDevice failed" : "");
     if (r) return 1;
