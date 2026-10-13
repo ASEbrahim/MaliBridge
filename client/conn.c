@@ -568,8 +568,11 @@ int vkb_desc_batch(void)
 {
     static int v = -1;
     if (v < 0) {
-        const char *e = getenv("VKBRIDGE_NO_DESC_BATCH");
-        v = !(e && *e && strcmp(e, "0"));
+        /* Off by default: Risk of Rain 2 showed black flickering with it on (2026-10-14, Mali-G720,
+         * v0.2) and no game measured faster. VKBRIDGE_DESC_BATCH=1 turns it on; VKBRIDGE_NO_DESC_BATCH=1
+         * still wins. */
+        const char *on = getenv("VKBRIDGE_DESC_BATCH"), *off = getenv("VKBRIDGE_NO_DESC_BATCH");
+        v = on && *on && strcmp(on, "0") && !(off && *off && strcmp(off, "0"));
     }
     return v;
 }
