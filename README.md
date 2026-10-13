@@ -56,7 +56,7 @@ Everything here is still work in progress.
 | Lethal Company | runs well, 43-45 fps |
 | Subnautica | runs well, 20-24 fps with Detail set to High |
 | Inscryption | runs well, 68-83 fps |
-| Risk of Rain 2 | runs, 15-16 fps in the first stage (37-42 at the menu); the owner saw black flickering, under investigation |
+| Risk of Rain 2 | runs, 15-23 fps in the first stage at 1280x720, about 30 fps at half resolution (playable); needs descriptor batching off, the v0.2.1 default |
 | The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) |
 | Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) |
 | Deep Rock Galactic | runs, but slowly |
