@@ -36,9 +36,11 @@ $(OUT)/vkbridge-smoke: $(VKB)/tests/smoke.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl
 
+# Unsigned char as on the AArch64 guest the checks also run on: x86's signed char hid bcdec's
+# plain-char sign extension of BC4/BC5 SNORM endpoints, which failed bcn_check on the tablet.
 $(OUT)/%_check: $(VKB)/tests/%_check.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm
+	$(CC) $(CFLAGS) -funsigned-char -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm
 
 test: all
 	$(VKB)/host/run_tests.sh $(OUT)
