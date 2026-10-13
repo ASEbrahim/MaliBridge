@@ -215,37 +215,55 @@ uint astc_ise(inout uvec4 b, uint pos, uint q, uint v[16], uint n)
     return pos;
 }
 
-uint g_aw[32]; /* the candidate's weight indices (interleaved by plane when dual) */
+uint g_aw[32]; /* the packed candidate's weight indices (interleaved by plane when dual) */
+
+/* The level of a b-bit weight range nearest t (0..1): the levels lie within half a step of uniform,
+ * so it is the rounded index or its neighbour on t's side. */
+uint astc_wq(uint b, float t)
+{
+    uint n = (1u << b) - 1u, k = uint(clamp(t, 0.0, 1.0) * float(n) + 0.5);
+    float wk = astc_w(b, k);
+    t *= 64.0;
+    uint k2 = wk < t ? min(k + 1u, n) : (k > 0u ? k - 1u : 0u);
+    return abs(astc_w(b, k2) - t) < abs(wk - t) ? k2 : k;
+}
 
 /* Weights for decoded endpoints d0, d1 per partition (plane 0 over the channels in m, plane 1 alpha
- * when dual): the error of the block, the indices in g_aw, the chosen weights (0..1) in wf / wa. */
-float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, out float wf[16], out float wa[16])
+ * when dual): the error of the block, the chosen weights (0..1) in wf / wa, with pack their indices
+ * in g_aw. A texel's error is quadratic in the weight along the endpoints' line, so its best level
+ * is the one nearest its projection on the line. */
+float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, bool pack, out float wf[16], out float wa[16])
 {
-    uint levels = 1u << wb;
     float e = 0.0;
     vec4 rest = vec4(1.0) - m;
     if (dual) rest.a = 0.0;
+    vec4 ax[2];
+    for (uint k = 0u; k < 2u; k++) {
+        ax[k] = (d1[k] - d0[k]) * m;
+        float l = dot(ax[k], ax[k]);
+        ax[k] *= l > 0.0 ? 1.0 / l : 0.0;
+    }
+    float ra = d1[0].a - d0[0].a;
+    ra = ra != 0.0 ? 1.0 / ra : 0.0;
     for (uint p = 0u; p < 16u; p++) {
         uint part = (g_apart >> p) & 1u;
         vec4 v = vec4(g_px[p]), a = d0[part], b = d1[part];
-        float be = 1e30, ba = 1e30;
-        uint bk = 0u, bka = 0u;
-        for (uint k = 0u; k < levels; k++) {
-            float w = astc_w(wb, k) / 64.0;
-            vec4 d = (v - mix(a, b, w));
-            float ee = dot(d * d, m);
-            if (ee < be) { be = ee; bk = k; }
-            if (dual && d.a * d.a < ba) { ba = d.a * d.a; bka = k; }
-        }
-        vec4 dr = (v - a) * rest;
-        e += be + dot(dr, dr) + (dual ? ba : 0.0);
-        wf[p] = astc_w(wb, bk) / 64.0;
-        wa[p] = astc_w(wb, bka) / 64.0;
+        uint k = astc_wq(wb, dot((v - a) * m, ax[part]));
+        float w = astc_w(wb, k) / 64.0;
+        vec4 d = (v - mix(a, b, w)) * m + (v - a) * rest;
+        e += dot(d, d);
+        wf[p] = w;
         if (dual) {
-            g_aw[2u * p] = bk;
-            g_aw[2u * p + 1u] = bka;
-        } else {
-            g_aw[p] = bk;
+            uint ka = astc_wq(wb, (v.a - a.a) * ra);
+            wa[p] = astc_w(wb, ka) / 64.0;
+            float da = v.a - mix(a.a, b.a, wa[p]);
+            e += da * da;
+            if (pack) {
+                g_aw[2u * p] = k;
+                g_aw[2u * p + 1u] = ka;
+            }
+        } else if (pack) {
+            g_aw[p] = k;
         }
     }
     return e;
@@ -272,25 +290,19 @@ void astc_refit(vec4 m, uint part, float w[16], inout vec4 e0, inout vec4 e1)
     e1 = mix(e1, clamp((a * s1 - b * s0) / det, 0.0, 255.0), m);
 }
 
-/* One candidate: its error, its block in out. seed: the partition seed with 2 partitions (g_apart
- * set), else ~0u. */
-float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, out uvec4 blk)
+/* One candidate from endpoints l0, l1 per partition (a principal axis' extremes; with dual, alpha's
+ * extremes in .a): its error, and with pack its block in blk. seed: the partition seed with 2
+ * partitions (g_apart set), else ~0u. */
+float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec4 l1[2], bool pack, out uvec4 blk)
 {
     vec4 m = rgba && !dual ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0);
     bool two = seed != ~0u;
     uint np = two ? 2u : 1u;
-    if (!two) g_apart = 0u;
     vec4 e0[2], e1[2];
-    for (uint k = 0u; k < np; k++) {
-        astc_line(m, k, e0[k], e1[k]);
+    for (uint k = 0u; k < 2u; k++) {
+        e0[k] = l0[k];
+        e1[k] = l1[k];
         if (!rgba) e0[k].a = e1[k].a = 255.0;
-    }
-    if (!two) { e0[1] = e0[0]; e1[1] = e1[0]; }
-    if (dual) {
-        float amin = 255.0, amax = 0.0;
-        for (uint p = 0u; p < 16u; p++) { amin = min(amin, float(g_px[p].a)); amax = max(amax, float(g_px[p].a)); }
-        e0[0].a = amin;
-        e1[0].a = amax;
     }
     uint nv = rgba ? 8u : 6u;
     float best = 1e30;
@@ -319,32 +331,35 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, out uvec4 blk)
         }
         if (!two) { d0[1] = d0[0]; d1[1] = d1[0]; }
         float wf[16], wa[16];
-        float e = astc_weights(d0, d1, m, dual, wb, wf, wa);
+        float e = astc_weights(d0, d1, m, dual, wb, pack, wf, wa);
         if (e < best) {
             best = e;
-            /* block mode: 4x4 weights (A = 2, B = 0), range R/H, D for the second plane */
-            uint r = wb == 2u ? 4u : (wb == 3u ? 7u : 4u), h = wb == 4u ? 1u : 0u;
-            uint bm = ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5) | (h << 9) | ((dual ? 1u : 0u) << 10);
-            uvec4 b = uvec4(0u);
-            astc_put(b, 0u, 11u, bm);
-            if (two) {
-                astc_put(b, 11u, 2u, 1u);
-                astc_put(b, 13u, 10u, seed);
-                astc_put(b, 25u, 4u, rgba ? 12u : 8u); /* bits 23-24 zero: every partition this CEM */
-                astc_ise(b, 29u, q, v, 2u * nv);
-            } else {
-                astc_put(b, 13u, 4u, rgba ? 12u : 8u);
-                astc_ise(b, 17u, q, v, nv);
+            if (pack) {
+                /* block mode: 4x4 weights (A = 2, B = 0), range R/H, D for the second plane */
+                uint r = wb == 2u ? 4u : (wb == 3u ? 7u : 4u), h = wb == 4u ? 1u : 0u;
+                uint bm = ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5) | (h << 9) | ((dual ? 1u : 0u) << 10);
+                uvec4 b = uvec4(0u);
+                astc_put(b, 0u, 11u, bm);
+                if (two) {
+                    astc_put(b, 11u, 2u, 1u);
+                    astc_put(b, 13u, 10u, seed);
+                    astc_put(b, 25u, 4u, rgba ? 12u : 8u); /* bits 23-24 zero: every partition this CEM */
+                    astc_ise(b, 29u, q, v, 2u * nv);
+                } else {
+                    astc_put(b, 13u, 4u, rgba ? 12u : 8u);
+                    astc_ise(b, 17u, q, v, nv);
+                }
+                uint nw = dual ? 32u : 16u, wbits = nw * wb;
+                if (dual) astc_put(b, 128u - wbits - 2u, 2u, 3u); /* plane 2 is alpha */
+                uvec4 w = uvec4(0u);
+                for (uint i = 0u; i < nw; i++) astc_put(w, i * wb, wb, g_aw[i]);
+                /* weights run from the top of the block down */
+                b |= uvec4(bitfieldReverse(w.w), bitfieldReverse(w.z), bitfieldReverse(w.y), bitfieldReverse(w.x));
+                blk = b;
             }
-            uint nw = dual ? 32u : 16u, wbits = nw * wb;
-            if (dual) astc_put(b, 128u - wbits - 2u, 2u, 3u); /* plane 2 is alpha */
-            uvec4 w = uvec4(0u);
-            for (uint i = 0u; i < nw; i++) astc_put(w, i * wb, wb, g_aw[i]);
-            /* weights run from the top of the block down */
-            b |= uvec4(bitfieldReverse(w.w), bitfieldReverse(w.z), bitfieldReverse(w.y), bitfieldReverse(w.x));
-            blk = b;
         }
         if (pass == 0) {
+            if (e == 0.0) break;
             for (uint k = 0u; k < np; k++) {
                 e0[k] = d0[k];
                 e1[k] = d1[k];
@@ -357,32 +372,67 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, out uvec4 blk)
 }
 
 /* part: for a BC7 block of 2 or 3 subsets, its entry in ASTC_BC7P (seed << 16 | partition-1
- * texels), else ~0u. */
+ * texels), else ~0u. Candidates are scored without packing; the best is encoded again, packed. */
 uvec4 astc_encode(uint part)
 {
-    bool alpha = false;
-    for (uint p = 0u; p < 16u; p++) alpha = alpha || g_px[p].a != 255;
-    uvec4 best, b;
+    bool alpha = false, same = true;
+    for (uint p = 0u; p < 16u; p++) {
+        alpha = alpha || g_px[p].a != 255;
+        same = same && g_px[p] == g_px[0];
+    }
+    if (same) {
+        /* one colour: a void-extent block, the colour in UNORM16 */
+        uvec4 c = uvec4(g_px[0]) * 257u;
+        return uvec4(0xfffffdfcu, 0xffffffffu, c.r | (c.g << 16), c.b | (c.a << 16));
+    }
+    g_apart = 0u;
+    vec4 s0[2], s1[2]; /* one partition: the line over the colour (with alpha when that varies) */
+    astc_line(alpha ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0), 0u, s0[0], s1[0]);
+    s0[1] = s0[0];
+    s1[1] = s1[0];
+    uvec4 blk;
     float e, e2;
+    uint bwb, bq; /* the best candidate's weight bits and endpoint range */
+    bool bdual = false, btwo = false;
     if (!alpha) {
-        e = astc_try(false, false, 2u, 256u, ~0u, best);
-        e2 = astc_try(false, false, 3u, 256u, ~0u, b);
-        if (e2 < e) { e = e2; best = b; }
-        e2 = astc_try(false, false, 4u, 192u, ~0u, b);
-        if (e2 < e) { e = e2; best = b; }
+        e = astc_try(false, false, 2u, 256u, ~0u, s0, s1, false, blk); bwb = 2u; bq = 256u;
+        e2 = astc_try(false, false, 3u, 256u, ~0u, s0, s1, false, blk);
+        if (e2 < e) { e = e2; bwb = 3u; bq = 256u; }
+        e2 = astc_try(false, false, 4u, 192u, ~0u, s0, s1, false, blk);
+        if (e2 < e) { e = e2; bwb = 4u; bq = 192u; }
         if (part != ~0u) {
             g_apart = part & 0xffffu;
-            e2 = astc_try(false, false, 2u, 40u, part >> 16, b);
-            if (e2 < e) { e = e2; best = b; }
+            vec4 p0[2], p1[2];
+            astc_line(vec4(1.0, 1.0, 1.0, 0.0), 0u, p0[0], p1[0]);
+            astc_line(vec4(1.0, 1.0, 1.0, 0.0), 1u, p0[1], p1[1]);
+            e2 = astc_try(false, false, 2u, 40u, part >> 16, p0, p1, false, blk);
+            if (e2 < e) {
+                astc_try(false, false, 2u, 40u, part >> 16, p0, p1, true, blk);
+                return blk;
+            }
+            g_apart = 0u;
         }
     } else {
-        e = astc_try(true, false, 2u, 256u, ~0u, best);
-        e2 = astc_try(true, false, 3u, 192u, ~0u, b);
-        if (e2 < e) { e = e2; best = b; }
-        e2 = astc_try(true, false, 4u, 48u, ~0u, b);
-        if (e2 < e) { e = e2; best = b; }
-        e2 = astc_try(true, true, 2u, 48u, ~0u, b);
-        if (e2 < e) { e = e2; best = b; }
+        e = astc_try(true, false, 2u, 256u, ~0u, s0, s1, false, blk); bwb = 2u; bq = 256u;
+        e2 = astc_try(true, false, 3u, 192u, ~0u, s0, s1, false, blk);
+        if (e2 < e) { e = e2; bwb = 3u; bq = 192u; }
+        e2 = astc_try(true, false, 4u, 48u, ~0u, s0, s1, false, blk);
+        if (e2 < e) { e = e2; bwb = 4u; bq = 48u; }
+        /* dual plane: the colour's own line, alpha from its extremes */
+        vec4 d0[2], d1[2];
+        astc_line(vec4(1.0, 1.0, 1.0, 0.0), 0u, d0[0], d1[0]);
+        float amin = 255.0, amax = 0.0;
+        for (uint p = 0u; p < 16u; p++) { amin = min(amin, float(g_px[p].a)); amax = max(amax, float(g_px[p].a)); }
+        d0[0].a = amin;
+        d1[0].a = amax;
+        d0[1] = d0[0];
+        d1[1] = d1[0];
+        e2 = astc_try(true, true, 2u, 48u, ~0u, d0, d1, false, blk);
+        if (e2 < e) {
+            astc_try(true, true, 2u, 48u, ~0u, d0, d1, true, blk);
+            return blk;
+        }
     }
-    return best;
+    astc_try(alpha, false, bwb, bq, ~0u, s0, s1, true, blk);
+    return blk;
 }
