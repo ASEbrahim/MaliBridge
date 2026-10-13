@@ -39,5 +39,6 @@ variant spv_bc3_astc -DFMT_BC3 -DENC_ASTC
 variant spv_bc4_eac -DFMT_BC4 -DENC_EAC
 variant spv_bc5_eac -DFMT_BC5 -DENC_EAC
 variant spv_bc7_astc -DFMT_BC7 -DENC_ASTC
+variant spv_bc6h_astc -DFMT_BC6H -DENC_ASTC_HDR
 rm -rf "$tmp"
 echo "wrote $out"
