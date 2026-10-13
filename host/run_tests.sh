@@ -10,8 +10,8 @@ result() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "  ok   $2"; else fail=$
 # A server-side protocol error fails the run even when the desktop driver shrugs it off (a missing
 # count in vkBeginCommandBuffer's encoding passed every check on RADV and crashed Mali).
 server_errors() {
-  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no|named ahead failed" out/server.log 2>/dev/null)
-  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no|named ahead failed" out/server.log)"; return 1; }
+  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" out/server.log 2>/dev/null)
+  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" out/server.log)"; return 1; }
 }
 run_mode() {
   local mode=$1
@@ -30,6 +30,13 @@ run_mode() {
   fi
   if [ -x out/opaque_check ]; then timeout 60 ./out/opaque_check >out/t-opaque.log 2>&1; result $? "opaque_check ($(tail -1 out/t-opaque.log))"; fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
+  # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
+  if [ -x out/desc_traffic_check ]; then
+    for nb in 0 1; do
+      VKBRIDGE_NO_DESC_BATCH=$nb VKBRIDGE_STATS=100000 timeout 120 ./out/desc_traffic_check >out/t-desc-$nb.log 2>&1
+      result $? "desc_traffic_check, VKBRIDGE_NO_DESC_BATCH=$nb ($(tail -1 out/t-desc-$nb.log | grep -o '^[A-Z]*'); $(grep -o '[0-9]* messages, [0-9]* KB on the wire' out/t-desc-$nb.log))"
+    done
+  fi
   if [ -n "${VKB_WINE_DIR:-}" ] && [ -d "$VKB_WINE_DIR/app" ]; then
     ./d3d11_test.sh >out/t-d3d11.log 2>&1; grep -q "^OK:" out/t-d3d11.log; result $? "d3d11_check via DXVK ($(grep -E '^(OK|FAILED)' out/t-d3d11.log))"
   fi

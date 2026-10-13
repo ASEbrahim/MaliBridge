@@ -141,7 +141,9 @@ The suite runs `smoke`, `bcn_check` (every BC format and mode, bit-exact against
 Mali, once with BC transcoded to ETC2/EAC/ASTC, by PSNR against bcdec, and once decoded; the BC6H
 -> ASTC HDR transcoder, which RADV cannot sample, runs directly on HDR images and its blocks are
 decoded by bcn_check's own ASTC decoder; `bcn_check hdr` runs only that),
-`opaque_check`, `recycle_check`, vkcube over Wayland (dma-buf and wl_shm) and X11, and, if the
+`opaque_check`, `recycle_check`, `desc_traffic_check` (a DXVK-like set allocation and update per
+draw, read back by every draw; with and without `VKBRIDGE_NO_DESC_BATCH=1`, the client's message
+and byte totals printed), vkcube over Wayland (dma-buf and wl_shm) and X11, and, if the
 `vkb-arch-gamescope` docker image exists, gamescope with Zink. It also fails on any protocol
 error in the server log. `d3d11_check` runs under Proton's wine and DXVK when `VKB_WINE_DIR`
 points to a prefix holding `d3d11_check.exe` and DXVK's DLLs. `tests/clip_check.sh` and
@@ -161,7 +163,8 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_HANG_DETECT=1` | server | fence after every submission. A hung draw is reported with its state (bound sets, root constants, render targets, device fault info) |
 | `VKBRIDGE_HANG_AFTER_MS` | server | how long a submission may run before it counts as hung |
 | `VKBRIDGE_GPU_PROF=1` / `2` | server | per-pass GPU timestamps (render passes, dispatches, copies). `2` breaks them down by pipeline |
-| `VKBRIDGE_STATS=<s>` | both | every `<s>` seconds, per-command counts of round trips and async messages |
+| `VKBRIDGE_STATS=<s>` | both | every `<s>` seconds, per-command counts of round trips and async requests, and the messages and bytes actually written to the socket. The client also logs the run's totals at exit |
+| `VKBRIDGE_NO_DESC_BATCH=1` | client | async requests go as one message each and `vkUpdateDescriptorSets` in the generic encoding, instead of one `vkbBatch` message per flush and packed updates (for bisecting) |
 | `VKBRIDGE_MEM_STATS=0` | server | turns off the periodic memory accounting line (on by default) |
 | `VKBRIDGE_TRACE=1` | client | logs every call to stderr (`VKBRIDGE_TRACE_COMM=<name>` limits this to one process) |
 | `VKBRIDGE_DISCARD_SHADERS=h-<hash>,...` | server | pipelines with these shaders draw nothing |
