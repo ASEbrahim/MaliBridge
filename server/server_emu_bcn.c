@@ -15,8 +15,10 @@
  * the image is created in a compressed format with BC's block size (tx_target), and the decoder
  * variant encodes each block again (etc2_enc.glsl, astc_enc.glsl, eac_enc.glsl) into the scratch,
  * which is copied into the image as compressed blocks. Subnautica on a Mali-G720 held 4.75 GB of
- * decoded textures, 0.97 GB as BC, and ran out of memory (2026-10-12). Lossy (PSNR in
- * tests/bcn_check.c); VKBRIDGE_BC_TRANSCODE=0 decodes as before.
+ * decoded textures, 0.97 GB as BC, and ran out of memory (2026-10-12). BC6H goes to ASTC 4x4 HDR
+ * where the GPU samples it (textureCompressionASTC_HDR, which the device is then created with),
+ * instead of RGBA16F at 8x its size. Lossy (PSNR in tests/bcn_check.c); VKBRIDGE_BC_TRANSCODE=0
+ * decodes as before.
  *
  * Not emulated (logged once): reading a BC image back to a buffer, and copies between BC and
  * uncompressed images (they would need an encoder), or between a transcoded and a decoded image.
@@ -31,9 +33,9 @@
 #include <string.h>
 
 /* FAM_BC1_16: BC1 UNORM decoded to 16 bits (vkb_bc_packed_format), a decoder variant, not a family;
- * TX_*: the transcoders (TX_BC1 + family, no BC6H). */
+ * TX_*: the transcoders (TX_BC1 + family). */
 enum { FAM_BC1, FAM_BC2, FAM_BC3, FAM_BC4, FAM_BC5, FAM_BC6H, FAM_BC7, FAM_BC1_16, TX_BC1, TX_BC2, TX_BC3, TX_BC4, TX_BC5,
-       TX_BC6H_NONE, TX_BC7, FAM_COUNT };
+       TX_BC6H, TX_BC7, FAM_COUNT };
 #define BC_INDEX(f) ((f) - VK_FORMAT_BC1_RGB_UNORM_BLOCK)
 
 /* Scratch: chunks of 1-16 MiB; one command buffer holds up to CB_MAX before it reuses its own
@@ -113,8 +115,8 @@ static uint32_t family_flags(const vkb_emu_image *img)
 
 /* What a BC format is transcoded to where the GPU samples it: BC1 -> ETC2 RGB8 (RGB8A1 with alpha;
  * BC1's 4 bits a texel), BC2 / BC3 / BC7 -> ASTC 4x4 (8 bits like them, and better than ETC2
- * RGBA8 at BC7's colours), BC4 -> EAC R11, BC5 -> EAC RG11 (BC4/BC5's sizes, 11-bit). BC6H has
- * no encoder here (ASTC HDR would need one) and stays RGBA16F. */
+ * RGBA8 at BC7's colours), BC4 -> EAC R11, BC5 -> EAC RG11 (BC4/BC5's sizes, 11-bit), BC6H (UFLOAT
+ * and SFLOAT) -> ASTC 4x4 HDR (8 bits, half floats; no negative values, which SFLOAT loses). */
 static VkFormat tx_target(VkFormat f)
 {
     switch (f) {
@@ -128,6 +130,7 @@ static VkFormat tx_target(VkFormat f)
     case VK_FORMAT_BC4_SNORM_BLOCK: return VK_FORMAT_EAC_R11_SNORM_BLOCK;
     case VK_FORMAT_BC5_UNORM_BLOCK: return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
     case VK_FORMAT_BC5_SNORM_BLOCK: return VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK: return VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
     default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -141,6 +144,7 @@ static int tx_class(VkFormat t)
     case VK_FORMAT_ASTC_4x4_UNORM_BLOCK: case VK_FORMAT_ASTC_4x4_SRGB_BLOCK: return 3;
     case VK_FORMAT_EAC_R11_UNORM_BLOCK: case VK_FORMAT_EAC_R11_SNORM_BLOCK: return 4;
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK: case VK_FORMAT_EAC_R11G11_SNORM_BLOCK: return 5;
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK: return 6;
     default: return 0;
     }
 }
@@ -149,6 +153,28 @@ int vkb_emu_bcn_transcode_wanted(void)
 {
     const char *v = getenv("VKBRIDGE_BC_TRANSCODE");
     return !v || strcmp(v, "0");
+}
+
+int vkb_emu_bcn_astc_hdr(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t api)
+{
+    if (!vkb_emu_bcn_transcode_wanted() || vkb_emu_faked("astchdr") || api < VK_API_VERSION_1_1 || !idt->vkGetPhysicalDeviceFeatures2)
+        return 0;
+    VkPhysicalDeviceProperties p;
+    idt->vkGetPhysicalDeviceProperties(pd, &p);
+    int core = p.apiVersion >= VK_API_VERSION_1_3 && api >= VK_API_VERSION_1_3, ext = 0;
+    if (!core) {
+        uint32_t n = 0;
+        idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
+        VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));
+        idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
+        for (uint32_t i = 0; i < n; i++) ext |= !strcmp(e[i].extensionName, "VK_EXT_texture_compression_astc_hdr");
+        free(e);
+        if (!ext) return 0;
+    }
+    VkPhysicalDeviceTextureCompressionASTCHDRFeatures hf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hf};
+    idt->vkGetPhysicalDeviceFeatures2(pd, &f2);
+    return hf.textureCompressionASTC_HDR ? (core ? 1 : 2) : 0;
 }
 
 /* Bytes one block takes in the scratch: transcoded, or 16 decoded texels. */
@@ -514,11 +540,12 @@ static VkPipeline pipeline(vkb_emu_device *e, int fam)
     pthread_mutex_lock(&s->lock);
     if (!s->pipes[fam]) {
         static const uint32_t *const code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
-                                                        spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, NULL, spv_bc7_astc};
+                                                        spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
+                                                        spv_bc7_astc};
         static const size_t size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), sizeof(spv_bc3), sizeof(spv_bc4), sizeof(spv_bc5),
                                                sizeof(spv_bc6h), sizeof(spv_bc7), sizeof(spv_bc1_16), sizeof(spv_bc1_etc2),
-                                               sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac), 0,
-                                               sizeof(spv_bc7_astc)};
+                                               sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac),
+                                               sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc)};
         const vkb_dispatch *r = &e->dev->real;
         VkDevice d = e->dev->device;
         VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size[fam], code[fam]};
@@ -934,10 +961,11 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     }
     VKB_INFO("BC emulation: BC1 UNORM decodes to %s / %s", s->packed_ok[0] ? "R5G6B5" : "RGBA8 (no R5G6B5)",
              s->packed_ok[1] ? "A1R5G5B5" : "RGBA8 (no A1R5G5B5)");
-    /* Transcoding: the device was created with ETC2 / ASTC LDR on where the GPU has them
+    /* Transcoding: the device was created with ETC2 / ASTC LDR / ASTC HDR on where the GPU has them
      * (vkb_emu_device_create_info), and the target must be sampled, filtered and copied. */
     VkPhysicalDeviceFeatures pf;
     dev->real.vkGetPhysicalDeviceFeatures(dev->physical, &pf);
+    int hdr = vkb_emu_bcn_astc_hdr(&dev->real, dev->physical, dev->api_version) != 0;
     const VkFormatFeatureFlags txneed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     char msg[256];
@@ -946,8 +974,8 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
         VkFormat t = tx_target(f);
         if (!t || !vkb_emu_bcn_transcode_wanted()) continue;
-        int astc = tx_class(t) == 3;
-        if (astc ? !pf.textureCompressionASTC_LDR : !pf.textureCompressionETC2) continue;
+        int cls = tx_class(t);
+        if (cls == 6 ? !hdr : cls == 3 ? !pf.textureCompressionASTC_LDR : !pf.textureCompressionETC2) continue;
         VkFormatProperties fp;
         dev->real.vkGetPhysicalDeviceFormatProperties(dev->physical, t, &fp);
         if ((fp.optimalTilingFeatures & txneed) != txneed) continue;

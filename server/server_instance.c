@@ -298,6 +298,10 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     if ((emu & VKB_EMU_LOADSTORE_NONE) && has_ext(avail, avail_n, "VK_EXT_load_store_op_none") &&
         !list_has(exts, n, "VK_EXT_load_store_op_none"))
         exts[n++] = "VK_EXT_load_store_op_none";
+    /* BC6H transcoded to ASTC HDR, on a device below Vulkan 1.3 (vkb_emu_device_create_info). */
+    if ((emu & VKB_EMU_BCN) && vkb_emu_bcn_astc_hdr(&inst->real, pd, inst->api_version) == 2 &&
+        !list_has(exts, n, "VK_EXT_texture_compression_astc_hdr"))
+        exts[n++] = "VK_EXT_texture_compression_astc_hdr";
     /* The BC decoder binds its buffer and image with push descriptors. */
     if ((emu & VKB_EMU_BCN) && has_ext(avail, avail_n, "VK_KHR_push_descriptor") && !list_has(exts, n, "VK_KHR_push_descriptor"))
         exts[n++] = "VK_KHR_push_descriptor";

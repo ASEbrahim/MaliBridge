@@ -193,6 +193,11 @@ const VkMemoryGetFdInfoKHR *vkb_opaque_get_fd_info(vkb_srv_table *t, const VkMem
 
 /* emulation (server_emu*.c) */
 uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *missing);
+/* BC6H -> ASTC 4x4 HDR: whether the device gets textureCompressionASTC_HDR for it (transcoding wanted,
+ * the GPU has the feature; api: the instance's version): 0 no, 1 as Vulkan 1.3 core, 2 through
+ * VK_EXT_texture_compression_astc_hdr (which vkCreateDevice then enables). VKBRIDGE_FAKE_MISSING=
+ * ...,astchdr: no. */
+int vkb_emu_bcn_astc_hdr(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t api);
 void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32_t emu,
                                 VkDeviceCreateInfo *ci, vkb_arena *a);
 void vkb_emu_device_init(vkb_srv_table *dev, uint32_t emu);

@@ -72,8 +72,8 @@ static inline VkFormat vkb_bc_storage_format(VkFormat f)
     }
 }
 
-/* Bytes per 4x4 block of a format BC is transcoded to (ETC2 / EAC / ASTC 4x4; server_emu_bcn.c),
- * 0 for any other. */
+/* Bytes per 4x4 block of a format BC is transcoded to (ETC2 / EAC / ASTC 4x4, HDR for BC6H;
+ * server_emu_bcn.c), 0 for any other. */
 static inline uint32_t vkb_tx_block_bytes(VkFormat f)
 {
     switch (f) {
@@ -86,7 +86,8 @@ static inline uint32_t vkb_tx_block_bytes(VkFormat f)
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
     case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
     case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_4x4_SRGB_BLOCK: return 16;
+    case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK: return 16;
     default: return 0;
     }
 }

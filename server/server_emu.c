@@ -209,6 +209,26 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
         }
         if (emu & VKB_EMU_DEPTH_CLIP) f->depthClamp = VK_TRUE;
     }
+    /* BC6H transcoded to ASTC HDR needs its feature on: in the app's Vulkan 1.3 features if it gave
+     * them (where the feature's own structure may not also be), else in that structure. */
+    if ((emu & VKB_EMU_BCN) && vkb_emu_bcn_astc_hdr(&inst->real, pd, inst->api_version)) {
+        VkPhysicalDeviceTextureCompressionASTCHDRFeatures *hf = NULL;
+        VkPhysicalDeviceVulkan13Features *v13 = NULL;
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext) {
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) v13 = (VkPhysicalDeviceVulkan13Features *)b;
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES)
+                hf = (VkPhysicalDeviceTextureCompressionASTCHDRFeatures *)b;
+        }
+        if (v13) v13->textureCompressionASTC_HDR = VK_TRUE;
+        else if (hf) hf->textureCompressionASTC_HDR = VK_TRUE;
+        else if ((hf = vkb_arena_alloc(a, sizeof(*hf)))) {
+            memset(hf, 0, sizeof(*hf));
+            hf->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES;
+            hf->textureCompressionASTC_HDR = VK_TRUE;
+            hf->pNext = (void *)ci->pNext;
+            ci->pNext = hf;
+        }
+    }
     if (emu & VKB_EMU_DIVISOR) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT);
     if (emu & VKB_EMU_DEPTH_CLIP) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
     if (emu & VKB_EMU_MAINT5) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES);
