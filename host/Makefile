@@ -42,6 +42,8 @@ $(OUT)/%_check: $(VKB)/tests/%_check.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -funsigned-char -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm
 
+$(OUT)/bcn_check: $(VKB)/server/bc_spv.h
+
 test: all
 	$(VKB)/host/run_tests.sh $(OUT)
 

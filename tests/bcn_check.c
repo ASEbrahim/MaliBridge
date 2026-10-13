@@ -10,7 +10,10 @@
  * `bcn_check transcode`: the bridge transcodes BC to ETC2 / EAC / ASTC (a GPU that samples those),
  * which is lossy: textures are then made of blocks this file encodes from synthetic images (photo-
  * like noise with hard edges, gradients, soft and cut-out alpha, normal maps) and every level is
- * compared with bcdec by PSNR. The quality table per format and image comes first.
+ * compared with bcdec by PSNR. The quality table per format and image comes first. BC6H goes to
+ * ASTC 4x4 HDR where the GPU samples it; the transcoder itself is also run directly on HDR images
+ * (photo, gradient, sky) and its blocks decoded here (astc_decode), so a GPU without ASTC HDR (RADV)
+ * still measures it. `bcn_check hdr` runs only that.
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -25,10 +28,12 @@
 #define BCDEC_IMPLEMENTATION
 #define BCDEC_BC4BC5_PRECISE
 #include "../third_party/bcdec/bcdec.h"
+#include "../server/bc_spv.h" /* the bridge's BC6H -> ASTC HDR transcoder, run directly (test_hdr_shader) */
 
 #define TEX 64 /* 16x16 blocks */
 
 static int tx; /* the bridge transcodes (argument "transcode"): compare by PSNR */
+static int tx_hdr; /* ... BC6H too (to ASTC 4x4 HDR, where the GPU samples it) */
 static double min_psnr;
 
 static int is_bc1_unorm(VkFormat f) { return f == VK_FORMAT_BC1_RGB_UNORM_BLOCK || f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK; }
@@ -59,7 +64,10 @@ F(vkQueueWaitIdle); F(vkCreateBuffer); F(vkGetBufferMemoryRequirements); F(vkAll
 F(vkMapMemory); F(vkCreateImage); F(vkGetImageMemoryRequirements); F(vkBindImageMemory); F(vkCmdPipelineBarrier);
 F(vkCmdCopyBufferToImage); F(vkCmdBlitImage); F(vkCmdCopyImageToBuffer); F(vkDestroyImage); F(vkDestroyBuffer);
 F(vkFreeMemory); F(vkGetPhysicalDeviceProperties); F(vkCreateImageView); F(vkDestroyImageView); F(vkCmdCopyImage);
-F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2);
+F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCreateShaderModule); F(vkDestroyShaderModule);
+F(vkCreateDescriptorSetLayout); F(vkCreatePipelineLayout); F(vkCreateComputePipelines); F(vkCreateDescriptorPool);
+F(vkAllocateDescriptorSets); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
+F(vkCmdDispatch);
 #undef F
 
 static uint32_t find_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -111,6 +119,323 @@ static float h2f(uint16_t h)
     else if (e == 31) v = m ? NAN : INFINITY;
     else v = ldexpf((float)(m | 1024), (int)e - 25);
     return s ? -v : v;
+}
+
+/* ------------------------------------------------------------------ ASTC 4x4 reference decoder */
+
+/* A CPU decoder for the ASTC 4x4 blocks the BC6H transcoder makes, written from the specification
+ * (Khronos Data Format Specification, ASTC chapter): void-extent blocks, 1-4 partitions with one
+ * colour endpoint mode, every endpoint range, weight ranges of whole bits, colour endpoint modes
+ * 7 and 11 (HDR RGB). It lets the transcoder be checked by PSNR on
+ * a GPU that cannot sample ASTC HDR. Returns 0 for anything else. */
+
+static uint32_t ab_get(const uint8_t *b, int pos, int n)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < n; i++, pos++) v |= (uint32_t)((b[pos >> 3] >> (pos & 7)) & 1) << i;
+    return v;
+}
+
+/* Levels of an integer sequence encoding range: bits, trits, quints. */
+static void ise_kind(int levels, int *bits, int *trit, int *quint)
+{
+    *trit = *quint = 0;
+    *bits = 0;
+    int l = levels;
+    if (l % 3 == 0) *trit = 1, l /= 3;
+    else if (l % 5 == 0) *quint = 1, l /= 5;
+    while ((1 << *bits) < l) (*bits)++;
+}
+
+static int ise_size(int levels, int n)
+{
+    int bits, t, q;
+    ise_kind(levels, &bits, &t, &q);
+    return n * bits + (t ? (n * 8 + 4) / 5 : 0) + (q ? (n * 7 + 2) / 3 : 0);
+}
+
+/* n values of range `levels` from bit pos of b. */
+static void ise_decode(const uint8_t *b, int pos, int levels, int n, int *out)
+{
+    int bits, t, q;
+    ise_kind(levels, &bits, &t, &q);
+    int gs = t ? 5 : q ? 3 : 1;
+    for (int g = 0; g < n; g += gs) {
+        int m[5] = {0}, x[5] = {0};
+        uint32_t T = 0;
+        for (int j = 0; j < gs && g + j < n; j++) { /* a last, short group has no more bits */
+            m[j] = (int)ab_get(b, pos, bits);
+            pos += bits;
+            if (t) {
+                static const int tb[5] = {2, 2, 1, 2, 1}, ts[5] = {0, 2, 4, 5, 7};
+                T |= ab_get(b, pos, tb[j]) << ts[j];
+                pos += tb[j];
+            } else if (q) {
+                static const int qb[3] = {3, 2, 2}, qs[3] = {0, 3, 5};
+                T |= ab_get(b, pos, qb[j]) << qs[j];
+                pos += qb[j];
+            }
+        }
+        if (t) {
+            int C, t0, t1, t2, t3, t4;
+            if (((T >> 2) & 7) == 7) {
+                C = (int)((((T >> 5) & 7) << 2) | (T & 3));
+                t4 = t3 = 2;
+            } else {
+                C = (int)(T & 31);
+                if (((T >> 5) & 3) == 3) t4 = 2, t3 = (int)((T >> 7) & 1);
+                else t4 = (int)((T >> 7) & 1), t3 = (int)((T >> 5) & 3);
+            }
+            if ((C & 3) == 3) t2 = 2, t1 = (C >> 4) & 1, t0 = (((C >> 3) & 1) << 1) | ((C >> 2) & 1 & ~(C >> 3));
+            else if (((C >> 2) & 3) == 3) t2 = 2, t1 = 2, t0 = C & 3;
+            else t2 = (C >> 4) & 1, t1 = (C >> 2) & 3, t0 = (((C >> 1) & 1) << 1) | (C & 1 & ~(C >> 1));
+            x[0] = t0, x[1] = t1, x[2] = t2, x[3] = t3, x[4] = t4;
+        } else if (q) {
+            int q0, q1, q2;
+            if (((T >> 1) & 3) == 3 && ((T >> 5) & 3) == 0) {
+                q2 = (int)(((T & 1) << 2) | ((((T >> 4) & 1) & ~T & 1) << 1) | (((T >> 3) & 1) & ~T & 1));
+                q1 = q0 = 4;
+            } else {
+                int C;
+                if (((T >> 1) & 3) == 3) q2 = 4, C = (int)((((T >> 3) & 3) << 3) | ((~(T >> 5) & 3) << 1) | (T & 1));
+                else q2 = (int)((T >> 5) & 3), C = (int)(T & 31);
+                if ((C & 7) == 5) q1 = 4, q0 = (C >> 3) & 3;
+                else q1 = (C >> 3) & 3, q0 = C & 7;
+            }
+            x[0] = q0, x[1] = q1, x[2] = q2;
+        }
+        for (int j = 0; j < gs && g + j < n; j++) out[g + j] = (x[j] << bits) | m[j];
+    }
+}
+
+/* An endpoint value of range `levels` as the 8-bit value it stands for. */
+static int ep_unquant(int levels, int v)
+{
+    int bits, t, q;
+    ise_kind(levels, &bits, &t, &q);
+    if (!t && !q) {
+        int r = v << (8 - bits);
+        for (int s = bits; s < 8; s += bits) r |= r >> bits;
+        return r & 255;
+    }
+    int m = v & ((1 << bits) - 1), D = v >> bits, A = (m & 1) ? 0x1ff : 0, h = m >> 1, B = 0, C;
+    if (t) { /* the specification's bit patterns of B: b000b0bb0, cb000cbcb, dcb000dcb, edcb000ed, fedcb000f */
+        B = bits == 2 ? (h << 8) | (h << 4) | (h << 2) | (h << 1) : bits == 3 ? (h << 7) | (h << 2) | h : bits == 4 ? (h << 6) | h
+          : bits == 5 ? (h << 5) | (h >> 2) : bits == 6 ? (h << 4) | (h >> 4) : 0;
+    } else { /* b0000bb00, cb0000cbc, dcb0000dc, edcb0000e */
+        B = bits == 2 ? (h << 8) | (h << 3) | (h << 2) : bits == 3 ? (h << 7) | (h << 1) | (h >> 1) : bits == 4 ? (h << 6) | (h >> 1)
+          : bits == 5 ? (h << 5) | (h >> 3) : 0;
+    }
+    static const int ct[7] = {0, 204, 93, 44, 22, 11, 5}, cq[6] = {0, 113, 54, 26, 13, 6};
+    C = t ? ct[bits] : cq[bits];
+    int T = (D * C + B) ^ A;
+    return (A & 0x80) | (T >> 2);
+}
+
+static uint32_t ap_hash(uint32_t i)
+{
+    i ^= i >> 15;
+    i *= 0xEEDE0891u;
+    i ^= i >> 5;
+    i += i << 16;
+    i ^= i >> 7;
+    i ^= i >> 3;
+    i ^= i << 6;
+    i ^= i >> 17;
+    return i;
+}
+
+/* The partition of texel (x, y) of a 4x4 block (the specification's selection function). */
+static int ap_select(int seed, int x, int y, int pc)
+{
+    x <<= 1, y <<= 1; /* fewer than 31 texels */
+    seed += (pc - 1) * 1024;
+    uint32_t r = ap_hash((uint32_t)seed);
+    int s[12];
+    for (int k = 0; k < 8; k++) s[k] = (int)((r >> (4 * k)) & 15);
+    s[8] = (int)((r >> 18) & 15), s[9] = (int)((r >> 22) & 15), s[10] = (int)((r >> 26) & 15), s[11] = (int)(((r >> 30) | (r << 2)) & 15);
+    for (int k = 0; k < 12; k++) s[k] *= s[k];
+    int sh1, sh2;
+    if (seed & 1) sh1 = (seed & 2) ? 4 : 5, sh2 = pc == 3 ? 6 : 5;
+    else sh1 = pc == 3 ? 6 : 5, sh2 = (seed & 2) ? 4 : 5;
+    int sh3 = (seed & 0x10) ? sh1 : sh2;
+    for (int k = 0; k < 8; k++) s[k] >>= (k & 1) ? sh2 : sh1;
+    for (int k = 8; k < 12; k++) s[k] >>= sh3;
+    int a = (int)((s[0] * x + s[1] * y + (r >> 14)) & 0x3f), b = (int)((s[2] * x + s[3] * y + (r >> 10)) & 0x3f);
+    int c = (int)((s[4] * x + s[5] * y + (r >> 6)) & 0x3f), d = (int)((s[6] * x + s[7] * y + (r >> 2)) & 0x3f);
+    if (pc < 4) d = 0;
+    if (pc < 3) c = 0;
+    if (a >= b && a >= c && a >= d) return 0;
+    if (b >= c && b >= d) return 1;
+    return c >= d ? 2 : 3;
+}
+
+static int ap_clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* Colour endpoint mode 11 (HDR RGB direct): 16-bit LNS endpoints. */
+static void cem11(const int *v, int e0[4], int e1[4])
+{
+    int majcomp = ((v[4] & 0x80) >> 7) | ((v[5] & 0x80) >> 6);
+    e0[3] = e1[3] = 0x7800;
+    if (majcomp == 3) {
+        e0[0] = v[0] << 8, e0[1] = v[2] << 8, e0[2] = (v[4] & 0x7f) << 9;
+        e1[0] = v[1] << 8, e1[1] = v[3] << 8, e1[2] = (v[5] & 0x7f) << 9;
+        return;
+    }
+    int mode = ((v[1] & 0x80) >> 7) | ((v[2] & 0x80) >> 6) | ((v[3] & 0x80) >> 5);
+    int va = v[0] | ((v[1] & 0x40) << 2), vb0 = v[2] & 0x3f, vb1 = v[3] & 0x3f, vc = v[1] & 0x3f, vd0 = v[4] & 0x7f, vd1 = v[5] & 0x7f;
+    static const int dbits[8] = {7, 6, 7, 6, 5, 6, 5, 6};
+    int x0 = (v[2] >> 6) & 1, x1 = (v[3] >> 6) & 1, x2 = (v[4] >> 6) & 1, x3 = (v[5] >> 6) & 1, x4 = (v[4] >> 5) & 1, x5 = (v[5] >> 5) & 1;
+    int oh = 1 << mode;
+    if (oh & 0xa4) va |= x0 << 9;
+    if (oh & 0x8) va |= x2 << 9;
+    if (oh & 0x50) va |= x4 << 9;
+    if (oh & 0x50) va |= x5 << 10;
+    if (oh & 0xa0) va |= x1 << 10;
+    if (oh & 0xc0) va |= x2 << 11;
+    if (oh & 0x4) vc |= x1 << 6;
+    if (oh & 0xe8) vc |= x3 << 6;
+    if (oh & 0x20) vc |= x2 << 7;
+    if (oh & 0x5b) vb0 |= x0 << 6, vb1 |= x1 << 6;
+    if (oh & 0x12) vb0 |= x2 << 7, vb1 |= x3 << 7;
+    if (oh & 0xaf) vd0 |= x4 << 5, vd1 |= x5 << 5;
+    if (oh & 0x5) vd0 |= x2 << 6, vd1 |= x3 << 6;
+    int db = dbits[mode];
+    vd0 &= (1 << db) - 1, vd1 &= (1 << db) - 1; /* the bits above are the variable ones */
+    if (vd0 & (1 << (db - 1))) vd0 -= 1 << db;
+    if (vd1 & (1 << (db - 1))) vd1 -= 1 << db;
+    int sh = (mode >> 1) ^ 3;
+    va <<= sh, vb0 <<= sh, vb1 <<= sh, vc <<= sh, vd0 *= 1 << sh, vd1 *= 1 << sh;
+    int c1[3] = {va, va - vb0, va - vb1}, c0[3] = {va - vc, va - vb0 - vc - vd0, va - vb1 - vc - vd1};
+    for (int k = 0; k < 3; k++) c0[k] = ap_clamp(c0[k], 0, 4095), c1[k] = ap_clamp(c1[k], 0, 4095);
+    int sw = majcomp == 1 ? 1 : majcomp == 2 ? 2 : 0;
+    if (sw) {
+        int t = c0[0]; c0[0] = c0[sw]; c0[sw] = t;
+        t = c1[0]; c1[0] = c1[sw]; c1[sw] = t;
+    }
+    for (int k = 0; k < 3; k++) e0[k] = c0[k] << 4, e1[k] = c1[k] << 4;
+}
+
+/* Colour endpoint mode 7 (HDR RGB, base and scale). */
+static void cem7(const int *v, int e0[4], int e1[4])
+{
+    int modeval = ((v[0] & 0xc0) >> 6) | (((v[1] & 0x80) >> 7) << 2) | (((v[2] & 0x80) >> 7) << 3);
+    int majcomp, mode;
+    if ((modeval & 0xc) != 0xc) majcomp = modeval >> 2, mode = modeval & 3;
+    else if (modeval != 0xf) majcomp = modeval & 3, mode = 4;
+    else majcomp = 0, mode = 5;
+    int red = v[0] & 0x3f, green = v[1] & 0x1f, blue = v[2] & 0x1f, scale = v[3] & 0x1f;
+    int x0 = (v[1] >> 6) & 1, x1 = (v[1] >> 5) & 1, x2 = (v[2] >> 6) & 1, x3 = (v[2] >> 5) & 1, x4 = (v[3] >> 7) & 1, x5 = (v[3] >> 6) & 1,
+        x6 = (v[3] >> 5) & 1;
+    int oh = 1 << mode;
+    if (oh & 0x30) green |= x0 << 6;
+    if (oh & 0x3a) green |= x1 << 5;
+    if (oh & 0x30) blue |= x2 << 6;
+    if (oh & 0x3a) blue |= x3 << 5;
+    if (oh & 0x3d) scale |= x6 << 5;
+    if (oh & 0x2d) scale |= x5 << 6;
+    if (oh & 0x04) scale |= x4 << 7;
+    if (oh & 0x3b) red |= x4 << 6;
+    if (oh & 0x04) red |= x3 << 6;
+    if (oh & 0x10) red |= x5 << 7;
+    if (oh & 0x0f) red |= x2 << 7;
+    if (oh & 0x05) red |= x1 << 8;
+    if (oh & 0x0a) red |= x0 << 8;
+    if (oh & 0x05) red |= x0 << 9;
+    if (oh & 0x02) red |= x6 << 9;
+    if (oh & 0x01) red |= x3 << 10;
+    if (oh & 0x02) red |= x5 << 10;
+    static const int shamt[6] = {1, 1, 2, 3, 4, 5};
+    int s = shamt[mode];
+    red <<= s, green <<= s, blue <<= s, scale <<= s;
+    if (mode != 5) green = red - green, blue = red - blue;
+    int t;
+    if (majcomp == 1) t = red, red = green, green = t;
+    else if (majcomp == 2) t = red, red = blue, blue = t;
+    int c1[3] = {red, green, blue}, c0[3] = {red - scale, green - scale, blue - scale};
+    for (int k = 0; k < 3; k++) e0[k] = ap_clamp(c0[k], 0, 0xfff) << 4, e1[k] = ap_clamp(c1[k], 0, 0xfff) << 4;
+    e0[3] = e1[3] = 0x7800;
+}
+
+static uint16_t lns_half(int c)
+{
+    int m = c & 0x7ff, mt = m < 512 ? 3 * m : m >= 1536 ? 5 * m - 2048 : 4 * m - 512;
+    int h = ((c >> 11) << 10) + (mt >> 3);
+    return (uint16_t)(h > 0x7bff ? 0x7bff : h);
+}
+
+/* Decodes a block into RGBA floats; 0 if the block is outside what this decoder handles. */
+static int astc_decode(const uint8_t *b, float out[16][4])
+{
+    uint32_t mode = ab_get(b, 0, 11);
+    if ((mode & 0x1ff) == 0x1fc) {
+        int hdr = (mode >> 9) & 1;
+        for (int t = 0; t < 16; t++)
+            for (int c = 0; c < 4; c++) {
+                uint32_t v = ab_get(b, 64 + 16 * c, 16);
+                out[t][c] = hdr ? h2f((uint16_t)v) : v / 65535.0f;
+            }
+        return 1;
+    }
+    /* 4x4 weights, layout bits[3:2] = 00 with A = 2, B = 0, or bits[1:0] = 00 forms are not made */
+    if (!(mode & 3) || ((mode >> 2) & 3) != 0 || ((mode >> 5) & 3) != 2 || ((mode >> 7) & 3) != 0) return 0;
+    int R = (int)(((mode & 3) << 1) | ((mode >> 4) & 1)), H = (int)((mode >> 9) & 1), dual = (int)((mode >> 10) & 1);
+    static const int wl[2][8] = {{0, 0, 2, 3, 4, 5, 6, 8}, {0, 0, 10, 12, 16, 20, 24, 32}};
+    int wlev = wl[H][R], wbits, wt, wq;
+    ise_kind(wlev, &wbits, &wt, &wq);
+    if (wt || wq) return 0; /* weight ranges of whole bits only */
+    int nw = 16 * (dual ? 2 : 1), wsize = ise_size(wlev, nw);
+    int pc = (int)ab_get(b, 11, 2) + 1, seed = 0, cem, pos;
+    if (pc == 1) {
+        cem = (int)ab_get(b, 13, 4);
+        pos = 17;
+    } else {
+        seed = (int)ab_get(b, 13, 10);
+        uint32_t cf = ab_get(b, 23, 6);
+        if (cf & 3) return 0; /* one mode for every partition only */
+        cem = (int)(cf >> 2);
+        pos = 29;
+    }
+    if (cem != 7 && cem != 11) return 0;
+    int nv = pc * ((cem >> 2) + 1) * 2;
+    if (nv > 18) return 0;
+    int avail = 128 - wsize - pos - (dual ? 2 : 0);
+    static const int eplev[] = {256, 192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6};
+    int elev = 0;
+    for (size_t i = 0; i < sizeof(eplev) / sizeof(eplev[0]) && !elev; i++)
+        if (ise_size(eplev[i], nv) <= avail) elev = eplev[i];
+    if (!elev) return 0;
+    int ev[32], v[32];
+    ise_decode(b, pos, elev, nv, ev);
+    for (int i = 0; i < nv; i++) v[i] = ep_unquant(elev, ev[i]);
+    /* weights: read from the top of the block down */
+    uint8_t rb[16];
+    for (int i = 0; i < 16; i++) {
+        uint8_t x = b[15 - i], y = 0;
+        for (int k = 0; k < 8; k++) y |= (uint8_t)(((x >> k) & 1) << (7 - k));
+        rb[i] = y;
+    }
+    int w[32];
+    ise_decode(rb, 0, wlev, nw, w);
+    for (int i = 0; i < nw; i++) {
+        int r = w[i] << (6 - wbits);
+        for (int s = wbits; s < 6; s += wbits) r |= r >> wbits;
+        r &= 63;
+        w[i] = r > 32 ? r + 1 : r;
+    }
+    int plane2 = dual ? (int)ab_get(b, 128 - wsize - 2, 2) : -1;
+    for (int t = 0; t < 16; t++) {
+        int p = pc > 1 ? ap_select(seed, t & 3, t >> 2, pc) : 0;
+        const int *pv = v + p * ((cem >> 2) + 1) * 2;
+        int e0[4], e1[4];
+        if (cem == 11) cem11(pv, e0, e1);
+        else cem7(pv, e0, e1);
+        for (int c = 0; c < 4; c++) {
+            int wt = dual && c == plane2 ? w[2 * t + 1] : w[dual ? 2 * t : t];
+            out[t][c] = h2f(lns_half((e0[c] * (64 - wt) + e1[c] * wt + 32) >> 6));
+        }
+    }
+    return 1;
 }
 
 /* Reference texels (RGBA float, sRGB formats still encoded) of one block. */
@@ -328,8 +653,9 @@ static void test_format(VkFormat f, const char *name, float tol)
 /* Synthetic images, 8-bit RGBA: value noise in octaves with hard-edged patches (photo-like), the
  * same at texel scale with colours of their own (rough: gravel, foliage), smooth gradients, soft or
  * cut-out alpha over the photo, and a normal map of a noise height field. */
-enum { IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_SOFT, IMG_ALPHA_CUT, IMG_NORMAL, IMG_COUNT };
-static const char *const img_name[IMG_COUNT] = {"photo", "rough", "gradient", "soft alpha", "cut-out alpha", "normal map"};
+enum { IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_SOFT, IMG_ALPHA_CUT, IMG_NORMAL, IMG_HDR_PHOTO, IMG_HDR_GRADIENT, IMG_HDR_SKY, IMG_COUNT };
+static const char *const img_name[IMG_COUNT] = {"photo", "rough", "gradient", "soft alpha", "cut-out alpha", "normal map",
+                                                "HDR photo", "HDR gradient", "HDR sky"};
 
 static float lattice(int x, int y, uint32_t seed)
 {
@@ -670,9 +996,231 @@ static void enc_bc7(const float px[16][4], uint8_t *out)
     if (e1 < e6) memcpy(out, m1, 16);
 }
 
+/* HDR test images, linear RGB, for BC6H: photo-like (value noise in octaves as exp2 over about 9
+ * stops, hard-edged patches 4x brighter, small lamps 16x brighter), an exponential gradient (12
+ * stops corner to corner, its colour turning), and a sky (blue, brighter toward the horizon, soft
+ * clouds, a sun with a glow up to about 60). */
+static void hdr_px(int kind, int x, int y, float out[3])
+{
+    if (kind == IMG_HDR_GRADIENT) {
+        float u = x / 255.0f, v = y / 255.0f, l = exp2f(-6.0f + 12.0f * (0.6f * u + 0.4f * v));
+        out[0] = l * (0.6f + 0.4f * u), out[1] = l * (0.5f + 0.4f * sinf(2.0f * v + 1.0f)), out[2] = l * (0.9f - 0.6f * u * v);
+        return;
+    }
+    if (kind == IMG_HDR_SKY) {
+        float v = y / 255.0f, hz = 0.4f + 2.2f * v * v;
+        float cl = fminf(fmaxf((fbm(x / 48.0f, y / 20.0f, 97, 5) - 0.48f) * 3.0f, 0.0f), 1.0f);
+        float shade = 0.7f + 0.8f * fbm(x / 12.0f, y / 8.0f, 101, 3);
+        float dx = x - 180.0f, dy = y - 70.0f, d = sqrtf(dx * dx + dy * dy);
+        float sun = 60.0f * expf(-(d / 4.0f) * (d / 4.0f)) + 3.0f * expf(-d / 30.0f);
+        const float sky[3] = {0.18f, 0.36f, 0.95f}, cloud[3] = {1.5f, 1.45f, 1.4f}, sc[3] = {1.0f, 0.85f, 0.6f};
+        for (int c = 0; c < 3; c++) out[c] = (sky[c] * hz) * (1 - cl) + cloud[c] * shade * cl + sc[c] * sun * (1 - 0.7f * cl);
+        return;
+    }
+    float l = fbm(x / 32.0f, y / 32.0f, 11, 5), c1 = fbm(x / 48.0f, y / 48.0f, 23, 3), c2 = fbm(x / 40.0f, y / 40.0f, 37, 3);
+    float detail = fbm(x / 4.0f, y / 4.0f, 41, 2) - 0.5f;
+    float lum = exp2f(-4.0f + 9.0f * l + 1.2f * detail);
+    float r = 0.8f + 0.9f * (c1 - 0.5f), g = 0.7f - 0.5f * (c2 - 0.5f), b = 0.5f + 0.9f * (c2 - 0.5f);
+    if (fbm(x / 64.0f, y / 64.0f, 53, 2) > 0.56f) lum *= 4.0f, r = 1.2f - 0.5f * r, g = 0.4f + 0.5f * g; /* hard-edged regions */
+    int lx = x & 63, ly = y & 63, cx = 20 + (int)(lattice(x >> 6, y >> 6, 7) * 24), cy = 20 + (int)(lattice(x >> 6, y >> 6, 8) * 24);
+    if ((lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) <= 5) lum *= 16.0f; /* lamps */
+    out[0] = lum * r, out[1] = lum * g, out[2] = lum * b;
+}
+
+static uint16_t f2h(float f)
+{
+    if (!(f > 0)) return 0;
+    if (f >= 65504.0f) return 0x7bff;
+    int e;
+    float m = frexpf(f, &e); /* f = m * 2^e, m in [0.5, 1) */
+    if (e < -13) return (uint16_t)lroundf(f * 16777216.0f); /* subnormal */
+    int mm = (int)lroundf((m * 2 - 1) * 1024);
+    if (mm == 1024) mm = 0, e++;
+    return (uint16_t)(((e + 14) << 10) | mm);
+}
+
+/* BC6H, the modes this encoder uses as bcdec reads them: field (r0..r3, g0..g3, b0..b3 = 0..11,
+ * partition 12), bits, shift, reversed. Mode 1 (two regions, 10-bit base, 5-bit deltas), mode 10
+ * (two regions, 6 bits each), mode 11 (one region, 10 bits each), mode 14 (one region, 16-bit base,
+ * 4-bit deltas). */
+typedef struct bc6f {
+    uint8_t f, n, sh, rev;
+} bc6f;
+static const bc6f bc6_l1[] = {{6, 1, 4, 0}, {10, 1, 4, 0}, {11, 1, 4, 0}, {0, 10, 0, 0}, {4, 10, 0, 0}, {8, 10, 0, 0}, {1, 5, 0, 0},
+                              {7, 1, 4, 0}, {6, 4, 0, 0}, {5, 5, 0, 0}, {11, 1, 0, 0}, {7, 4, 0, 0}, {9, 5, 0, 0}, {11, 1, 1, 0},
+                              {10, 4, 0, 0}, {2, 5, 0, 0}, {11, 1, 2, 0}, {3, 5, 0, 0}, {11, 1, 3, 0}, {12, 5, 0, 0}};
+static const bc6f bc6_l10[] = {{0, 6, 0, 0}, {7, 1, 4, 0}, {11, 1, 0, 0}, {11, 1, 1, 0}, {10, 1, 4, 0}, {4, 6, 0, 0}, {6, 1, 5, 0}, {10, 1, 5, 0},
+                               {11, 1, 2, 0}, {6, 1, 4, 0}, {8, 6, 0, 0}, {7, 1, 5, 0}, {11, 1, 3, 0}, {11, 1, 5, 0}, {11, 1, 4, 0}, {1, 6, 0, 0},
+                               {6, 4, 0, 0}, {5, 6, 0, 0}, {7, 4, 0, 0}, {9, 6, 0, 0}, {10, 4, 0, 0}, {2, 6, 0, 0}, {3, 6, 0, 0}, {12, 5, 0, 0}};
+static const bc6f bc6_l11[] = {{0, 10, 0, 0}, {4, 10, 0, 0}, {8, 10, 0, 0}, {1, 10, 0, 0}, {5, 10, 0, 0}, {9, 10, 0, 0}};
+static const bc6f bc6_l14[] = {{0, 10, 0, 0}, {4, 10, 0, 0}, {8, 10, 0, 0}, {1, 4, 0, 0}, {0, 6, 10, 1},
+                               {5, 4, 0, 0}, {4, 6, 10, 1}, {9, 4, 0, 0}, {8, 6, 10, 1}};
+static const struct {
+    uint32_t code, code_bits, w, d, two, delta;
+    const bc6f *l;
+    size_t n;
+} bc6_modes[4] = {{0, 2, 10, 5, 1, 1, bc6_l1, sizeof(bc6_l1) / sizeof(bc6f)}, {30, 5, 6, 6, 1, 0, bc6_l10, sizeof(bc6_l10) / sizeof(bc6f)},
+                  {3, 5, 10, 10, 0, 0, bc6_l11, sizeof(bc6_l11) / sizeof(bc6f)}, {15, 5, 16, 4, 0, 1, bc6_l14, sizeof(bc6_l14) / sizeof(bc6f)}};
+
+/* bcdec's endpoint unquantization. */
+static int bc6_unq(int q, int w, int sgn)
+{
+    if (!sgn) {
+        if (w >= 15) return q;
+        if (q == 0) return 0;
+        if (q == (1 << w) - 1) return 0xffff;
+        return ((q << 16) + 0x8000) >> w;
+    }
+    if (w >= 16) return q;
+    int s = q < 0, v = s ? -q : q, u;
+    if (v == 0) u = 0;
+    else if (v >= (1 << (w - 1)) - 1) u = 0x7fff;
+    else u = ((v << 15) + 0x4000) >> (w - 1);
+    return s ? -u : u;
+}
+
+static int bc6_quant(float u, int w, int sgn)
+{
+    int hi = sgn ? (1 << (w - 1)) - 1 : (1 << w) - 1;
+    int q = (int)lroundf(sgn ? u * (float)(1 << (w - 1)) / 32768.0f - 0.5f : u * (float)(1 << w) / 65536.0f - 0.5f), best = 0;
+    float be = 1e30f;
+    for (int k = q - 1; k <= q + 1; k++) {
+        int c = k < 0 ? 0 : k > hi ? hi : k;
+        float e = fabsf((float)bc6_unq(c, w, sgn) - u);
+        if (e < be) be = e, best = c;
+    }
+    return best;
+}
+
+/* One BC6H block of mode m (bc6_modes) and partition part from half-float texels h; its error
+ * (squared, in half-float steps, by bcdec's decode), 1e30 where the endpoints do not fit. */
+static double bc6_try(const uint16_t h[16][3], int sgn, int m, int part, uint8_t *out)
+{
+    int w = (int)bc6_modes[m].w, two = (int)bc6_modes[m].two, ib = two ? 3 : 4;
+    static const int w3[8] = {0, 9, 18, 27, 37, 46, 55, 64}, w4[16] = {0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
+    const int *wt = two ? w3 : w4;
+    float u[16][4];
+    for (int t = 0; t < 16; t++) {
+        for (int c = 0; c < 3; c++) u[t][c] = h[t][c] * (sgn ? 32.0f / 31.0f : 64.0f / 31.0f);
+        u[t][3] = 0;
+    }
+    int q[4][3], idx[16];
+    for (int s = 0; s < 1 + two; s++) {
+        int mask[16];
+        for (int t = 0; t < 16; t++) mask[t] = (two ? bc7_part2[part][t] : 0) == s;
+        /* the principal axis of the subset, extremes along it */
+        float mean[3] = {0}, cov[3][3] = {{0}}, ax[3] = {1, 1, 1};
+        int n = 0;
+        for (int t = 0; t < 16; t++)
+            if (mask[t]) {
+                for (int c = 0; c < 3; c++) mean[c] += u[t][c];
+                n++;
+            }
+        for (int c = 0; c < 3; c++) mean[c] /= n;
+        for (int t = 0; t < 16; t++)
+            if (mask[t])
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++) cov[i][j] += (u[t][i] - mean[i]) * (u[t][j] - mean[j]);
+        for (int it = 0; it < 8; it++) {
+            float nx[3] = {0}, l = 0;
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++) nx[i] += cov[i][j] * ax[j];
+                l += nx[i] * nx[i];
+            }
+            if (l < 1e-9f) break;
+            for (int i = 0; i < 3; i++) ax[i] = nx[i] / sqrtf(l);
+        }
+        float t0 = 1e30f, t1 = -1e30f;
+        for (int t = 0; t < 16; t++)
+            if (mask[t]) {
+                float d = 0;
+                for (int c = 0; c < 3; c++) d += (u[t][c] - mean[c]) * ax[c];
+                t0 = fminf(t0, d), t1 = fmaxf(t1, d);
+            }
+        int ue[2][3];
+        for (int c = 0; c < 3; c++) {
+            q[2 * s][c] = bc6_quant(mean[c] + ax[c] * t0, w, sgn);
+            q[2 * s + 1][c] = bc6_quant(mean[c] + ax[c] * t1, w, sgn);
+            ue[0][c] = bc6_unq(q[2 * s][c], w, sgn), ue[1][c] = bc6_unq(q[2 * s + 1][c], w, sgn);
+        }
+        for (int t = 0; t < 16; t++) {
+            if (!mask[t]) continue;
+            double be = 1e30;
+            for (int i = 0; i < (1 << ib); i++) {
+                double e = 0;
+                for (int c = 0; c < 3; c++) {
+                    int v = (ue[0][c] * (64 - wt[i]) + ue[1][c] * wt[i] + 32) >> 6;
+                    float d = (float)(sgn ? (v * 31) >> 5 : (v * 31) >> 6) - h[t][c];
+                    e += d * d;
+                }
+                if (e < be) be = e, idx[t] = i;
+            }
+        }
+        int anchor = s ? bc7_anchor2[part] : 0;
+        if (idx[anchor] >> (ib - 1)) { /* the anchor's index has no top bit: swap the ends */
+            for (int c = 0; c < 3; c++) {
+                int x = q[2 * s][c];
+                q[2 * s][c] = q[2 * s + 1][c], q[2 * s + 1][c] = x;
+            }
+            for (int t = 0; t < 16; t++)
+                if (mask[t]) idx[t] = (1 << ib) - 1 - idx[t];
+        }
+    }
+    uint32_t f[13] = {0};
+    int ne = two ? 4 : 2, d = (int)bc6_modes[m].d;
+    for (int e = 0; e < ne; e++)
+        for (int c = 0; c < 3; c++) {
+            int v = q[e][c];
+            if (e && bc6_modes[m].delta) {
+                v -= q[0][c];
+                if (v < -(1 << (d - 1)) || v >= (1 << (d - 1))) return 1e30;
+            }
+            f[c * 4 + e] = (uint32_t)v & ((1u << (e ? d : w)) - 1);
+        }
+    f[12] = (uint32_t)part;
+    memset(out, 0, 16);
+    int pos = 0;
+    bits_put(out, &pos, (int)bc6_modes[m].code_bits, bc6_modes[m].code);
+    for (size_t i = 0; i < bc6_modes[m].n; i++) {
+        const bc6f *l = &bc6_modes[m].l[i];
+        uint32_t v = (f[l->f] >> l->sh) & ((1u << l->n) - 1), r = 0;
+        if (l->rev)
+            for (int k = 0; k < l->n; k++) r |= ((v >> k) & 1) << (l->n - 1 - k);
+        bits_put(out, &pos, l->n, l->rev ? r : v);
+    }
+    for (int t = 0; t < 16; t++) bits_put(out, &pos, ib - (t == 0 || (two && t == bc7_anchor2[part])), (uint32_t)idx[t]);
+    uint16_t dec[16 * 3];
+    bcdec_bc6h_half(out, dec, 12, sgn);
+    double err = 0;
+    for (int t = 0; t < 16; t++)
+        for (int c = 0; c < 3; c++) {
+            double x = (double)(int16_t)dec[t * 3 + c] - h[t][c];
+            err += x * x;
+        }
+    return err;
+}
+
+/* BC6H block (UFLOAT or SFLOAT) from linear RGB texels: the best of modes 11 and 14 and, over the
+ * 32 partitions, modes 1 and 10. */
+static void enc_bc6h(const float px[16][3], int sgn, uint8_t *out)
+{
+    uint16_t h[16][3];
+    for (int t = 0; t < 16; t++)
+        for (int c = 0; c < 3; c++) h[t][c] = f2h(px[t][c]);
+    if (!bc7_part2[0][15] && !bc7_part2[0][0]) bc7_partitions();
+    uint8_t cand[16];
+    double best = 1e300;
+    for (int m = 0; m < 4; m++)
+        for (int p = 0; p < (bc6_modes[m].two ? 32 : 1); p++) {
+            double e = bc6_try(h, sgn, m, p, cand);
+            if (e < best) best = e, memcpy(out, cand, 16);
+        }
+}
+
 static int is_snorm(VkFormat f) { return f == VK_FORMAT_BC4_SNORM_BLOCK || f == VK_FORMAT_BC5_SNORM_BLOCK; }
 
-/* One block of format f from texels px (8-bit RGBA; a normal map's x, y for BC5). */
+/* One block of format f from texels px (8-bit RGBA; a normal map's x, y for BC5; BC6H takes the HDR
+ * image's own texels). */
 static void enc_block(VkFormat f, const uint8_t rgba[16][4], int kind, int bx, int by, uint8_t *out)
 {
     float px[16][4], a[16];
@@ -706,6 +1254,12 @@ static void enc_block(VkFormat f, const uint8_t rgba[16][4], int kind, int bx, i
             enc_bc4(a, out + 8 * ch, is_snorm(f));
         }
         break;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK: {
+        float h[16][3];
+        for (int t = 0; t < 16; t++) hdr_px(kind, bx * 4 + (t & 3), by * 4 + (t >> 2), h[t]);
+        enc_bc6h(h, f == VK_FORMAT_BC6H_SFLOAT_BLOCK, out);
+        break;
+    }
     default: enc_bc7(px, out); break;
     }
 }
@@ -717,6 +1271,7 @@ static int image_for(VkFormat f)
     if (f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || f == VK_FORMAT_BC1_RGBA_SRGB_BLOCK) return IMG_ALPHA_CUT;
     if (f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC3_SRGB_BLOCK) return IMG_ALPHA_SOFT;
     if (f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK) return IMG_ALPHA_SOFT;
+    if (f == VK_FORMAT_BC6H_UFLOAT_BLOCK || f == VK_FORMAT_BC6H_SFLOAT_BLOCK) return IMG_HDR_PHOTO;
     return IMG_PHOTO;
 }
 
@@ -730,8 +1285,9 @@ static uint8_t *image_blocks(VkFormat f, int kind, uint32_t w, uint32_t h, uint3
         pool[f][kind] = malloc((size_t)64 * 64 * bytes);
         for (int by = 0; by < 64; by++)
             for (int bx = 0; bx < 64; bx++) {
-                uint8_t px[16][4];
-                for (int t = 0; t < 16; t++) image_px(kind, bx * 4 + (t & 3), by * 4 + (t >> 2), px[t]);
+                uint8_t px[16][4] = {{0}};
+                for (int t = 0; t < 16; t++)
+                    if (kind < IMG_HDR_PHOTO) image_px(kind, bx * 4 + (t & 3), by * 4 + (t >> 2), px[t]);
                 enc_block(f, px, kind, bx, by, pool[f][kind] + ((size_t)by * 64 + bx) * bytes);
             }
     }
@@ -751,12 +1307,15 @@ static int is_srgb(VkFormat f)
            f == VK_FORMAT_BC3_SRGB_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
 }
 
-/* Transcoded by the bridge (in transcode mode): all but BC6H. */
-static int transcoded(VkFormat f) { return tx && f != VK_FORMAT_BC6H_UFLOAT_BLOCK && f != VK_FORMAT_BC6H_SFLOAT_BLOCK; }
+static int is_bc6h(VkFormat f) { return f == VK_FORMAT_BC6H_UFLOAT_BLOCK || f == VK_FORMAT_BC6H_SFLOAT_BLOCK; }
+
+/* Transcoded by the bridge (in transcode mode): all but BC6H, and BC6H where the GPU samples ASTC HDR. */
+static int transcoded(VkFormat f) { return tx && (!is_bc6h(f) || tx_hdr); }
 
 /* Lowest PSNR (dB) a transcoded level may have against bcdec, colour and alpha, a little under the
  * worst measured on the test images (2026-10-13, RADV decoding ETC2/ASTC): BC1 -> ETC2 31.3 (rough),
- * BC7 -> ASTC 33.9 (rough), BC4/BC5 -> EAC 43.8, alpha 40.4. */
+ * BC7 -> ASTC 33.9 (rough), BC4/BC5 -> EAC 43.8, alpha 40.4. BC6H -> ASTC HDR: linear values against
+ * the level's largest, 40 (the target; measured: see test_hdr_shader). */
 static double psnr_floor(VkFormat f, int alpha)
 {
     if (alpha) return 36;
@@ -764,6 +1323,7 @@ static double psnr_floor(VkFormat f, int alpha)
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
         return 29;
     case VK_FORMAT_BC4_UNORM_BLOCK: case VK_FORMAT_BC4_SNORM_BLOCK: case VK_FORMAT_BC5_UNORM_BLOCK: case VK_FORMAT_BC5_SNORM_BLOCK: return 40;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK: return 40;
     default: return 31;
     }
 }
@@ -781,7 +1341,8 @@ static float lin2srgb(float v)
 static VkBuffer host_buffer(VkDeviceSize size, VkDeviceMemory *mem, void **map)
 {
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size,
-                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     VkBuffer b;
     vkCreateBuffer(dev, &bci, NULL, &b);
     VkMemoryRequirements r;
@@ -867,8 +1428,8 @@ static int compare_level(VkImage bc, VkFormat f, uint32_t mip, uint32_t layer, c
     if (transcoded(f)) {
         /* lossy: squared errors of the colour channels and of alpha */
         int nc = f <= VK_FORMAT_BC4_SNORM_BLOCK && f >= VK_FORMAT_BC4_UNORM_BLOCK ? 1 : f <= VK_FORMAT_BC5_SNORM_BLOCK && f >= VK_FORMAT_BC5_UNORM_BLOCK ? 2 : 3;
-        int alpha = nc == 3 && f != VK_FORMAT_BC1_RGB_UNORM_BLOCK && f != VK_FORMAT_BC1_RGB_SRGB_BLOCK;
-        double se = 0, sea = 0;
+        int alpha = nc == 3 && f != VK_FORMAT_BC1_RGB_UNORM_BLOCK && f != VK_FORMAT_BC1_RGB_SRGB_BLOCK && !six;
+        double se = 0, sea = 0, top = 0;
         long n = 0;
         for (uint32_t by = 0; by < lv->bh; by++)
             for (uint32_t bx = 0; bx < lv->bw; bx++) {
@@ -881,13 +1442,14 @@ static int compare_level(VkImage bc, VkFormat f, uint32_t mip, uint32_t layer, c
                         size_t i = ((size_t)y * lv->w + x) * 4 + ch;
                         float g = big ? ((const uint8_t *)map)[i] / 255.0f : ((const float *)map)[i], w = want[t][ch];
                         if (is_srgb(f) && ch < 3) g = lin2srgb(g);
-                        if (ch < nc) se += (double)(g - w) * (g - w);
+                        if (ch < nc && six && (!isfinite(w) || w < 0)) continue; /* ASTC HDR has no sign */
+                        if (ch < nc) se += (double)(g - w) * (g - w), top = fmax(top, w);
                         else if (ch == 3 && alpha) sea += (double)(g - w) * (g - w);
                     }
                     n++;
                 }
             }
-        double peak = is_snorm(f) ? 2.0 : 1.0;
+        double peak = is_snorm(f) ? 2.0 : six ? top : 1.0; /* BC6H: the level's largest value */
         last_psnr = psnr(se, n * nc, peak);
         last_psnr_a = alpha ? psnr(sea, n, 1.0) : 0;
         if (last_psnr < min_psnr) min_psnr = last_psnr;
@@ -1097,6 +1659,153 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
     }
 }
 
+/* ------------------------------------------------------------------ BC6H -> ASTC HDR, the shader itself */
+
+/* The bridge's BC6H transcoder (spv_bc6h_astc from server/bc_spv.h) run directly over bw x bh
+ * blocks, as the bridge dispatches it: the ASTC blocks (malloc'd), NULL if it cannot run. Lets the
+ * encoder be checked by PSNR (astc_decode) on a GPU that cannot sample ASTC HDR, and on one that
+ * can, apart from how the bridge picks and creates the image. */
+static uint8_t *run_bc6h_astc(const uint8_t *blocks, uint32_t bw, uint32_t bh, int sgn, double *ms)
+{
+    static VkDescriptorSetLayout dsl;
+    static VkPipelineLayout layout;
+    static VkPipeline pipe;
+    static VkDescriptorPool dpool;
+    static VkDescriptorSet set;
+    if (!pipe) {
+        VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, b};
+        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 1, &pr};
+        VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(spv_bc6h_astc), spv_bc6h_astc};
+        VkShaderModule sm;
+        if (vkCreateDescriptorSetLayout(dev, &dci, NULL, &dsl) || vkCreatePipelineLayout(dev, &plci, NULL, &layout) ||
+            vkCreateShaderModule(dev, &smci, NULL, &sm))
+            return NULL;
+        VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
+                                            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL},
+                                            layout, VK_NULL_HANDLE, 0};
+        VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe);
+        vkDestroyShaderModule(dev, sm, NULL);
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+        VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 1, &ps};
+        VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, 1, &dsl};
+        if (r || vkCreateDescriptorPool(dev, &dpci, NULL, &dpool)) return NULL;
+        dai.descriptorPool = dpool;
+        if (vkAllocateDescriptorSets(dev, &dai, &set)) return NULL;
+    }
+    VkDeviceSize n = (VkDeviceSize)bw * bh * 16;
+    VkDeviceMemory sm, dm;
+    void *sp, *dp;
+    VkBuffer src = host_buffer(n, &sm, &sp), dst = host_buffer(n, &dm, &dp);
+    memcpy(sp, blocks, n);
+    memset(dp, 0, n);
+    VkDescriptorBufferInfo bi[2] = {{src, 0, VK_WHOLE_SIZE}, {dst, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[0], NULL},
+                                  {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[1], NULL}};
+    vkUpdateDescriptorSets(dev, 2, wr, 0, NULL);
+    /* push constants as the bridge's pc_t: src_word, row_blocks, layer_blocks, flags (2: signed),
+     * dst_word, pad, extent */
+    uint32_t pc[8] = {0, bw, bw * bh, sgn ? 2u : 0u, 0, 0, bw * 4, bh * 4};
+    VkCommandBuffer cb = begin();
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cb, (bw + 7) / 8, (bh + 7) / 8, 1);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    submit(cb);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (ms) *ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    uint8_t *out = malloc(n);
+    memcpy(out, dp, n);
+    vkDestroyBuffer(dev, src, NULL);
+    vkDestroyBuffer(dev, dst, NULL);
+    vkFreeMemory(dev, sm, NULL);
+    vkFreeMemory(dev, dm, NULL);
+    return out;
+}
+
+/* PSNR (dB, linear values, peak: the largest reference value) of ASTC blocks against the BC6H
+ * blocks they were made from, as bcdec decodes them; *undecoded: ASTC blocks astc_decode refused.
+ * References that are not finite, and negative ones (ASTC HDR has no sign), are left out. */
+static double astc_psnr(VkFormat f, const uint8_t *bc, const uint8_t *astc, uint32_t nblocks, int *undecoded)
+{
+    double se = 0, peak = 0;
+    long n = 0;
+    *undecoded = 0;
+    for (uint32_t i = 0; i < nblocks; i++) {
+        float want[16][4], got[16][4];
+        decode_block(f, bc + 16 * i, want);
+        if (!astc_decode(astc + 16 * i, got)) {
+            (*undecoded)++;
+            continue;
+        }
+        for (int t = 0; t < 16; t++)
+            for (int c = 0; c < 3; c++) {
+                float w = want[t][c];
+                if (!isfinite(w) || w < 0) continue;
+                if (!isfinite(got[t][c])) got[t][c] = 1e9f;
+                se += (double)(got[t][c] - w) * (got[t][c] - w);
+                if (w > peak) peak = w;
+                n++;
+            }
+    }
+    return psnr(se, n, peak);
+}
+
+/* The transcoder over the HDR test images (UFLOAT and SFLOAT), each 256x256, by PSNR against
+ * bcdec; then over random blocks of all 14 modes (wide, often extreme values: every block must
+ * decode, PSNR only reported). */
+static void test_hdr_shader(void)
+{
+    static const VkFormat fmts[2] = {VK_FORMAT_BC6H_UFLOAT_BLOCK, VK_FORMAT_BC6H_SFLOAT_BLOCK};
+    static const int kinds[3] = {IMG_HDR_PHOTO, IMG_HDR_GRADIENT, IMG_HDR_SKY};
+    for (int fi = 0; fi < 2; fi++) {
+        VkFormat f = fmts[fi];
+        const char *name = fi ? "BC6H sfloat -> ASTC 4x4 HDR (shader, CPU decode)" : "BC6H ufloat -> ASTC 4x4 HDR (shader, CPU decode)";
+        for (int k = 0; k < 3; k++) {
+            enum { S = 256 };
+            uint8_t *bc = image_blocks(f, kinds[k], S, S, 0, 0);
+            double ms;
+            uint8_t *astc = run_bc6h_astc(bc, S / 4, S / 4, fi, &ms);
+            if (!astc) {
+                printf("FAIL %s: cannot run the transcoder\n", name);
+                failures++;
+                free(bc);
+                return;
+            }
+            int und;
+            double p = astc_psnr(f, bc, astc, (S / 4) * (S / 4), &und);
+            int bad = und || p < psnr_floor(f, 0) || p >= 99;
+            printf("%s %s, %s: PSNR %.1f dB (floor %.0f)", bad ? "FAIL" : "PASS", name, img_name[kinds[k]], p, psnr_floor(f, 0));
+            if (und) printf(", %d blocks undecodable", und);
+            if (getenv("BCN_VERBOSE")) printf(", %.2f ms", ms);
+            printf("\n");
+            failures += bad;
+            free(bc);
+            free(astc);
+        }
+        enum { N = 4096 };
+        uint8_t *bc = malloc(N * 16);
+        for (int i = 0; i < N; i++) make_block(f, bc + 16 * i, 16, i);
+        uint8_t *astc = run_bc6h_astc(bc, 64, N / 64, fi, NULL);
+        int und = 0;
+        double p = astc ? astc_psnr(f, bc, astc, N, &und) : 0;
+        if (!astc || und) {
+            printf("FAIL %s, random blocks of all 14 modes: %d of %d blocks undecodable\n", name, astc ? und : N, N);
+            failures++;
+        } else {
+            printf("PASS %s, random blocks of all 14 modes: every block decodes (PSNR %.1f dB, no floor)\n", name, p);
+        }
+        free(bc);
+        free(astc);
+    }
+}
+
 /* What the image costs: through the bridge the decoded image's requirements, natively the BC
  * image's. BC5 decodes to RG8 (2 bytes a texel) and BC4 to R8, also when mutable between UNORM
  * and SNORM as DXVK makes every BC5 image; RGBA8 would be twice that. */
@@ -1242,9 +1951,10 @@ static void test_many_cbs(void)
 
 int main(int argc, char **argv)
 {
-    int gpu = 0;
+    int gpu = 0, hdr_only = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "transcode")) tx = 1;
+        else if (!strcmp(argv[i], "hdr")) hdr_only = 1;
         else gpu = atoi(argv[i]);
     }
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
@@ -1281,10 +1991,33 @@ int main(int argc, char **argv)
     G(vkCmdPipelineBarrier); G(vkCmdCopyBufferToImage); G(vkCmdBlitImage); G(vkCmdCopyImageToBuffer); G(vkDestroyImage);
     G(vkDestroyBuffer); G(vkFreeMemory); G(vkCreateImageView); G(vkDestroyImageView); G(vkCmdCopyImage); G(vkFreeCommandBuffers);
     if (props.apiVersion >= VK_API_VERSION_1_3) G(vkCmdCopyBufferToImage2);
+    G(vkCreateShaderModule); G(vkDestroyShaderModule); G(vkCreateDescriptorSetLayout); G(vkCreatePipelineLayout);
+    G(vkCreateComputePipelines); G(vkCreateDescriptorPool); G(vkAllocateDescriptorSets); G(vkUpdateDescriptorSets);
+    G(vkCmdBindPipeline); G(vkCmdBindDescriptorSets); G(vkCmdPushConstants); G(vkCmdDispatch);
 #undef G
     vkGetDeviceQueue(dev, 0, 0, &queue);
+    if (tx && props.apiVersion >= VK_API_VERSION_1_3) {
+        /* the bridge transcodes BC6H where the GPU has ASTC HDR and samples, filters and copies
+         * ASTC 4x4 HDR images (server_emu_bcn.c); the checks then blit from them */
+        PFN_vkGetPhysicalDeviceFeatures2 gpdf2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2");
+        VkPhysicalDeviceTextureCompressionASTCHDRFeatures hf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hf};
+        if (gpdf2) gpdf2(pd, &f2);
+        VkFormatProperties hp;
+        vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK, &hp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        tx_hdr = hf.textureCompressionASTC_HDR && (hp.optimalTilingFeatures & need) == need;
+        if (tx_hdr && !(hp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT))
+            printf("INFO no blit from ASTC 4x4 HDR: the BC6H checks through the bridge will fail\n");
+    }
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, 0};
     vkCreateCommandPool(dev, &pci, NULL, &pool);
+    if (hdr_only) { /* `bcn_check hdr`: only the BC6H -> ASTC HDR transcoder, run directly (any GPU) */
+        test_hdr_shader();
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
     float u8 = 2.5f / 255.0f; /* hardware decoders round differently from bcdec by up to 2 */
     if (tx) {
         static const int photo[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT}, cut[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_CUT};
@@ -1300,8 +2033,18 @@ int main(int argc, char **argv)
         test_quality(VK_FORMAT_BC4_SNORM_BLOCK, "BC4 snorm -> EAC R11 snorm", photo, 3);
         test_quality(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 -> EAC RG11", normal, 1);
         test_quality(VK_FORMAT_BC5_SNORM_BLOCK, "BC5 snorm -> EAC RG11 snorm", normal, 1);
-        test_format(VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H ufloat (all 14 modes, decoded)", 0.002f);
-        test_format(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat (all 14 modes, decoded)", 0.002f);
+        /* BC6H -> ASTC 4x4 HDR: through the bridge where the GPU samples ASTC HDR, else decoded as
+         * before; the transcoder itself either way, its blocks decoded here */
+        if (tx_hdr) {
+            static const int hdr[] = {IMG_HDR_PHOTO, IMG_HDR_GRADIENT, IMG_HDR_SKY};
+            test_quality(VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H ufloat -> ASTC 4x4 HDR", hdr, 3);
+            test_quality(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat -> ASTC 4x4 HDR", hdr, 3);
+        } else {
+            printf("INFO the GPU does not sample ASTC 4x4 HDR: BC6H is decoded\n");
+            test_format(VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H ufloat (all 14 modes, decoded)", 0.002f);
+            test_format(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat (all 14 modes, decoded)", 0.002f);
+        }
+        test_hdr_shader();
     } else {
         test_format(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 RGBA", u8);
         test_format(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB", u8);
