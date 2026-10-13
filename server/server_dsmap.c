@@ -218,9 +218,15 @@ static void VKAPI_CALL ds_UpdateDescriptorSets(VkDevice device, uint32_t nw, con
     VkCopyDescriptorSet c_local[DS_LOCAL], *c2 = nc <= DS_LOCAL ? c_local : malloc(nc * sizeof(*c2));
     if ((nw && !w2) || (nc && !c2)) goto out;
     uint32_t kw = 0, kc = 0;
+    /* DXVK writes one set per call, a write per binding: one lookup for the run. */
+    VkDescriptorSet from = VK_NULL_HANDLE, to = VK_NULL_HANDLE;
     for (uint32_t i = 0; i < nw; i++) {
         w2[kw] = w[i];
-        w2[kw].dstSet = lookup(m, w[i].dstSet);
+        if (w[i].dstSet != from || !from) {
+            from = w[i].dstSet;
+            to = lookup(m, from);
+        }
+        w2[kw].dstSet = to;
         if (w2[kw].dstSet) kw++;
         else missing_id(m, "vkUpdateDescriptorSets", (uint64_t)w[i].dstSet);
     }
