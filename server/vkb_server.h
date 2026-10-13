@@ -153,6 +153,7 @@ void vkb_pcache_device_destroy(vkb_srv_table *t);
 
 /* server_conn.c */
 void vkb_srv_serve(int listen_fd);
+void vkb_srv_stats_reload(void); /* VKBRIDGE_STATS read again (after vkb_srv_env_reload) */
 vkb_srv_table *vkb_table_get(uint32_t id);
 uint32_t vkb_table_register(vkb_srv_table *t);
 void vkb_table_unregister(vkb_srv_table *t);

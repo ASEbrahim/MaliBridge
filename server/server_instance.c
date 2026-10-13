@@ -255,6 +255,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     uint32_t strategy = k ? k->info.strategy : VKB_MEM_NONE;
     uint32_t emu = k ? k->info.emu : 0;
     vkb_srv_env_reload(); /* <cache dir>/env: per-device test toggles without restarting the app */
+    vkb_srv_stats_reload();
     {
         /* VKBRIDGE_EMU_OFF=<hex mask of VKB_EMU_* bits>: this device runs without those emulations
          * (the client still reports their features: for bisecting, not for games). */

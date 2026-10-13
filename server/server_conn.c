@@ -304,6 +304,8 @@ void vkb_sv_vkbHello(vkb_srv_call *c)
 static uint64_t st_ns[VKB_CMD_COUNT], st_n[VKB_CMD_COUNT], st_wait_ns, st_last;
 static int st_period = -1;
 
+void vkb_srv_stats_reload(void) { st_period = -1; }
+
 static uint64_t mono_ns(void)
 {
     struct timespec ts;
@@ -314,7 +316,8 @@ static uint64_t mono_ns(void)
 static void stats_add(uint32_t cmd, uint64_t ns, uint64_t wait_ns)
 {
     if (st_period < 0) {
-        const char *v = getenv("VKBRIDGE_STATS");
+        /* <cache dir>/env works too: the app starts the server without the session's environment. */
+        const char *v = vkb_srv_env("VKBRIDGE_STATS");
         st_period = v ? atoi(v) : 0;
     }
     if (!st_period) return;

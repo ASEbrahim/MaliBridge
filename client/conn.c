@@ -79,6 +79,18 @@ typedef struct vkb_conn {
 } vkb_conn;
 
 static uint64_t process_token;
+/* VKBRIDGE_STATS (vkb_stats_count): messages written to the socket and their bytes, headers
+ * included - what each side pays a syscall, a header and an ordering step for. */
+static int stat_period = -1;
+static uint64_t stat_msgs, stat_wire, stat_msgs_total, stat_wire_total;
+static void stat_wire_add(uint64_t msgs, uint64_t bytes)
+{
+    if (stat_period <= 0) return;
+    __atomic_add_fetch(&stat_msgs, msgs, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_wire, bytes, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_msgs_total, msgs, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_wire_total, bytes, __ATOMIC_RELAXED);
+}
 /* The last asynchronous request's sequence number in this process (see vkb_msg_hdr). */
 static uint64_t async_seq;
 static uint32_t fork_epoch;
@@ -409,6 +421,7 @@ int vkb_call_exec(vkb_call *c)
             aq_cap = nc;
         }
         if (!aq_len) aq_first_ns = now_ns();
+        stat_wire_add(1, sizeof(h) + c->e.len);
         memcpy(aq_buf + aq_len, &h, sizeof(h));
         memcpy(aq_buf + aq_len + sizeof(h), c->e.buf, c->e.len);
         aq_len = need;
@@ -435,6 +448,7 @@ int vkb_call_exec(vkb_call *c)
     }
     /* Everything queued goes first, on this connection. */
     int qr = aq_flush_locked(conn);
+    stat_wire_add(1, sizeof(h) + c->e.len);
     if (c->flags & VKB_F_NOREPLY) {
         h.seq = ++async_seq;
         h.barrier = h.seq - 1;
@@ -502,21 +516,45 @@ int vkb_call_exec_async(vkb_call *c)
     return vkb_call_exec(c);
 }
 
-/* VKBRIDGE_STATS=<seconds>: per-command counts of round trips and async sends, logged. */
+/* VKBRIDGE_STATS=<seconds>: per-command counts of round trips and async sends, logged, and a
+ * summary of the whole run at exit (with a long period, only that: tests/desc_traffic_check). */
 static uint32_t stat_sync[VKB_CMD_COUNT], stat_async[VKB_CMD_COUNT];
-static uint64_t stat_bytes;
+static uint64_t stat_bytes, stat_cmd_bytes[VKB_CMD_COUNT];
+static uint64_t stat_total_sync[VKB_CMD_COUNT], stat_total_async[VKB_CMD_COUNT], stat_total_bytes;
 uint32_t vkb_stat_refused; /* descriptor.c */
 static uint64_t stat_last;
+
+static void stats_exit(void)
+{
+    uint64_t s = 0, a = 0;
+    for (uint32_t i = 0; i < VKB_CMD_COUNT; i++) {
+        s += stat_total_sync[i];
+        a += stat_total_async[i];
+    }
+    vkb_log(VKB_LOG_ERROR, "stats at exit: %llu round trips, %llu async, %llu KB encoded; %llu messages, %llu KB on the wire",
+            (unsigned long long)s, (unsigned long long)a, (unsigned long long)(stat_total_bytes >> 10),
+            (unsigned long long)stat_msgs_total, (unsigned long long)(stat_wire_total >> 10));
+    for (uint32_t i = 0; i < VKB_CMD_COUNT; i++)
+        if (stat_total_sync[i] + stat_total_async[i] >= 100)
+            vkb_log(VKB_LOG_ERROR, "  %-40s %8llu sync %8llu async", vkb_cmd_names[i], (unsigned long long)stat_total_sync[i],
+                    (unsigned long long)stat_total_async[i]);
+}
+
 void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
 {
-    static int period = -1;
-    if (period < 0) {
+    if (stat_period < 0) {
         const char *v = getenv("VKBRIDGE_STATS");
-        period = v ? atoi(v) : 0;
+        int p = v ? atoi(v) : 0;
+        if (p > 0) atexit(stats_exit);
+        stat_period = p > 0 ? p : 0;
     }
+    int period = stat_period;
     if (!period) return;
     __atomic_add_fetch(async ? &stat_async[cmd] : &stat_sync[cmd], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(async ? &stat_total_async[cmd] : &stat_total_sync[cmd], 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&stat_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_total_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_cmd_bytes[cmd], bytes, __ATOMIC_RELAXED);
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = (uint64_t)ts.tv_sec;
@@ -532,8 +570,10 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
         tot_s += stat_sync[i];
         tot_a += stat_async[i];
     }
-    vkb_log(VKB_LOG_ERROR, "stats over %us: %u round trips, %u async, %llu KB sent", period, tot_s, tot_a,
-            (unsigned long long)(stat_bytes >> 10));
+    vkb_log(VKB_LOG_ERROR, "stats over %us: %u round trips, %u async, %llu KB encoded; %llu messages, %llu KB on the wire", period,
+            tot_s, tot_a, (unsigned long long)(stat_bytes >> 10),
+            (unsigned long long)__atomic_exchange_n(&stat_msgs, 0, __ATOMIC_RELAXED),
+            (unsigned long long)(__atomic_exchange_n(&stat_wire, 0, __ATOMIC_RELAXED) >> 10));
     for (int k = 0; k < 8; k++) {
         uint32_t best = 0, bi = 0;
         for (uint32_t i = 0; i < VKB_CMD_COUNT; i++)
@@ -542,7 +582,8 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
                 bi = i;
             }
         if (!best) break;
-        vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async", vkb_cmd_names[bi], stat_sync[bi], stat_async[bi]);
+        vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async %7llu KB", vkb_cmd_names[bi], stat_sync[bi], stat_async[bi],
+                (unsigned long long)(stat_cmd_bytes[bi] >> 10));
         stat_sync[bi] = stat_async[bi] = 0;
     }
     /* Round trips are what cost: the rest of them too, from one a second. */
@@ -553,6 +594,7 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
     if (refused) vkb_log(VKB_LOG_ERROR, "  descriptor set allocations refused: %u", refused);
     memset(stat_sync, 0, sizeof(stat_sync));
     memset(stat_async, 0, sizeof(stat_async));
+    memset(stat_cmd_bytes, 0, sizeof(stat_cmd_bytes));
     stat_bytes = 0;
 }
 
