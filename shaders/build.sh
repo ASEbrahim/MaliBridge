@@ -1,10 +1,11 @@
 #!/bin/bash
-# Compiles the BCn decoder variants into server/bc_spv.h (committed, so a build
+# Compiles the BCn decoder and transcoder variants into server/bc_spv.h (committed, so a build
 # needs no shader compiler). Needs glslangValidator, or glslc (GLSLC=..., else the Android NDK's);
-# regenerates bc_tables.glsl first.
+# regenerates bc_tables.glsl and astc_tables.glsl first.
 set -eu
 cd "$(dirname "$0")"
 python3 gen_bc_tables.py
+python3 gen_astc_tables.py
 out=../server/bc_spv.h
 tmp=$(mktemp -d)
 glslc=${GLSLC:-}
@@ -31,5 +32,12 @@ for f in BC1 BC2 BC3 BC4 BC5 BC6H BC7; do
   variant spv_$(echo $f | tr A-Z a-z) -DFMT_$f
 done
 variant spv_bc1_16 -DFMT_BC1 -DPACK16
+# transcoders: decode, then encode to a format the GPU samples compressed
+variant spv_bc1_etc2 -DFMT_BC1 -DENC_ETC2
+variant spv_bc2_astc -DFMT_BC2 -DENC_ASTC
+variant spv_bc3_astc -DFMT_BC3 -DENC_ASTC
+variant spv_bc4_eac -DFMT_BC4 -DENC_EAC
+variant spv_bc5_eac -DFMT_BC5 -DENC_EAC
+variant spv_bc7_astc -DFMT_BC7 -DENC_ASTC
 rm -rf "$tmp"
 echo "wrote $out"
