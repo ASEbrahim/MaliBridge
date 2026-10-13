@@ -59,14 +59,18 @@ Everything here is still work in progress.
 | Stray | runs, but slowly (13-16 fps, limited by the emulated render thread) |
 | Deep Rock Galactic | runs, but slowly |
 
-Known limit: decoded BC textures take 4-8x the memory of the compressed data. Games that load
-many large textures (Risk of Rain 2) can run the device out of memory.
+Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples compressed, at the
+size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11).
+BC6H is still decoded to RGBA16F (8x its compressed size), and so is any texture the transcoder
+cannot take (storage images, uncompressed views in the format list, sizes or types the GPU refuses).
+Transcoding is lossy: `bcn_check transcode` measures 31-60 dB PSNR against the BC data depending
+on format and content.
 
 ## Mali workarounds
 
 Each one turns on only when the GPU lacks the feature.
 
-- **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`). BC1 goes to 16-bit where it can.
+- **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`), and where the GPU samples ETC2/EAC/ASTC (Mali does) encoded again into those in the same pass (`shaders/etc2_enc.glsl`, `astc_enc.glsl`, `eac_enc.glsl`), so the texture stays compressed. Otherwise decoded; BC1 goes to 16-bit where it can.
 - **Push descriptors** (`VK_KHR_push_descriptor`): emulated with descriptor sets per command buffer. vkd3d-proton will not start without them.
 - **Descriptor limits**: the 1,000,000-per-stage limits vkd3d-proton asks for are reported, and layouts are cut down to what the GPU has (500,000 on r44).
 - **Null descriptors / robustness2**: reported, with null descriptors replaced by dummy resources.
@@ -126,7 +130,8 @@ make -C host          # server, client ICD and test programs into host/out
 host/run_tests.sh     # every check, once on the plain driver and once imitating Mali (mali_env.sh)
 ```
 
-The suite runs `smoke`, `bcn_check` (every BC format and mode, bit-exact against bcdec),
+The suite runs `smoke`, `bcn_check` (every BC format and mode, bit-exact against bcdec; imitating
+Mali, once with BC transcoded to ETC2/EAC/ASTC, by PSNR against bcdec, and once decoded),
 `opaque_check`, `recycle_check`, vkcube over Wayland (dma-buf and wl_shm) and X11, and, if the
 `vkb-arch-gamescope` docker image exists, gamescope with Zink. It also fails on any protocol
 error in the server log. `d3d11_check` runs under Proton's wine and DXVK when `VKB_WINE_DIR`
@@ -158,6 +163,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_EMULATE=0` | server | no emulations at all |
 | `VKBRIDGE_EMU_OFF=<hex mask>` | server | turns off chosen emulations for bisecting (bits in `common/vkb_proto.h`) |
 | `VKBRIDGE_EMU_<NAME>=0` | server | turns off one emulation (`BCN`, `PUSH`, `DESCLIMITS`, `ROBUSTNESS2`, ...) |
+| `VKBRIDGE_BC_TRANSCODE=0` | server | BC textures decoded instead of transcoded to ETC2/EAC/ASTC |
 | `VKBRIDGE_NO_XFB_FOLD=1` | server | turns off the stream output fold |
 | `VKBRIDGE_NO_CRASH_GUARD=1` | server | turns off pipeline crash containment |
 | `VKBRIDGE_FAKE_MISSING=bc,push,...` | server | pretends the GPU lacks features (host testing, see `host/mali_env.sh`) |
@@ -171,17 +177,16 @@ client/        Vulkan ICD (guest side): dispatch, command buffers, memory, descr
 server/        Android server: connections, instances/devices, memory sharing, emulations, diagnostics
 common/        wire protocol shared by both sides; gen/ holds the generated encoders/decoders
 codegen/       gen_vkbridge.py: generates common/gen/ from vk.xml
-shaders/       BC1-BC7 decoder (GLSL) and its table generator -> server/bc_spv.h
+shaders/       BC1-BC7 decoder and ETC2/EAC/ASTC encoders (GLSL), table generators -> server/bc_spv.h
 tests/         self-checking Vulkan tests, SPIR-V corpus, device-side tools (gpubench, gauntlet)
 host/          desktop build and regression suite
 scripts/       device builds (Android server, Linux client)
-third_party/   Vulkan-Headers 1.4.341, bcdec
+third_party/   Vulkan-Headers 1.4.341, bcdec, etc2_encode's licence (the encoders derive from it)
 ```
 
 ## Roadmap
 
-- Transcode BC textures to ETC2/ASTC on the GPU, so that Mali samples compressed data and memory
-  stays close to what the game asked for.
+- Transcode BC6H to ASTC HDR (`VK_EXT_texture_compression_astc_hdr`) instead of decoding it.
 - Package the Mali emulations as a standalone Vulkan layer that works without the socket bridge.
 - Test on more devices and driver versions (other Mali generations, newer drivers).
 
@@ -198,6 +203,9 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   `third_party/bcdec/bcdec.h` (license at the end of the file). The GPU decoder
   (`shaders/bc_decode.comp`) follows its arithmetic, its BC6H/BC7 tables are generated from it
   (`shaders/bc_tables.glsl`), and `bcn_check` uses it as the reference decoder.
+- [etc2_encode](https://github.com/leegao/etc2_encode) by Lee Gao, MIT: the ETC2 and ASTC encoders
+  (`shaders/etc2_enc.glsl`, `shaders/astc_enc.glsl`) are ported from its compute shaders and
+  extended, with its tables; its licence is in those files and `third_party/etc2_encode/LICENSE`.
 - Lee Gao (leegao) found the Mali compiler's mishandling of DXVK's spec-constant composites
   (bionic-vulkan-wrapper issue #93). `server/server_spvfix.c` fixes the same pattern.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
