@@ -1,0 +1,10 @@
+# Build outputs
+host/out/
+out/
+build/
+*.o
+*.so
+*.spv
+!tests/corpus/*.spv
+__pycache__/
+*.pyc
