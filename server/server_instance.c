@@ -318,6 +318,47 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             exts[n++] = "VK_EXT_device_fault";
         }
     }
+    /* robustness2 reported without the driver having it (VKB_EMU_ROBUSTNESS2): robustBufferAccess
+     * is turned on for robustBufferAccess2 (server_emu.c), and image robustness, where the driver
+     * has it, for robustImageAccess2: out-of-bounds texel accesses then read zero or an in-bounds
+     * texel instead of whatever lies past the image. Lee Gao's compat_layer (MIT) does the same for
+     * its robustness2 emulation. VKBRIDGE_NO_FORCED_ROBUSTNESS=1 leaves both to the app. */
+    const char *no_robust = vkb_srv_env("VKBRIDGE_NO_FORCED_ROBUSTNESS");
+    if ((emu & VKB_EMU_ROBUSTNESS2) && !(no_robust && *no_robust && strcmp(no_robust, "0")) &&
+        inst->real.vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceImageRobustnessFeatures have = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have};
+        inst->real.vkGetPhysicalDeviceFeatures2(pd, &f2);
+        VkPhysicalDeviceProperties dp;
+        inst->real.vkGetPhysicalDeviceProperties(pd, &dp);
+        int core = dp.apiVersion >= VK_API_VERSION_1_3 && inst->api_version >= VK_API_VERSION_1_3;
+        int ext = has_ext(avail, avail_n, "VK_EXT_image_robustness");
+        VkBaseOutStructure *v13 = NULL, *ir = NULL;
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext) {
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) v13 = b;
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES) ir = b;
+        }
+        int on = 0;
+        if (!have.robustImageAccess) {
+            /* nothing to turn on */
+        } else if (v13) {
+            on = ((VkPhysicalDeviceVulkan13Features *)v13)->robustImageAccess = VK_TRUE;
+        } else if (ir) {
+            on = ((VkPhysicalDeviceImageRobustnessFeatures *)ir)->robustImageAccess = VK_TRUE;
+        } else if (core || ext) {
+            VkPhysicalDeviceImageRobustnessFeatures *rf = vkb_dec_alloc(&c->d, sizeof(*rf));
+            if (rf) {
+                memset(rf, 0, sizeof(*rf));
+                rf->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
+                rf->robustImageAccess = VK_TRUE;
+                rf->pNext = (void *)ci->pNext;
+                ci->pNext = rf;
+                if (!core && !list_has(exts, n, "VK_EXT_image_robustness")) exts[n++] = "VK_EXT_image_robustness";
+                on = 1;
+            }
+        }
+        if (on) VKB_INFO("vkCreateDevice: robustImageAccess on (robustness2 emulated)");
+    }
     int nocomp = 0;
     /* Also for the GPU profiler, which asks each attachment image whether it got AFBC. */
     if ((vkb_nocomp_wanted() || vkb_gprof_wanted()) && has_ext(avail, avail_n, "VK_EXT_image_compression_control")) {
