@@ -77,7 +77,8 @@ LOCAL_COMMANDS_PREFIX = ('vkCreateDebugUtilsMessengerEXT', 'vkDestroyDebugUtilsM
 
 # Commands whose client entry point is hand-written (the generated wire stub may still be used).
 CLIENT_CUSTOM = {
-    'vkAllocateDescriptorSets', 'vkResetDescriptorPool', 'vkDestroyDescriptorPool', 'vkCreateDescriptorPool',
+    'vkAllocateDescriptorSets', 'vkUpdateDescriptorSets', 'vkResetDescriptorPool', 'vkDestroyDescriptorPool',
+    'vkCreateDescriptorPool',
     'vkCreateDescriptorSetLayout', 'vkDestroyDescriptorSetLayout',
     'vkCreateInstance', 'vkDestroyInstance', 'vkEnumerateInstanceExtensionProperties',
     'vkEnumerateInstanceLayerProperties', 'vkEnumerateInstanceVersion', 'vkGetInstanceProcAddr',
@@ -390,7 +391,10 @@ SERVER_DISPATCH_EXTRA = ['vkMapMemory', 'vkUnmapMemory', 'vkGetMemoryHostPointer
                          'vkUpdateDescriptorSetWithTemplate', 'vkCmdPushDescriptorSetWithTemplateKHR']
 dispatch_cmds = sorted(set(wire_cmds) | {reg.canon_cmd(c) for c in SERVER_DISPATCH_EXTRA})
 # Wire-only helpers that are not Vulkan commands (handled by hand on both sides).
-EXTRA_WIRE = ['vkbHello', 'vkbQueryServer', 'vkbDescUpdateRaw', 'vkbPushDescRaw', 'vkbAllocDescSets', 'vkbAllocScanout']
+# vkbUpdateDescSets: vkUpdateDescriptorSets packed (client/descriptor.c); vkbBatch: queued
+# asynchronous requests as one message (client/conn.c, server_conn.c run_batch).
+EXTRA_WIRE = ['vkbHello', 'vkbQueryServer', 'vkbDescUpdateRaw', 'vkbPushDescRaw', 'vkbAllocDescSets', 'vkbAllocScanout',
+              'vkbUpdateDescSets', 'vkbBatch']
 
 # --------------------------------------------------------------------------------------------
 # Struct closure: every struct reachable from wire commands (params, members, pNext extenders).

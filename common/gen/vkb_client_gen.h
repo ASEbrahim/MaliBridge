@@ -432,6 +432,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkTransitionImageLayout(VkDevice device, u
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUnmapMemory(VkDevice device, VkDeviceMemory memory);
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkUnmapMemory2(VkDevice device, const VkMemoryUnmapInfo* pMemoryUnmapInfo);
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet descriptorSet, VkDescriptorUpdateTemplate descriptorUpdateTemplate, const void* pData);
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites, uint32_t descriptorCopyCount, const VkCopyDescriptorSet* pDescriptorCopies);
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout);
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo, uint64_t timeout);
 #endif

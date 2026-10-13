@@ -115,7 +115,14 @@ static void conn_thread_exit(void *p)
 
 /* Asynchronous requests of the whole process wait here and are written out in one go, ahead of
  * the next synchronous request any thread makes (or when the queue grows large). They carry their
- * sequence numbers, so whichever connection carries them, the server runs them in order. */
+ * sequence numbers, so whichever connection carries them, the server runs them in order.
+ *
+ * Normally the queue is one vkbBatch message (server_conn.c run_batch): the first request opens
+ * it with the next sequence number and every request until the flush is appended to it as a u32
+ * (command | table << 16), a u32 size and its payload padded to 8 bytes. DXVK sends ~100k small
+ * requests a second (a descriptor set allocation and an update per draw, Subnautica 2026-10-12);
+ * as messages of their own, each cost both sides a header, an ordering wait and a wake-up.
+ * VKBRIDGE_NO_DESC_BATCH=1: one message per request, as before. */
 static pthread_mutex_t aq_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *aq_buf;
 static size_t aq_len, aq_cap;
@@ -188,6 +195,31 @@ static void *aq_flusher(void *arg)
     }
     pthread_mutex_unlock(&aq_lock);
     return NULL;
+}
+
+/* Under aq_lock. */
+static int aq_grow(size_t need)
+{
+    size_t nc = aq_cap ? aq_cap : 65536;
+    while (nc < need) nc *= 2;
+    uint8_t *nb = realloc(aq_buf, nc);
+    if (!nb) return -1;
+    aq_buf = nb;
+    aq_cap = nc;
+    return 0;
+}
+
+/* Under aq_lock. */
+static void aq_start_flusher(void)
+{
+    if (aq_flusher_started) return;
+    aq_flusher_started = 1;
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, aq_flusher, NULL) != 0) aq_flusher_started = 0;
+    pthread_attr_destroy(&a);
 }
 
 static void aq_exit_flush(void)
@@ -402,38 +434,62 @@ int vkb_call_exec(vkb_call *c)
     vkb_msg_hdr h = {VKB_MAGIC, (uint32_t)c->e.len, c->cmd, c->table, (uint32_t)c->e.nfds, c->flags & VKB_F_NOREPLY, 0, 0};
     vkb_stats_count(c->cmd, (c->flags & VKB_F_NOREPLY) != 0, c->e.len);
     pthread_mutex_lock(&aq_lock);
+    if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds && vkb_desc_batch()) {
+        /* Appended to the open vkbBatch (or opening it) under the lock that orders the seqs. */
+        size_t pad = (8 - (c->e.len & 7)) & 7;
+        size_t need = (aq_len ? aq_len : sizeof(h)) + 8 + c->e.len + pad;
+        if (need > aq_cap && aq_grow(need) < 0) {
+            pthread_mutex_unlock(&aq_lock);
+            release_enc(c);
+            c->conn = NULL;
+            return 0;
+        }
+        int opened = !aq_len;
+        if (opened) {
+            vkb_msg_hdr bh = {VKB_MAGIC, 0, VKB_CMD_vkbBatch, 0, 0, VKB_F_NOREPLY, ++async_seq, 0};
+            bh.barrier = bh.seq - 1;
+            memcpy(aq_buf, &bh, sizeof(bh));
+            aq_len = sizeof(bh);
+            aq_first_ns = now_ns();
+            stat_wire_add(1, sizeof(bh));
+        }
+        uint32_t sub[2] = {c->cmd | c->table << 16, (uint32_t)c->e.len};
+        memcpy(aq_buf + aq_len, sub, 8);
+        memcpy(aq_buf + aq_len + 8, c->e.buf, c->e.len);
+        memset(aq_buf + aq_len + 8 + c->e.len, 0, pad);
+        aq_len = need;
+        stat_wire_add(0, 8 + c->e.len + pad);
+        ((vkb_msg_hdr *)aq_buf)->size = (uint32_t)(aq_len - sizeof(h));
+        aq_start_flusher();
+        if (opened) pthread_cond_signal(&aq_cond); /* the flusher waits only on an empty queue */
+        int r = aq_len >= AQ_FLUSH ? aq_flush_locked(conn) : 0;
+        pthread_mutex_unlock(&aq_lock);
+        release_enc(c);
+        c->conn = NULL;
+        if (r < 0) {
+            VKB_ERR("lost the bridge server (%s)", strerror(errno));
+            conn->dead = 1;
+            return 0;
+        }
+        return 1;
+    }
     if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds) {
-        /* Queued: header and payload appended under the lock that also orders the seqs. */
+        /* Queued as a message of its own: header and payload appended. */
         h.seq = ++async_seq;
         h.barrier = h.seq - 1;
         size_t need = aq_len + sizeof(h) + c->e.len;
-        if (need > aq_cap) {
-            size_t nc = aq_cap ? aq_cap : 65536;
-            while (nc < need) nc *= 2;
-            uint8_t *nb = realloc(aq_buf, nc);
-            if (!nb) {
-                pthread_mutex_unlock(&aq_lock);
-                release_enc(c);
-                c->conn = NULL;
-                return 0;
-            }
-            aq_buf = nb;
-            aq_cap = nc;
+        if (need > aq_cap && aq_grow(need) < 0) {
+            pthread_mutex_unlock(&aq_lock);
+            release_enc(c);
+            c->conn = NULL;
+            return 0;
         }
         if (!aq_len) aq_first_ns = now_ns();
         stat_wire_add(1, sizeof(h) + c->e.len);
         memcpy(aq_buf + aq_len, &h, sizeof(h));
         memcpy(aq_buf + aq_len + sizeof(h), c->e.buf, c->e.len);
         aq_len = need;
-        if (!aq_flusher_started) {
-            aq_flusher_started = 1;
-            pthread_t t;
-            pthread_attr_t a;
-            pthread_attr_init(&a);
-            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            if (pthread_create(&t, &a, aq_flusher, NULL) != 0) aq_flusher_started = 0;
-            pthread_attr_destroy(&a);
-        }
+        aq_start_flusher();
         pthread_cond_signal(&aq_cond);
         int r = aq_len >= AQ_FLUSH ? aq_flush_locked(conn) : 0;
         pthread_mutex_unlock(&aq_lock);
@@ -505,6 +561,16 @@ int vkb_async_results(void)
 {
     static int v = -1;
     if (v < 0) v = getenv("VKBRIDGE_SYNC") == NULL;
+    return v;
+}
+
+int vkb_desc_batch(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_NO_DESC_BATCH");
+        v = !(e && *e && strcmp(e, "0"));
+    }
     return v;
 }
 

@@ -138,6 +138,122 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSetWithTemplate(VkDevice dev
     vkb_call_exec_async(&c);
 }
 
+/*
+ * vkUpdateDescriptorSets, packed (vkbUpdateDescSets, server_dsmap.c): DXVK writes every binding
+ * of the set it just allocated, one VkWriteDescriptorSet per binding, ~1 KB per update in the
+ * generic encoding (64-byte structs, chain ends, presence bytes, whole image infos) - 29 MB/s of
+ * Subnautica's 45 MB/s over the bridge (2026-10-12). Per write: a u32 (type | UDS_SET new set |
+ * UDS_RANGE explicit element and count | binding << 8), the set when it changes, element and
+ * count unless 0 and 1, then per descriptor only what its type reads (a sampled image: view and
+ * layout). Copies, pNext chains and types beyond the core ones go the generic way, as does
+ * everything with VKBRIDGE_NO_DESC_BATCH=1.
+ */
+#define UDS_SET 0x10u
+#define UDS_RANGE 0x20u
+
+static size_t uds_desc_size(VkDescriptorType t)
+{
+    switch (t) {
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        return 8;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        return 20;
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        return 12;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+        return 24;
+    default:
+        return 0;
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSets(VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc,
+                                                         const VkCopyDescriptorSet *cp)
+{
+    size_t size = 12;
+    VkDescriptorSet prev = VK_NULL_HANDLE;
+    int packable = nc == 0 && nw > 0 && vkb_desc_batch();
+    for (uint32_t i = 0; i < nw && packable; i++) {
+        VkDescriptorType t = w[i].descriptorType;
+        size_t ds = uds_desc_size(t);
+        int has = !ds                                                                     ? 0
+                  : t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ? w[i].pTexelBufferView != NULL
+                  : ds == 24                                                              ? w[i].pBufferInfo != NULL
+                                                                                          : w[i].pImageInfo != NULL;
+        if (w[i].pNext || !has || !w[i].dstSet || !w[i].descriptorCount || w[i].dstBinding >= (1u << 24)) packable = 0;
+        size += 4 + (w[i].dstSet != prev ? 8 : 0) + (w[i].dstArrayElement || w[i].descriptorCount != 1 ? 8 : 0) +
+                ds * w[i].descriptorCount;
+        prev = w[i].dstSet;
+    }
+    if (!packable) {
+        vkb_wire_vkUpdateDescriptorSets(device, nw, w, nc, cp);
+        return;
+    }
+    vkb_device *dev = vkb_dev(device);
+    vkb_call c;
+    vkb_call_begin(&c, VKB_CMD_vkbUpdateDescSets, dev->obj.table);
+    size_t at = vkb_enc_raw(&c.e, NULL, size);
+    if (c.e.oom) {
+        vkb_call_exec_async(&c); /* reports the failure and releases the call */
+        return;
+    }
+    uint8_t *o = c.e.buf + at;
+#define PUT(v)                      \
+    do {                            \
+        __typeof__(v) v_ = (v);     \
+        memcpy(o, &v_, sizeof(v_)); \
+        o += sizeof(v_);            \
+    } while (0)
+    PUT(dev->obj.remote);
+    PUT(nw);
+    prev = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < nw; i++) {
+        const VkWriteDescriptorSet *x = &w[i];
+        int ranged = x->dstArrayElement || x->descriptorCount != 1;
+        PUT((uint32_t)x->descriptorType | (x->dstSet != prev ? UDS_SET : 0) | (ranged ? UDS_RANGE : 0) | x->dstBinding << 8);
+        if (x->dstSet != prev) PUT((uint64_t)x->dstSet);
+        prev = x->dstSet;
+        if (ranged) {
+            PUT(x->dstArrayElement);
+            PUT(x->descriptorCount);
+        }
+        for (uint32_t j = 0; j < x->descriptorCount; j++) {
+            switch (x->descriptorType) {
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+                PUT((uint64_t)x->pImageInfo[j].sampler);
+                break;
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                PUT((uint64_t)x->pImageInfo[j].sampler);
+                /* fall through */
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+                PUT((uint64_t)x->pImageInfo[j].imageView);
+                PUT((uint32_t)x->pImageInfo[j].imageLayout);
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                PUT((uint64_t)x->pTexelBufferView[j]);
+                break;
+            default:
+                PUT((uint64_t)x->pBufferInfo[j].buffer);
+                PUT((uint64_t)x->pBufferInfo[j].offset);
+                PUT((uint64_t)x->pBufferInfo[j].range);
+                break;
+            }
+        }
+    }
+#undef PUT
+    vkb_call_exec_async(&c);
+}
+
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdPushDescriptorSetWithTemplate(VkCommandBuffer commandBuffer, VkDescriptorUpdateTemplate tmpl,
                                                                         VkPipelineLayout layout, uint32_t set, const void *pData)
 {

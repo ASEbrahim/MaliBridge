@@ -298,4 +298,6 @@ void vkb_sv_vkbDescUpdateRaw(vkb_srv_call *c);
 void vkb_sv_vkbPushDescRaw(vkb_srv_call *c);
 void vkb_sv_vkbAllocDescSets(vkb_srv_call *c);
 void vkb_sv_vkbAllocScanout(vkb_srv_call *c);
+void vkb_sv_vkbUpdateDescSets(vkb_srv_call *c);
+void vkb_sv_vkbBatch(vkb_srv_call *c);
 #endif

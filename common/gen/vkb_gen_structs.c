@@ -15652,6 +15652,8 @@ const char *const vkb_cmd_names[VKB_CMD_COUNT] = {
         "vkbPushDescRaw",
         "vkbAllocDescSets",
         "vkbAllocScanout",
+        "vkbUpdateDescSets",
+        "vkbBatch",
         "vkAllocateCommandBuffers",
         "vkAllocateDescriptorSets",
         "vkAllocateMemory",
@@ -15940,6 +15942,8 @@ const char *const vkb_cmd_names[VKB_CMD_COUNT] = {
         "vkWaitSemaphores",
 };
 const unsigned char vkb_cmd_result[VKB_CMD_COUNT] = {
+        0,
+        0,
         0,
         0,
         0,

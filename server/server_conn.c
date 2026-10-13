@@ -443,6 +443,97 @@ static int srv_recv(vkb_srv_conn *conn, vkb_msg_hdr *h, uint8_t **payload, int *
     }
 }
 
+/* Runs one request whose payload is in c->d: dispatch table lookup, then the handler. */
+static void run_request(vkb_srv_conn *conn, vkb_srv_call *c, uint32_t cmd, uint32_t table, uint64_t wait_ns)
+{
+    vkb_enc_reset(&c->r);
+    c->conn = conn;
+    c->status = VKB_ST_OK;
+    c->nclose = 0;
+    c->in_stream = 0;
+    c->table = NULL;
+    c->dt = &vkb_global_dt;
+    if (cmd >= VKB_CMD_COUNT) {
+        VKB_ERR("unknown command id %u", cmd);
+        c->status = VKB_ST_BAD_MESSAGE;
+        return;
+    }
+    if (!conn->proc && cmd != VKB_CMD_vkbHello) {
+        VKB_ERR("%s before hello", vkb_cmd_names[cmd]);
+        c->status = VKB_ST_BAD_MESSAGE;
+        return;
+    }
+    if (table) {
+        c->table = vkb_table_get(table);
+        if (!c->table || c->table->proc != conn->proc) {
+            VKB_ERR("%s: unknown dispatch table %u", vkb_cmd_names[cmd], table);
+            c->status = VKB_ST_BAD_TABLE;
+            return;
+        }
+        c->dt = &c->table->dt;
+    }
+    uint64_t t1 = st_period ? mono_ns() : 0;
+    vkb_srv_set_current_table(c->table);
+    if (vkb_verbose) VKB_DBG("-> %s", vkb_cmd_names[cmd]);
+    vkb_srv_current_cmd = vkb_cmd_names[cmd];
+    vkb_srv_handlers[cmd](c);
+    vkb_srv_current_cmd = NULL;
+    vkb_srv_set_current_table(NULL);
+    if (st_period) stats_add(cmd, mono_ns() - t1, wait_ns);
+}
+
+/* An asynchronous request's outcome: nobody waits for it, so a failure can only be logged. */
+static void async_report(const vkb_srv_call *c, uint32_t cmd)
+{
+    if (c->status != VKB_ST_OK) {
+        VKB_ERR("asynchronous %s failed (status %u)", cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", c->status);
+    } else if (cmd < VKB_CMD_COUNT && vkb_cmd_result[cmd] && c->r.len >= sizeof(int32_t)) {
+        /* The client already told the app VK_SUCCESS. */
+        int32_t vr;
+        memcpy(&vr, c->r.buf, sizeof(vr));
+        if (vr < 0) VKB_ERR("asynchronous %s returned %d", vkb_cmd_names[cmd], vr);
+    }
+}
+
+/*
+ * vkbBatch: the client's queue of asynchronous requests as one message (client/conn.c) - per
+ * request a u32 (command | table << 16), a u32 size and the payload padded to 8 bytes; no
+ * descriptors. One sequence number for all of them, run here in order. DXVK sends ~100k small
+ * requests a second (a set allocation and an update per draw; Subnautica, 2026-10-12), and each
+ * one alone costs a header, an ordering wait and wake-up, and a pass through srv_recv.
+ */
+static void run_batch(vkb_srv_conn *conn, vkb_srv_call *c, const uint8_t *p, size_t len, uint64_t wait_ns)
+{
+    size_t pos = 0;
+    while (pos < len) {
+        uint32_t ct, n;
+        if (len - pos < 8) goto bad;
+        memcpy(&ct, p + pos, 4);
+        memcpy(&n, p + pos + 4, 4);
+        pos += 8;
+        if (n > len - pos) goto bad;
+        uint32_t cmd = ct & 0xffff;
+        if (cmd == VKB_CMD_vkbHello || cmd == VKB_CMD_vkbBatch) goto bad;
+        vkb_dec_init(&c->d, p + pos, n, &conn->arena, NULL, 0);
+        run_request(conn, c, cmd, ct >> 16, wait_ns);
+        wait_ns = 0;
+        vkb_dec_close_untaken(&c->d);
+        async_report(c, cmd);
+        for (int i = 0; i < c->nclose; i++) close(c->close_after[i]);
+        vkb_arena_reset(&conn->arena);
+        pos += ((size_t)n + 7) & ~(size_t)7;
+    }
+    return;
+bad:
+    VKB_ERR("transport: bad batch entry at %zu of %zu bytes; the rest of the batch dropped", pos, len);
+}
+
+/* Only ever handled by conn_main: a batch inside a batch or with a reply is malformed. */
+void vkb_sv_vkbBatch(vkb_srv_call *c)
+{
+    vkb_srv_bad_message(c);
+}
+
 static void *conn_main(void *arg)
 {
     vkb_srv_conn *conn = arg;
@@ -454,43 +545,19 @@ static void *conn_main(void *arg)
         int nfds = 0;
         uint8_t *payload;
         if (srv_recv(conn, &h, &payload, fds, &nfds) < 0) break;
-        vkb_enc_reset(&c.r);
-        vkb_dec_init(&c.d, payload, h.size, &conn->arena, fds, nfds);
-        c.conn = conn;
-        c.status = VKB_ST_OK;
-        c.nclose = 0;
-        c.in_stream = 0;
-        c.table = NULL;
-        c.dt = &vkb_global_dt;
-        if (h.cmd >= VKB_CMD_COUNT) {
-            VKB_ERR("unknown command id %u", h.cmd);
-            c.status = VKB_ST_BAD_MESSAGE;
-        } else if (!conn->proc && h.cmd != VKB_CMD_vkbHello) {
-            VKB_ERR("%s before hello", vkb_cmd_names[h.cmd]);
-            c.status = VKB_ST_BAD_MESSAGE;
-        } else {
-            if (h.table) {
-                c.table = vkb_table_get(h.table);
-                if (!c.table || c.table->proc != conn->proc) {
-                    VKB_ERR("%s: unknown dispatch table %u", vkb_cmd_names[h.cmd], h.table);
-                    c.status = VKB_ST_BAD_TABLE;
-                } else {
-                    c.dt = &c.table->dt;
-                }
-            }
-            if (c.status == VKB_ST_OK) {
-                uint64_t t0 = st_period ? mono_ns() : 0;
-                order_wait(conn->proc, h.barrier);
-                uint64_t t1 = st_period ? mono_ns() : 0;
-                vkb_srv_set_current_table(c.table);
-                if (vkb_verbose) VKB_DBG("-> %s", vkb_cmd_names[h.cmd]);
-                vkb_srv_current_cmd = vkb_cmd_names[h.cmd];
-                vkb_srv_handlers[h.cmd](&c);
-                vkb_srv_current_cmd = NULL;
-                vkb_srv_set_current_table(NULL);
-                if (st_period) stats_add(h.cmd, mono_ns() - t1, t1 - t0);
-            }
+        uint64_t wait_ns = 0;
+        if (conn->proc && h.cmd < VKB_CMD_COUNT && h.cmd != VKB_CMD_vkbHello) {
+            uint64_t t0 = st_period ? mono_ns() : 0;
+            order_wait(conn->proc, h.barrier);
+            if (st_period) wait_ns = mono_ns() - t0;
         }
+        if (h.cmd == VKB_CMD_vkbBatch && (h.flags & VKB_F_NOREPLY) && !nfds && conn->proc) {
+            run_batch(conn, &c, payload, h.size, wait_ns);
+            order_done(conn->proc, h.seq);
+            continue;
+        }
+        vkb_dec_init(&c.d, payload, h.size, &conn->arena, fds, nfds);
+        run_request(conn, &c, h.cmd, h.table, wait_ns);
         vkb_dec_close_untaken(&c.d);
         order_done(conn->proc, h.seq);
         if (!(h.flags & VKB_F_NOREPLY)) {
@@ -505,13 +572,8 @@ static void *conn_main(void *arg)
                 for (int i = 0; i < c.nclose; i++) close(c.close_after[i]);
                 break;
             }
-        } else if (c.status != VKB_ST_OK) {
-            VKB_ERR("asynchronous %s failed (status %u)", vkb_cmd_names[h.cmd], c.status);
-        } else if (vkb_cmd_result[h.cmd] && c.r.len >= sizeof(int32_t)) {
-            /* The client already told the app VK_SUCCESS; a failure can only be reported here. */
-            int32_t vr;
-            memcpy(&vr, c.r.buf, sizeof(vr));
-            if (vr < 0) VKB_ERR("asynchronous %s returned %d", vkb_cmd_names[h.cmd], vr);
+        } else {
+            async_report(&c, h.cmd);
         }
         for (int i = 0; i < c.nclose; i++) close(c.close_after[i]);
         vkb_arena_reset(&conn->arena);

@@ -6493,11 +6493,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkTrimCommandPool(VkDevice device, VkCo
     vkb_wire_vkTrimCommandPool(device, commandPool, flags);
 }
 
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites, uint32_t descriptorCopyCount, const VkCopyDescriptorSet* pDescriptorCopies)
-{
-    vkb_wire_vkUpdateDescriptorSets(device, descriptorWriteCount, pDescriptorWrites, descriptorCopyCount, pDescriptorCopies);
-}
-
 const vkb_proc_desc vkb_client_procs[] = {
     {"vkAcquireNextImage2KHR", (PFN_vkVoidFunction)vkb_ep_vkAcquireNextImage2KHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain", 0},
     {"vkAcquireNextImageKHR", (PFN_vkVoidFunction)vkb_ep_vkAcquireNextImageKHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain", 0},

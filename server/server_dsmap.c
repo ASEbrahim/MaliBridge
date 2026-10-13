@@ -201,6 +201,96 @@ out:
     if (sets != sets_local) free(sets);
 }
 
+/* ------------------------------------------------------------------ the packed update */
+
+/*
+ * vkbUpdateDescSets: vkUpdateDescriptorSets packed by the client (client/descriptor.c has the
+ * layout): device, write count, then per write a u32 (type | UDS_SET | UDS_RANGE | binding << 8),
+ * the set when it changes, element and count when not 0 and 1, and per descriptor only what its
+ * type reads. Unpacked into the arena and passed down the device's chain like the generic call
+ * (set names, buffer view names and the emulations all apply).
+ */
+#define UDS_SET 0x10u
+#define UDS_RANGE 0x20u
+
+void vkb_sv_vkbUpdateDescSets(vkb_srv_call *c)
+{
+    vkb_dec *d = &c->d;
+    VkDevice dev = (VkDevice)(uintptr_t)vkb_dec_u64(d);
+    uint32_t n = vkb_dec_u32(d);
+    /* Each write takes at least 12 bytes: a count past that is a bad message, not an allocation. */
+    if (d->err || !c->table || n == 0 || n > (d->len - d->pos) / 12) {
+        vkb_srv_bad_message(c);
+        return;
+    }
+    VkWriteDescriptorSet *w = vkb_dec_alloc(d, n * sizeof(*w));
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    for (uint32_t i = 0; w && i < n && !d->err; i++) {
+        uint32_t hd = vkb_dec_u32(d);
+        VkDescriptorType type = (VkDescriptorType)(hd & 0xf);
+        if (hd & UDS_SET) set = (VkDescriptorSet)(uintptr_t)vkb_dec_u64(d);
+        uint32_t first = 0, count = 1;
+        if (hd & UDS_RANGE) {
+            first = vkb_dec_u32(d);
+            count = vkb_dec_u32(d);
+        }
+        if (d->err || !set || count == 0 || count > (d->len - d->pos) / 8 || type > VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+            d->err = 1;
+            break;
+        }
+        w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, hd >> 8, first, count, type, NULL, NULL, NULL};
+        VkDescriptorImageInfo *img = NULL;
+        VkDescriptorBufferInfo *buf = NULL;
+        VkBufferView *texel = NULL;
+        switch (type) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            w[i].pTexelBufferView = texel = vkb_dec_alloc(d, count * sizeof(*texel));
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+            w[i].pBufferInfo = buf = vkb_dec_alloc(d, count * sizeof(*buf));
+            break;
+        default:
+            w[i].pImageInfo = img = vkb_dec_alloc(d, count * sizeof(*img));
+            break;
+        }
+        if (!texel && !buf && !img) {
+            d->err = 1;
+            break;
+        }
+        for (uint32_t j = 0; j < count && !d->err; j++) {
+            if (texel) {
+                texel[j] = (VkBufferView)(uintptr_t)vkb_dec_u64(d);
+            } else if (buf) {
+                buf[j].buffer = (VkBuffer)(uintptr_t)vkb_dec_u64(d);
+                buf[j].offset = vkb_dec_u64(d);
+                buf[j].range = vkb_dec_u64(d);
+            } else {
+                int has_sampler = type == VK_DESCRIPTOR_TYPE_SAMPLER || type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                img[j].sampler = has_sampler ? (VkSampler)(uintptr_t)vkb_dec_u64(d) : VK_NULL_HANDLE;
+                img[j].imageView = VK_NULL_HANDLE;
+                img[j].imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                if (type != VK_DESCRIPTOR_TYPE_SAMPLER) {
+                    img[j].imageView = (VkImageView)(uintptr_t)vkb_dec_u64(d);
+                    img[j].imageLayout = (VkImageLayout)vkb_dec_u32(d);
+                }
+            }
+        }
+    }
+    if (!w || d->err) {
+        vkb_srv_bad_message(c);
+        return;
+    }
+    if (!c->dt->vkUpdateDescriptorSets) {
+        vkb_srv_missing(c, "vkUpdateDescriptorSets");
+        return;
+    }
+    c->dt->vkUpdateDescriptorSets(dev, n, w, 0, NULL);
+}
+
 /* ------------------------------------------------------------------ wrappers */
 
 static void VKAPI_CALL ds_UpdateDescriptorSets(VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc,

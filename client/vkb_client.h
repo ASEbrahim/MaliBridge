@@ -156,6 +156,9 @@ void vkb_call_end(vkb_call *c);
 /* Sends without waiting for a reply (void commands without outputs); ordered by vkb_msg_hdr.seq. */
 int vkb_call_exec_async(vkb_call *c);
 int vkb_async_results(void);
+/* Asynchronous requests framed as one vkbBatch message, vkUpdateDescriptorSets packed: on unless
+ * VKBRIDGE_NO_DESC_BATCH=1 (for bisecting). */
+int vkb_desc_batch(void);
 void vkb_stats_count(uint32_t cmd, int async, size_t bytes);
 extern uint32_t vkb_stat_refused; /* refused vkAllocateDescriptorSets, for VKBRIDGE_STATS */
 uint32_t vkb_table_of(const void *dispatchable);
