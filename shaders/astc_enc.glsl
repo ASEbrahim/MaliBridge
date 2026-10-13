@@ -3,8 +3,7 @@
  * Ported to GLSL from astc_enc.slang and astc_pack.slang of leegao/etc2_encode (commit a32883c;
  * "Realtime rgba8 -> astc/etc2/etc1 encoder as a compute shader"), whose licence follows. Kept from
  * it: endpoints from the principal axis (power iteration on the covariance), the blue-contraction
- * swap, the block mode and BISE packing, and its trit, quint and endpoint tables (here only the
- * ranges used, rank -> ISE value | decoded value << 8). Changed: float32 instead of half
+ * swap, the block mode and BISE packing, and its trit and quint tables. Changed: float32 instead of half
  * arithmetic; weights picked by the error against the quantized endpoints as a decoder expands
  * them; one least-squares refit of the endpoints to those weights; several weight / endpoint
  * precisions tried per block (2-bit weights with 8-bit endpoints keep BC1/BC3 colour almost
@@ -55,13 +54,6 @@ const uint ASTC_TRITS[243] = uint[243](
     94u, 156u, 157u, 158u, 188u, 189u, 190u, 220u, 221u, 222u, 31u, 63u, 127u, 159u, 191u, 255u,
     252u, 253u, 254u);
 
-const uint ASTC_Q48[48] = uint[48](
-    0x0000u, 0x0510u, 0x0b20u, 0x1002u, 0x1512u, 0x1b22u, 0x2004u, 0x2614u, 0x2b24u, 0x3006u,
-    0x3616u, 0x3b26u, 0x4108u, 0x4618u, 0x4c28u, 0x510au, 0x561au, 0x5c2au, 0x610cu, 0x671cu,
-    0x6c2cu, 0x710eu, 0x771eu, 0x7c2eu, 0x832fu, 0x881fu, 0x8e0fu, 0x932du, 0x981du, 0x9e0du,
-    0xa32bu, 0xa91bu, 0xae0bu, 0xb329u, 0xb919u, 0xbe09u, 0xc427u, 0xc917u, 0xcf07u, 0xd425u,
-    0xd915u, 0xdf05u, 0xe423u, 0xea13u, 0xef03u, 0xf421u, 0xfa11u, 0xff01u);
-
 const uint ASTC_QUINTS[125] = uint[125](
     0u, 1u, 2u, 3u, 4u, 8u, 9u, 10u, 11u, 12u, 16u, 17u, 18u, 19u, 20u, 24u,
     25u, 26u, 27u, 28u, 5u, 13u, 21u, 29u, 6u, 32u, 33u, 34u, 35u, 36u, 40u, 41u,
@@ -71,34 +63,6 @@ const uint ASTC_QUINTS[125] = uint[125](
     104u, 105u, 106u, 107u, 108u, 112u, 113u, 114u, 115u, 116u, 120u, 121u, 122u, 123u, 124u, 101u,
     109u, 117u, 125u, 30u, 102u, 103u, 70u, 71u, 38u, 110u, 111u, 78u, 79u, 46u, 118u, 119u,
     86u, 87u, 54u, 126u, 127u, 94u, 95u, 62u, 39u, 47u, 55u, 63u, 31u);
-
-const uint ASTC_Q40[40] = uint[40](
-    0x0000u, 0x0608u, 0x0d10u, 0x1318u, 0x1a20u, 0x2002u, 0x270au, 0x2d12u, 0x341au, 0x3a22u,
-    0x4104u, 0x470cu, 0x4e14u, 0x541cu, 0x5b24u, 0x6106u, 0x680eu, 0x6e16u, 0x751eu, 0x7b26u,
-    0x8427u, 0x8a1fu, 0x9117u, 0x970fu, 0x9e07u, 0xa425u, 0xab1du, 0xb115u, 0xb80du, 0xbe05u,
-    0xc523u, 0xcb1bu, 0xd213u, 0xd80bu, 0xdf03u, 0xe521u, 0xec19u, 0xf211u, 0xf909u, 0xff01u);
-
-const uint ASTC_Q192[192] = uint[192](
-    0x0000u, 0x0140u, 0x0280u, 0x0402u, 0x0542u, 0x0682u, 0x0804u, 0x0944u, 0x0a84u, 0x0c06u,
-    0x0d46u, 0x0e86u, 0x1008u, 0x1148u, 0x1288u, 0x140au, 0x154au, 0x168au, 0x180cu, 0x194cu,
-    0x1a8cu, 0x1c0eu, 0x1d4eu, 0x1e8eu, 0x2010u, 0x2150u, 0x2290u, 0x2412u, 0x2552u, 0x2692u,
-    0x2814u, 0x2954u, 0x2a94u, 0x2c16u, 0x2d56u, 0x2e96u, 0x3018u, 0x3158u, 0x3298u, 0x341au,
-    0x355au, 0x369au, 0x381cu, 0x395cu, 0x3a9cu, 0x3c1eu, 0x3d5eu, 0x3e9eu, 0x4020u, 0x4160u,
-    0x42a0u, 0x4422u, 0x4562u, 0x46a2u, 0x4824u, 0x4964u, 0x4aa4u, 0x4c26u, 0x4d66u, 0x4ea6u,
-    0x5028u, 0x5168u, 0x52a8u, 0x542au, 0x556au, 0x56aau, 0x582cu, 0x596cu, 0x5aacu, 0x5c2eu,
-    0x5d6eu, 0x5eaeu, 0x6030u, 0x6170u, 0x62b0u, 0x6432u, 0x6572u, 0x66b2u, 0x6834u, 0x6974u,
-    0x6ab4u, 0x6c36u, 0x6d76u, 0x6eb6u, 0x7038u, 0x7178u, 0x72b8u, 0x743au, 0x757au, 0x76bau,
-    0x783cu, 0x797cu, 0x7abcu, 0x7c3eu, 0x7d7eu, 0x7ebeu, 0x81bfu, 0x827fu, 0x833fu, 0x85bdu,
-    0x867du, 0x873du, 0x89bbu, 0x8a7bu, 0x8b3bu, 0x8db9u, 0x8e79u, 0x8f39u, 0x91b7u, 0x9277u,
-    0x9337u, 0x95b5u, 0x9675u, 0x9735u, 0x99b3u, 0x9a73u, 0x9b33u, 0x9db1u, 0x9e71u, 0x9f31u,
-    0xa1afu, 0xa26fu, 0xa32fu, 0xa5adu, 0xa66du, 0xa72du, 0xa9abu, 0xaa6bu, 0xab2bu, 0xada9u,
-    0xae69u, 0xaf29u, 0xb1a7u, 0xb267u, 0xb327u, 0xb5a5u, 0xb665u, 0xb725u, 0xb9a3u, 0xba63u,
-    0xbb23u, 0xbda1u, 0xbe61u, 0xbf21u, 0xc19fu, 0xc25fu, 0xc31fu, 0xc59du, 0xc65du, 0xc71du,
-    0xc99bu, 0xca5bu, 0xcb1bu, 0xcd99u, 0xce59u, 0xcf19u, 0xd197u, 0xd257u, 0xd317u, 0xd595u,
-    0xd655u, 0xd715u, 0xd993u, 0xda53u, 0xdb13u, 0xdd91u, 0xde51u, 0xdf11u, 0xe18fu, 0xe24fu,
-    0xe30fu, 0xe58du, 0xe64du, 0xe70du, 0xe98bu, 0xea4bu, 0xeb0bu, 0xed89u, 0xee49u, 0xef09u,
-    0xf187u, 0xf247u, 0xf307u, 0xf585u, 0xf645u, 0xf705u, 0xf983u, 0xfa43u, 0xfb03u, 0xfd81u,
-    0xfe41u, 0xff01u);
 
 /* Candidates (4x4 weights; bits: 17 header, 2 more for the plane selector, 29 with 2 partitions):
  *   CEM 8 (RGB):   2-bit weights + 8-bit endpoints (32 + 48), 3-bit + 8-bit (48 + 48), 4-bit + QUANT_192 (64 + 46)
@@ -115,9 +79,25 @@ uint g_apart; /* texels (bit t) in partition 1 */
 
 bool astc_in(uint p, uint part) { return ((g_apart >> p) & 1u) == part; }
 
-uint astc_rank(uint q, uint r) { return q == 40u ? ASTC_Q40[r] : (q == 48u ? ASTC_Q48[r] : ASTC_Q192[r]); }
+/* Rank r (by decoded value) of endpoint range q (40, 48, 192, 256): ISE value, decoded value. A trit
+ * or quint range's lower half has the low bit clear and its upper half mirrors it; the decoded value
+ * is the specification's unquantization (T = D * C + B, inverted by the low bit). */
+uvec2 astc_rank(uint q, uint r)
+{
+    if (q == 256u) return uvec2(r, r);
+    bool up = r >= (q >> 1);
+    uint base = q == 40u ? 5u : 3u, rr = up ? q - 1u - r : r;
+    uint t = rr % base, h = rr / base; /* trit / quint, the bits above the low one */
+    uint nb, B, C;
+    if (q == 192u) { nb = 6u; B = (h << 4) | (h >> 4); C = 5u; }
+    else if (q == 48u) { nb = 4u; B = (h << 6) | h; C = 22u; }
+    else { nb = 3u; B = (h << 7) | (h << 1) | (h >> 1); C = 26u; }
+    uint T = t * C + B;
+    if (up) T ^= 0x1ffu;
+    return uvec2((t << nb) | (h << 1) | (up ? 1u : 0u), (up ? 0x80u : 0u) | (T >> 2));
+}
 
-/* The nearest endpoint value of range q (40, 48, 192, 256): ISE value, decoded value. */
+/* The nearest endpoint value of range q: ISE value, decoded value. */
 uvec2 astc_ep(uint q, float v)
 {
     v = clamp(v, 0.0, 255.0);
@@ -126,12 +106,12 @@ uvec2 astc_ep(uint q, float v)
         return uvec2(u, u);
     }
     uint n = q - 1u, r = uint(v * float(n) / 255.0 + 0.5);
-    uint e = astc_rank(q, r), e2 = astc_rank(q, r > 0u ? r - 1u : 0u);
-    float d = abs(float(e >> 8) - v);
-    if (abs(float(e2 >> 8) - v) < d) { e = e2; d = abs(float(e2 >> 8) - v); }
+    uvec2 e = astc_rank(q, r), e2 = astc_rank(q, r > 0u ? r - 1u : 0u);
+    float d = abs(float(e.y) - v);
+    if (abs(float(e2.y) - v) < d) { e = e2; d = abs(float(e2.y) - v); }
     e2 = astc_rank(q, min(r + 1u, n));
-    if (abs(float(e2 >> 8) - v) < d) e = e2;
-    return uvec2(e & 0xffu, e >> 8);
+    if (abs(float(e2.y) - v) < d) e = e2;
+    return e;
 }
 
 /* Weight value (0..64) of index k in a b-bit weight range (bit replication). */
