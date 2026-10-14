@@ -225,7 +225,8 @@ static VkResult graphics_pipeline(int marked, VkPipeline *pipe)
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, shader(spv_smoke_vert, sizeof(spv_smoke_vert)),
          "main", marked ? &marker : NULL},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, shader(spv_smoke_frag, sizeof(spv_smoke_frag)),
-         "main", NULL}};
+         "main", marked == 2 ? &marker : NULL}};
+    if (marked == 2) st[0].pSpecializationInfo = NULL; /* 2: the fragment stage carries the marker */
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
@@ -327,29 +328,47 @@ static double secs(void)
 /* --spin: the server runs with VKBRIDGE_TEST_CRASH_PIPELINE=spin and a short
  * VKBRIDGE_COMPILE_TIMEOUT_S: marked pipelines spin in the guarded call (the Mali-G925's compiler
  * did, for ever) and the compile watchdog interrupts them. */
-static int spin_mode(void)
+static int spin_mode(int fc2)
 {
     VkPipeline pipe;
-    double t0 = secs();
-    VkResult r = graphics_pipeline(1, &pipe);
-    double el = secs() - t0;
     char d[96];
-    snprintf(d, sizeof(d), "%.1f s", el);
-    expect_contained(r, pipe, "spin: a never-ending graphics compile is interrupted and fails");
-    check(el < 60, "spin: ... within the timeout", d);
-    check(alive(), "spin: connection alive after the interrupted compile", "");
-    r = graphics_pipeline(0, &pipe);
-    check(r == VK_SUCCESS && draw_ok(pipe), "spin: normal pipeline draws afterwards", r ? "creation failed" : "");
-    t0 = secs();
-    r = graphics_pipeline(1, &pipe);
-    el = secs() - t0;
-    snprintf(d, sizeof(d), "%.2f s", el);
-    expect_contained(r, pipe, "spin: the same pipeline again fails");
-    check(el < 1.0, "spin: ... at once (remembered as stuck)", d);
-    r = compute_pipeline(1, &pipe);
-    expect_contained(r, pipe, "spin: a never-ending compute compile is interrupted");
-    r = compute_pipeline(0, &pipe);
-    check(r == VK_SUCCESS && dispatch_ok(pipe), "spin: no poisoning: compute still dispatches", r ? "creation failed" : "");
+    double t0, el;
+    VkResult r;
+    if (fc2) {
+        /* spinfc2: the compile spins until float_controls2 is stripped (the first fallback that applies) */
+        r = graphics_pipeline(1, &pipe);
+        check(r == VK_SUCCESS && pipe && draw_ok(pipe), "spinfc2: a never-ending compile is rebuilt with float_controls2 stripped and draws",
+              r ? "creation failed" : "");
+        t0 = secs();
+        r = graphics_pipeline(1, &pipe);
+        el = secs() - t0;
+        snprintf(d, sizeof(d), "%.2f s", el);
+        check(r == VK_SUCCESS && el < 1.0 && draw_ok(pipe), "spinfc2: ... asked again: the remembered fallback at once", d);
+        r = compute_pipeline(1, &pipe);
+        check(r == VK_SUCCESS && pipe && dispatch_ok(pipe), "spinfc2: a never-ending compute compile is rebuilt and dispatches", r ? "creation failed" : "");
+    } else {
+        t0 = secs();
+        r = graphics_pipeline(1, &pipe);
+        el = secs() - t0;
+        snprintf(d, sizeof(d), "%.1f s", el);
+        expect_contained(r, pipe, "spin: a never-ending vertex compile with no fallback that helps fails");
+        check(el < 60, "spin: ... within the timeouts", d);
+        check(alive(), "spin: connection alive after the interrupted compiles", "");
+        r = graphics_pipeline(0, &pipe);
+        check(r == VK_SUCCESS && draw_ok(pipe), "spin: normal pipeline draws afterwards", r ? "creation failed" : "");
+        t0 = secs();
+        r = graphics_pipeline(1, &pipe);
+        el = secs() - t0;
+        snprintf(d, sizeof(d), "%.2f s", el);
+        expect_contained(r, pipe, "spin: the same pipeline again fails");
+        check(el < 1.0, "spin: ... at once (remembered)", d);
+        r = graphics_pipeline(2, &pipe);
+        check(r == VK_SUCCESS && pipe != VK_NULL_HANDLE, "spin: a never-ending fragment compile gets the stand-in fragment shader", r ? "creation failed" : "");
+        r = compute_pipeline(1, &pipe);
+        expect_contained(r, pipe, "spin: a never-ending compute compile is interrupted");
+        r = compute_pipeline(0, &pipe);
+        check(r == VK_SUCCESS && dispatch_ok(pipe), "spin: no poisoning: compute still dispatches", r ? "creation failed" : "");
+    }
     vkDestroyDevice(dev, NULL);
     vkDestroyInstance(inst, NULL);
     printf("%s: %d of %d checks passed\n", failures ? "FAILED" : "OK", checks - failures, checks);
@@ -358,7 +377,7 @@ static int spin_mode(void)
 
 int main(int argc, char **argv)
 {
-    int spin = argc > 1 && !strcmp(argv[1], "--spin");
+    int spin = argc > 1 && !strcmp(argv[1], "--spin"), spinfc2 = argc > 1 && !strcmp(argv[1], "--spinfc2");
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
         printf("FAIL loader: %s\n", dlerror());
@@ -399,7 +418,7 @@ int main(int argc, char **argv)
         printf("FAIL device A\n");
         return 1;
     }
-    if (spin) return spin_mode();
+    if (spin || spinfc2) return spin_mode(spinfc2);
     VkPipeline pipe;
     VkResult r = graphics_pipeline(1, &pipe);
     expect_contained(r, pipe, "A: faulting graphics pipeline fails, not the connection");
