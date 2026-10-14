@@ -435,7 +435,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const Vk
     vkb_device *dev = vkb_dev(device);
     vkb_physdev *pd = dev->pd;
     uint32_t ct = pAllocateInfo->memoryTypeIndex;
-    if (ct >= pd->client_mem.memoryTypeCount) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (ct >= pd->client_mem.memoryTypeCount) {
+        VKB_ONCE(VKB_LOG_WARN, "vkAllocateMemory in memory type %u: there are only %u", ct, pd->client_mem.memoryTypeCount);
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     VkMemoryAllocateInfo ai = *pAllocateInfo;
     ai.memoryTypeIndex = pd->type_map[ct].server_type;
     int shared = pd->type_map[ct].shared;
@@ -475,6 +478,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const Vk
     uint64_t size = vkb_dec_u64(&c.d);
     vkb_call_end(&c);
     if (r != VK_SUCCESS) {
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+            VKB_WARN("vkAllocateMemory of %llu bytes in memory type %u (flags 0x%x) = server type %u (flags 0x%x)%s failed: %d",
+                     (unsigned long long)pAllocateInfo->allocationSize, ct, pd->client_mem.memoryTypes[ct].propertyFlags,
+                     ai.memoryTypeIndex,
+                     ai.memoryTypeIndex < pd->server_mem.memoryTypeCount ? pd->server_mem.memoryTypes[ai.memoryTypeIndex].propertyFlags : 0,
+                     shared ? ", shared" : "", r);
         if (ptr) munmap(ptr, (size_t)ai.allocationSize);
         if (fd >= 0) close(fd);
         return r;

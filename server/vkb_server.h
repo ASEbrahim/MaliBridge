@@ -95,6 +95,7 @@ typedef struct vkb_srv_table {
     struct vkb_spvfix *spvfix;               /* server_spvfix.c */
     struct vkb_nulldesc *nulldesc;           /* server_nulldesc.c */
     struct vkb_bvmap *bvmap;                 /* server_bvmap.c */
+    uint32_t mem_types_seen;                 /* memory types this device has allocated in (logged once each) */
 } vkb_srv_table;
 
 /* server_main.c */
@@ -174,6 +175,8 @@ extern int vkb_npds;
 extern PFN_vkGetDeviceProcAddr vkb_mem_gdpa;
 int vkb_mem_dmaheap_available(void);
 void vkb_mem_export_install(vkb_srv_table *t);
+void vkb_mem_instance_install(vkb_srv_table *t); /* VKBRIDGE_FAKE_MISSING=lazymem: Mali's memory types (host tests) */
+void vkb_mem_log_types(vkb_srv_table *t, uint32_t id);
 void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd);
 const char *const *vkb_mem_required_extensions(uint32_t strategy, uint32_t *count);
 void vkb_mem_track(vkb_srv_table *dev, vkb_srv_mem *m);

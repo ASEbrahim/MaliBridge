@@ -77,20 +77,45 @@ typedef struct {
     VkMemoryPropertyFlags flags;
 } buffer;
 
+/* Why the last make_buffer / make_image failed: the check's "setup" line says it. */
+static char setup_why[200];
+static const char *setup(void) { return setup_why[0] ? setup_why : "setup"; }
+
+static int alloc_failed(const char *what, uint32_t bits, uint32_t t, VkResult r)
+{
+    if (t == UINT32_MAX)
+        snprintf(setup_why, sizeof(setup_why), "setup: no memory type for the %s (types 0x%x allowed)", what, bits);
+    else
+        snprintf(setup_why, sizeof(setup_why), "setup: %s memory in type %u (flags 0x%x, of types 0x%x): VkResult %d", what, t,
+                 mp.memoryTypes[t].propertyFlags, bits, r);
+    return 0;
+}
+
 static int make_buffer(buffer *b, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags want)
 {
     VkBufferCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
-    if (vkCreateBuffer(dev, &ci, NULL, &b->buf)) return 0;
+    VkResult res = vkCreateBuffer(dev, &ci, NULL, &b->buf);
+    if (res) {
+        snprintf(setup_why, sizeof(setup_why), "setup: vkCreateBuffer: VkResult %d", res);
+        return 0;
+    }
     VkMemoryRequirements r;
     vkGetBufferMemoryRequirements(dev, b->buf, &r);
     uint32_t t = find_type(r.memoryTypeBits, want);
-    if (t == UINT32_MAX) return 0;
+    if (t == UINT32_MAX) return alloc_failed("buffer", r.memoryTypeBits, t, 0);
     b->flags = mp.memoryTypes[t].propertyFlags;
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r.size, t};
-    if (vkAllocateMemory(dev, &ai, NULL, &b->mem) || vkBindBufferMemory(dev, b->buf, b->mem, 0)) return 0;
+    if ((res = vkAllocateMemory(dev, &ai, NULL, &b->mem))) return alloc_failed("buffer", r.memoryTypeBits, t, res);
+    if ((res = vkBindBufferMemory(dev, b->buf, b->mem, 0))) {
+        snprintf(setup_why, sizeof(setup_why), "setup: vkBindBufferMemory: VkResult %d", res);
+        return 0;
+    }
     b->ptr = NULL;
     if (want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-        if (vkMapMemory(dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->ptr)) return 0;
+        if ((res = vkMapMemory(dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->ptr))) {
+            snprintf(setup_why, sizeof(setup_why), "setup: vkMapMemory: VkResult %d", res);
+            return 0;
+        }
     }
     return 1;
 }
@@ -400,14 +425,23 @@ static VkImage make_image(VkFormat fmt, uint32_t w, uint32_t h, VkImageUsageFlag
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, fmt, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                             VK_IMAGE_TILING_OPTIMAL, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     VkImage img;
-    if (vkCreateImage(dev, &ci, NULL, &img)) return VK_NULL_HANDLE;
+    VkResult res = vkCreateImage(dev, &ci, NULL, &img);
+    if (res) {
+        snprintf(setup_why, sizeof(setup_why), "setup: vkCreateImage: VkResult %d", res);
+        return VK_NULL_HANDLE;
+    }
     VkMemoryRequirements r;
     vkGetImageMemoryRequirements(dev, img, &r);
     uint32_t t = find_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (t == UINT32_MAX) t = find_type(r.memoryTypeBits, 0);
+    if (t == UINT32_MAX) return alloc_failed("image", r.memoryTypeBits, t, 0), VK_NULL_HANDLE;
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r.size, t};
     VkDeviceMemory m;
-    if (vkAllocateMemory(dev, &ai, NULL, &m) || vkBindImageMemory(dev, img, m, 0)) return VK_NULL_HANDLE;
+    if ((res = vkAllocateMemory(dev, &ai, NULL, &m))) return alloc_failed("image", r.memoryTypeBits, t, res), VK_NULL_HANDLE;
+    if ((res = vkBindImageMemory(dev, img, m, 0))) {
+        snprintf(setup_why, sizeof(setup_why), "setup: vkBindImageMemory: VkResult %d", res);
+        return VK_NULL_HANDLE;
+    }
     return img;
 }
 
@@ -426,7 +460,7 @@ static void test_image_clear(void)
     buffer rb;
     if (!img || !make_buffer(&rb, w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-        check(0, "image clear + readback", "setup");
+        check(0, "image clear + readback", setup());
         return;
     }
     VkCommandBuffer cb = begin();
@@ -480,7 +514,7 @@ static void test_draw(int indirect)
     buffer ib;
     if (!img || !make_buffer(&rb, w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
         !make_buffer(&ib, 256, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-        check(0, name, "setup");
+        check(0, name, setup());
         return;
     }
     /* At 0 and 32: the commands (indexed: count, instances, first index, vertex offset, first instance;

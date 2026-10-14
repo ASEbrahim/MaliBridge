@@ -121,6 +121,23 @@ static void build_memory_model(vkb_physdev *pd)
         pd->type_map[i].server_type = cands[i].server;
         pd->type_map[i].shared = cands[i].shared;
     }
+    /* Images and GPU-only buffers need a device-local type without host access backed by ordinary
+     * memory: without one (a client that took Mali's lazily allocated type for it), every image
+     * allocation fails with VK_ERROR_OUT_OF_DEVICE_MEMORY. */
+    int ordinary = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        VkMemoryPropertyFlags sf = s->memoryTypes[cands[i].server].propertyFlags;
+        if (!cands[i].shared && (cands[i].flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+            !(sf & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)))
+            ordinary = 1;
+    }
+    if (!ordinary) {
+        char line[256];
+        int n = 0;
+        for (uint32_t i = 0; i < s->memoryTypeCount && n < (int)sizeof(line) - 24; i++)
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %u:0x%x", i, s->memoryTypes[i].propertyFlags);
+        VKB_ONCE(VKB_LOG_WARN, "memory: no ordinary device-local type for images (server types%s); image allocations will fail", line);
+    }
     for (uint32_t i = 0; i < s->memoryTypeCount; i++)
         VKB_DBG("server memory type %u: flags 0x%x heap %u", i, s->memoryTypes[i].propertyFlags, s->memoryTypes[i].heapIndex);
     for (uint32_t i = 0; i < nc; i++)

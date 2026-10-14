@@ -178,6 +178,7 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         vkb_dispatch_load_instance(&t->real, vkb_gipa, inst);
         t->dt = t->real;
         vkb_opaque_instance_install(t);
+        vkb_mem_instance_install(t);
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);
@@ -437,6 +438,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_mem_export_install(t);
             VKB_INFO("device %u created on %s (%u extensions, memory sharing %s)", id, k ? k->name : "?", n,
                      vkb_mem_strategy_name(strategy));
+            vkb_mem_log_types(t, id);
             for (uint32_t i = 0; i < n; i++) VKB_DBG("  device extension %s", exts[i]);
         }
     } else {

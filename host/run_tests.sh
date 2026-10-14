@@ -20,6 +20,11 @@ run_mode() {
   if [ "$mode" = mali ]; then . ./mali_env.sh >/dev/null; else unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API; . ./bridge_env.sh >/dev/null; fi
   timeout 120 ./out/vkbridge-smoke >out/t-smoke.log 2>&1; result $? "smoke ($(tail -1 out/t-smoke.log))"
   if [ "$mode" = mali ]; then
+    # Mali's memory types (lazymem): images get an ordinary device-local type, never the lazily
+    # allocated one (an older client did: image checks failed at "setup", gamescope got -2)
+    grep -q "imitating Mali's memory types" out/server.log && ! grep -q "lazily allocated, imitated" out/server.log &&
+      ! grep -q "no ordinary device-local type" out/t-smoke.log
+    result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' out/server.log))"
     # Other Mali drivers: push descriptors but not robustness2 (nulls in push descriptor writes are
     # replaced too), no multiDrawIndirect (Mali-G57 r32/r38: indirect draws are split)
     VKB_MISSING=robustness2,multidraw . ./mali_env.sh >/dev/null

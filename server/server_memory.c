@@ -657,13 +657,25 @@ static VkResult alloc_exportable(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb
             want = req.memoryTypeBits;
         }
     }
-    uint32_t bits = fp.memoryTypeBits & want;
+    /* Never a lazily allocated or protected type: ordinary memory cannot live there (Mali's only
+     * device-local type without host access is lazily allocated; allocations in it fail). */
+    VkPhysicalDeviceMemoryProperties mp;
+    t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+    uint32_t ordinary = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if (!(mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT))) ordinary |= 1u << i;
+    uint32_t bits = fp.memoryTypeBits & want & ordinary;
     if (!bits) {
-        VKB_ERR("export emulation: no memory type takes both the dma-buf (0x%x) and the resource (0x%x)", fp.memoryTypeBits, want);
+        VKB_ERR("export emulation: no ordinary memory type takes both the dma-buf (0x%x) and the resource (0x%x)", fp.memoryTypeBits, want);
         close(fd);
         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
     }
-    if (!(bits & (1u << ai->memoryTypeIndex))) ai->memoryTypeIndex = (uint32_t)__builtin_ctz(bits);
+    if (!(bits & (1u << ai->memoryTypeIndex))) {
+        uint32_t to = (uint32_t)__builtin_ctz(bits);
+        VKB_INFO("export emulation: type %u does not take the dma-buf (types 0x%x); type %u (flags 0x%x) instead", ai->memoryTypeIndex,
+                 fp.memoryTypeBits, to, mp.memoryTypes[to].propertyFlags);
+        ai->memoryTypeIndex = to;
+    }
     int imp_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     VkImportMemoryFdInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, ai->pNext, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, imp_fd};
     chain_drop(&imp.pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
@@ -795,6 +807,101 @@ void vkb_mem_export_install(vkb_srv_table *t)
 {
     if (t->pd && (t->pd->info.emu & (VKB_EMU_DMABUF_EXPORT | VKB_EMU_OPAQUE_FD)) && t->real.vkGetMemoryFdKHR)
         t->dt.vkGetMemoryFdKHR = exp_GetMemoryFdKHR;
+}
+
+/* ------------------------------------------------------------------ Mali's memory types, imitated */
+
+/*
+ * VKBRIDGE_FAKE_MISSING=...,lazymem (host tests): the memory types Mali reports. Its only
+ * device-local type without host access is LAZILY_ALLOCATED (G720 and G715: flags 0x11), and an
+ * ordinary resource allocated there fails with VK_ERROR_OUT_OF_DEVICE_MEMORY. A client that took
+ * that type for the device's ordinary memory had nowhere to put images (tablet run 3, and a Pixel 9
+ * on an older build, 2026-10-13: the self-test's image checks failed at "setup", gamescope got
+ * vkAllocateMemory -2). Here the desktop driver's device-local types without host access say
+ * LAZILY_ALLOCATED to the client, and the client's allocations in them are refused so.
+ */
+static int lazy_imitated(VkMemoryPropertyFlags f)
+{
+    return (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !(f & VK_MEMORY_PROPERTY_PROTECTED_BIT);
+}
+
+static int fake_lazy(void)
+{
+    static int v = -1;
+    if (v < 0) v = vkb_emu_faked("lazymem");
+    return v;
+}
+
+static void fake_lazy_props(VkPhysicalDeviceMemoryProperties *mp)
+{
+    for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
+        if (lazy_imitated(mp->memoryTypes[i].propertyFlags)) mp->memoryTypes[i].propertyFlags |= VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
+}
+
+static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties *mp)
+{
+    vkb_srv_current_table()->real.vkGetPhysicalDeviceMemoryProperties(pd, mp);
+    fake_lazy_props(mp);
+}
+
+static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2 *mp)
+{
+    vkb_srv_current_table()->real.vkGetPhysicalDeviceMemoryProperties2(pd, mp);
+    fake_lazy_props(&mp->memoryProperties);
+}
+
+void vkb_mem_instance_install(vkb_srv_table *t)
+{
+    if (!fake_lazy()) return;
+    if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
+    if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;
+    VKB_INFO("imitating Mali's memory types: device-local types without host access are lazily allocated");
+}
+
+/* ------------------------------------------------------------------ what allocations did (logs) */
+
+/* The driver's memory types in one line, at every device: an in-app server prints its self-test
+ * only in the first session's log, and a tester's log should still show what images can use. */
+void vkb_mem_log_types(vkb_srv_table *t, uint32_t id)
+{
+    VkPhysicalDeviceMemoryProperties mp;
+    t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+    if (fake_lazy()) fake_lazy_props(&mp);
+    char line[512];
+    int n = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && n < (int)sizeof(line) - 40; i++)
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " %u:0x%x/h%u", i, mp.memoryTypes[i].propertyFlags, mp.memoryTypes[i].heapIndex);
+    line[n < (int)sizeof(line) ? n : (int)sizeof(line) - 1] = 0;
+    VKB_INFO("device %u: driver memory types (type:flags/heap)%s; shared types 0x%x", id, line,
+             t->pd ? t->pd->info.shareable_types : 0);
+}
+
+/* One line for the first allocation each device makes in each memory type (which path it took),
+ * and one for every failure (the first 32 per process): what was asked, where, and the VkResult. */
+static void log_alloc(vkb_srv_table *t, const VkMemoryAllocateInfo *ai, uint32_t type, uint8_t ded, const char *path, VkResult r)
+{
+    static int failures;
+    uint32_t bit = type < 32 ? 1u << type : 0;
+    if (r == VK_SUCCESS) {
+        if (!bit || (__atomic_fetch_or(&t->mem_types_seen, bit, __ATOMIC_RELAXED) & bit)) return;
+    } else if (__atomic_fetch_add(&failures, 1, __ATOMIC_RELAXED) >= 32) {
+        return;
+    }
+    VkPhysicalDeviceMemoryProperties mp;
+    t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+    if (fake_lazy()) fake_lazy_props(&mp);
+    VkMemoryPropertyFlags f = type < mp.memoryTypeCount ? mp.memoryTypes[type].propertyFlags : 0;
+    uint32_t heap = type < mp.memoryTypeCount ? mp.memoryTypes[type].heapIndex : 0;
+    const char *what = ded == 1 ? ", dedicated to an image" : ded == 2 ? ", dedicated to a buffer" : "";
+    if (r == VK_SUCCESS)
+        VKB_INFO("device %u: first allocation in memory type %u (flags 0x%x, heap %u): %llu bytes%s, %s", t->id, type, f, heap,
+                 (unsigned long long)ai->allocationSize, what, path);
+    else
+        VKB_WARN("device %u: vkAllocateMemory of %llu bytes in memory type %u (flags 0x%x%s, heap %u)%s, %s, failed: %d", t->id,
+                 (unsigned long long)ai->allocationSize, type, f,
+                 f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? " - lazily allocated, for transient attachments only"
+                 : f & VK_MEMORY_PROPERTY_PROTECTED_BIT ? " - protected" : "",
+                 heap, what, path, r);
 }
 
 /* ------------------------------------------------------------------ scanout buffers (Wayland zero-copy) */
@@ -981,8 +1088,9 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
         int opaque = vkb_opaque_shared_info(t, &ai); /* server_opaque.c */
         r = alloc_shared(c->dt, dev, s, &ai, client_fd, &m, &out_fd);
         if (r == VK_SUCCESS && opaque) vkb_opaque_shared_done(m, out_fd);
-        if (r != VK_SUCCESS) VKB_WARN("shared allocation of %llu bytes (type %u, %s) failed: %d",
-                                      (unsigned long long)ai.allocationSize, ai.memoryTypeIndex, vkb_mem_strategy_name(s), r);
+        char path[48];
+        snprintf(path, sizeof(path), "shared (%s)", vkb_mem_strategy_name(s));
+        log_alloc(t, &ai, ai.memoryTypeIndex, ded, path, r);
     } else {
         if (client_fd >= 0) close(client_fd);
         m = calloc(1, sizeof(*m));
@@ -999,8 +1107,41 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
                 ((const VkImportMemoryFdInfoKHR *)b)->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
                 import_fd = ((const VkImportMemoryFdInfoKHR *)b)->fd;
         int emulating = t->pd && (t->pd->info.emu & VKB_EMU_DMABUF_EXPORT) && wants_dmabuf_export(&ai);
+        const char *path = import_fd >= 0 ? "dma-buf import" : opaque ? "opaque fd as dma-buf" : "plain";
+        uint32_t type = ai.memoryTypeIndex;
+        if (fake_lazy() && import_fd < 0 && !opaque) {
+            /* Mali refuses ordinary memory in its lazily allocated type (the imitation above). */
+            VkPhysicalDeviceMemoryProperties mp;
+            t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+            if (ai.memoryTypeIndex < mp.memoryTypeCount && lazy_imitated(mp.memoryTypes[ai.memoryTypeIndex].propertyFlags)) {
+                r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                path = "plain (lazily allocated, imitated)";
+                goto plain_done;
+            }
+        }
         if (emulating && import_fd < 0) {
+            /* The chain as it came: alloc_exportable unlinks structures from it. */
+            const VkBaseInStructure *links[32];
+            int nl = 0;
+            for (const VkBaseInStructure *b = ai.pNext; b && nl < 32; b = b->pNext) links[nl++] = b;
+            int whole = nl < 32;
             r = alloc_exportable(t, &ai, m);
+            path = "export emulation (dma-heap)";
+            type = ai.memoryTypeIndex;
+            /* Pages the dma-heap would not give, or the driver would not import: the memory is still
+             * made, without a dma-buf (most allocations asking for export are never exported; one
+             * that is fails at vkGetMemoryFdKHR instead of here). VKBRIDGE_EXPORT_FALLBACK=0: not. */
+            const char *fb = getenv("VKBRIDGE_EXPORT_FALLBACK");
+            if (r != VK_SUCCESS && whole && !(fb && *fb == '0')) {
+                log_alloc(t, &ai, type, ded, path, r);
+                ai.pNext = nl ? links[0] : NULL;
+                for (int i = 0; i < nl; i++) ((VkBaseInStructure *)links[i])->pNext = i + 1 < nl ? links[i + 1] : NULL;
+                chain_drop(&ai.pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+                ai.memoryTypeIndex = type = m->type;
+                r = c->dt->vkAllocateMemory(dev, &ai, NULL, &m->mem);
+                path = "plain, after export emulation failed (no dma-buf to export)";
+                if (r == VK_SUCCESS) VKB_ONCE(VKB_LOG_WARN, "export emulation failed; memory made without a dma-buf instead (exporting it will fail)");
+            }
         } else {
             int keep = emulating ? fcntl(import_fd, F_DUPFD_CLOEXEC, 0) : -1;
             if (emulating) chain_drop(&ai.pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
@@ -1011,6 +1152,8 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
         if (r != VK_SUCCESS && opaque) r = vkb_opaque_alloc_retry(t, &ai, m);
         if (r != VK_SUCCESS && t->emu && vkb_emu_strip_opaque(&ai, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO))
             r = c->dt->vkAllocateMemory(dev, &ai, NULL, &m->mem);
+    plain_done:
+        log_alloc(t, &ai, type, ded, path, r);
         if (r != VK_SUCCESS) {
             close_import_fds(ai.pNext);
             free(m);
