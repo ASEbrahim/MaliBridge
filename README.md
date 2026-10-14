@@ -39,32 +39,42 @@ when they connect.
 
 ## Status
 
-Tested on one device so far: a Mali-G720 Immortalis (MediaTek Dimensity 9300+, driver r44p1),
-inside the DroidDeck launcher, which runs the server and starts the guest.
+Tested in depth on a Mali-G720 Immortalis (Galaxy Tab S10+, MediaTek Dimensity 9300+, driver
+r44p1) and on a Mali-G925 Immortalis (Galaxy Tab S11 Ultra, Dimensity 9400, Android 16), inside
+the DroidDeck launcher, which runs the server and starts the guest. With the same build the G925
+runs these games about 1.4-2x faster than the G720. See [INSTALL.md](INSTALL.md) to try it.
 Everything here is still work in progress.
 
-| Game | Result |
-|---|---|
-| Hades | runs well |
-| Hollow Knight | runs well, 87-124 fps |
-| ULTRAKILL | runs well, 55-57 fps |
-| Celeste | runs well, 57-59 fps |
-| Portal | runs well, 80 fps |
-| Cuphead | runs well |
-| Dead Cells | runs well |
-| ENDER LILIES | runs well, 42-44 fps |
-| Lethal Company | runs well, 43-45 fps |
-| Subnautica | runs well, 20-24 fps with Detail set to High |
-| Inscryption | runs well, 68-83 fps |
-| Doki Doki Literature Club | runs well, title screen 91-92 fps |
-| Half-Life 2 | runs well, 59-74 fps in the opening chapter |
-| Portal 2 | runs well, about 45-50 fps in play with drops to around 30 |
-| Hollow Knight: Silksong | runs very well, a steady 62-66 fps in play |
-| Stardew Valley | runs well, 60 fps (its cap) on the title screen |
-| Risk of Rain 2 | runs well at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default |
-| The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) |
-| Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) |
-| Deep Rock Galactic | runs, but slowly |
+| Game | Mali-G720 (Tab S10+) | Mali-G925 (Tab S11 Ultra) |
+|---|---|---|
+| Hades | runs well | not tested |
+| Hollow Knight | runs well, 87-124 fps | runs well (player report) |
+| ULTRAKILL | runs well, 55-57 fps | not tested |
+| Celeste | runs well, 57-59 fps | not tested |
+| Portal | runs well, 80 fps | not tested |
+| Cuphead | runs well | not tested |
+| Dead Cells | runs well | not tested |
+| ENDER LILIES | runs well, 42-44 fps | not tested |
+| Lethal Company | runs well, 43-45 fps | not tested |
+| Subnautica | runs well, 20-24 fps with Detail set to High | 28-40 fps (while thermally throttled) |
+| Inscryption | runs well, 68-83 fps | not tested |
+| Doki Doki Literature Club | runs well, title screen 91-92 fps | not tested |
+| Half-Life 2 | runs well, 59-74 fps in the opening chapter | 95-103 fps |
+| Portal 2 | runs well, about 45-50 fps in play with drops to around 30 | 115 fps in the menu |
+| Hollow Knight: Silksong | runs very well, a steady 62-66 fps in play | 72-96 fps |
+| The Elder Scrolls V: Skyrim Special Edition | runs well, about 60 fps (its cap) on Medium; smooth in third person, some stutter on first load | not tested |
+| Stardew Valley | runs well, 60 fps (its cap) on the title screen | 57-62 fps |
+| Risk of Rain 2 | runs well at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default | 30-43 fps at 1280x720; 20-28 fps in a crowded boss fight, measured while screen recording |
+| The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) | starts since v0.4 (before, "DirectX 12 required"); the intro plays at 60 fps. In game: known issue, being worked on (see below) |
+| Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) | known issue, being worked on (see below) |
+| Deep Rock Galactic | runs, but slowly | not tested |
+
+Known issue on the Mali-G925: its shader compiler never finishes compiling Unreal Engine 4's
+colour-grading shader (Stray), so the game waits for ever; The Witcher 3 stops after its intro in
+what looks like the same way. Since v0.4 the bridge interrupts a pipeline compile that runs past
+10 s and builds the pipeline again with a fallback: for that shader, a neutral colour grade in
+place of the game's. This has not yet been confirmed on the device. A real fix, a rewrite of the
+shader that the G925 compiles, is being worked on.
 
 Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples compressed, at the
 size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11,
@@ -94,7 +104,8 @@ Each one turns on only when the GPU lacks the feature.
 - **Clip/cull distance**: built-ins turned into varyings, with clipping done in the fragment shader.
 - **Per-vertex built-ins**: loose built-ins in geometry and tessellation shaders are folded into `gl_PerVertex` blocks. Loose ones crash Mali's compiler.
 - **SPIR-V fixes**: DXVK's spec-constant `OpSelect` guards, which Mali's compiler folds wrongly so textures read black; YCbCr samplers in compute layouts.
-- **Vertex attribute divisor**: the binding gets a stride of 0 and is rebound for each run of instances, with draws split to match.
+- **Vertex attribute divisor**: the binding gets a stride of 0 and is rebound for each run of instances, with draws split to match. Also used where the driver has only `VK_KHR_vertex_attribute_divisor` without the zero divisor (the Mali-G925 on Android 16), and `VK_EXT_vertex_attribute_divisor` is offered there: vkd3d-proton refuses a GPU without it ("DirectX 12 required" in The Witcher 3).
+- **Renamed extensions**: where a newer driver has only the KHR name of an extension that games look for under its EXT name (index_type_uint8, line_rasterization, robustness2, global_priority, load_store_op_none, vertex_attribute_divisor), the EXT name is offered and mapped onto the KHR one.
 - **maintenance5 / maintenance6, depth clip enable, load/store op none**: mapped onto what the driver has.
 - **dualSrcBlend, fillModeNonSolid, multiViewport**: reported so that DXVK 3 starts. The rare use is approximated and logged.
 - **multiDrawIndirect** (Mali-G57 on r32/r38): an indirect draw of n commands is recorded as n single indirect draws.
@@ -102,7 +113,9 @@ Each one turns on only when the GPU lacks the feature.
 - **Elastic descriptor pools**: allocation past a pool's size, which desktop drivers allow and Mali refuses.
 - **OPAQUE_FD external memory and image dma-buf export**: backed by dma-buf / dma-heap pages.
 - **Pipeline compile crash guard**: a driver crash inside shader or pipeline compilation fails that call instead of the whole session.
-- **Persistent pipeline cache**: Mali recompiles everything in each new process unless it gets a cache, and DXVK passes none.
+- **Compile watchdog**: a pipeline compile still running in the driver after 10 s is interrupted, and the pipeline is built again with a fallback: Unreal Engine 4's colour-grading shader gets a neutral stand-in (`server/shaders/ue4_lut_standin.frag`, no grading), any other fragment shader a constant colour as the last resort. What worked is remembered in `<cache dir>/stuck-pipelines`, so later runs do not wait again; the stuck SPIR-V is saved to `<cache dir>/stuck-spirv/`.
+- **Semaphore waits the driver fails**: the Mali-G925 driver sometimes answers `vkWaitSemaphores` with `VK_ERROR_INITIALIZATION_FAILED`. The wait is checked again and succeeds when the semaphores are signalled, instead of ending the game.
+- **Persistent pipeline cache**: Mali recompiles everything in each new process unless it gets a cache, and DXVK passes none. The cache is kept per Steam game (by app id), and Steam's "Processing Vulkan shaders" step now fills the cache the game loads, so letting it finish shortens the first run's stutter. Processes that save the same cache at once merge their pipelines, and a game that is killed keeps what it compiled.
 - **Shader quirk lists**: listed shaders are drawn with rasterization discarded or replaced by a constant colour, for draws the GPU cannot run.
 
 ## Building
@@ -172,11 +185,19 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_BC_TRANSCODE=0` | server | BC textures decoded instead of transcoded to ETC2/EAC/ASTC (`VKBRIDGE_FAKE_MISSING=astchdr`: only BC6H decoded) |
 | `VKBRIDGE_BC_TRANSCODE_QUALITY=auto` | server | the default: `fast` for mip levels of 1024x1024 texels or more (2048x512 too; nearly all of a big texture's encoding time, and what a 720p-1080p screen shows least), `default` for smaller ones. Set `fast`, `default` or `high` to use one everywhere |
 | `VKBRIDGE_BC_TRANSCODE_QUALITY=fast` / `default` / `high` | server | how hard the BC transcoders search. `fast`: shorter searches (on the host GPU about 3.7x faster ETC2, 1.6-1.8x EAC, 1.5x BC7 -> ASTC) at 0.2-2 dB PSNR less, for quicker loading of large textures; `high`: every ASTC candidate, up to 0.6 dB more for 1.5x the BC7 time (ETC2/EAC as default). `default`: the full search everywhere |
+| `VKBRIDGE_COMPILE_WARN_S=<s>` | server | a pipeline compile running longer than this (default 5) is logged with its shaders' hashes and their SPIR-V saved to `<cache dir>/stuck-spirv/` |
+| `VKBRIDGE_COMPILE_TIMEOUT_S=<s>` | server | a compile running longer than this (default 10) is interrupted and the pipeline built with a fallback; `0` only logs |
+| `VKBRIDGE_COMPILE_FALLBACKS=gsfold,fc2` | server | extra fallbacks tried first after a stuck compile: the layer-only geometry stage folded into the vertex shader, and `SPV_KHR_float_controls2` stripped |
+| `VKBRIDGE_LAYER_GS_FOLD=1` | server | folds every layer-only pass-through geometry stage up front |
+| `VKBRIDGE_NO_PCACHE=1` | server | turns off the persistent pipeline cache |
+| `VKBRIDGE_PCACHE_KEY=<name>` | client | which persistent pipeline cache this process gets (default: the Steam app id) |
+| `VKBRIDGE_WAIT_FIX=0` | server | hands failed semaphore and fence waits straight back to the app; `VKBRIDGE_WAIT_RETRY_MS` (default 2000) is how long a failed wait is checked again |
 | `VKBRIDGE_NO_XFB_FOLD=1` | server | turns off the stream output fold |
 | `VKBRIDGE_NO_CRASH_GUARD=1` | server | turns off pipeline crash containment |
 | `VKBRIDGE_NO_FORCED_ROBUSTNESS=1` | server | the robustness2 emulation leaves buffer and image robustness to the app instead of turning them on |
 | `VKBRIDGE_NULLDESC_2D=1` | server | null images all get the one 2D RGBA8 stand-in, whatever shape the shader declares (as before v0.3) |
-| `VKBRIDGE_FAKE_MISSING=bc,push,...` | server | pretends the GPU lacks features (host testing, see `host/mali_env.sh`) |
+| `VKBRIDGE_FAKE_MISSING=bc,push,...` | server | pretends the GPU lacks features (host testing, see `host/mali_env.sh`). Read from `<cache dir>/env` at server start too, so a newer Mali can take an older one's paths |
+| `VKBRIDGE_SERVER_HIDE_EXTS=<ext>,...` | server | hides these driver extensions from clients |
 | `VKBRIDGE_HIDE_EXTS`, `VKBRIDGE_MAX_API` | client | hide extensions or cap the API version reported to apps |
 | `VKBRIDGE_DEBUG=1`, `VKBRIDGE_LOG_LEVEL=<n>` | client | client log verbosity |
 
