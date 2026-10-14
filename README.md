@@ -138,32 +138,12 @@ glslangValidator, or the NDK's glslc), `tests/gen_shaders.sh` (test shaders; gls
 
 ## Testing on a desktop
 
-`host/` builds both halves for x86_64 Linux. The server then runs on the desktop's own driver
-(RADV by default), and it can pretend to lack what Mali lacks:
+`host/` builds both halves for x86_64 Linux and runs the server on a desktop driver, optionally
+imitating what Mali lacks. Every release passes its regression suite on both:
 
 ```sh
-make -C host          # server, client ICD and test programs into host/out
-host/run_tests.sh     # every check, once on the plain driver and once imitating Mali (mali_env.sh)
+make -C host && host/run_tests.sh
 ```
-
-The suite runs `smoke`, `bcn_check` (every BC format and mode, bit-exact against bcdec; imitating
-Mali, once with BC transcoded to ETC2/EAC/ASTC, by PSNR against bcdec, and once decoded; the BC6H
--> ASTC HDR transcoder, which RADV cannot sample, runs directly on HDR images and its blocks are
-decoded by bcn_check's own ASTC decoder; `bcn_check hdr` runs only that),
-`nulldesc_check` (null images of every view type and numeric class, written directly, by template
-and pushed; imitating Mali, each must get a stand-in of its shape), `opaque_check`, `recycle_check`,
-`desc_traffic_check` (a DXVK-like set allocation and update per
-draw, read back by every draw; with and without `VKBRIDGE_NO_DESC_BATCH=1`, the client's message
-and byte totals printed), `flicker_check` (DXVK's frame structure: frames in flight, a pool per
-frame reset and refilled, submits from another thread, synchronous calls from a third; batched
-and not), vkcube over Wayland (dma-buf and wl_shm) and X11, and, if the
-`vkb-arch-gamescope` docker image exists, gamescope with Zink. It also fails on any protocol
-error in the server log. `d3d11_check` runs under Proton's wine and DXVK when `VKB_WINE_DIR`
-points to a prefix holding `d3d11_check.exe` and DXVK's DLLs, and `d3d11_flicker` (every frame of
-a many-draw D3D11 workload read back and checked, batching on) when `d3d11_flicker.exe` is there too. `tests/clip_check.sh` and
-`tests/pervertex_check.sh` test the SPIR-V rewrites (spirv-tools from PATH or a docker image).
-`query_check`, `placed_check` and `desc_limits_check` run against `. host/mali_env.sh`.
-`crash_contain_check` needs a server started with `VKBRIDGE_TEST_CRASH_PIPELINE=1`.
 
 ## Environment toggles worth knowing
 
@@ -241,7 +221,7 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
 - [compat_layer](https://github.com/leegao/compat_layer) by Lee Gao, MIT: turning on image
   robustness alongside buffer robustness for the robustness2 emulation (`server/server_instance.c`)
   follows its robustness2 emulation, as do zero-filling the null-descriptor stand-in buffer and
-  replacing nulls in push descriptor writes (`server/server_nulldesc.c`). No code is copied; `docs/COMPAT_SURVEY.md` compares the layers.
+  replacing nulls in push descriptor writes (`server/server_nulldesc.c`). No code is copied.
 - The Mali compatibility layer (`VK_LAYER_DROIDDECK_mali_compat`) by David Cimo
   ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali)) and The412Banner (DroidDeck branch
   `test/non-adreno-all`), GPL-3.0: the zero-filled null-descriptor buffer and the null push
