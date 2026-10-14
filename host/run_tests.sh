@@ -45,8 +45,20 @@ run_mode() {
       result $? "desc_traffic_check, VKBRIDGE_NO_DESC_BATCH=$nb ($(tail -1 out/t-desc-$nb.log | grep -o '^[A-Z]*'); $(grep -o '[0-9]* messages, [0-9]* KB on the wire' out/t-desc-$nb.log))"
     done
   fi
+  # DXVK's frame structure (frames in flight, pools reset per frame, submits from another thread)
+  if [ -x out/flicker_check ]; then
+    for nb in 0 1; do
+      VKBRIDGE_DESC_BATCH=$((1-nb)) timeout 180 ./out/flicker_check >out/t-flicker-$nb.log 2>&1
+      result $? "flicker_check, VKBRIDGE_NO_DESC_BATCH=$nb ($(grep -o '[0-9]* draws wrong in [0-9]* frames' out/t-flicker-$nb.log))"
+    done
+  fi
   if [ -n "${VKB_WINE_DIR:-}" ] && [ -d "$VKB_WINE_DIR/app" ]; then
     ./d3d11_test.sh >out/t-d3d11.log 2>&1; grep -q "^OK:" out/t-d3d11.log; result $? "d3d11_check via DXVK ($(grep -E '^(OK|FAILED)' out/t-d3d11.log))"
+    # Every frame read back, through DXVK, with batching on (needs d3d11_flicker.exe in the prefix)
+    if [ -f "$VKB_WINE_DIR/app/d3d11_flicker.exe" ]; then
+      VKBRIDGE_DESC_BATCH=1 ./d3d11_test.sh d3d11_flicker.exe >out/t-d3d11-flicker.log 2>&1; grep -q "^OK" out/t-d3d11-flicker.log
+      result $? "d3d11_flicker via DXVK, batched ($(grep -o '[0-9]* cells wrong in [0-9]* frames' out/t-d3d11-flicker.log))"
+    fi
   fi
   timeout 60 vkcube-wayland --c 120 >out/t-vkcube.log 2>&1; result $? "vkcube-wayland (dma-buf)"
   VKBRIDGE_WSI_SHM=1 timeout 60 vkcube-wayland --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube-wayland (wl_shm)"

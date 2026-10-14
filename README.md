@@ -147,10 +147,13 @@ Mali, once with BC transcoded to ETC2/EAC/ASTC, by PSNR against bcdec, and once 
 decoded by bcn_check's own ASTC decoder; `bcn_check hdr` runs only that),
 `opaque_check`, `recycle_check`, `desc_traffic_check` (a DXVK-like set allocation and update per
 draw, read back by every draw; with and without `VKBRIDGE_NO_DESC_BATCH=1`, the client's message
-and byte totals printed), vkcube over Wayland (dma-buf and wl_shm) and X11, and, if the
+and byte totals printed), `flicker_check` (DXVK's frame structure: frames in flight, a pool per
+frame reset and refilled, submits from another thread, synchronous calls from a third; batched
+and not), vkcube over Wayland (dma-buf and wl_shm) and X11, and, if the
 `vkb-arch-gamescope` docker image exists, gamescope with Zink. It also fails on any protocol
 error in the server log. `d3d11_check` runs under Proton's wine and DXVK when `VKB_WINE_DIR`
-points to a prefix holding `d3d11_check.exe` and DXVK's DLLs. `tests/clip_check.sh` and
+points to a prefix holding `d3d11_check.exe` and DXVK's DLLs, and `d3d11_flicker` (every frame of
+a many-draw D3D11 workload read back and checked, batching on) when `d3d11_flicker.exe` is there too. `tests/clip_check.sh` and
 `tests/pervertex_check.sh` test the SPIR-V rewrites (spirv-tools from PATH or a docker image).
 `query_check`, `placed_check` and `desc_limits_check` run against `. host/mali_env.sh`.
 `crash_contain_check` needs a server started with `VKBRIDGE_TEST_CRASH_PIPELINE=1`.
