@@ -59,6 +59,8 @@ Everything here is still work in progress.
 | Doki Doki Literature Club | runs well, title screen 91-92 fps |
 | Half-Life 2 | runs well, 59-74 fps in the opening chapter |
 | Portal 2 | runs well, about 45-50 fps in play with drops to around 30 |
+| Hollow Knight: Silksong | runs very well, a steady 62-66 fps in play |
+| Stardew Valley | runs well, 60 fps (its cap) on the title screen |
 | Risk of Rain 2 | runs well at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default |
 | The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) |
 | Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) |
