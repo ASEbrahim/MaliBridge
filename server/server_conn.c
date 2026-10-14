@@ -296,7 +296,13 @@ void vkb_sv_vkbHello(vkb_srv_call *c)
         c->conn->proc = proc_join(token, (int)pid);
         if (c->conn->proc->conns == 1) {
             VKB_INFO("process %u is %s", pid, comm ? comm : "?");
-            if (comm) snprintf(c->conn->proc->comm, sizeof(c->conn->proc->comm), "%s", comm);
+            if (comm) {
+                /* "name@key": the key picks the persistent pipeline cache (client/conn.c pcache_key) */
+                const char *at = strrchr(comm, '@');
+                vkb_srv_proc *pr = c->conn->proc;
+                snprintf(pr->comm, sizeof(pr->comm), "%.*s", at ? (int)(at - comm) : (int)strlen(comm), comm);
+                if (at && at[1]) snprintf(pr->pkey, sizeof(pr->pkey), "%s", at + 1);
+            }
         }
     }
     vkb_enc_u32(&c->r, 1);

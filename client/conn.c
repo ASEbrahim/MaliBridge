@@ -277,6 +277,71 @@ static const char *socket_path(void)
     return buf;
 }
 
+/* Which persistent pipeline cache the server should give this process, appended to the process
+ * name in the hello ("name@key"; servers without the convention just see a longer name).
+ *   steam<id>       a Steam game (SteamAppId, else SteamGameId, as Steam and Proton set them);
+ *   steam<id>.run   Steam's shader pre-caching (fossilize_replay) replaying what this device
+ *                   recorded of the game (an archive under shadercache/<id>/steamapprun_...);
+ *   steam<id>.dl    the same for the collections Steam downloaded (shadercache/<id>/...).
+ * The game merges the two pre-caching files into its own when it starts, so "Processing Vulkan
+ * shaders" warms the cache the game loads (it used to fill a fossilize_repla cache nothing read).
+ * VKBRIDGE_PCACHE_KEY=<name> overrides (letters, digits, '-', '_', '.'). Empty: none known. */
+static int all_digits(const char *s, size_t n)
+{
+    if (!n || n > 20) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] < '0' || s[i] > '9') return 0;
+    return !(n == 1 && s[0] == '0');
+}
+
+static void pcache_key(const char *comm, char *out, size_t cap)
+{
+    out[0] = 0;
+    const char *k = getenv("VKBRIDGE_PCACHE_KEY");
+    if (k && *k) {
+        snprintf(out, cap, "%s", k);
+        return;
+    }
+    char id[24] = "";
+    int fossilize = !strncmp(comm, "fossilize", 9), run = 0;
+    if (fossilize) {
+        /* Steam runs it on the archives in steamapps/shadercache/<appid>/fozpipelinesv6/; the
+         * replayer's own child processes get the same arguments. */
+        enum { CMD_MAX = 65536 };
+        char *cmd = malloc(CMD_MAX);
+        int fd = cmd ? open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC) : -1;
+        ssize_t n = 0;
+        while (fd >= 0 && n < CMD_MAX - 1) {
+            ssize_t r = read(fd, cmd + n, (size_t)(CMD_MAX - 1 - n));
+            if (r <= 0) break;
+            n += r;
+        }
+        if (fd >= 0) close(fd);
+        if (cmd) cmd[n] = 0;
+        for (ssize_t i = 0; n > 0 && i < n;) {
+            const char *arg = cmd + i;
+            size_t len = strnlen(arg, (size_t)(n - i));
+            const char *sc = memmem(arg, len, "shadercache/", 12);
+            if (sc) {
+                const char *d = sc + 12;
+                size_t dn = strspn(d, "0123456789");
+                if (d[dn] == '/' && all_digits(d, dn) && !id[0]) snprintf(id, sizeof(id), "%.*s", (int)dn, d);
+                if (strstr(arg, "/steamapprun_pipeline_cache")) run = 1;
+            }
+            i += (ssize_t)len + 1;
+        }
+        free(cmd);
+    }
+    if (!id[0]) {
+        const char *names[2] = {"SteamAppId", "SteamGameId"};
+        for (int i = 0; i < 2 && !id[0]; i++) {
+            const char *v = getenv(names[i]);
+            if (v && all_digits(v, strlen(v))) snprintf(id, sizeof(id), "%s", v);
+        }
+    }
+    if (id[0]) snprintf(out, cap, "steam%s%s", id, fossilize ? (run ? ".run" : ".dl") : "");
+}
+
 static int do_connect(vkb_conn *c)
 {
     const char *path = socket_path();
@@ -315,7 +380,10 @@ static int do_connect(vkb_conn *c)
         if (fgets(comm, sizeof(comm), f)) comm[strcspn(comm, "\n")] = 0;
         fclose(f);
     }
-    vkb_enc_str(&e, comm);
+    char key[64], hello[160];
+    pcache_key(comm, key, sizeof(key));
+    snprintf(hello, sizeof(hello), "%s%s%s", comm, key[0] ? "@" : "", key);
+    vkb_enc_str(&e, hello);
     vkb_msg_hdr h = {VKB_MAGIC, (uint32_t)e.len, VKB_CMD_vkbHello, 0, 0, 0, 0, 0};
     int ok = vkb_send_msg(s, &h, e.buf, NULL, 0) == 0;
     vkb_enc_free(&e);

@@ -79,6 +79,11 @@ run_mode() {
       result $? "d3d11_flicker via DXVK, batched ($(grep -o '[0-9]* cells wrong in [0-9]* frames' out/t-d3d11-flicker.log))"
     fi
   fi
+  # Persistent pipeline cache: Steam app keys, pre-caching taken in, killed games, shared files
+  # (a server of its own with a cache directory; once, the mode makes no difference to it)
+  if [ "$mode" = plain ] && [ -x out/pcache_check ]; then
+    timeout 120 ./pcache_test.sh >out/t-pcache.log 2>&1; result $? "pcache_test ($(tail -1 out/t-pcache.log))"
+  fi
   timeout 60 vkcube-wayland --c 120 >out/t-vkcube.log 2>&1; result $? "vkcube-wayland (dma-buf)"
   VKBRIDGE_WSI_SHM=1 timeout 60 vkcube-wayland --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube-wayland (wl_shm)"
   timeout 60 vkcube --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube (X11)"

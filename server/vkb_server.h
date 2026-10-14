@@ -27,6 +27,7 @@ typedef struct vkb_srv_proc {
     int pid;
     int conns;
     char comm[32];                 /* the client's process name (per-program pipeline caches) */
+    char pkey[48];                 /* the client's pipeline cache key ("name@key" in the hello), or "" */
     struct vkb_srv_proc *next;
     /* Ordering of the process's asynchronous requests (vkb_msg_hdr.seq/barrier). */
     pthread_mutex_t olock;
