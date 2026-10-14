@@ -98,6 +98,7 @@ typedef struct vkb_srv_table {
     struct vkb_nulldesc *nulldesc;           /* server_nulldesc.c */
     struct vkb_bvmap *bvmap;                 /* server_bvmap.c */
     uint32_t mem_types_seen;                 /* memory types this device has allocated in (logged once each) */
+    struct vkb_report_dev *report;           /* server_report.c */
 } vkb_srv_table;
 
 /* server_main.c */
@@ -134,6 +135,18 @@ void vkb_probe_write_md(FILE *f);
 void vkb_probe_write_json(FILE *f);
 int vkb_probe_issues(void (*cb)(void *arg, const char *line), void *arg);
 
+/* server_report.c: the session report (<log dir>/malibridge-report.md and .json) */
+void vkb_report_session(const char *log_path); /* a session starts (its server log's path; NULL: none) */
+void vkb_report_log(int level, const char *fmt, const char *msg); /* every log line */
+void vkb_report_hello(vkb_srv_proc *p);
+void vkb_report_gone(vkb_srv_proc *p);
+void vkb_report_instance(vkb_srv_table *t, const VkInstanceCreateInfo *ci);
+void vkb_report_device(vkb_srv_table *inst, const VkDeviceCreateInfo *ci, VkResult r, const char *dropped_features,
+                       const char *not_passed_exts);
+void vkb_report_device_init(vkb_srv_table *t); /* device-lost watch on submissions and waits */
+void vkb_report_device_destroy(vkb_srv_table *t);
+void vkb_report_features(const VkPhysicalDeviceFeatures *want, const VkPhysicalDeviceFeatures *have, char *out, size_t cap);
+const char *vkb_srv_env_list(char *out, size_t cap); /* <cache dir>/env as applied (server_pcache.c) */
 void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, VkResult r, const char *slow_stages);
 
 /* server_spvfix.c */
@@ -214,6 +227,7 @@ void vkb_mem_free_all(vkb_srv_table *dev);
 uint8_t vkb_memstat_dedicated(const VkMemoryAllocateInfo *ai);
 void vkb_memstat_image(VkFormat bc, int64_t bytes, int64_t bc_src_bytes, int64_t bc_decoded_bytes); /* bc 0: not BC */
 void vkb_memstat_buffer(int64_t bytes);
+void vkb_memstat_query(int pid, int64_t *pid_bytes, int64_t *total, int64_t *images, int64_t *bc_images, int64_t *bc_src);
 
 /* OPAQUE_FD on dma-bufs (server_opaque.c) */
 void vkb_opaque_instance_install(vkb_srv_table *t);

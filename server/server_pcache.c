@@ -147,6 +147,17 @@ void vkb_srv_env_reload(void)
     pthread_mutex_unlock(&env_lock);
 }
 
+const char *vkb_srv_env_list(char *out, size_t cap)
+{
+    size_t len = 0;
+    out[0] = 0;
+    pthread_mutex_lock(&env_lock);
+    for (unsigned i = 0; i < env_n && len < cap; i++)
+        len += (size_t)snprintf(out + len, cap - len, "%s%s=%s", len ? " " : "", env_tab[i].key, env_tab[i].val);
+    pthread_mutex_unlock(&env_lock);
+    return out;
+}
+
 const char *vkb_srv_env(const char *name)
 {
     const char *v = NULL;

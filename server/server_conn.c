@@ -117,6 +117,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 vkb_emu_device_destroy(t);
                 vkb_hang_device_destroy(t);  /* its watcher thread calls the driver */
                 vkb_guard_device_destroy(t); /* as vkDestroyDevice does: no table left pointing at t */
+                vkb_report_device_destroy(t);
                 vkb_mem_free_all(t);
                 t->real.vkDestroyDevice(t->device, NULL);
             } else {
@@ -162,6 +163,7 @@ static void proc_leave(vkb_srv_proc *p)
     if (last) {
         vkb_proc_cleanup(p);
         VKB_INFO("client process %d gone", p->pid);
+        vkb_report_gone(p);
         pthread_mutex_destroy(&p->olock);
         pthread_cond_destroy(&p->ocond);
         free(p);
@@ -303,6 +305,7 @@ void vkb_sv_vkbHello(vkb_srv_call *c)
                 snprintf(pr->comm, sizeof(pr->comm), "%.*s", at ? (int)(at - comm) : (int)strlen(comm), comm);
                 if (at && at[1]) snprintf(pr->pkey, sizeof(pr->pkey), "%s", at + 1);
             }
+            vkb_report_hello(c->conn->proc);
         }
     }
     vkb_enc_u32(&c->r, 1);

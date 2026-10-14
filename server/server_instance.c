@@ -192,6 +192,7 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
             inst = VK_NULL_HANDLE;
         } else {
+            vkb_report_instance(t, ci);
             VKB_INFO("instance %u created (app \"%s\", engine \"%s\", Vulkan %u.%u)", id,
                      ci->pApplicationInfo && ci->pApplicationInfo->pApplicationName ? ci->pApplicationInfo->pApplicationName : "",
                      ci->pApplicationInfo && ci->pApplicationInfo->pEngineName ? ci->pApplicationInfo->pEngineName : "",
@@ -282,6 +283,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     VkExtensionProperties *avail = vkb_dec_alloc(&c->d, (avail_n ? avail_n : 1) * sizeof(*avail));
     inst->real.vkEnumerateDeviceExtensionProperties(pd, NULL, &avail_n, avail);
     uint32_t extra_n = 0;
+    char not_passed[600] = "";
     const char *const *extra = vkb_mem_required_extensions(strategy, &extra_n);
     const char **exts = vkb_dec_alloc(&c->d, (ci->enabledExtensionCount + extra_n + 12) * sizeof(char *));
     uint32_t n = 0;
@@ -300,6 +302,8 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
                 continue;
             }
             VKB_DBG("device extension %s is emulated or client-side; not passed to the driver", e);
+            size_t nl = strlen(not_passed);
+            if (nl + strlen(e) + 2 < sizeof(not_passed)) snprintf(not_passed + nl, sizeof(not_passed) - nl, "%s%s", nl ? " " : "", e);
             continue;
         }
         if (!list_has(exts, n, e)) exts[n++] = e;
@@ -396,6 +400,16 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     ci->enabledLayerCount = 0;
     ci->ppEnabledLayerNames = NULL;
 
+    /* features the client enabled that the GPU lacks (the emulated ones), for the session report */
+    char dropped[400] = "";
+    {
+        VkPhysicalDeviceFeatures have;
+        inst->real.vkGetPhysicalDeviceFeatures(pd, &have);
+        const VkPhysicalDeviceFeatures *want = ci->pEnabledFeatures;
+        for (const VkBaseInStructure *b = ci->pNext; b && !want; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) want = &((const VkPhysicalDeviceFeatures2 *)b)->features;
+        if (want) vkb_report_features(want, &have, dropped, sizeof(dropped));
+    }
     vkb_emu_device_create_info(inst, pd, emu, ci, c->d.arena);
 
     {
@@ -453,6 +467,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_gprof_device_init(t); /* wraps what the client's calls reach, emulations included */
             vkb_bvmap_device_init(t); /* last: client-named buffer views are driver views beneath */
             vkb_wait_device_init(t);  /* waits the driver fails with a stray error (server_wait.c) */
+            vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);
             VKB_INFO("device %u created on %s (%u extensions, memory sharing %s)", id, k ? k->name : "?", n,
                      vkb_mem_strategy_name(strategy));
@@ -463,6 +478,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         VKB_ERR("vkCreateDevice failed: %d (%u extensions)", r, n);
         for (uint32_t i = 0; i < n; i++) VKB_ERR("  requested %s", exts[i]);
     }
+    vkb_report_device(inst, ci, r, dropped, not_passed);
     vkb_enc_u32(&c->r, (uint32_t)r);
     vkb_enc_u64(&c->r, (uint64_t)(uintptr_t)dev);
     vkb_enc_u32(&c->r, id);
@@ -488,6 +504,7 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_emu_device_destroy(t);
     vkb_hang_device_destroy(t);
     vkb_guard_device_destroy(t);
+    vkb_report_device_destroy(t);
     vkb_mem_free_all(t);
     t->real.vkDestroyDevice(dev, NULL);
     VKB_INFO("device %u destroyed", t->id);

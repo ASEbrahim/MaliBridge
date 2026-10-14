@@ -907,6 +907,7 @@ static int dump_on(void)
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
     const VkPresentRegionsKHR *regions = NULL;
+    vkb_frames_present(); /* for the server's session report (frames.c) */
     for (const VkBaseInStructure *b = pPresentInfo->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR) regions = (const void *)b;
     VkResult worst = VK_SUCCESS;

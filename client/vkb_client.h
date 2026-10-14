@@ -210,5 +210,6 @@ int vkb_is_client_device_ext(const char *n);
 
 /* misc */
 int vkb_memfd(const char *name, size_t size);
+void vkb_frames_present(void); /* frames.c: frame statistics for the server's session report */
 
 #endif

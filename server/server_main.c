@@ -63,6 +63,7 @@ void vkb_log(int level, const char *fmt, ...)
             ts.tv_nsec / 1000000, tags[level & 3], msg);
     fflush(f);
     pthread_mutex_unlock(&log_lock);
+    vkb_report_log(level, fmt, msg); /* errors and warnings by call site, for the session report */
 #ifdef __ANDROID__
     static const int prio[] = {ANDROID_LOG_ERROR, ANDROID_LOG_WARN, ANDROID_LOG_INFO, ANDROID_LOG_DEBUG};
     __android_log_write(prio[level & 3], "vkbridge", msg);
@@ -185,6 +186,7 @@ static void open_log(const char *path)
     log_file = f;
     pthread_mutex_unlock(&log_lock);
     if (old) fclose(old);
+    vkb_report_session(path); /* the report goes beside the log */
 }
 
 /* Loads the Vulkan loader and runs the self-test; 0 when there is nothing to serve. */

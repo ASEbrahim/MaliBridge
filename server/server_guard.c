@@ -902,9 +902,8 @@ static int is_lut_pipeline(const VkGraphicsPipelineCreateInfo *info, const uint6
     return 0;
 }
 
-static VkResult VKAPI_CALL gd_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
-                                                     const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *a,
-                                                     VkPipeline *out)
+static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *infos,
+                            const VkAllocationCallbacks *a, VkPipeline *out)
 {
     vkb_guard *g = find(device);
     if (!g) return VK_ERROR_INITIALIZATION_FAILED;
@@ -1028,9 +1027,8 @@ static VkResult compute_relaxed(vkb_guard *g, VkDevice device, VkPipelineCache c
     return r;
 }
 
-static VkResult VKAPI_CALL gd_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
-                                                    const VkComputePipelineCreateInfo *infos, const VkAllocationCallbacks *a,
-                                                    VkPipeline *out)
+static VkResult compute_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *infos,
+                                const VkAllocationCallbacks *a, VkPipeline *out)
 {
     vkb_guard *g = find(device);
     if (!g) return VK_ERROR_INITIALIZATION_FAILED;
@@ -1125,6 +1123,50 @@ static VkResult VKAPI_CALL gd_CreateShaderModule(VkDevice device, const VkShader
     tls_arm = arm.prev;
     watch_end(w);
     if (r == VK_SUCCESS && out) mod_remember(*out, ci);
+    return r;
+}
+
+/* Every pipeline creation timed for the session report (server_report.c); the slow ones with their
+ * stages' hashes. */
+static void account(VkDevice device, int compute, uint32_t n, const void *infos, double t0, VkResult r)
+{
+    double ms = (mono_s() - t0) * 1000.0;
+    vkb_guard *g = find(device);
+    char st[400];
+    st[0] = 0;
+    if (ms >= 2000.0 && n) {
+        uint64_t h[STAGES_MAX], key[STAGES_MAX];
+        uint32_t stg[STAGES_MAX], nh;
+        if (compute) {
+            const VkComputePipelineCreateInfo *ci = infos;
+            h[0] = stage_hash(&ci->stage, &key[0]);
+            stg[0] = ci->stage.stage;
+            nh = 1;
+        } else {
+            nh = gfx_hashes(infos, n, h, stg, key);
+        }
+        stages_text(h, stg, nh, st, sizeof(st));
+    }
+    vkb_report_compile(g ? g->t : NULL, compute, n, ms, r, st);
+}
+
+static VkResult VKAPI_CALL gd_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
+                                                     const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *a,
+                                                     VkPipeline *out)
+{
+    double t0 = mono_s();
+    VkResult r = gfx_guarded(device, cache, n, infos, a, out);
+    account(device, 0, n, infos, t0, r);
+    return r;
+}
+
+static VkResult VKAPI_CALL gd_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
+                                                    const VkComputePipelineCreateInfo *infos, const VkAllocationCallbacks *a,
+                                                    VkPipeline *out)
+{
+    double t0 = mono_s();
+    VkResult r = compute_guarded(device, cache, n, infos, a, out);
+    account(device, 1, n, infos, t0, r);
     return r;
 }
 

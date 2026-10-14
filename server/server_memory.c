@@ -232,6 +232,21 @@ void vkb_memstat_buffer(int64_t bytes)
     pthread_mutex_unlock(&st.lock);
 }
 
+/* For the session report: one process's tracked memory, and the process-wide image totals. */
+void vkb_memstat_query(int pid, int64_t *pid_bytes, int64_t *total, int64_t *images, int64_t *bc_images, int64_t *bc_src)
+{
+    pthread_mutex_lock(&st.lock);
+    *pid_bytes = 0;
+    for (int i = 0; i < ST_PIDS; i++)
+        if (st.pid[i].pid == pid) *pid_bytes = st.pid[i].bytes;
+    *total = 0;
+    for (int i = 0; i < CLS_N; i++) *total += st.cls[i].bytes;
+    *images = st.img.bytes;
+    *bc_images = st.img_bc.bytes;
+    *bc_src = st.img_bc_src.bytes;
+    pthread_mutex_unlock(&st.lock);
+}
+
 #define MB(x) ((long long)((x) >> 20))
 
 static long status_kb(const char *buf, const char *key)
