@@ -34,21 +34,25 @@
  * the game's thread waited for the reply for ever (UE "RenderThread timed out after 120 s"), and
  * no GPU work was involved. A watchdog thread now looks at every guarded call: one running past
  * VKBRIDGE_COMPILE_WARN_S (5) is logged with its stages' SPIR-V hashes (and the SPIR-V saved to
- * <cache dir>/stuck-spirv/), and one running past VKBRIDGE_COMPILE_TIMEOUT_S (20; 0 = only log)
+ * <cache dir>/stuck-spirv/), and one running past VKBRIDGE_COMPILE_TIMEOUT_S (10; 0 = only log)
  * is interrupted with a signal that jumps out of the driver as a contained crash does. Unreal
  * Engine takes a failed pipeline as fatal ("Fatal error!"), and a game that survives it draws
- * black, so the pipeline is then rebuilt with a fallback, cheapest change to the picture first:
- *   1 a layer-only pass-through geometry stage folded into the vertex shader (spirv_gsfold.c) -
- *     every stuck Stray pipeline had one (UE4's WriteToSliceGS), the picture stays right;
- *   2 SPV_KHR_float_controls2 stripped from every stage (DXVK emits it only where the driver has
- *     VK_KHR_shader_float_controls2, which the G925 has and the G720 had not);
- *   3 the fragment stage replaced by a constant-colour stand-in (the draws are wrong, the game
- *     goes on);
- * each under the same watchdog; if none builds, the call fails. What worked is remembered in
- * <cache dir>/stuck-pipelines (keyed by the stages' SPIR-V, entry points and specialization;
- * " m=<fallback>") and used at once from then on, in later runs too (delete the file to retry).
- * VKBRIDGE_LAYER_GS_FOLD=1 applies fallback 1 to every foldable pipeline up front. The same
- * caveat as for crashes applies: a lock the driver held while it spun stays held.
+ * black, so the pipeline is then rebuilt with a fallback, each under the same watchdog:
+ *   - UE4's colour-grading LUT fragment shader (CombineLUTs; spirv_gsfold.c recognizes it) is
+ *     replaced by a neutral LUT (server/shaders/ue4_lut_standin.frag): no grading, a generic
+ *     filmic curve, the picture keeps its content. On the G925 this shader itself was the
+ *     trigger (Stray, 2026-10-14): the geometry fold and float_controls2 stripping each timed out
+ *     too, and a constant colour whited the screen out;
+ *   - otherwise the fragment stage becomes a constant-colour stand-in (last resort);
+ *   - opt-in, before those (VKBRIDGE_COMPILE_FALLBACKS=gsfold,fc2): a layer-only pass-through
+ *     geometry stage folded into the vertex shader (spirv_gsfold.c), and SPV_KHR_float_controls2
+ *     stripped from every stage;
+ * if none builds, the call fails. What worked is remembered in <cache dir>/stuck-pipelines (keyed
+ * by the stages' SPIR-V, entry points and specialization; " m=<fallback> v=<list version>") and
+ * used at once from then on, in later runs too; a line from an older fallback list is tried again
+ * (delete the file to retry everything). VKBRIDGE_LAYER_GS_FOLD=1 folds every foldable geometry
+ * stage up front. The same caveat as for crashes applies: a lock the driver held while it spun
+ * stays held.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -230,16 +234,20 @@ static size_t code_bytes;
 
 static pthread_mutex_t watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static watch_slot slots[WATCH_SLOTS];
-static double warn_s = 5, timeout_s = 20;
+static double warn_s = 5, timeout_s = 10; /* the G925's normal compiles of Stray's shaders took < 2 s */
 static int watch_started, timeout_sig;
 static mod_hash mods[MOD_BUCKETS];
 static uint64_t stuck[STUCK_MAX][STAGES_MAX];
 static uint32_t stuck_n[STUCK_MAX], nstuck;
 static int stuck_mode[STUCK_MAX]; /* FB_*: what this pipeline gets instead */
 
-enum { FB_FAIL = 0, FB_RELAXED = 1, FB_STANDIN = 2, FB_NOGS = 3, FB_COUNT };
-static const char *const fb_names[] = {"fails", "float_controls2 stripped", "stand-in fragment shader",
-                                       "pass-through geometry stage folded into the vertex shader"};
+enum { FB_FAIL = 0, FB_RELAXED = 1, FB_STANDIN = 2, FB_NOGS = 3, FB_LUT = 4, FB_COUNT };
+static const char *const fb_names[] = {"fails", "float_controls2 stripped", "constant-colour stand-in fragment shader",
+                                       "pass-through geometry stage folded into the vertex shader",
+                                       "neutral colour-grading LUT stand-in (UE4 CombineLUTs)"};
+/* stuck-pipelines lines carry the version of the fallback list that chose them: a line from an
+ * older list is tried again (2117ebc's constant colour whited out Stray's picture). */
+#define STUCK_VERSION 3
 
 static double mono_s(void)
 {
@@ -436,7 +444,7 @@ static void add_stuck(const uint64_t *key, uint32_t n, int mode, const char *not
     FILE *f = fopen(path, "a");
     if (f) {
         for (uint32_t i = 0; i < n; i++) fprintf(f, "%sk-%016llx", i ? "," : "", (unsigned long long)key[i]);
-        fprintf(f, " m=%d # %s: %s\n", mode, fb_names[mode], note);
+        fprintf(f, " m=%d v=%d # %s: %s\n", mode, STUCK_VERSION, fb_names[mode], note);
         fclose(f);
     }
 }
@@ -452,8 +460,8 @@ static void load_stuck(void)
     while (fgets(line, sizeof(line), f)) {
         char *hash = strchr(line, '#');
         if (hash) *hash = 0;
-        char *m = strstr(line, "m=");
-        if (!m) continue; /* written before the fallbacks existed (cb567cc): tried again */
+        char *m = strstr(line, "m="), *ver = strstr(line, "v=");
+        if (!m || !ver || atoi(ver + 2) < STUCK_VERSION) continue; /* an older fallback list chose it: tried again */
         int mode = atoi(m + 2);
         *m = 0;
         if (mode < FB_FAIL || mode >= FB_COUNT) mode = FB_FAIL;
@@ -539,6 +547,11 @@ static const uint32_t standin_fs[] = {
     0x0000000a, 0x0000000a, 0x0000000a, 0x0000000b, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
     0x00000005, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd, 0x00010038};
 
+/* server/shaders/ue4_lut_standin.frag (glslc -O --target-env=vulkan1.0) */
+static const uint32_t lut_standin_fs[] = {
+#include "ue4_lut_standin.inc"
+};
+
 typedef struct fb_build {
     VkPipelineShaderStageCreateInfo st[STAGES_MAX];
     VkShaderModule tmp[STAGES_MAX];
@@ -612,6 +625,22 @@ static int fb_stages(vkb_guard *g, VkDevice device, const VkPipelineShaderStageC
     }
     for (uint32_t i = 0; i < n; i++) {
         b->st[i] = st[i];
+        if (mode == FB_LUT && st[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+            size_t size = 0;
+            int own = 0;
+            uint32_t *code = stage_code(&st[i], h[i], &size, &own);
+            int lut = code && vkb_fs_is_ue4_lut(code, size);
+            if (own) free(code);
+            if (!lut) break;
+            VkShaderModule m = fb_module(g, device, b, lut_standin_fs, sizeof(lut_standin_fs));
+            if (!m) break;
+            b->st[i].module = m;
+            b->st[i].pNext = NULL;
+            b->st[i].pName = "main";
+            b->st[i].pSpecializationInfo = NULL;
+            changed = 1;
+            continue;
+        }
         if (mode == FB_STANDIN && st[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
             VkShaderModule m = fb_module(g, device, b, standin_fs, sizeof(standin_fs));
             if (!m) break;
@@ -894,13 +923,22 @@ static VkResult VKAPI_CALL gd_CreateGraphicsPipelines(VkDevice device, VkPipelin
     }
     r = armed_gfx(g, device, cache, n, infos, a, out, h, stg, nh, &timed);
     if (!timed) return r;
-    /* The driver never finished: the fallbacks, cheapest change to the picture first. */
-    static const int order[] = {FB_NOGS, FB_RELAXED, FB_STANDIN};
-    for (size_t k = 0; n == 1 && k < sizeof(order) / sizeof(order[0]); k++) {
+    /* The driver never finished: the fallbacks. By default only fragment-level ones - on the G925
+     * the geometry fold and float_controls2 stripping did not help (each costs a timeout) - the
+     * best picture first; VKBRIDGE_COMPILE_FALLBACKS=gsfold,fc2 tries those before them. */
+    int order[6], norder = 0;
+    const char *extra = vkb_srv_env("VKBRIDGE_COMPILE_FALLBACKS");
+    if (extra && strstr(extra, "gsfold")) order[norder++] = FB_NOGS;
+    if (extra && strstr(extra, "fc2")) order[norder++] = FB_RELAXED;
+    order[norder++] = FB_LUT;
+    order[norder++] = FB_STANDIN;
+    for (int k = 0; n == 1 && k < norder; k++) {
         r = try_fallback(g, device, cache, infos, a, out, h, stg, nh, order[k], &timed);
         if (r == VK_SUCCESS) {
             VKB_ERR("  the pipeline was built with its fallback: %s%s", fb_names[order[k]],
-                    order[k] == FB_STANDIN ? " (its draws are wrong; the game goes on)" : "");
+                    order[k] == FB_STANDIN ? " (its draws are wrong; the game goes on)"
+                    : order[k] == FB_LUT    ? " (no colour grading; the picture keeps its content)"
+                                            : "");
             remember("vkCreateGraphicsPipelines", h, key, stg, nh, order[k]);
             return r;
         }

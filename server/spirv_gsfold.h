@@ -15,4 +15,10 @@ int vkb_gs_layer_passthrough(const uint32_t *code, size_t size, uint32_t *layer_
  * *out_size bytes), or NULL when the output is not a lone 32-bit integer. */
 uint32_t *vkb_vs_write_layer(const uint32_t *code, size_t size, uint32_t location, size_t *out_size);
 
+
+
+/* Unreal Engine 4's colour-grading LUT fragment shader (CombineLUTs): reads Layer and a vec2 at
+ * location 0, writes location 0, and decodes UE4's log encoding (444/1023, 14). It may sample
+ * user LUT textures (blended in); the neutral stand-in ignores them. */
+int vkb_fs_is_ue4_lut(const uint32_t *code, size_t size);
 #endif

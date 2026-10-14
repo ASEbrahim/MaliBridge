@@ -11,12 +11,17 @@
  * VKBRIDGE_TEST_CRASH_PIPELINE=spin spins in that compile; the compile watchdog must then build
  * the pipeline without the geometry stage (its first fallback) and the picture must still be right.
  *
+ * --lut: the fragment stage is UE4's colour-grading LUT shape (shaders/gsfold/lut.frag) and carries
+ * the marker: the server's compile watchdog must replace it with its neutral LUT stand-in, and
+ * the drawn texel must be that stand-in's value (no grading) - not this shader's red tint.
+ *
  * Shaders: tests/shaders/gsfold/ (glslc -O --target-env=vulkan1.2 -mfmt=num -> gsfold_*.inc).
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 #include <dlfcn.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +31,9 @@ static const uint32_t vert_spv[] = {
 };
 static const uint32_t geom_spv[] = {
 #include "gsfold_geom.inc"
+};
+static const uint32_t lut_spv[] = {
+#include "gsfold_lut.inc"
 };
 static const uint32_t frag_spv[] = {
 #include "gsfold_frag.inc"
@@ -58,7 +66,7 @@ static const VkSpecializationInfo marker = {1, &marker_entry, 4, &marker_value};
 
 int main(int argc, char **argv)
 {
-    int mark = argc > 1 && !strcmp(argv[1], "--mark");
+    int mark = argc > 1 && !strcmp(argv[1], "--mark"), lut = argc > 1 && !strcmp(argv[1], "--lut");
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) return printf("FAIL loader\n"), 2;
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
@@ -139,8 +147,8 @@ int main(int argc, char **argv)
     vkCreateFramebuffer(dev, &fci, NULL, &fb);
 
     VkShaderModule mods[3];
-    const uint32_t *codes[3] = {vert_spv, geom_spv, frag_spv};
-    size_t sizes[3] = {sizeof(vert_spv), sizeof(geom_spv), sizeof(frag_spv)};
+    const uint32_t *codes[3] = {vert_spv, geom_spv, lut ? lut_spv : frag_spv};
+    size_t sizes[3] = {sizeof(vert_spv), sizeof(geom_spv), lut ? sizeof(lut_spv) : sizeof(frag_spv)};
     for (int i = 0; i < 3; i++) {
         VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizes[i], codes[i]};
         vkCreateShaderModule(dev, &smci, NULL, &mods[i]);
@@ -152,7 +160,7 @@ int main(int argc, char **argv)
     VkPipelineShaderStageCreateInfo st[3] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, mods[0], "main", NULL},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, mods[1], "main", mark ? &marker : NULL},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, mods[2], "main", NULL}};
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, mods[2], "main", lut ? &marker : NULL}};
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
@@ -212,6 +220,18 @@ int main(int argc, char **argv)
         for (int layer = 0; layer < 2; layer++) {
             const uint8_t *p = px + (size_t)layer * W * H * 4 + ((H / 4) * W + W / 4) * 4; /* inside the triangle */
             int drawn = p[0] > 50 && p[0] < 80 && p[1] > 115 && p[1] < 140 && p[2] > 180 && p[2] < 200;
+            if (lut) {
+                /* the bridge's neutral LUT stand-in (server/shaders/ue4_lut_standin.frag) at this texel */
+                float uv = (W / 4 + 0.5f) / W, n[3] = {(uv - 0.5f / 32) * (32.0f / 31), (uv - 0.5f / 32) * (32.0f / 31), slice / 31.0f};
+                int good = 1;
+                for (int c = 0; c < 3; c++) {
+                    float l = fmaxf(exp2f((n[c] - 0.434017599f) * 14.0f) * 0.18f - 0.00266771927f, 0.0f);
+                    float t = fminf(fmaxf(l * (2.51f * l + 0.03f) / (l * (2.43f * l + 0.59f) + 0.14f), 0.0f), 1.0f);
+                    float e = (t < 0.0031308f ? t * 12.92f : 1.055f * powf(t, 1.0f / 2.4f) - 0.055f) / 1.05f;
+                    good &= abs((int)p[c] - (int)lrintf(e * 255.0f)) <= 2;
+                }
+                drawn = layer == slice ? good : (p[0] | p[1] | p[2]) != 0;
+            }
             int want = layer == slice;
             printf("%s slice %d: layer %d %s (pixel %u %u %u %u)\n", drawn == want ? "PASS" : "FAIL", slice, layer,
                    drawn ? "drawn" : "empty", p[0], p[1], p[2], p[3]);

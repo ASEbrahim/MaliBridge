@@ -248,3 +248,25 @@ uint32_t *vkb_vs_write_layer(const uint32_t *code, size_t size, uint32_t locatio
     spv_free(&m);
     return out;
 }
+
+int vkb_fs_is_ue4_lut(const uint32_t *code, size_t size)
+{
+    spv_mod m;
+    if (spv_parse(&m, code, size) != 0) return 0;
+    int ok = spv_execution_model(&m) == SpvExecutionModelFragment;
+    int layer = 0, grey = 0, range = 0;
+    uint32_t f32 = 0;
+    for (uint32_t i = 0; ok && i < m.count; i++) {
+        const spv_inst *in = &m.ins[i];
+        if (in->op == SpvOpTypeFloat && in->n >= 3 && in->w[1] == 32) f32 = in->w[0];
+        if (in->op == SpvOpDecorate && in->n >= 4 && in->w[1] == SpvDecorationBuiltIn && in->w[2] == BI_LAYER) layer = 1;
+        if (in->op == SpvOpConstant && in->n == 4 && f32 && in->w[0] == f32) {
+            float v;
+            memcpy(&v, &in->w[2], 4);
+            if (v > 0.4340170f && v < 0.4340180f) grey = 1; /* 444 / 1023 */
+            if (v == 14.0f) range = 1;
+        }
+    }
+    spv_free(&m);
+    return ok && layer && grey && range;
+}

@@ -5,7 +5,8 @@
 # VKBRIDGE_COMPILE_TIMEOUT_S and rebuilt with a fallback:
 #   spin     the marked stage spins whatever is done to it: a marked vertex stage fails after the
 #            fallbacks are tried, a marked fragment stage gets the stand-in fragment shader;
-#   spinfc2  the marked stage compiles once float_controls2 is stripped (forced in this test).
+#   spinfc2  the marked stage compiles once float_controls2 is stripped (forced in this test;
+#            that fallback is opt-in: VKBRIDGE_COMPILE_FALLBACKS=fc2).
 # Also: remembered (asked again: the same outcome at once), the stuck-pipelines file and the saved
 # SPIR-V. Prints "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
@@ -15,7 +16,7 @@ run() {
   local mode=$1 work sock srv r
   work=$(mktemp -d)
   sock=${XDG_RUNTIME_DIR:-/tmp}/vkbridge-spin-$$.sock
-  VKBRIDGE_TEST_CRASH_PIPELINE=$mode VKBRIDGE_COMPILE_WARN_S=1 VKBRIDGE_COMPILE_TIMEOUT_S=3 \
+  VKBRIDGE_COMPILE_FALLBACKS=$([ "$mode" = spinfc2 ] && echo fc2) VKBRIDGE_TEST_CRASH_PIPELINE=$mode VKBRIDGE_COMPILE_WARN_S=1 VKBRIDGE_COMPILE_TIMEOUT_S=3 \
     VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
     "$out/vkbridge-server" --socket "$sock" --log "$work/server.log" --cache-dir "$work/c" >/dev/null 2>&1 &
   srv=$!

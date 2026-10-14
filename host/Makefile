@@ -20,7 +20,7 @@ TESTS := vkbridge-smoke bcn_check opaque_check dmabuf_image_check recycle_check 
 
 all: $(OUT)/vkbridge-server $(OUT)/libvulkan_droidbridge.so $(OUT)/vkbridge_icd.json $(addprefix $(OUT)/,$(TESTS))
 
-$(OUT)/vkbridge-server: $(SERVER_SRC) $(wildcard $(SRV)/*.h $(VKB)/common/*.h $(VKB)/common/gen/*.h)
+$(OUT)/vkbridge-server: $(SERVER_SRC) $(wildcard $(SRV)/*.h $(SRV)/*.inc $(VKB)/common/*.h $(VKB)/common/gen/*.h)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(SAN) $(WARN) $(INC) -I$(SRV) -o $@ $(SERVER_SRC) -ldl -lpthread -lm -rdynamic
 
@@ -48,7 +48,7 @@ $(OUT)/bcn_check: $(VKB)/server/bc_spv.h
 
 $(OUT)/divisor_check: $(VKB)/tests/divisor_vert.inc $(VKB)/tests/divisor_frag.inc
 
-$(OUT)/gsfold_check: $(VKB)/tests/gsfold_vert.inc $(VKB)/tests/gsfold_geom.inc $(VKB)/tests/gsfold_frag.inc
+$(OUT)/gsfold_check: $(VKB)/tests/gsfold_vert.inc $(VKB)/tests/gsfold_geom.inc $(VKB)/tests/gsfold_frag.inc $(VKB)/tests/gsfold_lut.inc
 
 $(OUT)/flicker_check: $(VKB)/tests/flicker_check.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
