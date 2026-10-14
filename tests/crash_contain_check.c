@@ -316,8 +316,49 @@ static int alive(void)
     return vkCreateFence(dev, &fci, NULL, &f) == VK_SUCCESS && vkGetFenceStatus(dev, f) == VK_SUCCESS;
 }
 
-int main(void)
+#include <time.h>
+static double secs(void)
 {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* --spin: the server runs with VKBRIDGE_TEST_CRASH_PIPELINE=spin and a short
+ * VKBRIDGE_COMPILE_TIMEOUT_S: marked pipelines spin in the guarded call (the Mali-G925's compiler
+ * did, for ever) and the compile watchdog interrupts them. */
+static int spin_mode(void)
+{
+    VkPipeline pipe;
+    double t0 = secs();
+    VkResult r = graphics_pipeline(1, &pipe);
+    double el = secs() - t0;
+    char d[96];
+    snprintf(d, sizeof(d), "%.1f s", el);
+    expect_contained(r, pipe, "spin: a never-ending graphics compile is interrupted and fails");
+    check(el < 60, "spin: ... within the timeout", d);
+    check(alive(), "spin: connection alive after the interrupted compile", "");
+    r = graphics_pipeline(0, &pipe);
+    check(r == VK_SUCCESS && draw_ok(pipe), "spin: normal pipeline draws afterwards", r ? "creation failed" : "");
+    t0 = secs();
+    r = graphics_pipeline(1, &pipe);
+    el = secs() - t0;
+    snprintf(d, sizeof(d), "%.2f s", el);
+    expect_contained(r, pipe, "spin: the same pipeline again fails");
+    check(el < 1.0, "spin: ... at once (remembered as stuck)", d);
+    r = compute_pipeline(1, &pipe);
+    expect_contained(r, pipe, "spin: a never-ending compute compile is interrupted");
+    r = compute_pipeline(0, &pipe);
+    check(r == VK_SUCCESS && dispatch_ok(pipe), "spin: no poisoning: compute still dispatches", r ? "creation failed" : "");
+    vkDestroyDevice(dev, NULL);
+    vkDestroyInstance(inst, NULL);
+    printf("%s: %d of %d checks passed\n", failures ? "FAILED" : "OK", checks - failures, checks);
+    return failures ? 1 : 0;
+}
+
+int main(int argc, char **argv)
+{
+    int spin = argc > 1 && !strcmp(argv[1], "--spin");
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
         printf("FAIL loader: %s\n", dlerror());
@@ -358,6 +399,7 @@ int main(void)
         printf("FAIL device A\n");
         return 1;
     }
+    if (spin) return spin_mode();
     VkPipeline pipe;
     VkResult r = graphics_pipeline(1, &pipe);
     expect_contained(r, pipe, "A: faulting graphics pipeline fails, not the connection");

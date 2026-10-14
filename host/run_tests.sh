@@ -88,6 +88,8 @@ run_mode() {
   # older Mali's feature set, both from <cache dir>/env (a server of its own; once)
   if [ "$mode" = plain ]; then
     timeout 300 ./wait_imitate_test.sh >out/t-wait.log 2>&1; result $? "wait_imitate_test ($(tail -1 out/t-wait.log))"
+    # A pipeline compile that never ends (the G925's compiler on Stray): interrupted, the call fails
+    timeout 180 ./compile_watchdog_test.sh >out/t-spin.log 2>&1; result $? "compile_watchdog_test ($(tail -1 out/t-spin.log))"
   fi
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
