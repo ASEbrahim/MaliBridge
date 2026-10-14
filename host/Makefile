@@ -5,9 +5,11 @@
 #   make -C host test       run the regression suite (run_tests.sh)
 VKB := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))..)
 SRV := $(VKB)/server
-OUT ?= $(VKB)/host/out
+#   make -C host TSAN=1     the same with ThreadSanitizer, into host/out-tsan (OUT= to move it)
+OUT ?= $(VKB)/host/out$(if $(TSAN),-tsan)
 CC ?= gcc
 CFLAGS ?= -O1 -g
+SAN := $(if $(TSAN),-fsanitize=thread -g)
 WARN := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-sign-compare
 INC := -I$(VKB)/third_party/Vulkan-Headers-1.4.341/include -I$(VKB)/common -I$(VKB)/common/gen
 COMMON_SRC := $(VKB)/common/vkb_wire.c $(VKB)/common/gen/vkb_gen_structs.c
@@ -20,11 +22,11 @@ all: $(OUT)/vkbridge-server $(OUT)/libvulkan_droidbridge.so $(OUT)/vkbridge_icd.
 
 $(OUT)/vkbridge-server: $(SERVER_SRC) $(wildcard $(SRV)/*.h $(VKB)/common/*.h $(VKB)/common/gen/*.h)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) $(WARN) $(INC) -I$(SRV) -o $@ $(SERVER_SRC) -ldl -lpthread -lm -rdynamic
+	$(CC) $(CFLAGS) $(SAN) $(WARN) $(INC) -I$(SRV) -o $@ $(SERVER_SRC) -ldl -lpthread -lm -rdynamic
 
 $(OUT)/libvulkan_droidbridge.so: $(CLIENT_SRC) $(wildcard $(VKB)/client/*.h $(VKB)/common/*.h $(VKB)/common/gen/*.h)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) $(WARN) -fPIC -shared -Wl,-z,nodelete -fvisibility=hidden -DVKB_CLIENT $(INC) -I$(VKB)/client -I$(VKB)/client/compat \
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -fPIC -shared -Wl,-z,nodelete -fvisibility=hidden -DVKB_CLIENT $(INC) -I$(VKB)/client -I$(VKB)/client/compat \
 		-o $@ $(CLIENT_SRC) -ldl -lpthread -Wl,--no-undefined
 
 $(OUT)/vkbridge_icd.json:
@@ -34,19 +36,19 @@ $(OUT)/vkbridge_icd.json:
 # The test programs load whatever Vulkan driver VK_DRIVER_FILES names (the bridge or a native one).
 $(OUT)/vkbridge-smoke: $(VKB)/tests/smoke.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl
+	$(CC) $(CFLAGS) $(SAN) -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl
 
 # Unsigned char as on the AArch64 guest the checks also run on: x86's signed char hid bcdec's
 # plain-char sign extension of BC4/BC5 SNORM endpoints, which failed bcn_check on the tablet.
 $(OUT)/%_check: $(VKB)/tests/%_check.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -funsigned-char -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm
+	$(CC) $(CFLAGS) $(SAN) -funsigned-char -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm
 
 $(OUT)/bcn_check: $(VKB)/server/bc_spv.h
 
 $(OUT)/flicker_check: $(VKB)/tests/flicker_check.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -funsigned-char -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm -lpthread
+	$(CC) $(CFLAGS) $(SAN) -funsigned-char -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm -lpthread
 
 test: all
 	$(VKB)/host/run_tests.sh $(OUT)

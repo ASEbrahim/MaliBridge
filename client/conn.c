@@ -297,11 +297,17 @@ static int do_connect(vkb_conn *c)
     }
     c->sock = s;
     /* Hello: protocol check and which process this thread belongs to. */
-    if (!process_token) process_token = make_token();
+    /* Two threads making their first call at once must not each pick a token: the server would
+     * take them for two processes, with separate objects and separate async orders. */
+    uint64_t token = __atomic_load_n(&process_token, __ATOMIC_ACQUIRE);
+    if (!token) {
+        uint64_t mine = make_token();
+        token = __atomic_compare_exchange_n(&process_token, &token, mine, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? mine : token;
+    }
     vkb_enc e;
     vkb_enc_init(&e);
     vkb_enc_u64(&e, VKB_PROTOCOL_HASH);
-    vkb_enc_u64(&e, process_token);
+    vkb_enc_u64(&e, token);
     vkb_enc_u32(&e, (uint32_t)getpid());
     char comm[64] = "?";
     FILE *f = fopen("/proc/self/comm", "re");
