@@ -3,7 +3,8 @@
  * bcn_check: uploads random blocks of every BC format (every BC6H and BC7 mode forced in turn),
  * blits the texture to RGBA32F and compares each texel with bcdec's CPU decode. Then the shapes
  * uploads take: mip chains with partial blocks, array layers in one region, a sub-region upload,
- * vkCmdCopyBufferToImage2, mutable images with sRGB/UNORM views, a BC -> BC image copy, and a
+ * vkCmdCopyBufferToImage2, mutable images with sRGB/UNORM views, a BC -> BC image copy, copies into
+ * BC images from uncompressed ones holding the blocks (R32G32B32A32_UINT / R32G32_UINT), and a
  * 4096x4096 BC7 array larger than the bridge's per-command-buffer decode scratch. Run it natively
  * (the GPU's own BC decoder) and through the bridge with BC emulated.
  *
@@ -64,7 +65,7 @@ F(vkQueueWaitIdle); F(vkCreateBuffer); F(vkGetBufferMemoryRequirements); F(vkAll
 F(vkMapMemory); F(vkCreateImage); F(vkGetImageMemoryRequirements); F(vkBindImageMemory); F(vkCmdPipelineBarrier);
 F(vkCmdCopyBufferToImage); F(vkCmdBlitImage); F(vkCmdCopyImageToBuffer); F(vkDestroyImage); F(vkDestroyBuffer);
 F(vkFreeMemory); F(vkGetPhysicalDeviceProperties); F(vkCreateImageView); F(vkDestroyImageView); F(vkCmdCopyImage);
-F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCreateShaderModule); F(vkDestroyShaderModule);
+F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCmdCopyImage2); F(vkCreateShaderModule); F(vkDestroyShaderModule);
 F(vkCreateDescriptorSetLayout); F(vkCreatePipelineLayout); F(vkCreateComputePipelines); F(vkCreateDescriptorPool);
 F(vkAllocateDescriptorSets); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
 F(vkCmdDispatch);
@@ -1808,6 +1809,102 @@ static void test_hdr_shader(void)
     }
 }
 
+/* Blocks uploaded into an uncompressed image of the block's size (`uf`: R32G32_UINT for 8-byte
+ * blocks, R32G32B32A32_UINT for 16-byte ones) and copied from there into a 60x44 BC image, 2 mips x
+ * 2 layers, as D3D11 CopyResource between block-compatible formats does: mip 0 both layers in one
+ * region, mip 1 layer 1 whole (vkCmdCopyImage2 when there is one; 8x6 blocks over a 30x22 level),
+ * and a 3x2-block sub-region over mip 1 layer 0 after its direct upload. Each level is compared
+ * with bcdec (by PSNR when transcoded), as the direct uploads are. */
+static void test_copy_in(VkFormat f, VkFormat uf, const char *name, float tol)
+{
+    enum { W = 60, H = 44, MIPS = 2, LAYERS = 2 };
+    int bytes = block_bytes(f);
+    level lv[MIPS][LAYERS];
+    min_psnr = 99;
+    for (uint32_t m = 0; m < MIPS; m++)
+        for (uint32_t l = 0; l < LAYERS; l++) random_level(f, &lv[m][l], W >> m, H >> m);
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(pd, uf, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+        printf("SKIP %s: no transfers from format %d\n", name, uf);
+        return;
+    }
+    VkDeviceMemory um, im, u0m, u1m;
+    void *upp;
+    VkBuffer up = host_buffer(65536, &um, &upp);
+    memset(upp, 0xcd, 65536);
+    VkImage img = make_image(f, W, H, MIPS, LAYERS, 0, NULL, 0, &im);
+    VkImage u0 = make_image(uf, lv[0][0].bw, lv[0][0].bh, 1, LAYERS, 0, NULL, 0, &u0m);
+    VkImage u1 = make_image(uf, lv[1][1].bw, lv[1][1].bh, 1, 1, 0, NULL, 0, &u1m);
+    if (!img || !u0 || !u1) {
+        printf("FAIL %s: cannot create the images\n", name);
+        failures++;
+        return;
+    }
+    /* buffer: mip 0 layers 0-1 (for u0), mip 1 layer 1 (for u1), mip 1 layer 0 (direct upload) */
+    size_t n0 = (size_t)lv[0][0].bw * lv[0][0].bh * bytes, n1 = (size_t)lv[1][0].bw * lv[1][0].bh * bytes;
+    memcpy(upp, lv[0][0].blocks, n0);
+    memcpy((uint8_t *)upp + n0, lv[0][1].blocks, n0);
+    memcpy((uint8_t *)upp + 2 * n0, lv[1][1].blocks, n1);
+    memcpy((uint8_t *)upp + 2 * n0 + n1, lv[1][0].blocks, n1);
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    barrier_all(cb, u0, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    barrier_all(cb, u1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy r0 = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, {0, 0, 0}, {lv[0][0].bw, lv[0][0].bh, 1}};
+    vkCmdCopyBufferToImage(cb, up, u0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r0);
+    VkBufferImageCopy r1 = {2 * n0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {lv[1][1].bw, lv[1][1].bh, 1}};
+    vkCmdCopyBufferToImage(cb, up, u1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r1);
+    VkBufferImageCopy rd = {2 * n0 + n1, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {0, 0, 0}, {lv[1][0].w, lv[1][0].h, 1}};
+    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rd);
+    barrier_all(cb, u0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier_all(cb, u1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    /* extents count source texels, that is blocks */
+    VkImageCopy c0 = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, {0, 0, 0},
+                      {lv[0][0].bw, lv[0][0].bh, 1}};
+    vkCmdCopyImage(cb, u0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c0);
+    VkImageCopy c1 = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1}, {0, 0, 0},
+                      {lv[1][1].bw, lv[1][1].bh, 1}};
+    if (vkCmdCopyImage2) {
+        VkImageCopy2 c2 = {VK_STRUCTURE_TYPE_IMAGE_COPY_2, NULL, c1.srcSubresource, c1.srcOffset, c1.dstSubresource, c1.dstOffset, c1.extent};
+        VkCopyImageInfo2 ci2 = {VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2, NULL, u1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c2};
+        vkCmdCopyImage2(cb, &ci2);
+    } else {
+        vkCmdCopyImage(cb, u1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c1);
+    }
+    /* blocks (2..4, 1..2) of u1 over the same blocks of mip 1 layer 0 */
+    VkImageCopy cs = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {2, 1, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {8, 4, 0}, {3, 2, 1}};
+    vkCmdCopyImage(cb, u1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cs);
+    for (uint32_t by = 1; by < 3; by++)
+        memcpy(lv[1][0].blocks + ((size_t)by * lv[1][0].bw + 2) * bytes, lv[1][1].blocks + ((size_t)by * lv[1][1].bw + 2) * bytes,
+               (size_t)3 * bytes);
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    int bad = 0;
+    for (uint32_t m = 0; m < MIPS; m++)
+        for (uint32_t l = 0; l < LAYERS; l++) bad += compare_level(img, f, m, l, &lv[m][l], tol, name);
+    if (bad) {
+        printf(tx ? "FAIL %s: %d levels below the PSNR floor\n" : "FAIL %s: %d values differ from bcdec\n", name, bad);
+        failures++;
+    } else {
+        printf("PASS %s: %d mips x %d layers, sub-region%s", name, MIPS, LAYERS, vkCmdCopyImage2 ? " (CopyImage2)" : "");
+        if (transcoded(f)) printf(", PSNR >= %.1f dB", min_psnr);
+        printf("\n");
+    }
+    for (uint32_t m = 0; m < MIPS; m++)
+        for (uint32_t l = 0; l < LAYERS; l++) free(lv[m][l].blocks);
+    vkDestroyImage(dev, img, NULL);
+    vkDestroyImage(dev, u0, NULL);
+    vkDestroyImage(dev, u1, NULL);
+    vkDestroyBuffer(dev, up, NULL);
+    vkFreeMemory(dev, um, NULL);
+    vkFreeMemory(dev, im, NULL);
+    vkFreeMemory(dev, u0m, NULL);
+    vkFreeMemory(dev, u1m, NULL);
+}
+
 /* What the image costs: through the bridge the decoded image's requirements, natively the BC
  * image's. BC5 decodes to RG8 (2 bytes a texel) and BC4 to R8, also when mutable between UNORM
  * and SNORM as DXVK makes every BC5 image; RGBA8 would be twice that. */
@@ -1992,7 +2089,10 @@ int main(int argc, char **argv)
     G(vkBindBufferMemory); G(vkMapMemory); G(vkCreateImage); G(vkGetImageMemoryRequirements); G(vkBindImageMemory);
     G(vkCmdPipelineBarrier); G(vkCmdCopyBufferToImage); G(vkCmdBlitImage); G(vkCmdCopyImageToBuffer); G(vkDestroyImage);
     G(vkDestroyBuffer); G(vkFreeMemory); G(vkCreateImageView); G(vkDestroyImageView); G(vkCmdCopyImage); G(vkFreeCommandBuffers);
-    if (props.apiVersion >= VK_API_VERSION_1_3) G(vkCmdCopyBufferToImage2);
+    if (props.apiVersion >= VK_API_VERSION_1_3) {
+        G(vkCmdCopyBufferToImage2);
+        G(vkCmdCopyImage2);
+    }
     G(vkCreateShaderModule); G(vkDestroyShaderModule); G(vkCreateDescriptorSetLayout); G(vkCreatePipelineLayout);
     G(vkCreateComputePipelines); G(vkCreateDescriptorPool); G(vkAllocateDescriptorSets); G(vkUpdateDescriptorSets);
     G(vkCmdBindPipeline); G(vkCmdBindDescriptorSets); G(vkCmdPushConstants); G(vkCmdDispatch);
@@ -2076,6 +2176,12 @@ int main(int argc, char **argv)
     static const VkFormat bc5_list[] = {VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC5_SNORM_BLOCK};
     test_shapes(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 unorm shapes, mutable with a format list, SNORM view", u8, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                 bc5_list, 2, VK_FORMAT_BC5_SNORM_BLOCK);
+    test_copy_in(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R32G32_UINT, "BC1 RGBA from R32G32_UINT", u8);
+    test_copy_in(VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_R32G32_UINT, "BC4 unorm from R32G32_UINT", u8);
+    test_copy_in(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC3 from R32G32B32A32_UINT", u8);
+    test_copy_in(VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC5 unorm from R32G32B32A32_UINT", u8);
+    test_copy_in(VK_FORMAT_BC6H_UFLOAT_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC6H from R32G32B32A32_UINT", 0.002f);
+    test_copy_in(VK_FORMAT_BC7_SRGB_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC7 sRGB from R32G32B32A32_UINT", u8);
     test_size(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 unorm size (RG8)", 2, 0, NULL, 0);
     test_size(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 unorm mutable size (RG8)", 2, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, bc5_list, 2);
     test_size(VK_FORMAT_BC5_SNORM_BLOCK, "BC5 snorm size (RG8)", 2, 0, NULL, 0);

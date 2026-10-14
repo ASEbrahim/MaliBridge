@@ -20,8 +20,14 @@
  * instead of RGBA16F at 8x its size. Lossy (PSNR in tests/bcn_check.c); VKBRIDGE_BC_TRANSCODE=0
  * decodes as before.
  *
- * Not emulated (logged once): reading a BC image back to a buffer, and copies between BC and
- * uncompressed images (they would need an encoder), or between a transcoded and a decoded image.
+ * A copy into a BC image from a size-compatible uncompressed one (R32G32B32A32_UINT for 16-byte
+ * blocks, R32G32_UINT for 8-byte ones: D3D11 CopyResource between block-compatible formats, vkd3d's
+ * BC aliasing) takes the source's texels as blocks: they are copied to a staging buffer and decoded
+ * (or transcoded) from there like an upload (idea from bcn_layer f3cb7e9, Pipetto-crypto / Lee Gao, MIT).
+ *
+ * Not emulated (logged once): reading a BC image back to a buffer, and copies from a BC image into
+ * an uncompressed one (the image holds decoded or transcoded texels; giving BC blocks back would need
+ * a BC encoder), and copies between a transcoded and a decoded image.
  */
 #define _GNU_SOURCE
 #include "server_emu.h"
@@ -67,6 +73,8 @@ typedef struct bcn_cb {      /* a command buffer's scratch */
     uint32_t n, cap;
     uint32_t cur;            /* the chunk the next slot comes from, `used` bytes into it */
     VkDeviceSize used;
+    chunk *stage;            /* blocks copied out of uncompressed images, apart from the decode scratch */
+    uint32_t nstage, capstage;
 } bcn_cb;
 
 typedef struct bcn_state {
@@ -424,7 +432,8 @@ static int chunk_create(vkb_emu_device *e, VkDeviceSize size, chunk *out)
     const vkb_dispatch *r = &e->dev->real;
     VkDevice d = e->dev->device;
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (r->vkCreateBuffer(d, &bci, NULL, &out->buf) != VK_SUCCESS) return 0;
     VkMemoryRequirements req;
     r->vkGetBufferMemoryRequirements(d, out->buf, &req);
@@ -501,33 +510,39 @@ static int idle_take(VkDeviceSize size)
     return 1;
 }
 
+/* A chunk a command buffer is done with: idle if the budget has room, else destroyed. */
+static void chunk_release(vkb_emu_device *e, chunk *k)
+{
+    bcn_state *s = e->bcn;
+    int keep = 0;
+    if (s && idle_take(k->size)) {
+        pthread_mutex_lock(&s->lock);
+        if (s->nidle == s->capidle) {
+            uint32_t cap = s->capidle ? s->capidle * 2 : 8;
+            chunk *ni = realloc(s->idle, cap * sizeof(*ni));
+            if (ni) {
+                s->idle = ni;
+                s->capidle = cap;
+            }
+        }
+        if (s->nidle < s->capidle) {
+            s->idle[s->nidle++] = *k;
+            keep = 1;
+        }
+        pthread_mutex_unlock(&s->lock);
+        if (!keep) __atomic_sub_fetch(&g_idle, k->size, __ATOMIC_RELAXED);
+    }
+    if (!keep) chunk_destroy(e, k);
+}
+
 void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch)
 {
     bcn_cb *c = cb_scratch;
     if (!c) return;
-    bcn_state *s = e->bcn;
-    for (uint32_t i = 0; i < c->n; i++) {
-        int keep = 0;
-        if (s && idle_take(c->held[i].size)) {
-            pthread_mutex_lock(&s->lock);
-            if (s->nidle == s->capidle) {
-                uint32_t cap = s->capidle ? s->capidle * 2 : 8;
-                chunk *ni = realloc(s->idle, cap * sizeof(*ni));
-                if (ni) {
-                    s->idle = ni;
-                    s->capidle = cap;
-                }
-            }
-            if (s->nidle < s->capidle) {
-                s->idle[s->nidle++] = c->held[i];
-                keep = 1;
-            }
-            pthread_mutex_unlock(&s->lock);
-            if (!keep) __atomic_sub_fetch(&g_idle, c->held[i].size, __ATOMIC_RELAXED);
-        }
-        if (!keep) chunk_destroy(e, &c->held[i]);
-    }
+    for (uint32_t i = 0; i < c->n; i++) chunk_release(e, &c->held[i]);
+    for (uint32_t i = 0; i < c->nstage; i++) chunk_release(e, &c->stage[i]);
     free(c->held);
+    free(c->stage);
     memset(c, 0, sizeof(*c));
 }
 
@@ -876,7 +891,93 @@ static int blit_region(const vkb_emu_image *s, const VkImageSubresourceLayers *s
 
 static void skipped_copy(void)
 {
-    VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy between a BC image and another format is skipped (logged once)");
+    VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy from a BC image into an uncompressed one (it would need an encoder) or into an "
+                           "incompatible BC format is skipped (logged once)");
+}
+
+/* Bytes of one texel of the uncompressed formats a BC block can be copied from (64 and 128 bits),
+ * 0 for any other. */
+static uint32_t block_texel_bytes(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R16G16B16A16_USCALED:
+    case VK_FORMAT_R16G16B16A16_SSCALED: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R64_UINT: case VK_FORMAT_R64_SINT: case VK_FORMAT_R64_SFLOAT: return 8;
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R64G64_UINT: case VK_FORMAT_R64G64_SINT: case VK_FORMAT_R64G64_SFLOAT: return 16;
+    default: return 0;
+    }
+}
+
+/* Staging for `need` bytes of blocks, kept by the command buffer until it is begun, reset or freed.
+ * One it holds already is reused once the decoder has read what an earlier copy left there. */
+static VkBuffer stage_buffer(vkb_emu_device *e, VkCommandBuffer cb, bcn_cb *c, VkDeviceSize need)
+{
+    for (uint32_t i = 0; i < c->nstage; i++)
+        if (c->stage[i].size >= need) {
+            e->dev->real.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+                                              0, NULL);
+            return c->stage[i].buf;
+        }
+    if (c->nstage == c->capstage) {
+        uint32_t cap = c->capstage ? c->capstage * 2 : 2;
+        chunk *ns = realloc(c->stage, cap * sizeof(*ns));
+        if (!ns) return VK_NULL_HANDLE;
+        c->stage = ns;
+        c->capstage = cap;
+    }
+    if (chunk_get(e, need, need, 1, &c->stage[c->nstage]) <= 0) return VK_NULL_HANDLE;
+    return c->stage[c->nstage++].buf;
+}
+
+/* A copy from an uncompressed image into a BC one: a texel of the source is a block of the
+ * destination, and the extent counts source texels (blocks). The blocks go to staging, packed, and
+ * are decoded from there as an upload of them would be. */
+static void copy_blocks_in(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkImageLayout sl, vkb_emu_image *d, VkImageLayout dl,
+                           uint32_t n, const VkImageCopy *regions)
+{
+    vkb_emu_image *s = vkb_emu_find_image(e, src);
+    uint32_t bb = vkb_bc_block_bytes(d->client_format);
+    if (!s || block_texel_bytes(s->format) != bb) {
+        VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy into a BC image from format %d (not %u bytes a texel) is skipped (logged once)",
+                 s ? s->format : VK_FORMAT_UNDEFINED, bb);
+        return;
+    }
+    bcn_cb *c = vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb));
+    VkBufferImageCopy *out = malloc((n ? n : 1) * sizeof(*out));
+    region *g = malloc((n ? n : 1) * sizeof(*g));
+    if (!c || !out || !g) goto done;
+    int s3d = s->type == VK_IMAGE_TYPE_3D, d3d = d->type == VK_IMAGE_TYPE_3D;
+    VkDeviceSize total = 0;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const VkImageCopy *r = &regions[i];
+        uint32_t slices = s3d ? r->extent.depth : r->srcSubresource.layerCount;
+        if (!r->extent.width || !r->extent.height || !slices) continue;
+        out[k] = (VkBufferImageCopy){total, 0, 0, r->srcSubresource, r->srcOffset, {r->extent.width, r->extent.height, s3d ? slices : 1}};
+        VkImageSubresourceLayers ds = r->dstSubresource;
+        if (!d3d) ds.layerCount = slices;
+        g[k++] = (region){total, r->extent.width * 4, r->extent.height * 4, ds, r->dstOffset,
+                          {r->extent.width * 4, r->extent.height * 4, d3d ? slices : 1}};
+        total += (VkDeviceSize)r->extent.width * r->extent.height * slices * bb;
+        total = (total + SLOT_ALIGN - 1) & ~(VkDeviceSize)(SLOT_ALIGN - 1);
+    }
+    if (!k) goto done;
+    VkBuffer buf = stage_buffer(e, cb, c, total);
+    if (!buf) {
+        VKB_ONCE(VKB_LOG_ERROR, "BC emulation: no memory to stage a %llu-byte copy into a BC image (logged once)", (unsigned long long)total);
+        goto done;
+    }
+    e->dev->real.vkCmdCopyImageToBuffer(cb, src, sl, buf, k, out);
+    decode(e, cb, buf, d, dl, k, g);
+    static int told;
+    if (!__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED))
+        VKB_INFO("BC emulation: copy into a BC image (format %d) from format %d decoded through staging (logged once)", d->client_format,
+                 s->format);
+done:
+    free(out);
+    free(g);
 }
 
 int vkb_emu_copy_image(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n,
@@ -884,6 +985,10 @@ int vkb_emu_copy_image(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkIma
 {
     vkb_emu_image *s = bc_image(e, src), *d = bc_image(e, dst);
     if (!s && !d) return 0;
+    if (!s) {
+        copy_blocks_in(e, cb, src, sl, d, dl, n, regions);
+        return 1;
+    }
     int kind = copy_kind(s, d);
     if (kind < 0) {
         if (kind == -1) skipped_copy();
@@ -909,6 +1014,16 @@ int vkb_emu_copy_image2(vkb_emu_device *e, VkCommandBuffer cb, const VkCopyImage
 {
     vkb_emu_image *s = bc_image(e, info->srcImage), *d = bc_image(e, info->dstImage);
     if (!s && !d) return 0;
+    if (!s) {
+        VkImageCopy *r = malloc((info->regionCount ? info->regionCount : 1) * sizeof(*r));
+        for (uint32_t i = 0; r && i < info->regionCount; i++) {
+            const VkImageCopy2 *q = &info->pRegions[i];
+            r[i] = (VkImageCopy){q->srcSubresource, q->srcOffset, q->dstSubresource, q->dstOffset, q->extent};
+        }
+        if (r) copy_blocks_in(e, cb, info->srcImage, info->srcImageLayout, d, info->dstImageLayout, info->regionCount, r);
+        free(r);
+        return 1;
+    }
     int kind = copy_kind(s, d);
     if (kind < 0) {
         if (kind == -1) skipped_copy();
