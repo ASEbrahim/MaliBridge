@@ -56,6 +56,7 @@ Everything here is still work in progress.
 | Lethal Company | runs well, 43-45 fps |
 | Subnautica | runs well, 20-24 fps with Detail set to High |
 | Inscryption | runs well, 68-83 fps |
+| Doki Doki Literature Club | runs well, title screen 91-92 fps |
 | Risk of Rain 2 | runs well at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default |
 | The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) |
 | Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) |
@@ -80,7 +81,7 @@ textures take 288 MB from 287 MB compressed.
 
 Each one turns on only when the GPU lacks the feature.
 
-- **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`), and where the GPU samples ETC2/EAC/ASTC (Mali does) encoded again into those in the same pass (`shaders/etc2_enc.glsl`, `astc_enc.glsl`, `eac_enc.glsl`; BC6H into ASTC 4x4 HDR, `astc_hdr_enc.glsl`, where the GPU has it), so the texture stays compressed at about its BC size. Otherwise decoded (BC6H to RGBA16F); BC1 goes to 16-bit where it can. `VKBRIDGE_BC_TRANSCODE=0` decodes everything.
+- **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`), and where the GPU samples ETC2/EAC/ASTC (Mali does) encoded again into those in the same pass (`shaders/etc2_enc.glsl`, `astc_enc.glsl`, `eac_enc.glsl`; BC6H into ASTC 4x4 HDR, `astc_hdr_enc.glsl`, where the GPU has it), so the texture stays compressed at about its BC size. Otherwise decoded (BC6H to RGBA16F); BC1 goes to 16-bit where it can. `VKBRIDGE_BC_TRANSCODE=0` decodes everything. Copies into a BC image from a same-size uncompressed one (`vkCmdCopyImage`, D3D11 `CopyResource`) go through the same path; copies out of a BC image into an uncompressed one are not supported.
 - **Push descriptors** (`VK_KHR_push_descriptor`): emulated with descriptor sets per command buffer. vkd3d-proton will not start without them.
 - **Descriptor limits**: the 1,000,000-per-stage limits vkd3d-proton asks for are reported, and layouts are cut down to what the GPU has (500,000 on r44).
 - **Null descriptors / robustness2**: reported, with null descriptors replaced by dummy resources (the buffer zero-filled; in descriptor set updates, templates, push descriptors and vertex buffer binds), and the driver's own buffer and image robustness turned on. A null image gets a stand-in of the shape its shader declares (1D, 2D, 3D, cube, arrays; float, uint or sint), read from the pipelines' SPIR-V as Lee Gao's compat_layer does.
@@ -188,7 +189,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_NO_XFB_FOLD=1` | server | turns off the stream output fold |
 | `VKBRIDGE_NO_CRASH_GUARD=1` | server | turns off pipeline crash containment |
 | `VKBRIDGE_NO_FORCED_ROBUSTNESS=1` | server | the robustness2 emulation leaves buffer and image robustness to the app instead of turning them on |
-| `VKBRIDGE_NULLDESC_2D=1` | server | null images all get the one 2D RGBA8 stand-in, whatever shape the shader declares (as before v0.2.2) |
+| `VKBRIDGE_NULLDESC_2D=1` | server | null images all get the one 2D RGBA8 stand-in, whatever shape the shader declares (as before v0.3) |
 | `VKBRIDGE_FAKE_MISSING=bc,push,...` | server | pretends the GPU lacks features (host testing, see `host/mali_env.sh`) |
 | `VKBRIDGE_HIDE_EXTS`, `VKBRIDGE_MAX_API` | client | hide extensions or cap the API version reported to apps |
 | `VKBRIDGE_DEBUG=1`, `VKBRIDGE_LOG_LEVEL=<n>` | client | client log verbosity |
