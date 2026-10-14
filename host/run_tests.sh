@@ -49,6 +49,13 @@ run_mode() {
     result $? "nulldesc_check ($(tail -1 out/t-nulldesc.log)$([ "$mode" = mali ] && echo "; $(grep -c 'null descriptor stand-in made' out/server.log) stand-in shapes"))"
   fi
   if [ -x out/opaque_check ]; then timeout 60 ./out/opaque_check >out/t-opaque.log 2>&1; result $? "opaque_check ($(tail -1 out/t-opaque.log))"; fi
+  # Zink's shared linear images (dma-buf, no modifier): Mali refuses them at that tiling (imitated:
+  # dmabuflinear) and Skyrim SE exited on its 1D one; the bridge makes them without the handle type
+  if [ -x out/dmabuf_image_check ]; then
+    timeout 60 ./out/dmabuf_image_check >out/t-dmabuf-image.log 2>&1 &&
+      { [ "$mode" != mali ] || grep -q "dma-buf image refused at tiling" out/server.log; }
+    result $? "dmabuf_image_check ($(tail -1 out/t-dmabuf-image.log))"
+  fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
   # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
   if [ -x out/desc_traffic_check ]; then

@@ -322,6 +322,48 @@ static void image_unaccount(const vkb_emu_image *r)
         vkb_memstat_image(r->stat_bc_src ? r->client_format : 0, -r->stat_bytes, -r->stat_bc_src, -r->stat_ideal);
 }
 
+/* Mali r44 makes dma-buf images only at DRM-modifier tiling: VkExternalMemoryImageCreateInfo with
+ * DMA_BUF on a LINEAR (or OPTIMAL) image is refused with
+ * VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT. Zink asks for exactly that for its shared
+ * linear resources (it checks the format without the external struct), and Skyrim Special
+ * Edition's process gave up 50 ms after a refused 4096x1 R32_SFLOAT 1D one (2026-10-14). Such an
+ * image is made without the dma-buf handle type, as the opaque-fd emulation makes the images the
+ * driver will not import into (server_opaque.c): its memory still comes from the allocation that
+ * asks to export (the dma-heap export emulation on Mali), the driver lays it out as the same
+ * plain image in every process, and a linear image's layout is vkGetImageSubresourceLayout's.
+ * A modifier image is left refused: its layout is what the importer was promised.
+ * VKBRIDGE_FAKE_MISSING=dmabuflinear imitates the refusal on the host. */
+static int dmabuf_plain_retry(VkImageCreateInfo *ci)
+{
+    if (ci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) return 0;
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext) {
+        if (b->sType != VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) continue;
+        ext_handles *h = (ext_handles *)b;
+        if (!(h->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) return 0;
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+            VKB_INFO("dma-buf image refused at tiling %d (type %d format %d %ux%ux%u usage 0x%x); made without the dma-buf "
+                     "handle type (its memory is exported as allocated)", ci->tiling, ci->imageType, ci->format, ci->extent.width,
+                     ci->extent.height, ci->extent.depth, ci->usage);
+        h->handleTypes &= ~(VkExternalMemoryHandleTypeFlags)VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        if (!h->handleTypes) vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+        return 1;
+    }
+    return 0;
+}
+
+static VkResult driver_create_image(VkDevice device, const VkImageCreateInfo *ci, const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+{
+    static int fake = -1;
+    if (fake < 0) fake = vkb_emu_faked("dmabuflinear");
+    if (fake && ci->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+        for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+                (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
+                return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT; /* as Mali r44 answers */
+    return vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
                                                      const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
@@ -330,13 +372,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     VkFormat client_format = ci->format;
     vkb_emu_image_create_info(e, ci);
     int opaque = vkb_opaque_image(e, ci);
-    VkResult r = vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
+    VkResult r = driver_create_image(device, ci, pAllocator, pImage);
     if (r != VK_SUCCESS && opaque && vkb_opaque_retry(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO))
-        r = vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
+        r = driver_create_image(device, ci, pAllocator, pImage);
     if (r == VK_ERROR_INVALID_EXTERNAL_HANDLE && vkb_emu_strip_opaque(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO))
-        r = vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
+        r = driver_create_image(device, ci, pAllocator, pImage);
     if (r == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT && single_row_pitch_to_driver(ci))
-        r = vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
+        r = driver_create_image(device, ci, pAllocator, pImage);
+    if (r != VK_SUCCESS && dmabuf_plain_retry(ci)) r = driver_create_image(device, ci, pAllocator, pImage);
     if (r == VK_SUCCESS) {
         vkb_emu_track_image(e, *pImage, ci, client_format);
         image_account(e, device, *pImage, ci, client_format);
