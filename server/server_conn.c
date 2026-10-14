@@ -110,8 +110,8 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 vkb_gprof_device_destroy(t);
                 vkb_trace_device_destroy(t);
                 vkb_spvfix_device_destroy(t);
-                vkb_nulldesc_device_destroy(t);
                 vkb_dsmap_device_destroy(t);
+                vkb_nulldesc_device_destroy(t);
                 vkb_pools_device_destroy(t);
                 vkb_pcache_device_destroy(t);
                 vkb_emu_device_destroy(t);

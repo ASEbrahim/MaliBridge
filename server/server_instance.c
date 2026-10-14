@@ -428,8 +428,8 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_emu_device_init(t, emu);
             vkb_pcache_device_init(t);
             vkb_pools_device_init(t);
+            vkb_nulldesc_device_init(t); /* beneath the set names: it maps the driver's sets to their layouts */
             vkb_dsmap_device_init(t);
-            vkb_nulldesc_device_init(t);
             vkb_spvfix_device_init(t);
             vkb_trace_device_init(t);
             vkb_gprof_device_init(t); /* wraps what the client's calls reach, emulations included */
@@ -461,8 +461,8 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_gprof_device_destroy(t);
     vkb_trace_device_destroy(t);
     vkb_spvfix_device_destroy(t);
-    vkb_nulldesc_device_destroy(t);
     vkb_dsmap_device_destroy(t);
+    vkb_nulldesc_device_destroy(t);
     vkb_pools_device_destroy(t);
     vkb_pcache_device_destroy(t);
     vkb_emu_device_destroy(t);

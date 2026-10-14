@@ -83,7 +83,7 @@ Each one turns on only when the GPU lacks the feature.
 - **BC1-BC7 textures**: decoded on the GPU by a compute shader when uploaded (`shaders/bc_decode.comp`), and where the GPU samples ETC2/EAC/ASTC (Mali does) encoded again into those in the same pass (`shaders/etc2_enc.glsl`, `astc_enc.glsl`, `eac_enc.glsl`; BC6H into ASTC 4x4 HDR, `astc_hdr_enc.glsl`, where the GPU has it), so the texture stays compressed at about its BC size. Otherwise decoded (BC6H to RGBA16F); BC1 goes to 16-bit where it can. `VKBRIDGE_BC_TRANSCODE=0` decodes everything.
 - **Push descriptors** (`VK_KHR_push_descriptor`): emulated with descriptor sets per command buffer. vkd3d-proton will not start without them.
 - **Descriptor limits**: the 1,000,000-per-stage limits vkd3d-proton asks for are reported, and layouts are cut down to what the GPU has (500,000 on r44).
-- **Null descriptors / robustness2**: reported, with null descriptors replaced by dummy resources (the buffer zero-filled; in descriptor set updates, templates, push descriptors and vertex buffer binds), and the driver's own buffer and image robustness turned on.
+- **Null descriptors / robustness2**: reported, with null descriptors replaced by dummy resources (the buffer zero-filled; in descriptor set updates, templates, push descriptors and vertex buffer binds), and the driver's own buffer and image robustness turned on. A null image gets a stand-in of the shape its shader declares (1D, 2D, 3D, cube, arrays; float, uint or sint), read from the pipelines' SPIR-V as Lee Gao's compat_layer does.
 - **vkd3d-proton descriptor set 3 repair**: rebinds the heap set when vkd3d-proton binds a corrupted handle. The corruption comes from a union in vkd3d-proton v2.12-v3.0 and hung the GPU in The Witcher 3.
 - **Stream output fold**: the pass-through geometry shader that DXVK builds for D3D11 stream output is folded into the vertex shader. Mali runs geometry shaders very slowly (Subnautica went from 6 to ~30 fps).
 - **Clip/cull distance**: built-ins turned into varyings, with clipping done in the fragment shader.
@@ -145,7 +145,9 @@ The suite runs `smoke`, `bcn_check` (every BC format and mode, bit-exact against
 Mali, once with BC transcoded to ETC2/EAC/ASTC, by PSNR against bcdec, and once decoded; the BC6H
 -> ASTC HDR transcoder, which RADV cannot sample, runs directly on HDR images and its blocks are
 decoded by bcn_check's own ASTC decoder; `bcn_check hdr` runs only that),
-`opaque_check`, `recycle_check`, `desc_traffic_check` (a DXVK-like set allocation and update per
+`nulldesc_check` (null images of every view type and numeric class, written directly, by template
+and pushed; imitating Mali, each must get a stand-in of its shape), `opaque_check`, `recycle_check`,
+`desc_traffic_check` (a DXVK-like set allocation and update per
 draw, read back by every draw; with and without `VKBRIDGE_NO_DESC_BATCH=1`, the client's message
 and byte totals printed), `flicker_check` (DXVK's frame structure: frames in flight, a pool per
 frame reset and refilled, submits from another thread, synchronous calls from a third; batched
@@ -186,6 +188,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_NO_XFB_FOLD=1` | server | turns off the stream output fold |
 | `VKBRIDGE_NO_CRASH_GUARD=1` | server | turns off pipeline crash containment |
 | `VKBRIDGE_NO_FORCED_ROBUSTNESS=1` | server | the robustness2 emulation leaves buffer and image robustness to the app instead of turning them on |
+| `VKBRIDGE_NULLDESC_2D=1` | server | null images all get the one 2D RGBA8 stand-in, whatever shape the shader declares (as before v0.2.2) |
 | `VKBRIDGE_FAKE_MISSING=bc,push,...` | server | pretends the GPU lacks features (host testing, see `host/mali_env.sh`) |
 | `VKBRIDGE_HIDE_EXTS`, `VKBRIDGE_MAX_API` | client | hide extensions or cap the API version reported to apps |
 | `VKBRIDGE_DEBUG=1`, `VKBRIDGE_LOG_LEVEL=<n>` | client | client log verbosity |
