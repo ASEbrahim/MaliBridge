@@ -4,6 +4,8 @@
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
+#include "server_emu.h"
+#include "vkb_ext_alias.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -281,11 +283,22 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     uint32_t n = 0;
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
         const char *e = ci->ppEnabledExtensionNames[i];
-        if (!has_ext(avail, avail_n, e)) {
+        /* VKBRIDGE_FAKE_MISSING may name extensions the driver is to be taken as lacking (host tests). */
+        if (!has_ext(avail, avail_n, e) || vkb_emu_faked(e)) {
+            /* An EXT name the driver has only as KHR (vkb_ext_alias.h): the KHR one in its place. */
+            const char *k = NULL;
+            for (size_t j = 0; j < VKB_EXT_ALIAS_COUNT && !k; j++)
+                if (!strcmp(vkb_ext_aliases[j].app, e) && has_ext(avail, avail_n, vkb_ext_aliases[j].driver))
+                    k = vkb_ext_aliases[j].driver;
+            if (k) {
+                VKB_INFO("vkCreateDevice: %s enabled as %s", e, k);
+                if (!list_has(exts, n, k)) exts[n++] = k;
+                continue;
+            }
             VKB_DBG("device extension %s is emulated or client-side; not passed to the driver", e);
             continue;
         }
-        exts[n++] = e;
+        if (!list_has(exts, n, e)) exts[n++] = e;
     }
     for (uint32_t i = 0; i < extra_n; i++)
         if (has_ext(avail, avail_n, extra[i]) && !list_has(exts, n, extra[i])) exts[n++] = extra[i];

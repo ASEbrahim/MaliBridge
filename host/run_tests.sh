@@ -84,6 +84,9 @@ run_mode() {
   if [ "$mode" = plain ] && [ -x out/pcache_check ]; then
     timeout 120 ./pcache_test.sh >out/t-pcache.log 2>&1; result $? "pcache_test ($(tail -1 out/t-pcache.log))"
   fi
+  # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
+  # divisors 0/2/1: native on plain, emulated on mali
+  timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"
   timeout 60 vkcube-wayland --c 120 >out/t-vkcube.log 2>&1; result $? "vkcube-wayland (dma-buf)"
   VKBRIDGE_WSI_SHM=1 timeout 60 vkcube-wayland --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube-wayland (wl_shm)"
   timeout 60 vkcube --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube (X11)"
@@ -94,7 +97,27 @@ run_mode() {
     grep -q "frames in" out/t-gamescope-$mode.log; result $? "gamescope + Zink glxgears ($(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-$mode.log))"
   fi
 }
+# Drivers with VK_KHR_vertex_attribute_divisor only (vkb_ext_alias.h): Mali-G925 on Android 16 also
+# lacks the zero divisor (emulated whole); a complete KHR-only driver gets the EXT name as an alias
+divisor_variants() {
+  echo "== KHR-only divisor drivers"
+  local l
+  l=$(wc -l < out/server.log)
+  VKB_MISSING=divisorzero,VK_EXT_vertex_attribute_divisor . ./bridge_env.sh >/dev/null
+  VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check >out/t-divisor-g925.log 2>&1 &&
+    VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check --core14 >>out/t-divisor-g925.log 2>&1 &&
+    tail -n +$((l+1)) out/server.log | grep -q "lacks vertexAttributeInstanceRateZeroDivisor; emulated instead" &&
+    tail -n +$((l+1)) out/server.log | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor"
+  result $? "divisor_check, Mali-G925's KHR divisor without the zero divisor: emulated ($(grep -c '^PASS' out/t-divisor-g925.log) passed)"
+  l=$(wc -l < out/server.log)
+  VKB_MISSING=VK_EXT_vertex_attribute_divisor . ./bridge_env.sh >/dev/null
+  VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check >out/t-divisor-khr.log 2>&1 &&
+    tail -n +$((l+1)) out/server.log | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor" &&
+    ! tail -n +$((l+1)) out/server.log | grep -q "emulation 0x[0-9a-f]* installed"
+  result $? "divisor_check, complete KHR-only divisor: EXT name aliased, native ($(tail -1 out/t-divisor-khr.log))"
+}
 run_mode plain
+divisor_variants
 server_errors; result $? "no protocol errors in the server log (plain)"
 run_mode mali
 server_errors; result $? "no protocol errors in the server log (mali)"

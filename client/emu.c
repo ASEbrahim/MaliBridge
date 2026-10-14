@@ -7,6 +7,7 @@
 #include "emu.h"
 #include "gen/vkb_client_gen.h"
 #include "vkb_emu_formats.h"
+#include "vkb_ext_alias.h"
 
 #include <string.h>
 #include <unistd.h>
@@ -69,6 +70,14 @@ void vkb_emu_patch_limits(vkb_physdev *pd, VkPhysicalDeviceProperties *p)
         RAISE((d)->maxPerStageUpdateAfterBindResources, 4 * DESC_LIMIT);         \
     } while (0)
 
+/* The app name of an extension the driver has under its KHR name only (vkb_ext_alias.h). */
+static int aliased(vkb_physdev *pd, const char *app)
+{
+    for (uint32_t i = 0; i < VKB_EXT_ALIAS_COUNT; i++)
+        if ((pd->aliased & (1u << i)) && !strcmp(vkb_ext_aliases[i].app, app)) return 1;
+    return 0;
+}
+
 void vkb_emu_patch_properties_chain(vkb_physdev *pd, VkBaseOutStructure *b)
 {
     if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT)
@@ -105,6 +114,13 @@ void vkb_emu_patch_properties_chain(vkb_physdev *pd, VkBaseOutStructure *b)
             p->maxVertexAttribDivisor = UINT32_MAX;
             p->supportsNonZeroFirstInstance = VK_TRUE;
         }
+    } else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT &&
+               aliased(pd, "VK_EXT_vertex_attribute_divisor")) {
+        /* The EXT structure is not an alias of the KHR one: a KHR-only driver leaves it alone. */
+        VkPhysicalDeviceVertexAttributeDivisorProperties k = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &k};
+        vkb_wire_vkGetPhysicalDeviceProperties2((VkPhysicalDevice)pd, &p2);
+        ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *)b)->maxVertexAttribDivisor = k.maxVertexAttribDivisor;
     }
 }
 

@@ -7,6 +7,7 @@
 #include "vkb_client.h"
 #include "gen/vkb_client_gen.h"
 #include "emu.h"
+#include "vkb_ext_alias.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -232,7 +233,7 @@ int vkb_physdev_ready(vkb_physdev *pd)
     const char *const *cl = vkb_client_device_exts(&ncl);
     uint32_t nemu = 0;
     const VkExtensionProperties *emu = vkb_emu_extensions(pd, &nemu);
-    pd->exts = calloc(n + ncl + nemu + 2, sizeof(VkExtensionProperties));
+    pd->exts = calloc(n + ncl + nemu + VKB_EXT_ALIAS_COUNT + 2, sizeof(VkExtensionProperties));
     pd->next = 0;
     for (uint32_t i = 0; i < n; i++)
         if (bridged_device_ext(srv[i].extensionName) && bridged_device_ext_for(pd, srv[i].extensionName)) pd->exts[pd->next++] = srv[i];
@@ -240,6 +241,21 @@ int vkb_physdev_ready(vkb_physdev *pd)
         int dup = 0;
         for (uint32_t j = 0; j < pd->next; j++) dup |= !strcmp(pd->exts[j].extensionName, emu[i].extensionName);
         if (!dup) pd->exts[pd->next++] = emu[i];
+    }
+    /* EXT names the driver has only as KHR ones (vkb_ext_alias.h). */
+    pd->aliased = 0;
+    for (uint32_t i = 0; i < VKB_EXT_ALIAS_COUNT; i++) {
+        int have_app = 0, have_driver = 0;
+        for (uint32_t j = 0; j < pd->next; j++) {
+            have_app |= !strcmp(pd->exts[j].extensionName, vkb_ext_aliases[i].app);
+            have_driver |= !strcmp(pd->exts[j].extensionName, vkb_ext_aliases[i].driver);
+        }
+        if (have_app || !have_driver) continue;
+        VkExtensionProperties *e = &pd->exts[pd->next++];
+        snprintf(e->extensionName, sizeof(e->extensionName), "%s", vkb_ext_aliases[i].app);
+        e->specVersion = vkb_ext_aliases[i].spec;
+        pd->aliased |= 1u << i;
+        VKB_INFO("%s: offered as an alias of %s", vkb_ext_aliases[i].app, vkb_ext_aliases[i].driver);
     }
     if (drm_node(NULL, NULL)) {
         VkExtensionProperties *e = &pd->exts[pd->next++];

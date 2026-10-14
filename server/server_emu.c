@@ -53,7 +53,8 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (!strcmp(e[i].extensionName, "VK_EXT_load_store_op_none")) lson_ext = 1;
     }
     free(e);
-    /* VKBRIDGE_FAKE_MISSING=bc,divisor,clip,cull,depthclip pretends the GPU lacks them (host tests). */
+    /* VKBRIDGE_FAKE_MISSING=bc,divisor,clip,cull,depthclip pretends the GPU lacks them (host tests);
+     * divisorzero: a divisor without vertexAttributeInstanceRateZeroDivisor (Mali-G925). */
     const char *fake = getenv("VKBRIDGE_FAKE_MISSING");
     if (fake) {
         if (token(fake, "bc")) f.textureCompressionBC = VK_FALSE;
@@ -73,6 +74,20 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     uint32_t emu = 0;
     VkPhysicalDeviceProperties props;
     idt->vkGetPhysicalDeviceProperties(pd, &props);
+    /* vkd3d-proton (every D3D12 game) wants vertexAttributeInstanceRateZeroDivisor too. Mali-G925 on
+     * Android 16 has the KHR extension without it (and without supportsNonZeroFirstInstance): such a
+     * divisor is taken as missing and emulated whole - the emulation does both, at any firstInstance. */
+    if (divisor && idt->vkGetPhysicalDeviceFeatures2 && props.apiVersion >= VK_API_VERSION_1_1) {
+        VkPhysicalDeviceVertexAttributeDivisorFeatures df = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &df};
+        idt->vkGetPhysicalDeviceFeatures2(pd, &f2);
+        int zero = df.vertexAttributeInstanceRateZeroDivisor && !(fake && token(fake, "divisorzero"));
+        if (!df.vertexAttributeInstanceRateDivisor || !zero) {
+            VKB_ONCE(VKB_LOG_INFO, "vertex attribute divisor: the driver's lacks %s; emulated instead",
+                     df.vertexAttributeInstanceRateDivisor ? "vertexAttributeInstanceRateZeroDivisor" : "vertexAttributeInstanceRateDivisor");
+            divisor = 0;
+        }
+    }
     /* Vulkan 1.4 has maintenance5 in core. */
     if (!maint5 && (props.apiVersion < VK_API_VERSION_1_4 || (fake && token(fake, "maint5"))) && !env_off("VKBRIDGE_EMU_MAINT5"))
         emu |= VKB_EMU_MAINT5;
@@ -234,7 +249,15 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
             ci->pNext = hf;
         }
     }
-    if (emu & VKB_EMU_DIVISOR) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT);
+    if (emu & VKB_EMU_DIVISOR) {
+        chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT);
+        /* Vulkan 1.4 has the features in core: the driver sees no divisor at all. */
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES) {
+                VkPhysicalDeviceVulkan14Features *v = (VkPhysicalDeviceVulkan14Features *)b;
+                v->vertexAttributeInstanceRateDivisor = v->vertexAttributeInstanceRateZeroDivisor = VK_FALSE;
+            }
+    }
     if (emu & VKB_EMU_DEPTH_CLIP) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
     if (emu & VKB_EMU_MAINT5) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES);
     if (emu & VKB_EMU_MAINT6) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES);

@@ -66,6 +66,7 @@ typedef struct vkb_physdev {
     uint32_t heap_map[VK_MAX_MEMORY_HEAPS];         /* client heap -> server heap */
     VkExtensionProperties *exts;                    /* filtered device extensions */
     uint32_t next;
+    uint32_t aliased;                               /* vkb_ext_aliases[i] offered under the app name: bit i */
     int ready;
     pthread_mutex_t lock;
     struct vkb_physdev *list_next;
