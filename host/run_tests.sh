@@ -36,6 +36,13 @@ run_mode() {
   else
     timeout 180 ./out/bcn_check >out/t-bcn.log 2>&1; result $? "bcn_check ($(tail -1 out/t-bcn.log))"
   fi
+  # Null images of every shape (cube, 3D, 1D, arrays, uint/sint): on mali each gets a stand-in of
+  # its binding's shape, from the pipeline's SPIR-V
+  if [ -x out/nulldesc_check ]; then
+    timeout 60 ./out/nulldesc_check >out/t-nulldesc.log 2>&1 &&
+      { [ "$mode" != mali ] || [ "$(grep -c 'null descriptor stand-in made' out/server.log)" -ge 6 ]; }
+    result $? "nulldesc_check ($(tail -1 out/t-nulldesc.log)$([ "$mode" = mali ] && echo "; $(grep -c 'null descriptor stand-in made' out/server.log) stand-in shapes"))"
+  fi
   if [ -x out/opaque_check ]; then timeout 60 ./out/opaque_check >out/t-opaque.log 2>&1; result $? "opaque_check ($(tail -1 out/t-opaque.log))"; fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
   # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
