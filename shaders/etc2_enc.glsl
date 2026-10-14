@@ -8,7 +8,9 @@
  * every table and both flips are tried; the individual mode is used where the differential one
  * cannot reach; the base colour is refitted once to the chosen modifiers; T mode tries both colour
  * roles; planar mode (gradients, which BC1 textures are full of) is added; and ETC2 RGB8A1
- * punch-through alpha, which BC1 with alpha needs, is added.
+ * punch-through alpha, which BC1 with alpha needs, is added. BC_QUALITY 0 (fast): no refit, 3 tables
+ * around the subblock's spread instead of 8, the flip whose halves differ more, and T mode only
+ * for a poor block.
  *
  * MIT License
  *
@@ -86,7 +88,23 @@ int etc1_sub(ivec3 base, bool flip, uint sb, bool clear, out uint table, inout u
     uint bsel = 0u;
     table = 0u;
     target = vec3(base);
-    for (uint t = 0u; t < 8u; t++) {
+    uint t0 = 0u, t1 = 7u;
+    if (BC_QUALITY == 0u) {
+        /* fast: the first table whose large modifier covers the texels' furthest grey offset, and
+         * its neighbours */
+        int far = 0;
+        for (uint i = 0u; i < 8u; i++) {
+            uint p = etc_subpx(flip, sb, i);
+            ivec3 d = g_px[p].rgb - base;
+            if (!etc_clear(p)) far = max(far, abs(d.x + d.y + d.z) / 3);
+        }
+        uint tf = 7u;
+        for (uint t = 0u; t < 7u; t++)
+            if (ETC1_MOD[t].y >= far) { tf = t; break; }
+        t0 = max(tf, 1u) - 1u;
+        t1 = min(tf + 1u, 7u);
+    }
+    for (uint t = t0; t <= t1; t++) {
         int e = 0, n = 0;
         uint s = 0u;
         ivec3 acc = ivec3(0);
@@ -137,7 +155,7 @@ int etc1_try(bool flip, bool clear, out uvec2 hl)
     }
     int best = 0x7fffffff;
     hl = uvec2(0u);
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < (BC_QUALITY == 0u ? 1 : 2); pass++) {
         ivec3 q5a = clamp(ivec3(round(avg[0] * (31.0 / 255.0))), 0, 31);
         ivec3 q5b = clamp(ivec3(round(avg[1] * (31.0 / 255.0))), 0, 31);
         ivec3 d = q5b - q5a;
@@ -322,11 +340,24 @@ uvec2 etc2_encode(bool punch)
     bool clear = false;
     for (uint p = 0u; p < 16u; p++) clear = clear || etc_clear(p);
     uvec2 best, hl;
-    int e = etc1_try(false, clear, best), e2;
-    e2 = etc1_try(true, clear, hl);
-    if (e2 < e) { e = e2; best = hl; }
-    e2 = etct_try(clear, hl);
-    if (e2 < e) { e = e2; best = hl; }
+    int e, e2;
+    if (BC_QUALITY == 0u) {
+        /* fast: one flip, the one whose subblocks' sums differ more */
+        ivec3 l = ivec3(0), r = ivec3(0), t = ivec3(0), b = ivec3(0);
+        for (uint p = 0u; p < 16u; p++) {
+            if ((p & 3u) < 2u) l += g_px[p].rgb; else r += g_px[p].rgb;
+            if (p < 8u) t += g_px[p].rgb; else b += g_px[p].rgb;
+        }
+        e = etc1_try(etc_err(t, b) > etc_err(l, r), clear, best);
+    } else {
+        e = etc1_try(false, clear, best);
+        e2 = etc1_try(true, clear, hl);
+        if (e2 < e) { e = e2; best = hl; }
+    }
+    if (BC_QUALITY != 0u || e > 16 * 64) { /* fast: T mode where ETC1 is off by about 8 a texel channel */
+        e2 = etct_try(clear, hl);
+        if (e2 < e) { e = e2; best = hl; }
+    }
     if (!clear) {
         e2 = etcp_try(hl);
         if (e2 < e) { e = e2; best = hl; }

@@ -4,7 +4,7 @@
  * block is a base codeword, a multiplier and one of 16 modifier tables, each texel one of the
  * table's 8 modifiers: value = base * 8 (+ 4 unsigned) + modifier * multiplier * 8, clamped to
  * 0..2047 (unsigned) or -1023..1023 (signed). Every table is tried with the base and multiplier
- * that span the block's range, and the best one again with its neighbours.
+ * that span the block's range, and the best one again with its neighbours (not when fast).
  */
 
 const int EAC_TAB[16][8] = int[16][8](
@@ -59,7 +59,7 @@ uvec2 eac_encode(float v[16], bool sgn)
         if (e < best) { best = e; bcw = cw; bm = m; bt = t; bidx = idx; }
     }
     int cw0 = bcw, m0 = bm;
-    for (int dm = -1; dm <= 1; dm++)
+    for (int dm = -1; dm <= 1 && BC_QUALITY != 0u; dm++) /* fast (BC_QUALITY 0): not refined */
         for (int dc = -2; dc <= 2; dc++) {
             int m = m0 + dm, cw = cw0 + dc;
             if ((dm == 0 && dc == 0) || m < 0 || m > 15 || cw < cwlo || cw > cwhi) continue;

@@ -14,7 +14,7 @@
  * into ETC2 RGB8 / RGB8A1 (BC1), ASTC 4x4 (BC2, BC3, BC7), EAC R11 / RG11 (BC4, BC5) or ASTC 4x4
  * HDR (BC6H), and write the blocks to the scratch buffer in order (rows of blocks, layer after
  * layer): the image stays compressed on a GPU without BC (etc2_enc.glsl, astc_enc.glsl,
- * eac_enc.glsl, astc_hdr_enc.glsl).
+ * eac_enc.glsl, astc_hdr_enc.glsl). BC_QUALITY (below) trades their search for time.
  */
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -70,6 +70,9 @@ uint outw[4u * ROW_WORDS]; /* the block's texels, packed */
 uint bswap32(uint v) { return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24); }
 
 #if defined(TRANSCODE)
+/* How hard the encoders search (VKBRIDGE_BC_TRANSCODE_QUALITY, a specialization constant): 0 fast,
+ * 1 the default, 2 high. */
+layout(constant_id = 0) const uint BC_QUALITY = 1u;
 ivec4 g_px[16]; /* the block's texels, 8-bit RGBA, for the encoder */
 uint g_bc7_parts, g_bc7_part, g_bc7_mask; /* a BC7 block's subsets, partition and its subset per texel */
 #if defined(ENC_ETC2)

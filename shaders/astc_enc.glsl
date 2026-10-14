@@ -10,7 +10,9 @@
  * 8-bit endpoints keep BC1/BC3 colour almost exactly), for blocks with alpha a second weight plane
  * for alpha, and for BC7 blocks of 2 or 3 subsets 2 partitions with the ASTC partition nearest
  * BC7's (from a 256-entry table instead of upstream's k-means and 48 KB lookup); the lowest error
- * is kept. A block of one colour is a void-extent block.
+ * is kept. A block of one colour is a void-extent block. BC_QUALITY 0 (fast): no refit, a shorter
+ * power iteration, a second candidate only for a poor block, and BC7's 1-partition blocks one
+ * candidate; 2 (high): every candidate, and BC7's 2-partition blocks 1 partition too.
  *
  * MIT License
  *
@@ -120,7 +122,7 @@ void astc_line(vec4 m, uint part, out vec4 lo, out vec4 hi)
     lo = c;
     hi = c;
     if (dot(ax, ax) < 1e-4) return;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < (BC_QUALITY == 0u ? 2 : 6); i++) {
         vec4 nx = cov * ax;
         float l = dot(nx, nx);
         if (l < 1e-12) break;
@@ -337,7 +339,7 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec
             /* weights run from the top of the block down */
             blk = b | uvec4(0u, 0u, bitfieldReverse(wi.y), bitfieldReverse(wi.x));
         }
-        if (pass == 0 && e == 0.0) break;
+        if (pass == 0 && (e == 0.0 || BC_QUALITY == 0u)) break;
         /* pass 1: the endpoints refitted to pass 0's weights (e0 / e1) */
     }
     return best;
@@ -346,6 +348,9 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec
 /* A block error (squared differences summed over the texels' channels, 8-bit units) good enough to
  * stop at: about 0.7 a texel, under a decoder's own rounding. */
 const float ASTC_GOOD = 8.0;
+
+/* The error past which the next candidate is tried: fast, about 2 a texel; high, any. */
+float astc_good() { return BC_QUALITY == 0u ? 64.0 : (BC_QUALITY == 1u ? ASTC_GOOD : -1.0); }
 
 /* part: for a BC7 block of 2 or 3 subsets, its entry in ASTC_BC7P (seed << 16 | partition-1
  * texels), else ~0u. fine: BC7 (BC2 / BC3 colour is BC1's: 4 shades on a 5:6:5 line, which 2-bit
@@ -357,7 +362,7 @@ const float ASTC_GOOD = 8.0;
  * and QUANT_192; BC7 3-bit and 8-bit, then 4-bit and QUANT_192, or for a BC7 block of 2 or 3 subsets
  * its 2 partitions first and 4-bit weights only after. With alpha: 3-bit weights and QUANT_192, then
  * for BC2 / BC3 a second plane for alpha (2-bit, QUANT_48: their alpha seldom follows the colour),
- * for BC7 4-bit weights and QUANT_48. */
+ * for BC7 4-bit weights and QUANT_48 (high: then a second plane as well). */
 uvec4 astc_encode(uint part, bool fine)
 {
     bool alpha = false, same = true;
@@ -379,10 +384,10 @@ uvec4 astc_encode(uint part, bool fine)
     float e;
     if (alpha) {
         e = astc_try(true, false, 3u, 192u, ~0u, s0, s1, 1e30, blk);
-        if (e <= ASTC_GOOD) return blk;
+        if (e <= astc_good()) return blk;
         if (fine) {
-            astc_try(true, false, 4u, 48u, ~0u, s0, s1, e, blk);
-            return blk;
+            e = astc_try(true, false, 4u, 48u, ~0u, s0, s1, e, blk);
+            if (BC_QUALITY < 2u) return blk;
         }
         /* dual plane: the colour's own line, alpha from its extremes */
         vec4 d0[2], d1[2];
@@ -406,9 +411,13 @@ uvec4 astc_encode(uint part, bool fine)
         astc_line(vec4(1.0, 1.0, 1.0, 0.0), 1u, p0[1], p1[1]);
         e = astc_try(false, false, 2u, 40u, part >> 16, p0, p1, 1e30, blk);
         g_apart = 0u;
+        if (BC_QUALITY == 2u) e = astc_try(false, false, 3u, 256u, ~0u, s0, s1, e, blk);
+    } else if (fine && BC_QUALITY == 0u) {
+        astc_try(false, false, 4u, 192u, ~0u, s0, s1, 1e30, blk); /* the usual winner on BC7 */
+        return blk;
     } else {
         e = fine ? astc_try(false, false, 3u, 256u, ~0u, s0, s1, 1e30, blk) : astc_try(false, false, 2u, 256u, ~0u, s0, s1, 1e30, blk);
     }
-    if (e > ASTC_GOOD) astc_try(false, false, 4u, 192u, ~0u, s0, s1, e, blk);
+    if (e > astc_good()) astc_try(false, false, 4u, 192u, ~0u, s0, s1, e, blk);
     return blk;
 }

@@ -86,6 +86,7 @@ typedef struct bcn_state {
     VkPhysicalDeviceMemoryProperties mp;
     int packed_ok[2];        /* R5G6B5, A1R5G5B5 can hold BC1 UNORM */
     VkFormat tx[16];         /* per BC format (BC_INDEX): what it is transcoded to, UNDEFINED: decoded */
+    uint32_t quality;        /* the transcoders' search (bc_decode.comp's BC_QUALITY): 0 fast, 1 default, 2 high */
     pthread_mutex_t lock;
     chunk *idle;             /* scratch no pending command buffer uses (bytes in g_idle) */
     uint32_t nidle, capidle;
@@ -161,6 +162,17 @@ int vkb_emu_bcn_transcode_wanted(void)
 {
     const char *v = vkb_srv_env("VKBRIDGE_BC_TRANSCODE"); /* <cache dir>/env too, read at device creation */
     return !v || strcmp(v, "0");
+}
+
+/* VKBRIDGE_BC_TRANSCODE_QUALITY: fast, default or high (unknown values: default). */
+static uint32_t transcode_quality(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_BC_TRANSCODE_QUALITY"); /* <cache dir>/env too */
+    if (!v) return 1;
+    if (!strcmp(v, "fast")) return 0;
+    if (!strcmp(v, "high")) return 2;
+    if (strcmp(v, "default")) VKB_WARN("BC emulation: VKBRIDGE_BC_TRANSCODE_QUALITY=%s unknown (fast, default, high): default", v);
+    return 1;
 }
 
 int vkb_emu_bcn_astc_hdr(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t api)
@@ -567,8 +579,13 @@ static VkPipeline pipeline(vkb_emu_device *e, int fam)
         VkShaderModule m;
         if (code[fam] && r->vkCreateShaderModule(d, &mci, NULL, &m) == VK_SUCCESS) {
             VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            /* the transcoders' search: BC_QUALITY, specialization constant 0 (left at its default of 1
+             * when that is asked for) */
+            const VkSpecializationMapEntry me = {0, 0, sizeof(uint32_t)};
+            const VkSpecializationInfo si = {1, &me, sizeof(uint32_t), &s->quality};
             pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
-                                                          VK_SHADER_STAGE_COMPUTE_BIT, m, "main", NULL};
+                                                          VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
+                                                          fam >= TX_BC1 && s->quality != 1 ? &si : NULL};
             pci.layout = s->layout;
             if (r->vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pci, NULL, &s->pipes[fam]) != VK_SUCCESS) {
                 VKB_ERR("BC emulation: decoder pipeline %d failed to build", fam);
@@ -1099,7 +1116,8 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
         int blit = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
         if (len < (int)sizeof(msg) - 24) len += snprintf(msg + len, sizeof(msg) - (size_t)len, " %d->%d%s", f, t, blit ? "" : " (no blit)");
     }
-    if (len) VKB_INFO("BC emulation: transcoding (BC format -> format):%s", msg);
+    s->quality = transcode_quality();
+    if (len) VKB_INFO("BC emulation: transcoding (BC format -> format):%s%s", msg, s->quality == 1 ? "" : s->quality ? ", high quality" : ", fast");
     else VKB_INFO("BC emulation: no transcoding (%s)", vkb_emu_bcn_transcode_wanted() ? "the GPU samples neither ETC2 nor ASTC" : "VKBRIDGE_BC_TRANSCODE=0");
     VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
