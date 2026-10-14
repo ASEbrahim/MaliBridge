@@ -112,6 +112,9 @@ void vkb_emu_desc_install(vkb_srv_table *dev);
 void vkb_emu_desc_uninstall(vkb_srv_table *dev);
 /* 1 when VKBRIDGE_FAKE_MISSING names t (host tests imitating Mali). */
 int vkb_emu_faked(const char *t);
+int vkb_emu_ext_hidden(const char *name); /* VKBRIDGE_FAKE_MISSING / VKBRIDGE_SERVER_HIDE_EXTS */
+int vkb_emu_hiding_exts(void);
+void vkb_emu_instance_install(vkb_srv_table *t); /* clients see the device extensions without the hidden ones */
 void vkb_emu_compat_uninstall(vkb_srv_table *dev);
 /* OPAQUE_FD on dma-bufs (server_opaque.c) */
 int vkb_opaque_wanted(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t emu);

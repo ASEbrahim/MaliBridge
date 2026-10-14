@@ -19,16 +19,119 @@ static int token(const char *list, const char *t)
     return 0;
 }
 
+/* VKBRIDGE_FAKE_MISSING, taken once: from the process environment (host tests) or from
+ * <cache dir>/env, which the server reads before its startup self-test. The in-app server tests
+ * once per app process, so on a tablet a change in the file needs the app restarted (force stop);
+ * a snapshot keeps vkCreateDevice consistent with what the self-test decided. With it a newer Mali
+ * can take an older one's paths, e.g. the G925 the G720's (docs: w3-stall-report). */
+static const char *fake_list(void)
+{
+    static const char *snap;
+    static int taken;
+    if (!__atomic_load_n(&taken, __ATOMIC_ACQUIRE)) {
+        const char *v = vkb_srv_env("VKBRIDGE_FAKE_MISSING");
+        snap = v && *v ? strdup(v) : NULL;
+        __atomic_store_n(&taken, 1, __ATOMIC_RELEASE);
+    }
+    return snap;
+}
+
 int vkb_emu_faked(const char *t)
 {
-    const char *fake = getenv("VKBRIDGE_FAKE_MISSING");
+    const char *fake = fake_list();
     return fake && token(fake, t);
 }
 
 static int env_off(const char *name)
 {
-    const char *v = getenv(name);
+    const char *v = vkb_srv_env(name);
     return v && !strcmp(v, "0");
+}
+
+/* Feature tokens of VKBRIDGE_FAKE_MISSING and the driver extensions they stand for. */
+static const struct {
+    const char *token, *ext[2];
+} fake_exts[] = {
+    {"divisor", {"VK_EXT_vertex_attribute_divisor", "VK_KHR_vertex_attribute_divisor"}},
+    {"depthclip", {"VK_EXT_depth_clip_enable", NULL}},
+    {"maint5", {"VK_KHR_maintenance5", NULL}},
+    {"maint6", {"VK_KHR_maintenance6", NULL}},
+    {"push", {"VK_KHR_push_descriptor", NULL}},
+    {"robustness2", {"VK_EXT_robustness2", "VK_KHR_robustness2"}},
+    {"loadstorenone", {"VK_KHR_load_store_op_none", NULL}},
+};
+
+/* A driver extension the clients are not shown: named in VKBRIDGE_FAKE_MISSING (as itself or
+ * through a feature token above) or in VKBRIDGE_SERVER_HIDE_EXTS (same snapshot rules; the
+ * client's own VKBRIDGE_HIDE_EXTS is separate). What an emulation offers in its place the client
+ * adds itself. */
+static const char *hide_list(void)
+{
+    static const char *snap;
+    static int taken;
+    if (!__atomic_load_n(&taken, __ATOMIC_ACQUIRE)) {
+        const char *v = vkb_srv_env("VKBRIDGE_SERVER_HIDE_EXTS");
+        snap = v && *v ? strdup(v) : NULL;
+        __atomic_store_n(&taken, 1, __ATOMIC_RELEASE);
+    }
+    return snap;
+}
+
+int vkb_emu_ext_hidden(const char *name)
+{
+    const char *hide = hide_list(), *fake = fake_list();
+    if (hide && token(hide, name)) return 1;
+    if (!fake) return 0;
+    if (token(fake, name)) return 1;
+    for (size_t i = 0; i < sizeof(fake_exts) / sizeof(fake_exts[0]); i++)
+        if (token(fake, fake_exts[i].token))
+            for (int j = 0; j < 2; j++)
+                if (fake_exts[i].ext[j] && !strcmp(fake_exts[i].ext[j], name)) return 1;
+    return 0;
+}
+
+int vkb_emu_hiding_exts(void)
+{
+    return hide_list() != NULL || fake_list() != NULL;
+}
+
+/* The device extensions a client sees, without the hidden ones (vkb_emu_ext_hidden). */
+static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *layer, uint32_t *count,
+                                                                              VkExtensionProperties *props)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    if (!t || layer) return t ? t->real.vkEnumerateDeviceExtensionProperties(pd, layer, count, props) : VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t n = 0;
+    VkResult r = t->real.vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
+    if (r != VK_SUCCESS) return r;
+    VkExtensionProperties *all = calloc(n ? n : 1, sizeof(*all));
+    if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    r = t->real.vkEnumerateDeviceExtensionProperties(pd, NULL, &n, all);
+    if (r < 0) {
+        free(all);
+        return r;
+    }
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (!vkb_emu_ext_hidden(all[i].extensionName)) all[kept++] = all[i];
+    if (!props) {
+        *count = kept;
+        free(all);
+        return VK_SUCCESS;
+    }
+    uint32_t w = *count < kept ? *count : kept;
+    memcpy(props, all, w * sizeof(*props));
+    *count = w;
+    free(all);
+    return w < kept ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+void vkb_emu_instance_install(vkb_srv_table *t)
+{
+    if (!vkb_emu_hiding_exts() || !t->real.vkEnumerateDeviceExtensionProperties) return;
+    t->dt.vkEnumerateDeviceExtensionProperties = hide_EnumerateDeviceExtensionProperties;
+    VKB_ONCE(VKB_LOG_INFO, "device extensions hidden from clients: VKBRIDGE_FAKE_MISSING=%s VKBRIDGE_SERVER_HIDE_EXTS=%s",
+             fake_list() ? fake_list() : "", hide_list() ? hide_list() : "");
 }
 
 uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *missing)
@@ -55,7 +158,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     free(e);
     /* VKBRIDGE_FAKE_MISSING=bc,divisor,clip,cull,depthclip pretends the GPU lacks them (host tests);
      * divisorzero: a divisor without vertexAttributeInstanceRateZeroDivisor (Mali-G925). */
-    const char *fake = getenv("VKBRIDGE_FAKE_MISSING");
+    const char *fake = fake_list();
     if (fake) {
         if (token(fake, "bc")) f.textureCompressionBC = VK_FALSE;
         if (token(fake, "divisor")) divisor = 0;
@@ -70,6 +173,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (token(fake, "multidraw")) f.multiDrawIndirect = VK_FALSE;
         if (token(fake, "maint6")) maint6 = 0;
         if (token(fake, "push")) push = 0;
+        if (token(fake, "loadstorenone")) lson_khr = 0;
     }
     uint32_t emu = 0;
     VkPhysicalDeviceProperties props;

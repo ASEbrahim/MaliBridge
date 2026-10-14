@@ -140,6 +140,7 @@ void vkb_nulldesc_device_destroy(vkb_srv_table *t);
 
 /* server_bvmap.c */
 void vkb_bvmap_device_init(vkb_srv_table *t);
+void vkb_wait_device_init(vkb_srv_table *t); /* server_wait.c */
 void vkb_bvmap_device_destroy(vkb_srv_table *t);
 
 /* server_dsmap.c */

@@ -84,6 +84,11 @@ run_mode() {
   if [ "$mode" = plain ] && [ -x out/pcache_check ]; then
     timeout 120 ./pcache_test.sh >out/t-pcache.log 2>&1; result $? "pcache_test ($(tail -1 out/t-pcache.log))"
   fi
+  # A wait the driver fails with a stray error (Mali-G925: -3) and the server-side imitation of an
+  # older Mali's feature set, both from <cache dir>/env (a server of its own; once)
+  if [ "$mode" = plain ]; then
+    timeout 300 ./wait_imitate_test.sh >out/t-wait.log 2>&1; result $? "wait_imitate_test ($(tail -1 out/t-wait.log))"
+  fi
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
   timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"

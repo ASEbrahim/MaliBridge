@@ -203,6 +203,7 @@ static int server_init(const char *vk_lib, const char *cache_dir)
     }
     vkb_dispatch_load_instance(&vkb_global_dt, vkb_gipa, VK_NULL_HANDLE);
     vkb_pcache_set_dir(cache_dir);
+    vkb_srv_env_reload(); /* <cache dir>/env: VKBRIDGE_FAKE_MISSING and the like reach the self-test */
     vkb_selftest_all();
     return 1;
 }
