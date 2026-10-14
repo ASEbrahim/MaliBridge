@@ -179,7 +179,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSets(VkDevice device, uint32
 {
     size_t size = 12;
     VkDescriptorSet prev = VK_NULL_HANDLE;
-    int packable = nc == 0 && nw > 0 && vkb_desc_batch();
+    int packable = nc == 0 && nw > 0 && vkb_desc_packed();
     for (uint32_t i = 0; i < nw && packable; i++) {
         VkDescriptorType t = w[i].descriptorType;
         size_t ds = uds_desc_size(t);

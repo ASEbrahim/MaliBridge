@@ -122,7 +122,7 @@ static void conn_thread_exit(void *p)
  * (command | table << 16), a u32 size and its payload padded to 8 bytes. DXVK sends ~100k small
  * requests a second (a descriptor set allocation and an update per draw, Subnautica 2026-10-12);
  * as messages of their own, each cost both sides a header, an ordering wait and a wake-up.
- * VKBRIDGE_NO_DESC_BATCH=1: one message per request, as before. */
+ * Off unless VKBRIDGE_DESC_BATCH=1 (vkb_desc_batch): otherwise one message per request, as before. */
 static pthread_mutex_t aq_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *aq_buf;
 static size_t aq_len, aq_cap;
@@ -434,7 +434,7 @@ int vkb_call_exec(vkb_call *c)
     vkb_msg_hdr h = {VKB_MAGIC, (uint32_t)c->e.len, c->cmd, c->table, (uint32_t)c->e.nfds, c->flags & VKB_F_NOREPLY, 0, 0};
     vkb_stats_count(c->cmd, (c->flags & VKB_F_NOREPLY) != 0, c->e.len);
     pthread_mutex_lock(&aq_lock);
-    if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds && vkb_desc_batch()) {
+    if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds && vkb_async_framed()) {
         /* Appended to the open vkbBatch (or opening it) under the lock that orders the seqs. */
         size_t pad = (8 - (c->e.len & 7)) & 7;
         size_t need = (aq_len ? aq_len : sizeof(h)) + 8 + c->e.len + pad;
@@ -574,6 +574,30 @@ int vkb_desc_batch(void)
         const char *on = getenv("VKBRIDGE_DESC_BATCH"), *off = getenv("VKBRIDGE_NO_DESC_BATCH");
         v = on && *on && strcmp(on, "0") && !(off && *off && strcmp(off, "0"));
     }
+    return v;
+}
+
+static int env_set(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && strcmp(e, "0");
+}
+
+/* The two halves of VKBRIDGE_DESC_BATCH=1, to bisect the Risk of Rain 2 flicker on the device:
+ * VKBRIDGE_DESC_BATCH_NOFRAME=1 keeps the packed vkUpdateDescriptorSets but sends every
+ * asynchronous request as a message of its own; VKBRIDGE_DESC_BATCH_NOPACK=1 keeps the vkbBatch
+ * framing but sends vkUpdateDescriptorSets the generic way. */
+int vkb_async_framed(void)
+{
+    static int v = -1;
+    if (v < 0) v = vkb_desc_batch() && !env_set("VKBRIDGE_DESC_BATCH_NOFRAME");
+    return v;
+}
+
+int vkb_desc_packed(void)
+{
+    static int v = -1;
+    if (v < 0) v = vkb_desc_batch() && !env_set("VKBRIDGE_DESC_BATCH_NOPACK");
     return v;
 }
 
