@@ -112,7 +112,11 @@ void vkb_pcache_set_dir(const char *dir)
 {
     if (!dir || !*dir) return;
     mkdir(dir, 0700);
-    pc_dir = dir;
+    /* A copy: the in-app start frees its string after server_init (The412Banner, e40cd361). */
+    char *copy = strdup(dir);
+    if (!copy) return;
+    free((char *)pc_dir);
+    pc_dir = copy;
     VKB_INFO("pipeline cache directory %s", dir);
 }
 
