@@ -14,7 +14,9 @@
  * compared with bcdec by PSNR. The quality table per format and image comes first. BC6H goes to
  * ASTC 4x4 HDR where the GPU samples it; the transcoder itself is also run directly on HDR images
  * (photo, gradient, sky) and its blocks decoded here (astc_decode), so a GPU without ASTC HDR (RADV)
- * still measures it. `bcn_check hdr` runs only that.
+ * still measures it. `bcn_check hdr` runs only that. Then a 2048x2048 mip chain (BC7, BC1; with
+ * BCN_BENCH=1 also BC3, BC4, BC5), uploaded a level at a time: each level's time and PSNR, which
+ * show the server's per-level quality choice (VKBRIDGE_BC_TRANSCODE_QUALITY=auto).
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -1662,6 +1664,69 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
     }
 }
 
+/* Transcode mode: a 2048x2048 texture's whole mip chain of a test image, one level a command
+ * buffer, each timed (submit to idle) and compared by PSNR. The server's quality
+ * (VKBRIDGE_BC_TRANSCODE_QUALITY, auto by default) picks the encoder per level: under auto, 2048 and
+ * 1024 are encoded fast and the rest at default, which these lines show against a run with fast or
+ * default forced. Levels past 1024x1024 are read back at 8 bits (compare_level), which caps their
+ * PSNR near 59 dB. */
+static void test_levels(VkFormat f, const char *name)
+{
+    enum { S = 2048, MIPS = 12 };
+    VkDeviceMemory im;
+    VkImage img = make_image(f, S, S, MIPS, 1, 0, NULL, 0, &im);
+    if (!img) {
+        printf("FAIL %s levels: cannot create the image\n", name);
+        failures++;
+        return;
+    }
+    size_t bytes = (size_t)(S / 4) * (S / 4) * block_bytes(f);
+    VkDeviceMemory um;
+    void *upp;
+    VkBuffer up = host_buffer(bytes, &um, &upp);
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    submit(cb);
+    level lv[MIPS];
+    double total = 0;
+    int bad = 0;
+    for (uint32_t m = 0; m < MIPS; m++) {
+        uint32_t w = S >> m ? S >> m : 1;
+        lv[m] = (level){w, w, (w + 3) / 4, (w + 3) / 4, image_blocks(f, image_for(f), w, w, 0, 0)};
+        memcpy(upp, lv[m].blocks, (size_t)lv[m].bw * lv[m].bh * block_bytes(f));
+        cb = begin();
+        VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1}, {0, 0, 0}, {w, w, 1}};
+        vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        submit(cb);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        total += ms;
+        lv[m].w = lv[m].h = w;
+        if (m == MIPS - 1) {
+            cb = begin();
+            barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            submit(cb);
+        }
+        printf("INFO %s level %u (%ux%u): %.2f ms\n", name, m, w, w, ms);
+    }
+    for (uint32_t m = 0; m < MIPS; m++) {
+        int b = compare_level(img, f, m, 0, &lv[m], 0, name);
+        bad += b;
+        printf("%s %s level %u (%ux%u): PSNR %.1f dB", b ? "FAIL" : "INFO", name, m, lv[m].w, lv[m].h, last_psnr);
+        if (last_psnr_a) printf(", alpha %.1f dB", last_psnr_a);
+        printf("\n");
+        free(lv[m].blocks);
+    }
+    printf("%s %s, 2048x2048 mip chain: %.2f ms in all (submit to idle, level by level)\n", bad ? "FAIL" : "PASS", name, total);
+    failures += bad != 0;
+    vkDestroyImage(dev, img, NULL);
+    vkDestroyBuffer(dev, up, NULL);
+    vkFreeMemory(dev, um, NULL);
+    vkFreeMemory(dev, im, NULL);
+}
+
 /* ------------------------------------------------------------------ BC6H -> ASTC HDR, the shader itself */
 
 /* The bridge's BC6H transcoder (spv_bc6h_astc from server/bc_spv.h) run directly over bw x bh
@@ -2147,6 +2212,13 @@ int main(int argc, char **argv)
             test_format(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat (all 14 modes, decoded)", 0.002f);
         }
         test_hdr_shader();
+        test_levels(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4");
+        test_levels(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB -> ETC2 RGB8");
+        if (getenv("BCN_BENCH")) {
+            test_levels(VK_FORMAT_BC3_UNORM_BLOCK, "BC3 -> ASTC 4x4");
+            test_levels(VK_FORMAT_BC4_UNORM_BLOCK, "BC4 -> EAC R11");
+            test_levels(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 -> EAC RG11");
+        }
     } else {
         test_format(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 RGBA", u8);
         test_format(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB", u8);

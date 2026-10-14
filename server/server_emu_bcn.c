@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* FAM_BC1_16: BC1 UNORM decoded to 16 bits (vkb_bc_packed_format), a decoder variant, not a family;
  * TX_*: the transcoders (TX_BC1 + family). */
@@ -80,13 +81,14 @@ typedef struct bcn_cb {      /* a command buffer's scratch */
 typedef struct bcn_state {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
-    VkPipeline pipes[FAM_COUNT];
+    VkPipeline pipes[3][FAM_COUNT]; /* per BC_QUALITY (decoders: [1] only) */
     VkDeviceSize ssbo_align;
     int push;                /* VK_KHR_push_descriptor; else per-command-buffer sets */
     VkPhysicalDeviceMemoryProperties mp;
     int packed_ok[2];        /* R5G6B5, A1R5G5B5 can hold BC1 UNORM */
     VkFormat tx[16];         /* per BC format (BC_INDEX): what it is transcoded to, UNDEFINED: decoded */
-    uint32_t quality;        /* the transcoders' search (bc_decode.comp's BC_QUALITY): 0 fast, 1 default, 2 high */
+    uint32_t quality;        /* the transcoders' search (bc_decode.comp's BC_QUALITY): 0 fast, 1 default, 2 high,
+                              * QUALITY_AUTO: fast for large mip levels, default for the rest (level_quality) */
     pthread_mutex_t lock;
     chunk *idle;             /* scratch no pending command buffer uses (bytes in g_idle) */
     uint32_t nidle, capidle;
@@ -164,15 +166,31 @@ int vkb_emu_bcn_transcode_wanted(void)
     return !v || strcmp(v, "0");
 }
 
-/* VKBRIDGE_BC_TRANSCODE_QUALITY: fast, default or high (unknown values: default). */
+/* VKBRIDGE_BC_TRANSCODE_QUALITY: auto (the default), fast, default or high (unknown values: auto). */
+#define QUALITY_AUTO 3u
 static uint32_t transcode_quality(void)
 {
     const char *v = vkb_srv_env("VKBRIDGE_BC_TRANSCODE_QUALITY"); /* <cache dir>/env too */
-    if (!v) return 1;
+    if (!v || !strcmp(v, "auto")) return QUALITY_AUTO;
     if (!strcmp(v, "fast")) return 0;
+    if (!strcmp(v, "default")) return 1;
     if (!strcmp(v, "high")) return 2;
-    if (strcmp(v, "default")) VKB_WARN("BC emulation: VKBRIDGE_BC_TRANSCODE_QUALITY=%s unknown (fast, default, high): default", v);
-    return 1;
+    VKB_WARN("BC emulation: VKBRIDGE_BC_TRANSCODE_QUALITY=%s unknown (auto, fast, default, high): auto", v);
+    return QUALITY_AUTO;
+}
+
+/* auto: mip levels of AUTO_FAST_TEXELS texels or more (1024x1024, 2048x512, ...) are encoded fast,
+ * smaller ones at default. The large levels are nearly all of the work (4096, 2048 and 1024 are
+ * 99.6% of a 4096 chain's texels) and the least visible: a game at 720p-1080p samples a 1024+ level
+ * at full size only close up, and fast costs 0.3-1.2 dB there (bc-quality report). Small levels,
+ * which distant surfaces and small textures (UI, decals) show, cost little to encode at default.
+ * The choice is per level (not per region), so a level streamed in pieces is encoded one way. */
+#define AUTO_FAST_TEXELS (1024u * 1024u)
+static uint32_t level_quality(const bcn_state *s, const vkb_emu_image *img, uint32_t mip)
+{
+    if (s->quality != QUALITY_AUTO) return s->quality;
+    uint32_t w = img->extent.width >> mip, h = img->extent.height >> mip;
+    return (uint64_t)(w ? w : 1) * (h ? h : 1) >= AUTO_FAST_TEXELS ? 0 : 1;
 }
 
 int vkb_emu_bcn_astc_hdr(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t api)
@@ -560,12 +578,15 @@ void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch)
 
 /* ------------------------------------------------------------------ decoder */
 
-static VkPipeline pipeline(vkb_emu_device *e, int fam)
+/* The decoder or transcoder for fam; q: the transcoders' BC_QUALITY (0-2, ignored by decoders). */
+static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q)
 {
     bcn_state *s = e->bcn;
-    if (s->pipes[fam]) return s->pipes[fam];
+    if (fam < TX_BC1) q = 1;
+    VkPipeline *pp = &s->pipes[q][fam], have = __atomic_load_n(pp, __ATOMIC_ACQUIRE);
+    if (have) return have;
     pthread_mutex_lock(&s->lock);
-    if (!s->pipes[fam]) {
+    if (!*pp) {
         static const uint32_t *const code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
                                                         spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
                                                         spv_bc7_astc};
@@ -582,20 +603,28 @@ static VkPipeline pipeline(vkb_emu_device *e, int fam)
             /* the transcoders' search: BC_QUALITY, specialization constant 0 (left at its default of 1
              * when that is asked for) */
             const VkSpecializationMapEntry me = {0, 0, sizeof(uint32_t)};
-            const VkSpecializationInfo si = {1, &me, sizeof(uint32_t), &s->quality};
+            const VkSpecializationInfo si = {1, &me, sizeof(uint32_t), &q};
             pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
-                                                          VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
-                                                          fam >= TX_BC1 && s->quality != 1 ? &si : NULL};
+                                                          VK_SHADER_STAGE_COMPUTE_BIT, m, "main", q != 1 ? &si : NULL};
             pci.layout = s->layout;
-            if (r->vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pci, NULL, &s->pipes[fam]) != VK_SUCCESS) {
-                VKB_ERR("BC emulation: decoder pipeline %d failed to build", fam);
-                s->pipes[fam] = VK_NULL_HANDLE;
+            VkPipeline p;
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (r->vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pci, NULL, &p) != VK_SUCCESS) {
+                VKB_ERR("BC emulation: decoder pipeline %d (quality %u) failed to build", fam, q);
+                p = VK_NULL_HANDLE;
             }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            /* built on the first upload that needs it: a load-time cost worth seeing on the device */
+            if (p) VKB_INFO("BC emulation: %s pipeline %d%s built in %.1f ms", fam >= TX_BC1 ? "transcoder" : "decoder", fam,
+                            fam < TX_BC1 ? "" : q == 0 ? " (fast)" : q == 2 ? " (high)" : " (default)",
+                            (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+            __atomic_store_n(pp, p, __ATOMIC_RELEASE);
             r->vkDestroyShaderModule(d, m, NULL);
         }
     }
     pthread_mutex_unlock(&s->lock);
-    return s->pipes[fam];
+    return *pp;
 }
 
 typedef struct region {
@@ -780,8 +809,12 @@ static VkDeviceSize region_bytes(const upload *u, const region *g, uint32_t slic
 static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_image *img, VkImageLayout layout,
                    uint32_t n, const region *regs)
 {
+    bcn_state *s = e->bcn;
     int fam = family(img->client_format);
-    VkPipeline pipe = pipeline(e, vkb_tx_block_bytes(img->format) ? TX_BC1 + fam : vkb_bc_is_packed(img->format) ? FAM_BC1_16 : fam);
+    fam = vkb_tx_block_bytes(img->format) ? TX_BC1 + fam : vkb_bc_is_packed(img->format) ? FAM_BC1_16 : fam;
+    /* in auto per region (level_quality): the first region's, built before anything is recorded */
+    uint32_t q0 = fam >= TX_BC1 ? level_quality(s, img, n ? regs[0].sub.mipLevel : 0) : 1;
+    VkPipeline pipe = pipeline(e, fam, q0), bound = VK_NULL_HANDLE;
     if (!pipe) return;
     upload u = {e, cb, vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)), src, img, layout, out_block_bytes(img),
                 vkb_bc_block_bytes(img->client_format)};
@@ -797,12 +830,19 @@ static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_
             if (u.sc->held[i].size > lim && u.sc->held[i].size <= CHUNK_MAX) lim = u.sc->held[i].size;
     }
     to_compute(&u);
-    e->dev->real.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     for (uint32_t i = 0; i < n; i++) {
         const region *g = &regs[i];
         uint32_t slices = is3d ? g->iext.depth : g->sub.layerCount;
         uint32_t bh = (g->iext.height + 3) / 4;
         if (!g->iext.width || !g->iext.height || !slices) continue;
+        if (fam >= TX_BC1 && s->quality == QUALITY_AUTO) {
+            VkPipeline p = pipeline(e, fam, level_quality(s, img, g->sub.mipLevel));
+            pipe = p ? p : pipe; /* a variant that failed to build: the one there is */
+        }
+        if (pipe != bound) {
+            e->dev->real.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+            bound = pipe;
+        }
         VkDeviceSize slice_bytes = region_bytes(&u, g, 1), row_bytes = slice_bytes / bh;
         if (slice_bytes <= lim) {
             /* whole slices, as many as a chunk holds */
@@ -1117,7 +1157,8 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
         if (len < (int)sizeof(msg) - 24) len += snprintf(msg + len, sizeof(msg) - (size_t)len, " %d->%d%s", f, t, blit ? "" : " (no blit)");
     }
     s->quality = transcode_quality();
-    if (len) VKB_INFO("BC emulation: transcoding (BC format -> format):%s%s", msg, s->quality == 1 ? "" : s->quality ? ", high quality" : ", fast");
+    static const char *const qname[4] = {", fast", "", ", high quality", ", auto quality (fast for levels of 1024x1024 texels or more)"};
+    if (len) VKB_INFO("BC emulation: transcoding (BC format -> format):%s%s", msg, qname[s->quality]);
     else VKB_INFO("BC emulation: no transcoding (%s)", vkb_emu_bcn_transcode_wanted() ? "the GPU samples neither ETC2 nor ASTC" : "VKBRIDGE_BC_TRANSCODE=0");
     VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
@@ -1142,8 +1183,9 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
 {
     bcn_state *s = dev->emu->bcn;
     if (!s) return;
-    for (int i = 0; i < FAM_COUNT; i++)
-        if (s->pipes[i]) dev->real.vkDestroyPipeline(dev->device, s->pipes[i], NULL);
+    for (int q = 0; q < 3; q++)
+        for (int i = 0; i < FAM_COUNT; i++)
+            if (s->pipes[q][i]) dev->real.vkDestroyPipeline(dev->device, s->pipes[q][i], NULL);
     dev->real.vkDestroyPipelineLayout(dev->device, s->layout, NULL);
     dev->real.vkDestroyDescriptorSetLayout(dev->device, s->dsl, NULL);
     /* Scratch that command buffers still hold goes with their state (server_emu_cmdstate.c). */
