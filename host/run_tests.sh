@@ -93,6 +93,9 @@ run_mode() {
     # UE4's layer-only pass-through geometry stage folded into the vertex shader (Stray's stuck
     # pipelines): up front with VKBRIDGE_LAYER_GS_FOLD=1, and as the never-ending compile's fallback
     timeout 300 ./gsfold_test.sh >out/t-gsfold.log 2>&1; result $? "gsfold_test ($(tail -1 out/t-gsfold.log))"
+    # The startup probe (imitated failures switch their emulations on, a dead start resumes, a
+    # small budget defers to the background) and the session report with its diff tool
+    timeout 300 ./probe_report_test.sh >out/t-probe.log 2>&1; result $? "probe_report_test ($(tail -1 out/t-probe.log))"
   fi
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
