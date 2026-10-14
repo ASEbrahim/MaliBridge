@@ -311,7 +311,8 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     VkPhysicalDeviceProperties p;
     t->real.vkGetPhysicalDeviceProperties(t->physical, &p);
     const char *env = vkb_srv_env("VKBRIDGE_SPIRV_FIX");
-    int on = env ? strcmp(env, "0") != 0 : p.vendorID == 0x13B5; /* ARM */
+    /* ARM, or a GPU the startup probe saw fold DXVK's guard at the defaults (server_probe.c) */
+    int on = env ? strcmp(env, "0") != 0 : p.vendorID == 0x13B5 || vkb_probe_flag(VKB_PROBE_FLAG_SPIRV_FIX);
     if (!on || !t->dt.vkCreateShaderModule) return;
     vkb_spvfix *f = calloc(1, sizeof(*f));
     if (!f) return;

@@ -212,6 +212,7 @@ typedef struct watch_slot {
     const uint32_t *code[STAGES_MAX]; /* inline SPIR-V of the call (valid while the slot is used) */
     size_t size[STAGES_MAX];
     int warned;
+    double limit; /* vkb_guard_run: its own limit (0: VKBRIDGE_COMPILE_TIMEOUT_S) */
 } watch_slot;
 
 typedef struct mod_hash {
@@ -700,6 +701,7 @@ static void *watch_main(void *arg)
             if (!w->used) continue;
             double el = now - w->start;
             char st[400];
+            double lim = w->limit > 0 ? w->limit : w->limit < 0 ? 0 : timeout_s;
             if (el >= warn_s && !w->warned) {
                 w->warned = 1;
                 stages_text(w->hash, w->stage, w->nstages, st, sizeof(st));
@@ -707,7 +709,7 @@ static void *watch_main(void *arg)
                          timeout_s > 0 ? "" : " - VKBRIDGE_COMPILE_TIMEOUT_S=0: not interrupted");
                 for (uint32_t k = 0; k < w->nstages; k++) save_spirv(w->hash[k], w->code[k], w->size[k]);
             }
-            if (timeout_s > 0 && el >= timeout_s && timeout_sig && !w->arm->timed_out) {
+            if (lim > 0 && el >= lim && timeout_sig && !w->arm->timed_out) {
                 w->arm->timed_out = 1;
                 pthread_kill(w->thread, timeout_sig);
             }
@@ -878,9 +880,26 @@ static int layer_fold_always(void)
     static int v = -1;
     if (v < 0) {
         const char *e = vkb_srv_env("VKBRIDGE_LAYER_GS_FOLD");
-        v = e && *e == '1';
+        /* also when the startup probe saw this driver draw a layer-only geometry stage wrong (and
+         * a vertex shader's Layer right): server_probe.c; =0 keeps the stage */
+        v = e && *e ? *e == '1' : vkb_probe_flag(VKB_PROBE_FLAG_GS_FOLD);
     }
     return v;
+}
+
+/* One pipeline whose fragment stage is UE4's colour-grading LUT (vkb_fs_is_ue4_lut). */
+static int is_lut_pipeline(const VkGraphicsPipelineCreateInfo *info, const uint64_t *h, uint32_t nh)
+{
+    for (uint32_t s = 0; s < info->stageCount && s < nh; s++) {
+        if (info->pStages[s].stage != VK_SHADER_STAGE_FRAGMENT_BIT) continue;
+        size_t size = 0;
+        int own = 0;
+        uint32_t *code = stage_code(&info->pStages[s], h[s], &size, &own);
+        int lut = code && vkb_fs_is_ue4_lut(code, size);
+        if (own) free(code);
+        return lut;
+    }
+    return 0;
 }
 
 static VkResult VKAPI_CALL gd_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
@@ -911,6 +930,17 @@ static VkResult VKAPI_CALL gd_CreateGraphicsPipelines(VkDevice device, VkPipelin
         if (r != VK_SUCCESS)
             for (uint32_t i = 0; out && i < n; i++) out[i] = VK_NULL_HANDLE;
         return r;
+    }
+    /* The startup probe saw this driver's compiler spin on the LUT's shape (server_probe.c): its
+     * stand-in at once instead of after a timeout (before the
+     * geometry fold: the spin is the worse failure). */
+    if (n == 1 && vkb_probe_flag(VKB_PROBE_FLAG_LUT_NOW) && is_lut_pipeline(infos, h, nh)) {
+        r = try_fallback(g, device, cache, infos, a, out, h, stg, nh, FB_LUT, &timed);
+        if (r == VK_SUCCESS) {
+            VKB_WARN("UE4 colour-grading LUT pipeline built with its neutral stand-in at once: the startup probe saw this "
+                     "driver's compiler spin on the shape (VKBRIDGE_PROBE_APPLY=0: compile it)");
+            return r;
+        }
     }
     /* VKBRIDGE_LAYER_GS_FOLD=1: every foldable pass-through geometry stage goes, before any timeout. */
     if (n == 1 && layer_fold_always()) {
@@ -1096,6 +1126,46 @@ static VkResult VKAPI_CALL gd_CreateShaderModule(VkDevice device, const VkShader
     watch_end(w);
     if (r == VK_SUCCESS && out) mod_remember(*out, ci);
     return r;
+}
+
+/* ------------------------------------------------------------------ the startup probe */
+
+const uint32_t *vkb_guard_lut_standin(size_t *size)
+{
+    *size = sizeof(lut_standin_fs);
+    return lut_standin_fs;
+}
+
+int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *arg, int *sig)
+{
+    guard_env();
+    if (sig) *sig = 0;
+    if (guard_off) {
+        fn(arg);
+        return VKB_GUARD_DONE;
+    }
+    watch_env();
+    guard_arm arm;
+    arm.prev = tls_arm;
+    arm.timed_out = 0;
+    watch_slot *volatile w = NULL;
+    if (sigsetjmp(arm.jb, 1)) {
+        watch_end(w);
+        if (sig) *sig = arm.sig;
+        return arm.timed_out ? VKB_GUARD_TIMED_OUT : VKB_GUARD_CRASHED;
+    }
+    tls_arm = &arm;
+    w = watch_begin(&arm, what, 0, NULL, NULL, 0, NULL, 0);
+    if (w) {
+        pthread_mutex_lock(&watch_lock);
+        w->limit = limit_s;
+        w->warned = 1; /* the probe says what it was doing itself */
+        pthread_mutex_unlock(&watch_lock);
+    }
+    fn(arg);
+    tls_arm = arm.prev;
+    watch_end(w);
+    return VKB_GUARD_DONE;
 }
 
 void vkb_guard_device_init(vkb_srv_table *t)

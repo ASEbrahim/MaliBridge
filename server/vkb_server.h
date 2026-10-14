@@ -10,6 +10,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "vkb_server_iface.h"
 #include "vkb_proto.h"
@@ -110,6 +111,30 @@ void vkb_log_summary(void);
 void vkb_guard_device_init(vkb_srv_table *t);
 void vkb_guard_device_destroy(vkb_srv_table *t);
 void vkb_guard_fault(int sig, void *addr); /* crash handler: jumps back into a guarded driver call, if any */
+/* fn(arg) armed like a driver compile (the startup probe): a fault in it, or a run past limit_s
+ * (0: VKBRIDGE_COMPILE_TIMEOUT_S, < 0: none), jumps back; *sig: the fault's signal. */
+enum { VKB_GUARD_DONE = 0, VKB_GUARD_CRASHED = 1, VKB_GUARD_TIMED_OUT = 2 };
+int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *arg, int *sig);
+const uint32_t *vkb_guard_lut_standin(size_t *size); /* the compile watchdog's UE4 LUT stand-in */
+
+/* server_probe.c: the startup capability probe (device profile in the cache directory). Runtime
+ * flags its results set: */
+#define VKB_PROBE_FLAG_LUT_NOW 0x1u     /* UE4 LUT pipelines get their stand-in at once (compiler spin) */
+#define VKB_PROBE_FLAG_GS_FOLD 0x2u     /* layer-only geometry stages folded into the vertex shader */
+#define VKB_PROBE_FLAG_SPIRV_FIX 0x4u   /* server_spvfix.c on whatever the vendor */
+#define VKB_PROBE_FLAG_TX_ETC2 0x8u     /* BC transcoders that did not build: those formats decoded */
+#define VKB_PROBE_FLAG_TX_EAC 0x10u
+#define VKB_PROBE_FLAG_TX_ASTC 0x20u
+#define VKB_PROBE_FLAG_TX_ASTC_HDR 0x40u
+#define VKB_PROBE_FLAG_TX_ALL 0x78u
+int vkb_probe_flag(uint32_t f);
+void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd);
+void vkb_probe_start_background(void); /* what did not fit the start's budget */
+void vkb_probe_write_md(FILE *f);
+void vkb_probe_write_json(FILE *f);
+int vkb_probe_issues(void (*cb)(void *arg, const char *line), void *arg);
+
+void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, VkResult r, const char *slow_stages);
 
 /* server_spvfix.c */
 void vkb_spvfix_device_init(vkb_srv_table *t);

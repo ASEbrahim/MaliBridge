@@ -1,0 +1,12 @@
+#version 450
+// DXVK's texture guard: OpSelect over a composite of specialization constants. build_probe.sh turns
+// the OpSpecConstantComposite into an OpConstantComposite, as DXVK emits it; Mali folded that at
+// the constants' defaults (all false: zeros) instead of the specialized values (Lee Gao, wrapper #93).
+layout(local_size_x = 1) in;
+layout(constant_id = 0) const bool SC = false;
+layout(set = 0, binding = 0) buffer O { uint v[4]; } o;
+void main() {
+    bvec4 sel = bvec4(SC, SC, SC, SC);
+    uvec4 r = mix(uvec4(0u), uvec4(11u, 22u, 33u, 44u), sel);
+    o.v[0] = r.x; o.v[1] = r.y; o.v[2] = r.z; o.v[3] = r.w;
+}

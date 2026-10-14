@@ -1,0 +1,6 @@
+#version 450
+// Writes a marker into a buffer bound by a push descriptor (or a set: the layout decides).
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer B { uint v[]; } b;
+layout(push_constant) uniform P { uint marker; } pc;
+void main() { b.v[0] = pc.marker; b.v[1] = pc.marker ^ 0xffffffffu; }

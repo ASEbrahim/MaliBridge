@@ -1,0 +1,9 @@
+#version 450
+// Reads texel (0,0) of a compressed texture (native BC) as 0-255 per channel.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer O { uint v[4]; } o;
+layout(set = 0, binding = 1) uniform sampler2D tex;
+void main() {
+    vec4 t = texelFetch(tex, ivec2(0), 0);
+    for (int c = 0; c < 4; c++) o.v[c] = uint(t[c] * 255.0 + 0.5);
+}

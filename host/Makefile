@@ -10,6 +10,8 @@ OUT ?= $(VKB)/host/out$(if $(TSAN),-tsan)
 CC ?= gcc
 CFLAGS ?= -O1 -g
 SAN := $(if $(TSAN),-fsanitize=thread -g)
+# The bridge build named in the startup probe's device profile and the session report.
+VKB_GIT := $(shell git -C $(VKB) describe --always --dirty 2>/dev/null || echo unknown)
 WARN := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-sign-compare
 INC := -I$(VKB)/third_party/Vulkan-Headers-1.4.341/include -I$(VKB)/common -I$(VKB)/common/gen
 COMMON_SRC := $(VKB)/common/vkb_wire.c $(VKB)/common/gen/vkb_gen_structs.c
@@ -22,7 +24,7 @@ all: $(OUT)/vkbridge-server $(OUT)/libvulkan_droidbridge.so $(OUT)/vkbridge_icd.
 
 $(OUT)/vkbridge-server: $(SERVER_SRC) $(wildcard $(SRV)/*.h $(SRV)/*.inc $(VKB)/common/*.h $(VKB)/common/gen/*.h)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) $(SAN) $(WARN) $(INC) -I$(SRV) -o $@ $(SERVER_SRC) -ldl -lpthread -lm -rdynamic
+	$(CC) $(CFLAGS) $(SAN) $(WARN) $(INC) -I$(SRV) -DVKB_GIT='"$(VKB_GIT)"' -o $@ $(SERVER_SRC) -ldl -lpthread -lm -rdynamic
 
 $(OUT)/libvulkan_droidbridge.so: $(CLIENT_SRC) $(wildcard $(VKB)/client/*.h $(VKB)/common/*.h $(VKB)/common/gen/*.h)
 	@mkdir -p $(OUT)

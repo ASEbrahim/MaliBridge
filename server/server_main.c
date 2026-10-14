@@ -272,13 +272,14 @@ JNIEXPORT jint JNICALL Java_com_droiddeck_launcher_gpu_VkBridgeNative_nativeStar
         VKB_ERR("in-app server serves %s, asked for %s (or its socket is gone)", jni_socket, sock ? sock : "(none)");
     } else if (jni_state == 0 && sock) {
         jni_state = -1;
+        /* Before the self-test: the startup probe's faults are contained too (server_probe.c).
+         * SIGABRT is left alone: an abort is not a compiler fault worth unwinding, and debuggerd's
+         * tombstone of it is what helps. */
+        catch_crash(SIGSEGV);
+        catch_crash(SIGBUS);
+        catch_crash(SIGILL);
+        catch_crash(SIGFPE);
         if (server_init(NULL, cache)) {
-            /* SIGABRT is left alone: an abort is not a compiler fault worth unwinding, and
-             * debuggerd's tombstone of it is what helps. */
-            catch_crash(SIGSEGV);
-            catch_crash(SIGBUS);
-            catch_crash(SIGILL);
-            catch_crash(SIGFPE);
             int lfd = listen_on(sock);
             pthread_t t;
             if (lfd >= 0 && pthread_create(&t, NULL, serve_thread, (void *)(intptr_t)lfd) == 0) {

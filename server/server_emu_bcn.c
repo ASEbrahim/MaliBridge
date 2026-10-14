@@ -578,6 +578,14 @@ void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch)
 
 /* ------------------------------------------------------------------ decoder */
 
+static const uint32_t *const fam_code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
+                                                    spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
+                                                    spv_bc7_astc};
+static const size_t fam_size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), sizeof(spv_bc3), sizeof(spv_bc4), sizeof(spv_bc5),
+                                           sizeof(spv_bc6h), sizeof(spv_bc7), sizeof(spv_bc1_16), sizeof(spv_bc1_etc2),
+                                           sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac),
+                                           sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc)};
+
 /* The decoder or transcoder for fam; q: the transcoders' BC_QUALITY (0-2, ignored by decoders). */
 static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q)
 {
@@ -587,18 +595,11 @@ static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q)
     if (have) return have;
     pthread_mutex_lock(&s->lock);
     if (!*pp) {
-        static const uint32_t *const code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
-                                                        spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
-                                                        spv_bc7_astc};
-        static const size_t size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), sizeof(spv_bc3), sizeof(spv_bc4), sizeof(spv_bc5),
-                                               sizeof(spv_bc6h), sizeof(spv_bc7), sizeof(spv_bc1_16), sizeof(spv_bc1_etc2),
-                                               sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac),
-                                               sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc)};
         const vkb_dispatch *r = &e->dev->real;
         VkDevice d = e->dev->device;
-        VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size[fam], code[fam]};
+        VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fam_size[fam], fam_code[fam]};
         VkShaderModule m;
-        if (code[fam] && r->vkCreateShaderModule(d, &mci, NULL, &m) == VK_SUCCESS) {
+        if (fam_code[fam] && r->vkCreateShaderModule(d, &mci, NULL, &m) == VK_SUCCESS) {
             VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             /* the transcoders' search: BC_QUALITY, specialization constant 0 (left at its default of 1
              * when that is asked for) */
@@ -1148,6 +1149,13 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
         if (!t || !vkb_emu_bcn_transcode_wanted()) continue;
         int cls = tx_class(t);
         if (cls == 6 ? !hdr : cls == 3 ? !pf.textureCompressionASTC_LDR : !pf.textureCompressionETC2) continue;
+        /* the startup probe could not build this target's transcoder on the driver (server_probe.c) */
+        uint32_t blocked = cls <= 2 ? VKB_PROBE_FLAG_TX_ETC2 : cls == 3 ? VKB_PROBE_FLAG_TX_ASTC : cls == 6 ? VKB_PROBE_FLAG_TX_ASTC_HDR
+                                                                                                          : VKB_PROBE_FLAG_TX_EAC;
+        if (vkb_probe_flag(blocked)) {
+            VKB_ONCE(VKB_LOG_WARN, "BC emulation: formats whose transcoder the startup probe could not build are decoded instead");
+            continue;
+        }
         VkFormatProperties fp;
         dev->real.vkGetPhysicalDeviceFormatProperties(dev->physical, t, &fp);
         if ((fp.optimalTilingFeatures & txneed) != txneed) continue;
@@ -1197,4 +1205,59 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
     free(s->idle);
     pthread_mutex_destroy(&s->lock);
     free(s);
+}
+
+/* ------------------------------------------------------------------ the startup probe */
+
+/* The transcoders (server_probe.c builds each on the driver, under the compile watchdog). */
+static const struct {
+    int fam;
+    const char *name;
+    uint32_t flag;
+} probe_tx[] = {{TX_BC1, "BC1->ETC2", VKB_PROBE_FLAG_TX_ETC2},    {TX_BC2, "BC2->ASTC", VKB_PROBE_FLAG_TX_ASTC},
+                {TX_BC3, "BC3->ASTC", VKB_PROBE_FLAG_TX_ASTC},    {TX_BC4, "BC4->EAC", VKB_PROBE_FLAG_TX_EAC},
+                {TX_BC5, "BC5->EAC", VKB_PROBE_FLAG_TX_EAC},      {TX_BC6H, "BC6H->ASTC-HDR", VKB_PROBE_FLAG_TX_ASTC_HDR},
+                {TX_BC7, "BC7->ASTC", VKB_PROBE_FLAG_TX_ASTC}};
+
+int vkb_emu_bcn_transcoders(void) { return (int)(sizeof(probe_tx) / sizeof(probe_tx[0])); }
+
+const char *vkb_emu_bcn_transcoder_name(int i, uint32_t *flag)
+{
+    *flag = probe_tx[i].flag;
+    return probe_tx[i].name;
+}
+
+/* Transcoder i built (at the default quality) and destroyed again, on a device of the probe's. */
+VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, int i, double *ms)
+{
+    int fam = probe_tx[i].fam;
+    VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_t)};
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkShaderModule m = VK_NULL_HANDLE;
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult res = r->vkCreateDescriptorSetLayout(d, &dci, NULL, &dsl);
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 1, &pr};
+    if (res == VK_SUCCESS) res = r->vkCreatePipelineLayout(d, &plci, NULL, &pl);
+    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fam_size[fam], fam_code[fam]};
+    if (res == VK_SUCCESS) res = r->vkCreateShaderModule(d, &mci, NULL, &m);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (res == VK_SUCCESS) {
+        VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                                                      m, "main", NULL};
+        pci.layout = pl;
+        res = r->vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pci, NULL, &p);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    *ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (p) r->vkDestroyPipeline(d, p, NULL);
+    if (m) r->vkDestroyShaderModule(d, m, NULL);
+    if (pl) r->vkDestroyPipelineLayout(d, pl, NULL);
+    if (dsl) r->vkDestroyDescriptorSetLayout(d, dsl, NULL);
+    return res;
 }

@@ -1,0 +1,16 @@
+#version 450
+// Reads through null descriptors (VK_EXT_robustness2 nullDescriptor): every read must be zero.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer O { uint v[8]; } o;
+layout(set = 0, binding = 1) buffer I { uint v[4]; } i;
+layout(set = 0, binding = 2) uniform sampler2D tex;
+layout(set = 0, binding = 3) uniform samplerBuffer tb;
+layout(set = 0, binding = 4) uniform U { uvec4 v; } u;
+void main() {
+    o.v[0] = i.v[0] | i.v[3];
+    o.v[1] = floatBitsToUint(texelFetch(tex, ivec2(0), 0).x) | floatBitsToUint(texelFetch(tex, ivec2(0), 0).w);
+    o.v[2] = uint(textureSize(tex, 0).x);
+    o.v[3] = floatBitsToUint(texelFetch(tb, 0).x) | uint(textureSize(tb));
+    o.v[4] = u.v.x | u.v.w;
+    o.v[5] = 0xc0deu;
+}

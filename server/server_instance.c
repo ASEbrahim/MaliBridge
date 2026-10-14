@@ -147,11 +147,14 @@ void vkb_selftest_all(void)
         k->info.emu = k->info.emu_available;
         const char *emu_env = getenv("VKBRIDGE_EMULATE");
         if (emu_env && !strcmp(emu_env, "0")) k->info.emu = 0;
+        /* what the driver really does (server_probe.c): may switch emulations on */
+        vkb_probe_device(k, inst, &dt, pds[i]);
         k->valid = 1;
         VKB_INFO("%s: memory sharing = %s, missing 0x%x, emulating 0x%x", k->name, vkb_mem_strategy_name(k->info.strategy),
                  k->info.missing, k->info.emu);
     }
     dt.vkDestroyInstance(inst, NULL);
+    vkb_probe_start_background();
 }
 
 /* ------------------------------------------------------------------ instance */
