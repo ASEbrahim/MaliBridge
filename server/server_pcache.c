@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -40,6 +41,12 @@
 /* App-made caches start from the program's cache only while it is this small, and only the first
  * few: Zink makes one per GL program (and keeps each in Mesa's disk cache), so every one of them
  * got - and wrote back to Mesa's cache, and copied over the socket - the whole Steam UI cache. */
+/* All the program files together (VKBRIDGE_PCACHE_TOTAL_MB, 0: no limit). On Android the directory
+ * is in the app's files now, which the system never trims, and a file per game adds up: past the
+ * limit the files used longest ago go, at the server's start and now and then at a new device
+ * (a file is touched when it is loaded, so its time is when it was last used or saved). */
+#define PC_TOTAL_MB_DEFAULT 512u
+#define PC_TRIM_PERIOD_S 300
 #define PC_SEED_MAX (8u << 20)
 #define PC_SEED_CACHES 2
 #define PC_SAVE_PERIOD_S 10
@@ -74,6 +81,7 @@ typedef struct vkb_pcache {
     pc_ident file;        /* the file as this cache last read or wrote it */
     int covers;           /* the file holds nothing `cache` lacks (it was written from it alone) */
     int full_warned;
+    int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
     time_t last_save;     /* CLOCK_MONOTONIC seconds */
     char warm[PC_WARM_KINDS][512]; /* pre-caching files taken in, removed after the next save */
@@ -98,6 +106,8 @@ static int pc_thread_started;
 
 const char *vkb_pcache_dir(void) { return pc_dir; }
 
+static void trim(const char *keep, int now);
+
 /* Test toggles without restarting the app (the server lives in it and reads its environment once):
  * <cache dir>/env holds KEY=VALUE lines (# comments), read again at every vkCreateDevice, and
  * vkb_srv_env() prefers them to the process environment. Only switches read per device take
@@ -113,6 +123,7 @@ static pthread_mutex_t env_lock = PTHREAD_MUTEX_INITIALIZER;
 void vkb_srv_env_reload(void)
 {
     if (!pc_dir) return;
+    vkb_cache_dir_ensure(); /* a new device is a good time to notice it went */
     char path[600];
     snprintf(path, sizeof(path), "%s/env", pc_dir);
     FILE *f = fopen(path, "r");
@@ -168,16 +179,178 @@ const char *vkb_srv_env(const char *name)
     return v ? v : getenv(name);
 }
 
+/* mkdir -p: 0, or -1 with errno. */
+int vkb_mkdirs(const char *path)
+{
+    char buf[600];
+    size_t n = strlen(path);
+    if (!n || n >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(buf, path, n + 1);
+    for (char *s = buf + 1; *s; s++) {
+        if (*s != '/') continue;
+        *s = 0;
+        if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+        *s = '/';
+    }
+    if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+    struct stat st;
+    if (stat(buf, &st) != 0) return -1;
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
+/* The cache directory can go while the server runs: Android empties an app's cache directory when
+ * storage runs out (a tablet at 100% lost it, the server's files and the env file with it, and
+ * every save after that failed with ENOENT). Each writer into it calls this when it is missing:
+ * it is made again, once, and said once. 1 when the directory is there. */
+static pthread_mutex_t dir_lock = PTHREAD_MUTEX_INITIALIZER;
+static int dir_fail_logged, nospace;
+
+int vkb_cache_dir_ensure(void)
+{
+    if (!pc_dir) return 0;
+    struct stat st;
+    if (stat(pc_dir, &st) == 0 && S_ISDIR(st.st_mode)) return 1;
+    pthread_mutex_lock(&dir_lock);
+    int ok = stat(pc_dir, &st) == 0 && S_ISDIR(st.st_mode); /* another writer made it meanwhile */
+    if (!ok) {
+        ok = vkb_mkdirs(pc_dir) == 0;
+        if (ok) {
+            dir_fail_logged = 0;
+            VKB_WARN("cache directory %s was removed; recreated (its pipeline caches, probe profile and env file are gone with it)", pc_dir);
+        } else if (!dir_fail_logged) {
+            dir_fail_logged = 1;
+            VKB_WARN("cache directory %s was removed and cannot be made again: %s; nothing is saved until it can", pc_dir, strerror(errno));
+        }
+    }
+    pthread_mutex_unlock(&dir_lock);
+    return ok;
+}
+
+/* <cache dir>/<sub>, made (and the cache directory with it) if missing; 0 or -1 with errno. */
+int vkb_cache_subdir(const char *sub)
+{
+    if (!pc_dir || !vkb_cache_dir_ensure()) {
+        errno = ENOENT;
+        return -1;
+    }
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", pc_dir, sub);
+    if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* A write into the cache directory failed with errno e. A full storage is said once until a write
+ * goes through again (vkb_cache_write_ok), whoever hits it: the server keeps running and the
+ * writers keep trying quietly. Returns 1 when the caller should report the error itself. */
+int vkb_cache_write_failed(const char *what, int e)
+{
+    if (e != ENOSPC && e != EDQUOT) return 1;
+    if (!__atomic_exchange_n(&nospace, 1, __ATOMIC_RELAXED))
+        VKB_WARN("cache directory %s: no space left on the device (%s not written); the bridge keeps running and tries again quietly", pc_dir ? pc_dir : "",
+                 what);
+    return 0;
+}
+
+void vkb_cache_write_ok(void)
+{
+    if (__atomic_load_n(&nospace, __ATOMIC_RELAXED) && __atomic_exchange_n(&nospace, 0, __ATOMIC_RELAXED))
+        VKB_INFO("cache directory %s: writes go through again", pc_dir ? pc_dir : "");
+}
+
 void vkb_pcache_set_dir(const char *dir)
 {
     if (!dir || !*dir) return;
-    mkdir(dir, 0700);
+    vkb_mkdirs(dir);
     /* A copy: the in-app start frees its string after server_init (The412Banner, e40cd361). */
     char *copy = strdup(dir);
     if (!copy) return;
     free((char *)pc_dir);
     pc_dir = copy;
     VKB_INFO("pipeline cache directory %s", dir);
+    pthread_mutex_lock(&pc_lock);
+    trim(NULL, 1);
+    pthread_mutex_unlock(&pc_lock);
+}
+
+typedef struct pc_entry {
+    char name[256];
+    off_t size;
+    struct timespec mtime;
+} pc_entry;
+
+static int entry_older(const void *a, const void *b)
+{
+    const pc_entry *x = a, *y = b;
+    if (x->mtime.tv_sec != y->mtime.tv_sec) return x->mtime.tv_sec < y->mtime.tv_sec ? -1 : 1;
+    return x->mtime.tv_nsec < y->mtime.tv_nsec ? -1 : x->mtime.tv_nsec > y->mtime.tv_nsec;
+}
+
+static uint64_t total_limit(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PCACHE_TOTAL_MB");
+    return (uint64_t)(v && *v ? strtoull(v, NULL, 10) : PC_TOTAL_MB_DEFAULT) << 20;
+}
+
+static time_t mono_s(void);
+
+/* The .vkpc files over the total limit, oldest first, but never one a device has open (keep: one
+ * more, by path). With pc_lock held. */
+static void trim(const char *keep, int now)
+{
+    static time_t last;
+    time_t t = mono_s();
+    if (!pc_dir || (!now && last && t - last < PC_TRIM_PERIOD_S)) return;
+    last = t;
+    uint64_t limit = total_limit();
+    if (!limit) return;
+    DIR *d = opendir(pc_dir);
+    if (!d) return;
+    pc_entry *e = NULL;
+    size_t n = 0, cap = 0;
+    uint64_t total = 0;
+    for (struct dirent *de; (de = readdir(d));) {
+        size_t len = strlen(de->d_name);
+        if (len < 6 || len >= sizeof(e->name) || strcmp(de->d_name + len - 5, ".vkpc")) continue;
+        struct stat st;
+        if (fstatat(dirfd(d), de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 64;
+            pc_entry *g = realloc(e, cap * sizeof(*e));
+            if (!g) break;
+            e = g;
+        }
+        memcpy(e[n].name, de->d_name, len + 1);
+        e[n].size = st.st_size;
+        e[n].mtime = st.st_mtim;
+        total += (uint64_t)st.st_size;
+        n++;
+    }
+    closedir(d);
+    if (total > limit) {
+        qsort(e, n, sizeof(*e), entry_older);
+        uint64_t freed = 0;
+        unsigned gone = 0;
+        for (size_t i = 0; i < n && total - freed > limit; i++) {
+            char path[600];
+            snprintf(path, sizeof(path), "%s/%s", pc_dir, e[i].name);
+            int busy = keep && !strcmp(path, keep);
+            for (vkb_pcache *p = pc_list; p && !busy; p = p->next) busy = !strcmp(p->path, path);
+            if (busy || unlink(path) != 0) continue;
+            freed += (uint64_t)e[i].size;
+            gone++;
+            VKB_INFO("pipeline cache %s (%lld KB) removed: the least recently used", path, (long long)(e[i].size >> 10));
+        }
+        VKB_INFO("pipeline caches: %llu MB in %zu files, over the %llu MB limit (VKBRIDGE_PCACHE_TOTAL_MB); %u removed, %llu MB freed",
+                 (unsigned long long)(total >> 20), n, (unsigned long long)(limit >> 20), gone, (unsigned long long)(freed >> 20));
+    }
+    free(e);
 }
 
 static vkb_pcache *cur(void)
@@ -267,6 +440,7 @@ static int write_file(const char *path, const uint8_t *buf, size_t size)
     char tmp[600];
     snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 && errno == ENOENT && vkb_cache_dir_ensure()) fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     int ok = fd >= 0;
     for (size_t done = 0; ok && done < size;) {
         ssize_t w = write(fd, buf + done, size - done);
@@ -274,8 +448,8 @@ static int write_file(const char *path, const uint8_t *buf, size_t size)
         if (w <= 0) ok = 0;
         else done += (size_t)w;
     }
-    if (fd >= 0 && fsync(fd) != 0) ok = 0;
-    if (fd >= 0) close(fd);
+    if (ok && fsync(fd) != 0) ok = 0;
+    if (fd >= 0 && close(fd) != 0) ok = 0;
     if (ok && rename(tmp, path) == 0) return 0;
     int e = errno;
     unlink(tmp);
@@ -399,9 +573,15 @@ static void save(vkb_pcache *p)
         ident_stat(p->path, &p->file);
         p->saved_size = own;
         p->covers = !merged;
+        p->save_err = 0;
+        vkb_cache_write_ok();
         consume_warm(p);
     } else {
-        VKB_WARN("device %u: pipeline cache not saved to %s: %s", t->id, p->path, strerror(errno));
+        /* Said once per cause, not at every try (every 10 s while the app compiles). */
+        int e = errno;
+        if (vkb_cache_write_failed("a pipeline cache", e) && e != p->save_err)
+            VKB_WARN("device %u: pipeline cache not saved to %s: %s (tried again quietly)", t->id, p->path, strerror(e));
+        p->save_err = e;
         __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
     }
     free(out);
@@ -574,6 +754,11 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     snprintf(p->path, sizeof(p->path), "%s%s.vkpc", base, key[0] ? key : prog);
     p->warm_role = strchr(key, '.') != NULL;
     p->last_save = mono_s();
+    pthread_mutex_lock(&pc_lock);
+    trim(p->path, 0);
+    pthread_mutex_unlock(&pc_lock);
+    /* Used now: the last the total limit removes (before it is read, so what is read is the file as it is). */
+    if (!p->warm_role) utimensat(AT_FDCWD, p->path, NULL, 0);
 
     size_t size = 0;
     uint8_t *data = p->warm_role ? NULL : read_file(p->path, &size, &p->file);

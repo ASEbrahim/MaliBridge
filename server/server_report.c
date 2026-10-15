@@ -1090,10 +1090,18 @@ static void write_file(const char *name, void (*fn)(FILE *, int), int final)
     snprintf(path, sizeof(path), "%s/%s", rdir, name);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *f = fopen(tmp, "we");
+    if (!f && errno == ENOENT && vkb_mkdirs(rdir) == 0) {
+        /* its directory went (on Android it can be the app's cache directory, emptied when storage runs out) */
+        static int told;
+        if (!told++) VKB_WARN("report directory %s was removed; recreated", rdir);
+        f = fopen(tmp, "we");
+    }
     if (!f) return;
     fn(f, final);
-    fclose(f);
-    rename(tmp, path);
+    int ok = fflush(f) == 0 && !ferror(f);
+    if (fclose(f) != 0) ok = 0;
+    if (ok) rename(tmp, path);
+    else unlink(tmp); /* a full storage: the last whole report stays */
 }
 
 static pthread_mutex_t wlock = PTHREAD_MUTEX_INITIALIZER;

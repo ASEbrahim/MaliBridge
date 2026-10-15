@@ -26,6 +26,7 @@
 #include "vkb_server.h"
 #include "spirv_pervertex.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +127,7 @@ static void dump_code(vkb_spvfix *f, const uint32_t *code, size_t size, const ch
     char path[600];
     snprintf(path, sizeof(path), "%s/failed-%u.spv", dir, f->dumped++);
     FILE *o = fopen(path, "wb");
+    if (!o && errno == ENOENT && vkb_cache_dir_ensure()) o = fopen(path, "wb"); /* the cache directory was removed */
     if (!o) return;
     fwrite(code, 1, size, o);
     fclose(o);

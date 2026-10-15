@@ -216,6 +216,12 @@ void vkb_dsmap_device_destroy(vkb_srv_table *t);
 /* server_pcache.c */
 void vkb_pcache_set_dir(const char *dir);
 const char *vkb_pcache_dir(void);
+/* Writers into the cache directory (server_pcache.c): it may be removed under a running server */
+int vkb_mkdirs(const char *path);                   /* mkdir -p; 0 or -1 with errno */
+int vkb_cache_dir_ensure(void);                     /* made again if removed (said once); 1: there */
+int vkb_cache_subdir(const char *sub);              /* <cache dir>/<sub> made if missing; 0 or -1 */
+int vkb_cache_write_failed(const char *what, int e); /* ENOSPC said once; 1: caller reports e */
+void vkb_cache_write_ok(void);                      /* a write went through (space again) */
 void vkb_srv_env_reload(void);             /* <cache dir>/env overrides, read at each vkCreateDevice */
 const char *vkb_srv_env(const char *name); /* an override, else getenv */
 void vkb_pcache_device_init(vkb_srv_table *t);

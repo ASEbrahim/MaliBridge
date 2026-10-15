@@ -8,7 +8,13 @@
 #   4  processes saving the same file add to each other's work instead of replacing it;
 #   5  only the first two empty caches an app makes start from the program's cache, and
 #      EXTERNALLY_SYNCHRONIZED ones (Zink's per-program caches) never;
-#   6  a game that had a cache by process name starts from it.
+#   6  a game that had a cache by process name starts from it;
+#   7  the cache directory removed under the running server (Android empties an app's cache
+#      directory when storage runs out): the next save makes it again, said once, no failed saves;
+#   8  a full storage (a 1 MB tmpfs, in a user namespace of its own; skipped where there is none):
+#      said once, the server keeps running, and the cache is saved once there is room again;
+#   9  the total limit (VKBRIDGE_PCACHE_TOTAL_MB): at a server's start the files used longest ago
+#      go until the rest fit, the newest stay.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}  # VKB_OUT=out-tsan for the ThreadSanitizer build
@@ -74,5 +80,64 @@ SteamAppId=4247 "$out/pcache_check" --first 2000 --count 20 >$work/6b.log 2>&1
 grep -q "steam4247.vkpc ([0-9]* KB loaded from .*pcache_check.vkpc)" "$log"
 step $? "a keyed game starts from its cache by process name"
 
-grep -E "process [0-9]+ is|pipeline cache|taken in|removed|several" "$log" > "$out/t-pcache-server.log"
+# 7 removed under a running game, as on the tablet: its periodic saves (every 10 s) and the one at
+#   its end, then a second removal and a new game (the directory comes back at its device)
+SteamAppId=4248 "$out/pcache_check" --first 3000 --count 40 --hold 14 >$work/7a.log 2>&1 &
+a=$!
+sleep 2
+rm -rf "$cache"
+wait $a
+n7=$(grep -c "cache directory .* was removed; recreated" "$log")
+have steam4248 && [ "$n7" = 1 ] && ! grep -q "pipeline cache not saved" "$log"
+step $? "cache directory removed under a running game: recreated (said $n7 time(s)), $(size steam4248) bytes saved"
+rm -rf "$cache"
+SteamAppId=4249 "$out/pcache_check" --first 3100 --count 10 >$work/7b.log 2>&1
+have steam4249 && [ "$(grep -c "cache directory .* was removed; recreated" "$log")" = 2 ]
+step $? "removed again: recreated at the next game ($(size steam4249) bytes)"
+
+# 8 a full storage
+if unshare -rm true 2>/dev/null; then
+  unshare -rm bash -c '
+    out=$1; work=$2; sock=$3.full
+    mkdir -p "$work/full" && mount -t tmpfs -o size=1m tmpfs "$work/full" || exit 2
+    cache=$work/full/c; log=$work/server-full.log
+    VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
+        "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$cache" >/dev/null 2>&1 &
+    srv=$!
+    trap "kill $srv 2>/dev/null; rm -f $sock" EXIT
+    for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
+    export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES= VKBRIDGE_PROBE=0
+    dd if=/dev/zero of="$work/full/filler" bs=4k count=1000 2>/dev/null # every block but a few
+    SteamAppId=4250 "$out/pcache_check" --first 4000 --count 80 --hold 22 >"$work/8a.log" 2>&1 || exit 3
+    SteamAppId=4251 "$out/pcache_check" --first 4100 --count 80 >"$work/8b.log" 2>&1 || exit 4
+    nospace=$(grep -c "no space left on the device" "$log"); notsaved=$(grep -c "pipeline cache not saved" "$log")
+    rm -f "$work/full/filler"
+    SteamAppId=4252 "$out/pcache_check" --first 4200 --count 20 >"$work/8c.log" 2>&1 || exit 5
+    kill -0 $srv || exit 6
+    ls "$cache"/*-steam4252.vkpc >/dev/null 2>&1 || exit 7
+    grep -q "writes go through again" "$log" || exit 8
+    echo "$nospace $notsaved" > "$work/8.res"
+    [ "$nospace" = 1 ] && [ "$notsaved" = 0 ] || exit 9
+  ' _ "$out" "$work" "$sock"
+  r=$?
+  step $r "full storage: said $(cut -d" " -f1 $work/8.res 2>/dev/null) time(s), $(cut -d" " -f2 $work/8.res 2>/dev/null) other save warnings, saved once there was room (exit $r)"
+  [ $r = 0 ] || grep -E "space|not saved|recreated|cache saved" "$work/server-full.log" | head -20
+else
+  echo "  skip full storage (no user namespaces)"
+fi
+
+# 9 four 1 MB files of different ages under a 2 MB limit, at another server's start
+c9=$work/c9; mkdir -p "$c9"
+for i in 1 2 3 4; do head -c 1048576 /dev/zero > "$c9/0000-0000-x-old$i.vkpc"; touch -d "-$((10 - i)) days" "$c9/0000-0000-x-old$i.vkpc"; done
+echo keep > "$c9/stuck-pipelines"
+VKBRIDGE_PCACHE_TOTAL_MB=2 VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
+    "$out/vkbridge-server" --socket "$sock.9" --log "$work/server9.log" --cache-dir "$c9" >/dev/null 2>&1 &
+s9=$!
+for _ in $(seq 50); do [ -S "$sock.9" ] && break; sleep 0.1; done
+kill $s9 2>/dev/null; wait $s9 2>/dev/null; rm -f "$sock.9"
+left=$(cd "$c9" && ls *.vkpc 2>/dev/null | tr '\n' ' ')
+[ "$left" = "0000-0000-x-old3.vkpc 0000-0000-x-old4.vkpc " ] && [ -f "$c9/stuck-pipelines" ] && grep -q "2 removed, 2 MB freed" "$work/server9.log"
+step $? "total limit: the two oldest of four 1 MB files removed at a 2 MB limit (left: $left)"
+
+grep -E "process [0-9]+ is|pipeline cache|taken in|removed|several|cache directory" "$log" > "$out/t-pcache-server.log"
 if [ $fails = 0 ]; then echo "OK: persistent pipeline cache"; else echo "FAILED: $fails step(s) (server log in $out/t-pcache-server.log)"; exit 1; fi
