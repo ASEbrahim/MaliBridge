@@ -269,8 +269,8 @@ int vkb_cache_subdir(const char *sub);              /* <cache dir>/<sub> made if
 int vkb_cache_write_failed(const char *what, int e); /* ENOSPC said once; 1: caller reports e */
 void vkb_cache_write_ok(void);                      /* a write went through (space again) */
 void vkb_srv_env_reload(void);             /* <cache dir>/env overrides, read at each vkCreateDevice */
-/* A switch, first found wins: <cache dir>/env, the server's environment, then on a client's
- * connection thread that game's preset (server_presets.c: its file, then the built-in one) */
+/* A switch, first found wins: on a client's connection thread that game's preset file, then
+ * <cache dir>/env, the server's environment, then that game's built-in preset (server_presets.c) */
 const char *vkb_srv_env(const char *name);
 enum { VKB_ENV_SRC_NONE, VKB_ENV_SRC_CACHE_ENV, VKB_ENV_SRC_ENV, VKB_ENV_SRC_PRESET_FILE, VKB_ENV_SRC_PRESET_BUILTIN };
 const char *vkb_srv_env_src(const char *name, int *src);   /* the same, and where it came from (VKB_ENV_SRC_*) */
@@ -306,6 +306,8 @@ void vkb_preset_free(vkb_srv_proc *p);
 /* this process's preset value of name, or NULL; *src VKB_ENV_SRC_PRESET_FILE or _BUILTIN */
 const char *vkb_preset_get(const vkb_srv_proc *p, const char *name, int *src);
 const char *vkb_preset_text(const vkb_srv_proc *p, char *out, size_t cap); /* "K=V ... (from file)", or "" */
+/* "preset for steam<appid>: a built-in preset exists but was not tested on <gpu>; ...", or "" */
+const char *vkb_preset_note(const vkb_srv_proc *p, char *out, size_t cap);
 uint32_t vkb_preset_client_knobs(void);  /* vkb_server_pd_info.client_knobs for this thread's client */
 
 /* server_instance.c */

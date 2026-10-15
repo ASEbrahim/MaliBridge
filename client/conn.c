@@ -654,8 +654,8 @@ int vkb_client_mode(void)
 }
 
 /* The client's switches the server sent (vkb_server_pd_info.client_knobs, at the first
- * vkbQueryServer): <cache dir>/env, the server's environment, the game's preset. The guest's own
- * environment beats them; an older server sends none. */
+ * vkbQueryServer): the game's preset file, <cache dir>/env, the server's environment, the game's
+ * built-in preset. The guest's own environment beats them; an older server sends none. */
 static uint32_t knobs_word;
 static int knobs_known;
 

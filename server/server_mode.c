@@ -20,13 +20,15 @@
  * VKBRIDGE_MODE so a later change there is one line).
  *
  * Where the mode comes from, first found wins:
- *   1. VKBRIDGE_MODE in <cache dir>/env (a developer override, read again at each device);
- *   2. VKBRIDGE_MODE in the server's environment;
- *   3. VKBRIDGE_MODE in the game's preset (server_presets.c: its file, then the built-in one), for
- *      that game's devices: read on the client's connection thread;
- *   4. <cache dir>/mode, one word, written by the app from Setup's "Safe mode" switch before it
+ *   1. VKBRIDGE_MODE in the game's preset file (server_presets.c), for that game's devices: read
+ *      on the client's connection thread;
+ *   2. VKBRIDGE_MODE in <cache dir>/env (a developer override, read again at each device);
+ *   3. VKBRIDGE_MODE in the server's environment;
+ *   4. VKBRIDGE_MODE in the game's built-in preset (on a GPU it was tested on), for that game's
+ *      devices;
+ *   5. <cache dir>/mode, one word, written by the app from Setup's "Safe mode" switch before it
  *      starts or reuses the server;
- *   5. the default, safe.
+ *   6. the default, safe.
  * Values: safe, performance (perf). Anything else is safe, with a warning. Re-read at each
  * vkbQueryServer and vkCreateDevice (one small file); a change is logged with its source.
  */

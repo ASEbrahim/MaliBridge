@@ -67,8 +67,8 @@ typedef struct vkb_server_pd_info {
 
 /* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an
  * older server sent zeros here), else VKB_KNOB_OFF or VKB_KNOB_ON. What the server has for the
- * client: <cache dir>/env, its own environment, the game's preset (server_presets.c). The guest's
- * own environment still wins (client/conn.c). */
+ * client: the game's preset file, <cache dir>/env, its own environment, the game's built-in preset
+ * (server_presets.c). The guest's own environment still wins (client/conn.c). */
 #define VKB_KNOB_OFF 1u
 #define VKB_KNOB_ON 2u
 #define VKB_KNOB_DESC_BATCH_SHIFT 0   /* VKBRIDGE_DESC_BATCH / VKBRIDGE_NO_DESC_BATCH */

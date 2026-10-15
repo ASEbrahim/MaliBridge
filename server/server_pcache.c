@@ -179,16 +179,20 @@ const char *vkb_srv_env_override(const char *name)
     return v;
 }
 
-/* First found wins: <cache dir>/env (the developer's and tester's override, read again at each
- * device), the server's environment, then - on a client's connection thread - that game's preset
- * (server_presets.c). The two global places beat the preset so that one line in <cache dir>/env
- * overrides a stale preset for every game at once, without editing preset files. */
+/* First found wins: on a client's connection thread that game's preset file (the user's own choice
+ * for it), then <cache dir>/env (the developer's and tester's override, read again at each
+ * device), the server's environment, then that game's built-in preset (server_presets.c). The
+ * global places beat the built-in preset so that one line in <cache dir>/env overrides a stale
+ * one for every game at once. */
 const char *vkb_srv_env_src(const char *name, int *src)
 {
-    int s = VKB_ENV_SRC_CACHE_ENV;
-    const char *v = vkb_srv_env_override(name);
-    if (!v && (v = getenv(name))) s = VKB_ENV_SRC_ENV;
-    if (!v) v = vkb_preset_get(vkb_srv_current_proc(), name, &s);
+    int ps = VKB_ENV_SRC_NONE, s;
+    const char *pv = vkb_preset_get(vkb_srv_current_proc(), name, &ps);
+    const char *v = NULL;
+    if (pv && ps == VKB_ENV_SRC_PRESET_FILE) v = pv, s = ps;
+    else if ((v = vkb_srv_env_override(name))) s = VKB_ENV_SRC_CACHE_ENV;
+    else if ((v = getenv(name))) s = VKB_ENV_SRC_ENV;
+    else v = pv, s = ps;
     if (src) *src = v ? s : VKB_ENV_SRC_NONE;
     return v;
 }

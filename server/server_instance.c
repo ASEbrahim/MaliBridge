@@ -257,7 +257,7 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
     memset(&info, 0, sizeof(info));
     if (k) info = k->info;
     else VKB_WARN("query for a physical device the self-test did not see");
-    info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: <cache dir>/env, the game's preset */
+    info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: the game's preset file, <cache dir>/env, ... */
     vkb_enc_raw(&c->r, &info, sizeof(info));
 }
 

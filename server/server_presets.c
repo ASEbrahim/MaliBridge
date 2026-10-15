@@ -5,20 +5,21 @@
  * that hello the process gets its preset, for its own devices only:
  *   - <cache dir>/presets/<appid>.env, written by a tester or a user: KEY=VALUE lines, the same
  *     keys as <cache dir>/env, '#' comments and blank lines skipped;
- *   - the built-in preset, presets_builtin.inc, compiled in (data only: one line per game).
- * The file beats the built-in preset key by key.
+ *   - the built-in preset, presets_builtin.inc, compiled in (data only: one line per game), taken
+ *     only on a GPU it was tested on: each entry lists deviceName substrings ("Mali-G720"); when
+ *     none of them is in the name of a GPU the server drives (its self-test's), or the list is
+ *     empty, the entry is not applied and its lines are said once, to copy into the file.
  *
- * Where a switch comes from, first found wins (vkb_srv_env, server_pcache.c):
- *   1. <cache dir>/env          the developer's and tester's global override, read at each device
- *   2. the server's environment
- *   3. <cache dir>/presets/<appid>.env
+ * Where a switch comes from, first found wins (vkb_srv_env_src, server_pcache.c):
+ *   1. <cache dir>/presets/<appid>.env   the user's own choice for that one game
+ *   2. <cache dir>/env                   the developer's and tester's global override, read at each device
+ *   3. the server's environment
  *   4. the built-in preset
- *   5. the mode's default        (server_mode.c; VKBRIDGE_MODE itself: Setup's switch, then safe)
- * The two global places beat the per-game ones on purpose: they are what someone sets for one
- * test or one session ("everything with the fix off"), and one line there then holds for every
- * game, a stale preset included, without editing preset files. A preset beats the mode's defaults
- * and, for VKBRIDGE_MODE, Setup's switch: it is the more specific choice. Turning 1 and 3 round
- * (a preset beating <cache dir>/env) is a change in vkb_srv_env_src alone.
+ *   5. the mode's default                (server_mode.c; VKBRIDGE_MODE itself: Setup's switch, then safe)
+ * Someone's own file for a game is the most specific choice there is, so it beats the global
+ * places; those still beat the built-in presets, so one line in <cache dir>/env holds for every
+ * game's built-in preset, a stale one included ("everything with the fix off"). A preset beats
+ * the mode's defaults and, for VKBRIDGE_MODE, Setup's switch.
  *
  * Only the keys below are taken from a preset: those the server reads on the client's connection
  * thread and keeps per device (or per call). A switch the server reads once for all processes
@@ -33,7 +34,10 @@
  * games of different modes at once the session report's first line shows the last device's.
  *
  * Logged once per app id and preset: "preset for steam<appid>: KEY=VALUE ... (from file), ...
- * (from built-in)". The session report lists each process's preset.
+ * (from built-in)", and for a built-in entry not tested on this GPU "preset for steam<appid>: a
+ * built-in preset exists but was not tested on <gpu>; not applied. To try it, copy it to
+ * <cache dir>/presets/<appid>.env: KEY=VALUE ...". The session report lists each process's preset
+ * and that line.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -54,13 +58,15 @@ struct vkb_preset {
     char appid[24];
     unsigned n;
     preset_kv kv[PRESET_MAX];
+    char untested[512]; /* built-in lines not applied: not tested on this GPU */
+    char note[1100];    /* the line saying so, or "" */
 };
 
 static const struct {
-    const char *appid, *kv, *why;
+    const char *appid, *gpus, *kv, *why;
 } builtin[] = {
 #include "presets_builtin.inc"
-    {NULL, NULL, NULL},
+    {NULL, NULL, NULL, NULL},
 };
 
 /* The keys a preset may set (see above) */
@@ -168,23 +174,61 @@ static void take_words(struct vkb_preset *p, const char *text, int src, const ch
     for (char *save = NULL, *w = strtok_r(buf, " \t", &save); w; w = strtok_r(NULL, " \t", &save)) take(p, w, src, where, ++n);
 }
 
+/* The GPUs the server drives (its self-test's), "a, b"; "an unknown GPU" before the self-test */
+static void gpu_names(char *out, size_t cap)
+{
+    size_t o = 0;
+    out[0] = 0;
+    for (int i = 0; i < vkb_npds && o < cap; i++)
+        if (vkb_pds[i].name[0]) o += (size_t)snprintf(out + o, cap - o, "%s%s", o ? ", " : "", vkb_pds[i].name);
+    if (!out[0]) snprintf(out, cap, "an unknown GPU");
+}
+
+/* 1 when a GPU the server drives has one of tested's comma-separated names in its deviceName */
+static int tested_here(const char *tested)
+{
+    for (const char *t = tested; t && *t;) {
+        size_t n = strcspn(t, ",");
+        char one[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+        snprintf(one, sizeof(one), "%.*s", (int)n, t);
+        for (int i = 0; one[0] && i < vkb_npds; i++)
+            if (strstr(vkb_pds[i].name, one)) return 1;
+        t += n;
+        if (*t) t++;
+    }
+    return 0;
+}
+
+/* One built-in entry: taken on a GPU it was tested on, else kept aside to be said */
+static void take_entry(struct vkb_preset *p, const char *gpus, const char *kv, const char *where)
+{
+    if (tested_here(gpus)) {
+        take_words(p, kv, VKB_ENV_SRC_PRESET_BUILTIN, where);
+        return;
+    }
+    size_t o = strlen(p->untested);
+    if (o < sizeof(p->untested) - 1) snprintf(p->untested + o, sizeof(p->untested) - o, "%s%s", o ? " " : "", kv);
+}
+
 static void load_builtin(struct vkb_preset *p)
 {
     char where[64];
     snprintf(where, sizeof(where), "built-in preset steam%s", p->appid);
     for (size_t i = 0; builtin[i].appid; i++)
-        if (!strcmp(builtin[i].appid, p->appid)) take_words(p, builtin[i].kv, VKB_ENV_SRC_PRESET_BUILTIN, where);
+        if (!strcmp(builtin[i].appid, p->appid)) take_entry(p, builtin[i].gpus, builtin[i].kv, where);
 #ifndef __ANDROID__
-    /* Host tests: VKBRIDGE_PRESET_FAKE_BUILTIN=<appid>:KEY=VALUE KEY=VALUE;<appid>:... stands in for
-     * entries of presets_builtin.inc */
+    /* Host tests: VKBRIDGE_PRESET_FAKE_BUILTIN=<appid>[@<gpu>,<gpu>]:KEY=VALUE KEY=VALUE;<appid>...
+     * stands in for entries of presets_builtin.inc (no "@...": an empty tested list) */
     const char *fake = vkb_srv_env_global("VKBRIDGE_PRESET_FAKE_BUILTIN");
     size_t al = strlen(p->appid);
     for (const char *e = fake; e && *e;) {
         size_t len = strcspn(e, ";");
-        if (len > al && !strncmp(e, p->appid, al) && e[al] == ':') {
-            char one[1024];
-            snprintf(one, sizeof(one), "%.*s", (int)(len - al - 1), e + al + 1);
-            take_words(p, one, VKB_ENV_SRC_PRESET_BUILTIN, where);
+        const char *colon = memchr(e, ':', len);
+        if (colon && (size_t)(colon - e) >= al && !strncmp(e, p->appid, al) && (e[al] == ':' || e[al] == '@')) {
+            char gpus[256] = "", one[1024];
+            if (e[al] == '@') snprintf(gpus, sizeof(gpus), "%.*s", (int)(colon - e - al - 1), e + al + 1);
+            snprintf(one, sizeof(one), "%.*s", (int)(len - (size_t)(colon - e) - 1), colon + 1);
+            take_entry(p, gpus, one, where);
         }
         e += len;
         if (*e) e++;
@@ -242,24 +286,38 @@ void vkb_preset_load(vkb_srv_proc *pr)
     snprintf(p->appid, sizeof(p->appid), "%s", id);
     load_builtin(p);
     load_file(p);
-    if (!p->n) {
+    if (p->untested[0]) {
+        char gpu[300];
+        gpu_names(gpu, sizeof(gpu));
+        const char *dir = vkb_pcache_dir();
+        snprintf(p->note, sizeof(p->note),
+                 "preset for steam%s: a built-in preset exists but was not tested on %s; not applied. To try it, copy it to "
+                 "%s/presets/%s.env: %s",
+                 p->appid, gpu, dir ? dir : "<cache dir>", p->appid, p->untested);
+        if (first_time(p->note)) VKB_INFO("%s", p->note);
+    }
+    if (!p->n && !p->note[0]) {
         free(p);
         return;
     }
-    char text[1500], line[2300];
-    text_of(p, text, sizeof(text));
-    /* the global places win: said here, so a preset that seems to do nothing is explained */
-    char shadow[600] = "";
-    size_t so = 0;
-    for (unsigned i = 0; i < p->n; i++) {
-        const char *ov = vkb_srv_env_override(p->kv[i].key);
-        const char *ev = ov ? NULL : getenv(p->kv[i].key);
-        if ((ov || ev) && so < sizeof(shadow))
-            so += (size_t)snprintf(shadow + so, sizeof(shadow) - so, "%s%s=%s from %s", so ? ", " : "", p->kv[i].key, ov ? ov : ev,
-                                   ov ? "<cache dir>/env" : "the environment");
+    if (p->n) {
+        char text[1500], line[2300];
+        text_of(p, text, sizeof(text));
+        /* the global places beat the built-in preset (not the file): said here, so a preset that
+         * seems to do nothing is explained */
+        char shadow[600] = "";
+        size_t so = 0;
+        for (unsigned i = 0; i < p->n; i++) {
+            if (p->kv[i].src != VKB_ENV_SRC_PRESET_BUILTIN) continue;
+            const char *ov = vkb_srv_env_override(p->kv[i].key);
+            const char *ev = ov ? NULL : getenv(p->kv[i].key);
+            if ((ov || ev) && so < sizeof(shadow))
+                so += (size_t)snprintf(shadow + so, sizeof(shadow) - so, "%s%s=%s from %s", so ? ", " : "", p->kv[i].key, ov ? ov : ev,
+                                       ov ? "<cache dir>/env" : "the environment");
+        }
+        snprintf(line, sizeof(line), "preset for steam%s: %s%s%s", p->appid, text, shadow[0] ? "; overridden: " : "", shadow);
+        if (first_time(line)) VKB_INFO("%s", line);
     }
-    snprintf(line, sizeof(line), "preset for steam%s: %s%s%s", p->appid, text, shadow[0] ? "; overridden: " : "", shadow);
-    if (first_time(line)) VKB_INFO("%s", line);
     __atomic_store_n(&pr->preset, p, __ATOMIC_RELEASE);
 }
 
@@ -286,6 +344,14 @@ const char *vkb_preset_text(const vkb_srv_proc *pr, char *out, size_t cap)
     if (!cap) return out;
     out[0] = 0;
     if (p) text_of(p, out, cap);
+    return out;
+}
+
+const char *vkb_preset_note(const vkb_srv_proc *pr, char *out, size_t cap)
+{
+    const struct vkb_preset *p = pr ? __atomic_load_n(&pr->preset, __ATOMIC_ACQUIRE) : NULL;
+    if (!cap) return out;
+    snprintf(out, cap, "%s", p ? p->note : "");
     return out;
 }
 
