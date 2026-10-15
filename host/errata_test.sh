@@ -3,7 +3,8 @@
 # own socket and cache directory; the switches go in <cache dir>/env, re-read at each device):
 #   1  the decisions by Mali driver version (VKBRIDGE_FAKE_DRIVER_VERSION) x mode: which errata
 #      are on for r44p1 (Mali-G720), r49p1 (Mali-G925, given as its beta driverInfo string), r54p2,
-#      r54p3, a job manager GPU, an Arm driver whose version cannot be read;
+#      r54p3, a job manager GPU, an Arm driver whose version cannot be read; clamp_zero (MK-32) on
+#      r49p1 only for a beta build and only in safe mode, on r51p0, off from r52p0;
 #   2  probe-driven ones (VKBRIDGE_ERRATA_PROBE): a failed probe turns its erratum on, a probe that
 #      only records does not;
 #   3  VKBRIDGE_ERRATA=+name,-name forces, an unknown name is warned about;
@@ -52,20 +53,25 @@ matrix() { # mode version expected
   [ "$got" = "$3" ]
   step $? "$1 mode, $2: $got$([ "$got" = "$3" ] || echo " (want $3)")"
 }
-matrix safe r44p1 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_counts
-matrix safe v1.r49p1-03bet0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts
+matrix safe r44p1 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_counts,clamp_zero
+matrix safe v1.r49p1-03bet0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero
 echo "$new" | grep -q "driver r49p1 beta (VKBRIDGE_FAKE_DRIVER_VERSION \"v1.r49p1-03bet0\")" &&
-  echo "$new" | grep -q "errata: view_quarantine ON (r49p1 in r49p1-r49p2; safe mode[;)]"
-step $? "the beta driverInfo string decoded, the reason logged ($(echo "$new" | grep -o 'errata: view_quarantine ON.*'))"
+  echo "$new" | grep -q "errata: view_quarantine ON (r49p1 in r49p1-r49p2; safe mode[;)]" &&
+  echo "$new" | grep -q "errata: clamp_zero ON (r49p1 in r49p1-r49p1 (a beta build: Arm's fix in r49p1 not confirmed for it); safe mode) - MK-32"
+step $? "the beta driverInfo string decoded, the reasons logged ($(echo "$new" | grep -o 'errata: view_quarantine ON.*'); $(echo "$new" | grep -o 'errata: clamp_zero ON.*' | cut -c1-60)...)"
+matrix safe v1.r49p1-01eac0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts
+matrix safe r51p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero
+matrix safe r52p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_counts
 matrix safe r54p2 wait_retry,dyn_reemit,vb_split,view_counts
 matrix safe r54p3 wait_retry,dyn_reemit,vb_split,view_counts
-matrix performance r44p1 wait_retry,vb_split,view_counts
+matrix performance r44p1 wait_retry,vb_split,view_counts,clamp_zero
 matrix performance v1.r49p1-03bet0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts
 matrix performance r54p2 wait_retry,vb_split,view_counts
 matrix performance r54p3 wait_retry,vb_split,view_counts
-matrix performance r46p0:jm wait_retry,dyn_reemit,vb_split,view_counts
-matrix performance r46p0:csf wait_retry,vb_split,view_counts
-matrix safe not-a-version wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts
+matrix performance r46p0:jm wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero
+matrix performance r46p0:csf wait_retry,vb_split,view_counts,clamp_zero
+matrix performance r50p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero
+matrix safe not-a-version wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero
 
 # 2 probes
 device VKBRIDGE_MODE=performance VKBRIDGE_FAKE_DRIVER_VERSION=r54p3 VKBRIDGE_ERRATA_PROBE=viewport_flip:fail,bitwise_vec:fail,rendering_churn:fail,dyn_state:pass
@@ -76,7 +82,7 @@ step $? "failed probes turn on viewport_flip and bitwise_scalar, the record-only
 # 3 switches
 device VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts,no_such_erratum
 got=$(on_set)
-[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,example ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
+[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,clamp_zero,example ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
   echo "$new" | grep -q "no erratum named no_such_erratum" && echo "$new" | grep -q "errata: example ON (VKBRIDGE_ERRATA=+example)"
 step $? "VKBRIDGE_ERRATA=+example,-view_counts: $got; the unknown name warned about"
 
