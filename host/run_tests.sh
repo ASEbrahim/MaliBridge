@@ -113,7 +113,15 @@ run_mode() {
     # The driver-errata layer: decisions by driver version, mode, probe and switch; a fix with its
     # imitation beneath it, the bridge's own calls through both (a server of its own; once)
     timeout 300 ./errata_test.sh >out/t-errata.log 2>&1; result $? "errata_test ($(tail -1 out/t-errata.log))"
+    # The image-view errata: MK-07's REMAINING counts and MK-06's view quarantine, each failing with
+    # its bug imitated and the fix off and passing with the fix; the quarantine's caps and the
+    # server's RSS over 40000 churned views (a server of its own; once)
+    timeout 300 ./views_test.sh >out/t-views.log 2>&1; result $? "views_test ($(tail -1 out/t-views.log))"
   fi
+  # Views with VK_REMAINING_* counts (3D images as 2D arrays: MK-07, always fixed) and views made,
+  # rendered to and destroyed over and over (MK-06's pattern), through this mode's server
+  timeout 60 ./out/view3d_check >out/t-view3d.log 2>&1; result $? "view3d_check ($(tail -1 out/t-view3d.log))"
+  timeout 60 ./out/viewchurn_check 500 >out/t-viewchurn.log 2>&1; result $? "viewchurn_check ($(tail -1 out/t-viewchurn.log))"
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
   timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"
