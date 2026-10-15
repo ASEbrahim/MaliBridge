@@ -83,9 +83,10 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_DYN_REEMIT] = {"dyn_reemit", "MK-04", "dyn_state", 1, G_ALWAYS, G_PROBE_FAIL | G_IN_RANGE,
         {{V(38, 0), V(44, 1), FAM_ANY, NULL, "depth/stencil/cull/stride"},
          {V(48, 0), V(54, 0), FAM_ANY, NULL, "EDS3 conservative raster, line mode, sample mask"},
-         {V(46, 0), V(51, 0), FAM_JM, NULL, "job manager GPUs"}}},
+         {V(46, 0), V(51, 0), FAM_JM, NULL, "job manager GPUs"}},
+        vkb_errata_dyn_install, vkb_errata_dyn_imitate},
     [VKB_ERRATUM_VB_SPLIT] = {"vb_split", "MK-05", "vb_strides", 0, G_ALWAYS, G_ALWAYS,
-        {{V(42, 0), V(48, 0), FAM_ANY, NULL, NULL}}},
+        {{V(42, 0), V(48, 0), FAM_ANY, NULL, NULL}}, vkb_errata_vb_install, vkb_errata_vb_imitate},
     [VKB_ERRATUM_VIEW_QUARANTINE] = {"view_quarantine", "MK-06", "rendering_churn", 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
         {{V(49, 1), V(49, 3), FAM_ANY, NULL, NULL}, {V(50, 0), V(51, 1), FAM_ANY, NULL, NULL}},
         vkb_errata_views_install, vkb_errata_views_install},
@@ -174,16 +175,16 @@ int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta)
     return 0;
 }
 
-static void driver_version(vkb_srv_table *t, drv_version *d, char *name, size_t name_cap)
+static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_version *d, char *name, size_t name_cap)
 {
     memset(d, 0, sizeof(*d));
     VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
     if (t->real.vkGetPhysicalDeviceProperties2 && t->api_version >= VK_API_VERSION_1_2)
-        t->real.vkGetPhysicalDeviceProperties2(t->physical, &p2);
+        t->real.vkGetPhysicalDeviceProperties2(pd, &p2);
     else {
         p2.pNext = NULL;
-        t->real.vkGetPhysicalDeviceProperties(t->physical, &p2.properties);
+        t->real.vkGetPhysicalDeviceProperties(pd, &p2.properties);
     }
     const VkPhysicalDeviceProperties *pr = &p2.properties;
     snprintf(name, name_cap, "%s", pr->deviceName);
@@ -286,7 +287,7 @@ void vkb_errata_device_init(vkb_srv_table *t)
     t->errata = e;
     char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     drv_version d;
-    driver_version(t, &d, gpu, sizeof(gpu));
+    driver_version(t, t->physical, &d, gpu, sizeof(gpu));
     int perf = performance_mode();
     const char *mode = perf ? "performance mode" : "safe mode";
 
@@ -354,6 +355,8 @@ void vkb_errata_device_init(vkb_srv_table *t)
         snprintf(l + n, 256 - n, "%s%s", n ? "," : "", x->name);
         if (on) {
             e->on |= 1u << i;
+            /* the driver is affected as far as is known, not only "always" */
+            if (g || pr == VKB_ERRATA_PROBE_FAIL || (d.arm && !d.known) || (plus >> i & 1)) e->targeted |= 1u << i;
             if (x->install)
                 VKB_INFO("errata: %s ON (%s)%s%s", x->name, why, x->mk ? " - " : "", x->mk ? x->mk : "");
             else if (x->elsewhere)
@@ -390,6 +393,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     if (!e) return;
     vkb_errata_views_destroy(t, e);
     vkb_errata_bitwise_destroy(t, e);
+    vkb_errata_cmd_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -414,13 +418,32 @@ const vkb_dispatch *vkb_errata_next(int imitation)
     return imitation ? &last_next_imi : &last_next_fix;
 }
 
-/* example: what a fix looks like. Its wrapper calls e->next_fix; an imitation calls e->next_imi. */
+/* A device extension the clients are not shown because of an erratum, on this physical device
+ * (t: its instance's table), or NULL. vb_split (MK-05): VK_EXT_vertex_input_dynamic_state below r48
+ * (its vkCmdSetVertexInputEXT sets strides another way); VKBRIDGE_ERRATA=-vb_split keeps it. */
+const char *vkb_errata_hidden_ext(const vkb_srv_table *t, VkPhysicalDevice pd)
+{
+    if (!t || !t->real.vkGetPhysicalDeviceProperties) return NULL;
+    uint32_t plus = 0, minus = 0;
+    parse_names("VKBRIDGE_ERRATA", vkb_srv_env("VKBRIDGE_ERRATA"), &plus, &minus);
+    if (minus >> VKB_ERRATUM_VB_SPLIT & 1) return NULL;
+    char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    drv_version d;
+    driver_version(t, pd, &d, gpu, sizeof(gpu));
+    if (!d.arm || !d.known || V(d.r, d.p) >= V(48, 0)) return NULL;
+    VKB_ONCE(VKB_LOG_INFO, "errata: vb_split: VK_EXT_vertex_input_dynamic_state hidden from clients (%s, driver r%up%u, below r48) - MK-05",
+             gpu, d.r, d.p);
+    return "VK_EXT_vertex_input_dynamic_state";
+}
+
+/* example: what a fix looks like. Its wrapper calls the function it replaced (example_next), so it
+ * chains with the image-view errata's wrapper of the same function; so does its imitation. */
 static VKAPI_ATTR VkResult VKAPI_CALL ex_CreateImageView(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a,
                                                          VkImageView *out)
 {
     vkb_errata_dev *e = vkb_errata_cur();
     __atomic_add_fetch(&e->example_calls, 1, __ATOMIC_RELAXED);
-    return e->next_fix.vkCreateImageView(d, ci, a, out);
+    return e->example_next(d, ci, a, out);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL ex_imi_CreateImageView(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a,
@@ -428,17 +451,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL ex_imi_CreateImageView(VkDevice d, const V
 {
     vkb_errata_dev *e = vkb_errata_cur();
     __atomic_add_fetch(&e->example_imitated, 1, __ATOMIC_RELAXED);
-    return e->next_imi.vkCreateImageView(d, ci, a, out);
+    return e->example_imi_next(d, ci, a, out);
 }
 
 static void example_install(vkb_srv_table *t, vkb_errata_dev *e)
 {
-    (void)e;
+    e->example_next = t->real.vkCreateImageView;
     ERRATA_HOOK(t, vkCreateImageView, ex_CreateImageView);
 }
 
 static void example_imitate(vkb_srv_table *t, vkb_errata_dev *e)
 {
-    (void)e;
+    e->example_imi_next = t->real.vkCreateImageView;
     ERRATA_HOOK(t, vkCreateImageView, ex_imi_CreateImageView);
 }

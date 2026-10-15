@@ -190,6 +190,7 @@ void vkb_errata_set_probe_source(int (*fn)(const char *probe)); /* the probe's r
  * code it was rewritten from (server_errata_bitwise.c); what layers beneath the errata hash with */
 uint64_t vkb_spv_app_hash(const uint32_t *code, size_t size);
 int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta); /* r<major>p<minor> in s */
+const char *vkb_errata_hidden_ext(const vkb_srv_table *inst, VkPhysicalDevice pd); /* an erratum's hidden device extension */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);
