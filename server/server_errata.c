@@ -41,7 +41,7 @@
  *
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
- * view_quarantine (MK-06), view_counts (MK-07), and example: a no-op on vkCreateImageView that
+ * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), and example: a no-op on vkCreateImageView that
  * counts the calls reaching it (and its imitation the calls beneath it), the pattern a fix follows.
  */
 #define _GNU_SOURCE
@@ -58,12 +58,14 @@
 
 enum { G_ALWAYS = 1, G_PROBE_FAIL = 2, G_IN_RANGE = 4, G_VERSION_UNKNOWN = 8 };
 enum { FAM_ANY, FAM_JM, FAM_CSF };
+enum { R_BETA = 1, R_SAFE = 2 }; /* a range for beta builds only / in safe mode only */
 
 typedef struct {
     uint32_t from, fixed; /* affected: from <= v < fixed (V_MAX: not fixed yet) */
     int family;           /* FAM_*: the GPUs it was seen on */
     const char *gpu;      /* a deviceName substring, or NULL */
     const char *note;
+    int flags;            /* R_* */
 } erratum_range;
 
 typedef struct {
@@ -101,6 +103,14 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
         vkb_errata_views_install, vkb_errata_views_install},
     [VKB_ERRATUM_VIEW_COUNTS] = {"view_counts", "MK-07", "view3d_layers", 0, G_ALWAYS, G_ALWAYS,
         {{V(19, 0), V(54, 1), FAM_ANY, NULL, NULL}}, vkb_errata_views_install, vkb_errata_views_install},
+    /* Arm: fixed in r49p1. The G925's r49p1 is a beta build ("v1.r49p1-03bet0"), which the errata
+     * notice does not cover: whether it has the fix is not known, so safe mode treats it as
+     * affected; performance mode goes by Arm. */
+    [VKB_ERRATUM_CLAMP_ZERO] = {"clamp_zero", "MK-32", NULL, 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
+        {{V(38, 1), V(49, 1), FAM_ANY, NULL, NULL},
+         {V(49, 1), V(49, 2), FAM_ANY, NULL, "a beta build: Arm's fix in r49p1 not confirmed for it", R_BETA | R_SAFE},
+         {V(50, 0), V(51, 1), FAM_ANY, NULL, NULL}},
+        vkb_errata_clampzero_install, vkb_errata_clampzero_imitate},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
 };
 
@@ -233,7 +243,7 @@ static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_vers
     version_from(&p2.properties, dp.driverInfo, d);
 }
 
-static const erratum_range *in_range(const erratum *e, const drv_version *d, const char *gpu)
+static const erratum_range *in_range(const erratum *e, const drv_version *d, const char *gpu, int perf)
 {
     if (!d->arm || !d->known) return NULL;
     uint32_t v = V(d->r, d->p);
@@ -243,6 +253,7 @@ static const erratum_range *in_range(const erratum *e, const drv_version *d, con
         if (v < g->from || v >= g->fixed) continue;
         if (g->family != FAM_ANY && g->family != d->family) continue;
         if (g->gpu && !strstr(gpu, g->gpu)) continue;
+        if (((g->flags & R_BETA) && !d->beta) || ((g->flags & R_SAFE) && perf)) continue;
         return g;
     }
     return NULL;
@@ -357,7 +368,7 @@ static int decide_erratum(int i, const drv_version *d, const char *gpu, int perf
     size_t o = 0;
     why[0] = 0;
     int pr = x->probe ? probe_result(x->probe) : VKB_ERRATA_PROBE_NOT_RUN;
-    const erratum_range *g = in_range(x, d, gpu);
+    const erratum_range *g = in_range(x, d, gpu, perf);
     int want = 0;
     if (gates & G_ALWAYS) want = 1, CAT("always");
     int by_probe = (gates & G_PROBE_FAIL) && x->probe_gates && pr == VKB_ERRATA_PROBE_FAIL;
@@ -462,6 +473,7 @@ void vkb_errata_device_init(vkb_srv_table *t)
         if (on) {
             e->on |= 1u << i;
             if (targeted) e->targeted |= 1u << i;
+            if (w.plus >> i & 1) e->forced |= 1u << i;
             if (x->install)
                 VKB_INFO("errata: %s ON (%s)%s%s", x->name, why, x->mk ? " - " : "", x->mk ? x->mk : "");
             else if (x->elsewhere)
@@ -500,6 +512,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_bitwise_destroy(t, e);
     vkb_errata_cmd_destroy(t, e);
     vkb_errata_flip_destroy(t, e);
+    vkb_errata_clampzero_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -622,6 +635,7 @@ void vkb_errata_probe_end(void *handle)
     vkb_errata_bitwise_destroy(&h->t, h->e);
     vkb_errata_cmd_destroy(&h->t, h->e);
     vkb_errata_flip_destroy(&h->t, h->e);
+    vkb_errata_clampzero_destroy(&h->t, h->e);
     free(h->e);
     free(h);
 }
