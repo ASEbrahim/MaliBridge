@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -40,6 +41,12 @@
 /* App-made caches start from the program's cache only while it is this small, and only the first
  * few: Zink makes one per GL program (and keeps each in Mesa's disk cache), so every one of them
  * got - and wrote back to Mesa's cache, and copied over the socket - the whole Steam UI cache. */
+/* All the program files together (VKBRIDGE_PCACHE_TOTAL_MB, 0: no limit). On Android the directory
+ * is in the app's files now, which the system never trims, and a file per game adds up: past the
+ * limit the files used longest ago go, at the server's start and now and then at a new device
+ * (a file is touched when it is loaded, so its time is when it was last used or saved). */
+#define PC_TOTAL_MB_DEFAULT 512u
+#define PC_TRIM_PERIOD_S 300
 #define PC_SEED_MAX (8u << 20)
 #define PC_SEED_CACHES 2
 #define PC_SAVE_PERIOD_S 10
@@ -98,6 +105,8 @@ static vkb_pcache *pc_list;
 static int pc_thread_started;
 
 const char *vkb_pcache_dir(void) { return pc_dir; }
+
+static void trim(const char *keep, int now);
 
 /* Test toggles without restarting the app (the server lives in it and reads its environment once):
  * <cache dir>/env holds KEY=VALUE lines (# comments), read again at every vkCreateDevice, and
@@ -265,6 +274,83 @@ void vkb_pcache_set_dir(const char *dir)
     free((char *)pc_dir);
     pc_dir = copy;
     VKB_INFO("pipeline cache directory %s", dir);
+    pthread_mutex_lock(&pc_lock);
+    trim(NULL, 1);
+    pthread_mutex_unlock(&pc_lock);
+}
+
+typedef struct pc_entry {
+    char name[256];
+    off_t size;
+    struct timespec mtime;
+} pc_entry;
+
+static int entry_older(const void *a, const void *b)
+{
+    const pc_entry *x = a, *y = b;
+    if (x->mtime.tv_sec != y->mtime.tv_sec) return x->mtime.tv_sec < y->mtime.tv_sec ? -1 : 1;
+    return x->mtime.tv_nsec < y->mtime.tv_nsec ? -1 : x->mtime.tv_nsec > y->mtime.tv_nsec;
+}
+
+static uint64_t total_limit(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PCACHE_TOTAL_MB");
+    return (uint64_t)(v && *v ? strtoull(v, NULL, 10) : PC_TOTAL_MB_DEFAULT) << 20;
+}
+
+static time_t mono_s(void);
+
+/* The .vkpc files over the total limit, oldest first, but never one a device has open (keep: one
+ * more, by path). With pc_lock held. */
+static void trim(const char *keep, int now)
+{
+    static time_t last;
+    time_t t = mono_s();
+    if (!pc_dir || (!now && last && t - last < PC_TRIM_PERIOD_S)) return;
+    last = t;
+    uint64_t limit = total_limit();
+    if (!limit) return;
+    DIR *d = opendir(pc_dir);
+    if (!d) return;
+    pc_entry *e = NULL;
+    size_t n = 0, cap = 0;
+    uint64_t total = 0;
+    for (struct dirent *de; (de = readdir(d));) {
+        size_t len = strlen(de->d_name);
+        if (len < 6 || len >= sizeof(e->name) || strcmp(de->d_name + len - 5, ".vkpc")) continue;
+        struct stat st;
+        if (fstatat(dirfd(d), de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 64;
+            pc_entry *g = realloc(e, cap * sizeof(*e));
+            if (!g) break;
+            e = g;
+        }
+        memcpy(e[n].name, de->d_name, len + 1);
+        e[n].size = st.st_size;
+        e[n].mtime = st.st_mtim;
+        total += (uint64_t)st.st_size;
+        n++;
+    }
+    closedir(d);
+    if (total > limit) {
+        qsort(e, n, sizeof(*e), entry_older);
+        uint64_t freed = 0;
+        unsigned gone = 0;
+        for (size_t i = 0; i < n && total - freed > limit; i++) {
+            char path[600];
+            snprintf(path, sizeof(path), "%s/%s", pc_dir, e[i].name);
+            int busy = keep && !strcmp(path, keep);
+            for (vkb_pcache *p = pc_list; p && !busy; p = p->next) busy = !strcmp(p->path, path);
+            if (busy || unlink(path) != 0) continue;
+            freed += (uint64_t)e[i].size;
+            gone++;
+            VKB_INFO("pipeline cache %s (%lld KB) removed: the least recently used", path, (long long)(e[i].size >> 10));
+        }
+        VKB_INFO("pipeline caches: %llu MB in %zu files, over the %llu MB limit (VKBRIDGE_PCACHE_TOTAL_MB); %u removed, %llu MB freed",
+                 (unsigned long long)(total >> 20), n, (unsigned long long)(limit >> 20), gone, (unsigned long long)(freed >> 20));
+    }
+    free(e);
 }
 
 static vkb_pcache *cur(void)
@@ -662,6 +748,11 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     snprintf(p->path, sizeof(p->path), "%s%s.vkpc", base, key[0] ? key : prog);
     p->warm_role = strchr(key, '.') != NULL;
     p->last_save = mono_s();
+    pthread_mutex_lock(&pc_lock);
+    trim(p->path, 0);
+    pthread_mutex_unlock(&pc_lock);
+    /* Used now: the last the total limit removes (before it is read, so what is read is the file as it is). */
+    if (!p->warm_role) utimensat(AT_FDCWD, p->path, NULL, 0);
 
     size_t size = 0;
     uint8_t *data = p->warm_role ? NULL : read_file(p->path, &size, &p->file);

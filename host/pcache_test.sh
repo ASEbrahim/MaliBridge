@@ -12,7 +12,9 @@
 #   7  the cache directory removed under the running server (Android empties an app's cache
 #      directory when storage runs out): the next save makes it again, said once, no failed saves;
 #   8  a full storage (a 1 MB tmpfs, in a user namespace of its own; skipped where there is none):
-#      said once, the server keeps running, and the cache is saved once there is room again.
+#      said once, the server keeps running, and the cache is saved once there is room again;
+#   9  the total limit (VKBRIDGE_PCACHE_TOTAL_MB): at a server's start the files used longest ago
+#      go until the rest fit, the newest stay.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}  # VKB_OUT=out-tsan for the ThreadSanitizer build
@@ -123,6 +125,19 @@ if unshare -rm true 2>/dev/null; then
 else
   echo "  skip full storage (no user namespaces)"
 fi
+
+# 9 four 1 MB files of different ages under a 2 MB limit, at another server's start
+c9=$work/c9; mkdir -p "$c9"
+for i in 1 2 3 4; do head -c 1048576 /dev/zero > "$c9/0000-0000-x-old$i.vkpc"; touch -d "-$((10 - i)) days" "$c9/0000-0000-x-old$i.vkpc"; done
+echo keep > "$c9/stuck-pipelines"
+VKBRIDGE_PCACHE_TOTAL_MB=2 VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
+    "$out/vkbridge-server" --socket "$sock.9" --log "$work/server9.log" --cache-dir "$c9" >/dev/null 2>&1 &
+s9=$!
+for _ in $(seq 50); do [ -S "$sock.9" ] && break; sleep 0.1; done
+kill $s9 2>/dev/null; wait $s9 2>/dev/null; rm -f "$sock.9"
+left=$(cd "$c9" && ls *.vkpc 2>/dev/null | tr '\n' ' ')
+[ "$left" = "0000-0000-x-old3.vkpc 0000-0000-x-old4.vkpc " ] && [ -f "$c9/stuck-pipelines" ] && grep -q "2 removed, 2 MB freed" "$work/server9.log"
+step $? "total limit: the two oldest of four 1 MB files removed at a 2 MB limit (left: $left)"
 
 grep -E "process [0-9]+ is|pipeline cache|taken in|removed|several|cache directory" "$log" > "$out/t-pcache-server.log"
 if [ $fails = 0 ]; then echo "OK: persistent pipeline cache"; else echo "FAILED: $fails step(s) (server log in $out/t-pcache-server.log)"; exit 1; fi
