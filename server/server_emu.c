@@ -112,8 +112,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
         return r;
     }
     uint32_t kept = 0;
+    const char *erratum = vkb_errata_hidden_ext(t, pd);
     for (uint32_t i = 0; i < n; i++)
-        if (!vkb_emu_ext_hidden(all[i].extensionName)) all[kept++] = all[i];
+        if (!vkb_emu_ext_hidden(all[i].extensionName) && !(erratum && !strcmp(all[i].extensionName, erratum))) all[kept++] = all[i];
     if (!props) {
         *count = kept;
         free(all);
@@ -128,9 +129,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
 
 void vkb_emu_instance_install(vkb_srv_table *t)
 {
-    if (!vkb_emu_hiding_exts() || !t->real.vkEnumerateDeviceExtensionProperties) return;
+    if (!t->real.vkEnumerateDeviceExtensionProperties) return;
+    /* always: the driver errata hide by GPU and driver version (vkb_errata_hidden_ext) */
     t->dt.vkEnumerateDeviceExtensionProperties = hide_EnumerateDeviceExtensionProperties;
-    VKB_ONCE(VKB_LOG_INFO, "device extensions hidden from clients: VKBRIDGE_FAKE_MISSING=%s VKBRIDGE_SERVER_HIDE_EXTS=%s",
+    if (vkb_emu_hiding_exts()) VKB_ONCE(VKB_LOG_INFO, "device extensions hidden from clients: VKBRIDGE_FAKE_MISSING=%s VKBRIDGE_SERVER_HIDE_EXTS=%s",
              fake_list() ? fake_list() : "", hide_list() ? hide_list() : "");
 }
 
