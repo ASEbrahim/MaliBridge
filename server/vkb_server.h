@@ -97,6 +97,7 @@ typedef struct vkb_srv_table {
     struct vkb_spvfix *spvfix;               /* server_spvfix.c */
     struct vkb_nulldesc *nulldesc;           /* server_nulldesc.c */
     struct vkb_bvmap *bvmap;                 /* server_bvmap.c */
+    struct vkb_errata_dev *errata;           /* server_errata.c */
     uint32_t mem_types_seen;                 /* memory types this device has allocated in (logged once each) */
     struct vkb_report_dev *report;           /* server_report.c */
 } vkb_srv_table;
@@ -166,6 +167,26 @@ void vkb_trace_device_init(vkb_srv_table *t);
 int vkb_nocomp_wanted(void); /* VKBRIDGE_NO_COMPRESSION (experiment) */
 void vkb_nocomp_device_init(vkb_srv_table *t, int enabled);
 void vkb_quirks_device_init(vkb_srv_table *t); /* server_quirks.c */
+
+/* server_errata.c: driver errata, fixed just above the driver */
+enum {
+    VKB_ERRATUM_WAIT_RETRY,      /* MK-01 waits fail with -3 after a signal */
+    VKB_ERRATUM_VIEWPORT_FLIP,   /* MK-02 negative viewport height ignored */
+    VKB_ERRATUM_BITWISE_SCALAR,  /* MK-03 integer vector bitwise op on a swizzle miscompiled */
+    VKB_ERRATUM_DYN_REEMIT,      /* MK-04 dynamic state lost across pipeline binds */
+    VKB_ERRATUM_VB_SPLIT,        /* MK-05 vkCmdBindVertexBuffers2 strides by array index */
+    VKB_ERRATUM_VIEW_QUARANTINE, /* MK-06 vkCmdBeginRendering reuses stale view state */
+    VKB_ERRATUM_VIEW_COUNTS,     /* MK-07 3D image as 2D array with VK_REMAINING_ARRAY_LAYERS */
+    VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
+    VKB_ERRATA_COUNT
+};
+enum { VKB_ERRATA_PROBE_NOT_RUN, VKB_ERRATA_PROBE_PASS, VKB_ERRATA_PROBE_FAIL };
+void vkb_errata_device_init(vkb_srv_table *t);
+void vkb_errata_device_destroy(vkb_srv_table *t);
+int vkb_errata_on(const vkb_srv_table *t, int id); /* VKB_ERRATUM_* decided on for this device */
+const char *vkb_errata_name(int id);
+void vkb_errata_set_probe_source(int (*fn)(const char *probe)); /* the probe's record: VKB_ERRATA_PROBE_* */
+int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta); /* r<major>p<minor> in s */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);

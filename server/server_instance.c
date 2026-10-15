@@ -457,6 +457,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_nocomp_device_init(t, nocomp);
             vkb_hang_device_init(t);  /* next: sees the driver-level calls of every layer above it */
             vkb_quirks_device_init(t);
+            vkb_errata_device_init(t); /* driver-near: the emulations' own calls reach the fixes too */
             vkb_emu_device_init(t, emu);
             vkb_pcache_device_init(t);
             vkb_pools_device_init(t);
@@ -502,6 +503,7 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_pools_device_destroy(t);
     vkb_pcache_device_destroy(t);
     vkb_emu_device_destroy(t);
+    vkb_errata_device_destroy(t);
     vkb_hang_device_destroy(t);
     vkb_guard_device_destroy(t);
     vkb_report_device_destroy(t);

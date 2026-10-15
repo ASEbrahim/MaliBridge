@@ -110,6 +110,9 @@ run_mode() {
     # A start that ends inside a probe: a stop or a kill runs it again, an abort or a hang past the
     # watchdog is died and decided; the default budget defers the heavy probes, both parts timed
     timeout 300 ./probe_end_test.sh >out/t-probe-end.log 2>&1; result $? "probe_end_test ($(tail -1 out/t-probe-end.log))"
+    # The driver-errata layer: decisions by driver version, mode, probe and switch; a fix with its
+    # imitation beneath it, the bridge's own calls through both (a server of its own; once)
+    timeout 300 ./errata_test.sh >out/t-errata.log 2>&1; result $? "errata_test ($(tail -1 out/t-errata.log))"
   fi
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
