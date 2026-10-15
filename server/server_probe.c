@@ -1756,8 +1756,9 @@ static void write_profile(pprofile *pf)
     char tmp[700];
     snprintf(tmp, sizeof(tmp), "%s.tmp", pf->path);
     FILE *f = fopen(tmp, "we");
+    if (!f && errno == ENOENT && vkb_cache_dir_ensure()) f = fopen(tmp, "we"); /* the cache directory was removed */
     if (!f) {
-        VKB_WARN("probe: cannot write %s: %s", tmp, strerror(errno));
+        if (vkb_cache_write_failed("the probe profile", errno)) VKB_WARN("probe: cannot write %s: %s", tmp, strerror(errno));
         return;
     }
     fprintf(f, "{\n  \"malibridge_probe\": 1,\n  \"key\": ");
@@ -1787,10 +1788,21 @@ static void write_profile(pprofile *pf)
         fprintf(f, "}%s\n", i + 1 < pf->n ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
+    /* A short write (a full storage) must not replace the profile it was meant to update. */
+    int ok = fflush(f) == 0 && !ferror(f);
+    if (ok) fsync(fileno(f));
+    int e = errno;
+    if (fclose(f) != 0 && ok) {
+        ok = 0;
+        e = errno;
+    }
+    if (!ok) {
+        unlink(tmp);
+        if (vkb_cache_write_failed("the probe profile", e)) VKB_WARN("probe: cannot write %s: %s", tmp, strerror(e));
+        return;
+    }
     if (rename(tmp, pf->path) != 0) VKB_WARN("probe: cannot rename %s: %s", tmp, strerror(errno));
+    else vkb_cache_write_ok();
 }
 
 /* ------------------------------------------------------------------ how a process ended in a probe */
@@ -1867,6 +1879,8 @@ static void probe_begin(pprofile *pf)
     char path[700];
     snprintf(path, sizeof(path), "%s.beat", pf->path);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 && errno == ENOENT && vkb_cache_dir_ensure()) fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) vkb_cache_write_failed("a probe heartbeat", errno); /* without it the probe is judged as before (judge_end) */
     pthread_mutex_lock(&plock);
     pf->beat_last = mono_ms();
     pf->beat_active = pf->beat_gap = 0;
@@ -1991,7 +2005,14 @@ static int judge_end(pprofile *pf, const char *name, char *detail, size_t cap)
 static int read_profile(pprofile *pf)
 {
     FILE *f = fopen(pf->path, "re");
-    if (!f) return 0;
+    if (!f) {
+        /* None yet, or it went (the cache directory emptied under a full storage): probed again
+         * from the start. A heartbeat left without its profile belongs to no run any more. */
+        char beat[700];
+        snprintf(beat, sizeof(beat), "%s.beat", pf->path);
+        if (unlink(beat) == 0) VKB_INFO("probe: %s had no profile beside it; removed, probing again", beat);
+        return 0;
+    }
     char line[1600], v[DETAIL];
     int key_ok = 0, complete = 0;
     char running[32] = "";

@@ -959,9 +959,7 @@ void vkb_gprof_device_init(vkb_srv_table *t)
         t->real.vkCreateComputePipelines = gp_CreateComputePipelines;
     }
     if (by_pipe) { /* the costliest pipelines' SPIR-V, saved by hash */
-        char path[600];
-        snprintf(path, sizeof(path), "%s/dump-spirv", vkb_pcache_dir());
-        mkdir(path, 0700);
+        vkb_cache_subdir("dump-spirv");
     }
     HOOK(vkDestroyImageView, gp_DestroyImageView, destroy_view);
     HOOK(vkCreateImage, gp_CreateImage, create_img);

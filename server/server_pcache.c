@@ -74,6 +74,7 @@ typedef struct vkb_pcache {
     pc_ident file;        /* the file as this cache last read or wrote it */
     int covers;           /* the file holds nothing `cache` lacks (it was written from it alone) */
     int full_warned;
+    int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
     time_t last_save;     /* CLOCK_MONOTONIC seconds */
     char warm[PC_WARM_KINDS][512]; /* pre-caching files taken in, removed after the next save */
@@ -113,6 +114,7 @@ static pthread_mutex_t env_lock = PTHREAD_MUTEX_INITIALIZER;
 void vkb_srv_env_reload(void)
 {
     if (!pc_dir) return;
+    vkb_cache_dir_ensure(); /* a new device is a good time to notice it went */
     char path[600];
     snprintf(path, sizeof(path), "%s/env", pc_dir);
     FILE *f = fopen(path, "r");
@@ -168,10 +170,95 @@ const char *vkb_srv_env(const char *name)
     return v ? v : getenv(name);
 }
 
+/* mkdir -p: 0, or -1 with errno. */
+int vkb_mkdirs(const char *path)
+{
+    char buf[600];
+    size_t n = strlen(path);
+    if (!n || n >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(buf, path, n + 1);
+    for (char *s = buf + 1; *s; s++) {
+        if (*s != '/') continue;
+        *s = 0;
+        if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+        *s = '/';
+    }
+    if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+    struct stat st;
+    if (stat(buf, &st) != 0) return -1;
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
+/* The cache directory can go while the server runs: Android empties an app's cache directory when
+ * storage runs out (a tablet at 100% lost it, the server's files and the env file with it, and
+ * every save after that failed with ENOENT). Each writer into it calls this when it is missing:
+ * it is made again, once, and said once. 1 when the directory is there. */
+static pthread_mutex_t dir_lock = PTHREAD_MUTEX_INITIALIZER;
+static int dir_fail_logged, nospace;
+
+int vkb_cache_dir_ensure(void)
+{
+    if (!pc_dir) return 0;
+    struct stat st;
+    if (stat(pc_dir, &st) == 0 && S_ISDIR(st.st_mode)) return 1;
+    pthread_mutex_lock(&dir_lock);
+    int ok = stat(pc_dir, &st) == 0 && S_ISDIR(st.st_mode); /* another writer made it meanwhile */
+    if (!ok) {
+        ok = vkb_mkdirs(pc_dir) == 0;
+        if (ok) {
+            dir_fail_logged = 0;
+            VKB_WARN("cache directory %s was removed; recreated (its pipeline caches, probe profile and env file are gone with it)", pc_dir);
+        } else if (!dir_fail_logged) {
+            dir_fail_logged = 1;
+            VKB_WARN("cache directory %s was removed and cannot be made again: %s; nothing is saved until it can", pc_dir, strerror(errno));
+        }
+    }
+    pthread_mutex_unlock(&dir_lock);
+    return ok;
+}
+
+/* <cache dir>/<sub>, made (and the cache directory with it) if missing; 0 or -1 with errno. */
+int vkb_cache_subdir(const char *sub)
+{
+    if (!pc_dir || !vkb_cache_dir_ensure()) {
+        errno = ENOENT;
+        return -1;
+    }
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", pc_dir, sub);
+    if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* A write into the cache directory failed with errno e. A full storage is said once until a write
+ * goes through again (vkb_cache_write_ok), whoever hits it: the server keeps running and the
+ * writers keep trying quietly. Returns 1 when the caller should report the error itself. */
+int vkb_cache_write_failed(const char *what, int e)
+{
+    if (e != ENOSPC && e != EDQUOT) return 1;
+    if (!__atomic_exchange_n(&nospace, 1, __ATOMIC_RELAXED))
+        VKB_WARN("cache directory %s: no space left on the device (%s not written); the bridge keeps running and tries again quietly", pc_dir ? pc_dir : "",
+                 what);
+    return 0;
+}
+
+void vkb_cache_write_ok(void)
+{
+    if (__atomic_load_n(&nospace, __ATOMIC_RELAXED) && __atomic_exchange_n(&nospace, 0, __ATOMIC_RELAXED))
+        VKB_INFO("cache directory %s: writes go through again", pc_dir ? pc_dir : "");
+}
+
 void vkb_pcache_set_dir(const char *dir)
 {
     if (!dir || !*dir) return;
-    mkdir(dir, 0700);
+    vkb_mkdirs(dir);
     /* A copy: the in-app start frees its string after server_init (The412Banner, e40cd361). */
     char *copy = strdup(dir);
     if (!copy) return;
@@ -261,6 +348,7 @@ static int write_file(const char *path, const uint8_t *buf, size_t size)
     char tmp[600];
     snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 && errno == ENOENT && vkb_cache_dir_ensure()) fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     int ok = fd >= 0;
     for (size_t done = 0; ok && done < size;) {
         ssize_t w = write(fd, buf + done, size - done);
@@ -268,8 +356,8 @@ static int write_file(const char *path, const uint8_t *buf, size_t size)
         if (w <= 0) ok = 0;
         else done += (size_t)w;
     }
-    if (fd >= 0 && fsync(fd) != 0) ok = 0;
-    if (fd >= 0) close(fd);
+    if (ok && fsync(fd) != 0) ok = 0;
+    if (fd >= 0 && close(fd) != 0) ok = 0;
     if (ok && rename(tmp, path) == 0) return 0;
     int e = errno;
     unlink(tmp);
@@ -393,9 +481,15 @@ static void save(vkb_pcache *p)
         ident_stat(p->path, &p->file);
         p->saved_size = own;
         p->covers = !merged;
+        p->save_err = 0;
+        vkb_cache_write_ok();
         consume_warm(p);
     } else {
-        VKB_WARN("device %u: pipeline cache not saved to %s: %s", t->id, p->path, strerror(errno));
+        /* Said once per cause, not at every try (every 10 s while the app compiles). */
+        int e = errno;
+        if (vkb_cache_write_failed("a pipeline cache", e) && e != p->save_err)
+            VKB_WARN("device %u: pipeline cache not saved to %s: %s (tried again quietly)", t->id, p->path, strerror(e));
+        p->save_err = e;
         __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
     }
     free(out);

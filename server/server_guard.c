@@ -59,6 +59,7 @@
 #include "server_emu.h"
 #include "spirv_gsfold.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -385,14 +386,26 @@ static void save_spirv(uint64_t h, const uint32_t *code, size_t size)
     }
     if (!code) return;
     char path[700];
-    snprintf(path, sizeof(path), "%s/stuck-spirv", dir);
-    mkdir(path, 0700);
+    if (vkb_cache_subdir("stuck-spirv") != 0) { /* the cache directory made again if it was removed */
+        vkb_cache_write_failed("stuck-spirv", errno);
+        return;
+    }
     snprintf(path, sizeof(path), "%s/stuck-spirv/h-%016llx.spv", dir, (unsigned long long)h);
     if (access(path, F_OK) == 0) return;
     FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(code, 1, size, f);
-        fclose(f);
+    if (!f) {
+        vkb_cache_write_failed("stuck-spirv", errno);
+        return;
+    }
+    int ok = fwrite(code, 1, size, f) == size;
+    int err = errno;
+    if (fclose(f) != 0 && ok) {
+        ok = 0;
+        err = errno;
+    }
+    if (!ok) {
+        unlink(path); /* a short one would be taken for the whole module */
+        vkb_cache_write_failed("stuck-spirv", err);
     }
 }
 
@@ -442,12 +455,33 @@ static void add_stuck(const uint64_t *key, uint32_t n, int mode, const char *not
     if (!note || !dir) return;
     char path[700];
     snprintf(path, sizeof(path), "%s/stuck-pipelines", dir);
+    int gone = access(path, F_OK) != 0;
     FILE *f = fopen(path, "a");
-    if (f) {
-        for (uint32_t i = 0; i < n; i++) fprintf(f, "%sk-%016llx", i ? "," : "", (unsigned long long)key[i]);
-        fprintf(f, " m=%d v=%d # %s: %s\n", mode, STUCK_VERSION, fb_names[mode], note);
-        fclose(f);
+    if (!f && errno == ENOENT && vkb_cache_dir_ensure()) f = fopen(path, "a"); /* the cache directory was removed */
+    if (!f) {
+        vkb_cache_write_failed("stuck-pipelines", errno);
+        return;
     }
+    if (gone) {
+        /* A new file: what this run knew from the old one (removed with the cache directory, or
+         * never written) goes back in, so the next start does not wait on those compiles again. */
+        pthread_mutex_lock(&watch_lock);
+        for (int j = 0; j < (int)nstuck; j++) {
+            if (j == k) continue;
+            for (uint32_t i = 0; i < stuck_n[j]; i++) fprintf(f, "%sk-%016llx", i ? "," : "", (unsigned long long)stuck[j][i]);
+            fprintf(f, " m=%d v=%d # %s: known before the file was removed\n", stuck_mode[j], STUCK_VERSION, fb_names[stuck_mode[j]]);
+        }
+        pthread_mutex_unlock(&watch_lock);
+    }
+    for (uint32_t i = 0; i < n; i++) fprintf(f, "%sk-%016llx", i ? "," : "", (unsigned long long)key[i]);
+    fprintf(f, " m=%d v=%d # %s: %s\n", mode, STUCK_VERSION, fb_names[mode], note);
+    int ok = fflush(f) == 0 && !ferror(f);
+    int e = errno;
+    if (fclose(f) != 0 && ok) {
+        ok = 0;
+        e = errno;
+    }
+    if (!ok) vkb_cache_write_failed("stuck-pipelines", e);
 }
 
 static void load_stuck(void)
