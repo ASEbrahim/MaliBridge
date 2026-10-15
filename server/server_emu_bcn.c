@@ -78,6 +78,8 @@ typedef struct bcn_cb {      /* a command buffer's scratch */
     uint32_t nstage, capstage;
 } bcn_cb;
 
+#define WARM_THREADS 2
+
 typedef struct bcn_state {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -90,14 +92,14 @@ typedef struct bcn_state {
     uint32_t quality;        /* the transcoders' search (bc_decode.comp's BC_QUALITY): 0 fast, 1 default, 2 high,
                               * QUALITY_AUTO: fast for large mip levels, default for the rest (level_quality) */
     pthread_mutex_t lock;
-    /* pipeline builds (pipeline()): one at a time per pipeline, the others wait for it; in auto, the
-     * other quality of a transcoder is built in the background once one is (warm) */
+    /* pipeline builds: once each (a caller finding one under way waits for it, or under auto takes
+     * the other quality if that is built); the warm threads build ahead from the first BC image on */
     pthread_mutex_t plock;
     pthread_cond_t pcond;
     uint8_t building[3][FAM_COUNT], failed[3][FAM_COUNT];
-    uint32_t want[3];        /* per quality, a bit per family: for the warm thread */
-    pthread_t warm;
-    int warm_up, warm_stop;
+    uint32_t urgent[3], want[3]; /* per quality, a bit per family: for the warm threads, urgent first */
+    pthread_t warm[WARM_THREADS];
+    int nwarm, warm_stop, warm_all;
     chunk *idle;             /* scratch no pending command buffer uses (bytes in g_idle) */
     uint32_t nidle, capidle;
 } bcn_state;
@@ -107,6 +109,8 @@ typedef struct pc_t {
     uint32_t dst_word, pad;
     uint32_t extent[2];
 } pc_t;
+
+static void prebuild(vkb_emu_device *e, int fam);
 
 static int family(VkFormat f)
 {
@@ -366,6 +370,7 @@ static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const 
 void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci)
 {
     if (!(e->flags & VKB_EMU_BCN) || !vkb_is_bc(ci->format)) return;
+    const VkFormat client = ci->format;
     /* The image keeps the meaning of the app's format (sRGB, SNORM) so blits and copies convert as
      * they would, and nothing but the app's usage plus TRANSFER_DST for the decoded uploads. A
      * mutable image is made mutable only among the decoded formats its views can map to (a format
@@ -393,6 +398,7 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci)
             if (k == n && n < sizeof(list) / sizeof(list[0])) list[n++] = f;
         }
     }
+    if (e->bcn) prebuild(e, tx ? TX_BC1 + family(client) : packed ? FAM_BC1_16 : family(client));
     ci->format = view;
     ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
     if (n == 1) ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -629,46 +635,114 @@ static VkPipeline build(vkb_emu_device *e, int fam, uint32_t q, int bg)
 
 static void *warm_main(void *arg);
 
-/* The decoder or transcoder for fam; q: the transcoders' BC_QUALITY (0-2, ignored by decoders).
- * Built once: a caller that finds it being built waits for that build. */
-static VkPipeline pipeline_bg(vkb_emu_device *e, int fam, uint32_t q, int bg)
+/* What fam is built at: decoders have one variant; under auto a transcoder has two (fast, default). */
+static uint32_t qualities(const bcn_state *s, int fam, uint32_t out[2])
+{
+    if (fam < TX_BC1) return out[0] = 1, 1;
+    if (s->quality != QUALITY_AUTO) return out[0] = s->quality, 1;
+    out[0] = 0, out[1] = 1;
+    return 2;
+}
+
+/* Queues fam at q for the warm threads (started on first use). plock held. */
+static void warm_queue(vkb_emu_device *e, int fam, uint32_t q, int urgent)
+{
+    bcn_state *s = e->bcn;
+    if (s->pipes[q][fam] || s->building[q][fam] || s->failed[q][fam] || s->warm_stop) return;
+    (urgent ? s->urgent : s->want)[q] |= 1u << fam;
+    if (!s->nwarm) {
+        for (int i = 0; i < WARM_THREADS; i++) {
+            int r = pthread_create(&s->warm[s->nwarm], NULL, warm_main, e);
+            if (r) VKB_WARN("BC emulation: cannot start a pipeline build thread (%d): pipelines are built at first use", r);
+            else s->nwarm++;
+        }
+        if (s->nwarm) VKB_INFO("BC emulation: building the transcoders ahead on %d threads", s->nwarm);
+        else s->warm_stop = 1; /* nothing will take the queue */
+    }
+    pthread_cond_broadcast(&s->pcond);
+}
+
+static void queue_family(vkb_emu_device *e, int fam, int urgent)
+{
+    uint32_t q[2], n = qualities(e->bcn, fam, q);
+    for (uint32_t i = 0; i < n; i++) warm_queue(e, fam, q[i], urgent);
+}
+
+/* A BC image is being made as fam: its pipelines first; with the first one, every transcoder this
+ * device may use, so none is compiled in the middle of an upload (Mali takes 0.3-0.95 s over the
+ * BC1, BC2, BC3, BC6H and BC7 ones on the G720, at each quality, and its pipeline cache does not
+ * spare that in a new process). */
+static void prebuild(vkb_emu_device *e, int fam)
+{
+    bcn_state *s = e->bcn;
+    uint32_t q[2], n = qualities(s, fam, q);
+    int ready = __atomic_load_n(&s->warm_all, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n && ready; i++) ready = __atomic_load_n(&s->pipes[q[i]][fam], __ATOMIC_ACQUIRE) != VK_NULL_HANDLE;
+    if (ready) return;
+    pthread_mutex_lock(&s->plock);
+    queue_family(e, fam, 1);
+    if (!s->warm_all) {
+        __atomic_store_n(&s->warm_all, 1, __ATOMIC_RELEASE);
+        for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++)
+            if (s->tx[BC_INDEX(f)]) queue_family(e, TX_BC1 + family(f), 0);
+    }
+    pthread_mutex_unlock(&s->plock);
+}
+
+/* Stores what a build of fam at q gave. plock held. */
+static void publish(bcn_state *s, int fam, uint32_t q, VkPipeline p)
+{
+    __atomic_store_n(&s->pipes[q][fam], p, __ATOMIC_RELEASE);
+    s->building[q][fam] = 0;
+    if (!p) s->failed[q][fam] = 1;
+    pthread_cond_broadcast(&s->pcond);
+}
+
+/* The decoder or transcoder for an upload of fam at q (the transcoders' BC_QUALITY, 0-2; ignored by
+ * decoders). Under auto a large level does not wait for the fast transcoder when the default one is
+ * built: default encodes it (better, a little slower), and fast moves to the front of the warm
+ * queue. Small levels are never encoded fast in its place - they stay as encoded, and they are what
+ * distant surfaces and UI show. Otherwise it waits for a build under way, or builds q itself. NULL:
+ * nothing builds. */
+static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q)
 {
     bcn_state *s = e->bcn;
     if (fam < TX_BC1) q = 1;
-    VkPipeline *pp = &s->pipes[q][fam], have = __atomic_load_n(pp, __ATOMIC_ACQUIRE);
-    if (have) return have;
+    VkPipeline p = __atomic_load_n(&s->pipes[q][fam], __ATOMIC_ACQUIRE);
+    if (p) return p;
+    int alt = fam >= TX_BC1 && s->quality == QUALITY_AUTO && q == 0;
+    const uint32_t o = 1;
     pthread_mutex_lock(&s->plock);
-    while (!*pp && s->building[q][fam]) pthread_cond_wait(&s->pcond, &s->plock);
-    if (*pp || s->failed[q][fam]) {
-        have = *pp;
+    for (;;) {
+        if ((p = s->pipes[q][fam])) break;
+        if (alt && (p = s->pipes[o][fam])) {
+            warm_queue(e, fam, q, 1);
+            VKB_ONCE(VKB_LOG_INFO, "BC emulation: a large level encoded with the default transcoder %d while the fast one is "
+                     "built (logged once)", fam);
+            break;
+        }
+        if (s->failed[q][fam]) {
+            if (!alt) break;
+            q = o, alt = 0; /* default, or nothing */
+            continue;
+        }
+        if (s->building[q][fam] || (alt && s->building[o][fam])) {
+            pthread_cond_wait(&s->pcond, &s->plock);
+            continue;
+        }
+        s->building[q][fam] = 1;
         pthread_mutex_unlock(&s->plock);
-        return have;
+        p = build(e, fam, q, 0);
+        pthread_mutex_lock(&s->plock);
+        publish(s, fam, q, p);
+        if (fam >= TX_BC1 && s->quality == QUALITY_AUTO && q < 2) warm_queue(e, fam, q ^ 1, 0);
+        break;
     }
-    s->building[q][fam] = 1;
-    pthread_mutex_unlock(&s->plock);
-    VkPipeline p = build(e, fam, q, bg);
-    pthread_mutex_lock(&s->plock);
-    __atomic_store_n(pp, p, __ATOMIC_RELEASE);
-    s->building[q][fam] = 0;
-    if (!p) s->failed[q][fam] = 1;
-    /* auto uses both fast and default for a format (by mip size): the first upload builds the one
-     * it needs, and the other is built beside it rather than in the middle of a later upload (on
-     * the G720 a 4096x4096x2 BC7 upload that was the fast transcoder's first use took 860 ms, 227
-     * at default with its transcoder built) */
-    uint32_t other = q ^ 1;
-    if (p && s->quality == QUALITY_AUTO && fam >= TX_BC1 && q < 2 && !s->pipes[other][fam] && !s->building[other][fam] &&
-        !s->failed[other][fam] && !s->warm_stop) {
-        s->want[other] |= 1u << fam;
-        if (!s->warm_up) s->warm_up = pthread_create(&s->warm, NULL, warm_main, e) == 0;
-    }
-    pthread_cond_broadcast(&s->pcond);
     pthread_mutex_unlock(&s->plock);
     return p;
 }
 
-static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q) { return pipeline_bg(e, fam, q, 0); }
-
-/* The warm thread: builds what pipeline_bg queued, until the device goes (vkb_emu_bcn_quiesce). */
+/* A warm thread: builds what is queued, urgent first, until the device goes (vkb_emu_bcn_quiesce). */
 static void *warm_main(void *arg)
 {
     vkb_emu_device *e = arg;
@@ -676,32 +750,44 @@ static void *warm_main(void *arg)
     vkb_srv_set_current_table(e->dev); /* the layers beneath (hang, gpuprof) find the device by it */
     pthread_mutex_lock(&s->plock);
     for (;;) {
-        while (!s->warm_stop && !s->want[0] && !s->want[1]) pthread_cond_wait(&s->pcond, &s->plock);
+        int fam = -1;
+        uint32_t q = 0;
+        for (int u = 0; u < 2 && fam < 0; u++)
+            for (uint32_t k = 0; k < 3 && fam < 0; k++) {
+                uint32_t *m = u ? s->want : s->urgent;
+                if (!m[k]) continue;
+                q = k, fam = __builtin_ctz(m[k]);
+                s->urgent[k] &= ~(1u << fam), s->want[k] &= ~(1u << fam);
+            }
         if (s->warm_stop) break;
-        uint32_t q = s->want[0] ? 0 : 1;
-        int fam = __builtin_ctz(s->want[q]);
-        s->want[q] &= ~(1u << fam);
+        if (fam < 0) {
+            pthread_cond_wait(&s->pcond, &s->plock);
+            continue;
+        }
+        if (s->pipes[q][fam] || s->building[q][fam] || s->failed[q][fam]) continue;
+        s->building[q][fam] = 1;
         pthread_mutex_unlock(&s->plock);
-        pipeline_bg(e, fam, q, 1);
+        VkPipeline p = build(e, fam, q, 1);
         pthread_mutex_lock(&s->plock);
+        publish(s, fam, q, p);
     }
     pthread_mutex_unlock(&s->plock);
     return NULL;
 }
 
-/* Before the device's layers go (vkDestroyDevice, or its process gone): the warm thread compiles
- * through them and the pipeline cache. A build under way finishes first. */
+/* Before the device's layers go (vkDestroyDevice, or its process gone): the warm threads compile
+ * through them and the pipeline cache. Builds under way finish first. */
 void vkb_emu_bcn_quiesce(vkb_srv_table *dev)
 {
     bcn_state *s = dev->emu ? dev->emu->bcn : NULL;
     if (!s) return;
     pthread_mutex_lock(&s->plock);
     s->warm_stop = 1;
-    int up = s->warm_up;
-    s->warm_up = 0;
+    int n = s->nwarm;
+    s->nwarm = 0;
     pthread_cond_broadcast(&s->pcond);
     pthread_mutex_unlock(&s->plock);
-    if (up) pthread_join(s->warm, NULL);
+    for (int i = 0; i < n; i++) pthread_join(s->warm[i], NULL);
 }
 
 typedef struct region {
@@ -889,7 +975,8 @@ static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_
     bcn_state *s = e->bcn;
     int fam = family(img->client_format);
     fam = vkb_tx_block_bytes(img->format) ? TX_BC1 + fam : vkb_bc_is_packed(img->format) ? FAM_BC1_16 : fam;
-    /* in auto per region (level_quality): the first region's, built before anything is recorded */
+    /* in auto per region (level_quality): the first region's, before anything is recorded (or the
+     * other quality while this one is still being built) */
     uint32_t q0 = fam >= TX_BC1 ? level_quality(s, img, n ? regs[0].sub.mipLevel : 0) : 1;
     VkPipeline pipe = pipeline(e, fam, q0), bound = VK_NULL_HANDLE;
     if (!pipe) return;
