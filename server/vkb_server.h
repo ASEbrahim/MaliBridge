@@ -29,6 +29,7 @@ typedef struct vkb_srv_proc {
     int conns;
     char comm[32];                 /* the client's process name (per-program pipeline caches) */
     char pkey[48];                 /* the client's pipeline cache key ("name@key" in the hello), or "" */
+    struct vkb_preset *preset;     /* server_presets.c: the game's preset (by Steam app id), or NULL */
     struct vkb_srv_proc *next;
     /* Ordering of the process's asynchronous requests (vkb_msg_hdr.seq/barrier). */
     pthread_mutex_t olock;
@@ -209,7 +210,7 @@ void vkb_errata_set_probe_source(int (*fn)(const char *probe)); /* the probe's r
 /* server_mode.c: the mode, safe (the default) or performance - VKBRIDGE_MODE in <cache dir>/env,
  * then in the environment, then <cache dir>/mode (Setup), then the default */
 enum { VKB_MODE_SAFE, VKB_MODE_PERFORMANCE };
-enum { VKB_MODE_SRC_DEFAULT, VKB_MODE_SRC_FILE, VKB_MODE_SRC_ENV, VKB_MODE_SRC_CACHE_ENV };
+enum { VKB_MODE_SRC_DEFAULT, VKB_MODE_SRC_FILE, VKB_MODE_SRC_ENV, VKB_MODE_SRC_CACHE_ENV, VKB_MODE_SRC_PRESET_FILE, VKB_MODE_SRC_PRESET_BUILTIN };
 int vkb_mode(void);         /* as last read (the first call reads it) */
 int vkb_mode_refresh(void); /* read again (each vkbQueryServer and vkCreateDevice); logs a change */
 int vkb_mode_source(void);  /* VKB_MODE_SRC_* */
@@ -268,7 +269,14 @@ int vkb_cache_subdir(const char *sub);              /* <cache dir>/<sub> made if
 int vkb_cache_write_failed(const char *what, int e); /* ENOSPC said once; 1: caller reports e */
 void vkb_cache_write_ok(void);                      /* a write went through (space again) */
 void vkb_srv_env_reload(void);             /* <cache dir>/env overrides, read at each vkCreateDevice */
-const char *vkb_srv_env(const char *name); /* an override, else getenv */
+/* A switch, first found wins: <cache dir>/env, the server's environment, then on a client's
+ * connection thread that game's preset (server_presets.c: its file, then the built-in one) */
+const char *vkb_srv_env(const char *name);
+enum { VKB_ENV_SRC_NONE, VKB_ENV_SRC_CACHE_ENV, VKB_ENV_SRC_ENV, VKB_ENV_SRC_PRESET_FILE, VKB_ENV_SRC_PRESET_BUILTIN };
+const char *vkb_srv_env_src(const char *name, int *src);   /* the same, and where it came from (VKB_ENV_SRC_*) */
+const char *vkb_srv_env_global(const char *name);          /* without the preset: server-wide state */
+const char *vkb_srv_env_override(const char *name);        /* <cache dir>/env's value alone, or NULL */
+const char *vkb_env_src_name(int src);                     /* "<cache dir>/env", "the environment", ... */
 void vkb_pcache_device_init(vkb_srv_table *t);
 void vkb_pcache_device_destroy(vkb_srv_table *t);
 /* a pipeline the server builds for itself, through the device's cache (VK_NULL_HANDLE without one) */
@@ -289,6 +297,16 @@ void vkb_srv_reply_status(vkb_srv_call *c, uint32_t status);
 vkb_srv_table *vkb_srv_current_table(void);
 void vkb_srv_set_current_table(vkb_srv_table *t);
 void vkb_proc_cleanup(vkb_srv_proc *p);
+vkb_srv_proc *vkb_srv_current_proc(void); /* the client process this connection thread serves, or NULL */
+
+/* server_presets.c: per-game presets, by Steam app id (<cache dir>/presets/<appid>.env and
+ * presets_builtin.inc) */
+void vkb_preset_load(vkb_srv_proc *p);   /* at the process's hello: its app id is known */
+void vkb_preset_free(vkb_srv_proc *p);
+/* this process's preset value of name, or NULL; *src VKB_ENV_SRC_PRESET_FILE or _BUILTIN */
+const char *vkb_preset_get(const vkb_srv_proc *p, const char *name, int *src);
+const char *vkb_preset_text(const vkb_srv_proc *p, char *out, size_t cap); /* "K=V ... (from file)", or "" */
+uint32_t vkb_preset_client_knobs(void);  /* vkb_server_pd_info.client_knobs for this thread's client */
 
 /* server_instance.c */
 void vkb_selftest_all(void);

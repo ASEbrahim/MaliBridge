@@ -221,6 +221,7 @@ int vkb_physdev_ready(vkb_physdev *pd)
     }
     vkb_dec_raw_into(&c.d, &pd->info, sizeof(pd->info));
     vkb_call_end(&c);
+    vkb_client_knobs_set(pd->info.client_knobs);
     vkb_wire_vkGetPhysicalDeviceProperties((VkPhysicalDevice)pd, &pd->props);
     vkb_wire_vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)pd, &pd->server_mem);
     build_memory_model(pd);

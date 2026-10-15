@@ -166,6 +166,9 @@ enum { VKB_CLIENT_MODE_SAFE, VKB_CLIENT_MODE_PERFORMANCE };
 int vkb_client_mode(void);
 int vkb_async_framed(void);
 int vkb_desc_packed(void);
+/* vkb_server_pd_info.client_knobs from the first vkbQueryServer (conn.c): the server's switches */
+void vkb_client_knobs_set(uint32_t w);
+int vkb_query_mirror_wanted(void);
 void vkb_stats_count(uint32_t cmd, int async, size_t bytes);
 extern uint32_t vkb_stat_refused; /* refused vkAllocateDescriptorSets, for VKBRIDGE_STATS */
 uint32_t vkb_table_of(const void *dispatchable);

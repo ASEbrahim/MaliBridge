@@ -72,6 +72,7 @@ typedef struct rp_proc {
     int pid;
     char comm[32], key[48];
     char app[64], engine[64];
+    char preset[400]; /* the game's preset (server_presets.c), "" without one */
     uint32_t engine_version, api;
     double t_hello, t_device, t_gone; /* session seconds */
     int devices, devices_failed, alive;
@@ -208,6 +209,7 @@ void vkb_report_hello(vkb_srv_proc *pr)
     if (p) {
         snprintf(p->comm, sizeof(p->comm), "%s", pr->comm);
         snprintf(p->key, sizeof(p->key), "%s", pr->pkey);
+        vkb_preset_text(pr, p->preset, sizeof(p->preset));
         if (!p->alive) p->t_hello = now_s();
         p->alive = 1;
         p->t_gone = 0;
@@ -925,6 +927,13 @@ static void write_md(FILE *f, int final)
         if (p->first_frame_s >= 0) fprintf(f, ", first frame +%.1f s", p->first_frame_s - p->t_hello);
         if (!p->alive && p->t_gone > 0) fprintf(f, ", exited at %.1f s (ran %.1f s)", p->t_gone, p->t_gone - p->t_hello);
         fprintf(f, "; %d device(s)%s\n", p->devices, p->devices_failed ? " (and failed creations)" : "");
+        if (p->preset[0]) {
+            fprintf(f, "- preset: `");
+            md_text(f, p->preset);
+            fprintf(f, "`\n");
+        } else {
+            fprintf(f, "- preset: none\n");
+        }
         if (p->frames[0]) {
             fprintf(f, "- frames: `");
             md_text(f, p->frames);
@@ -1038,6 +1047,8 @@ static void write_json(FILE *f, int final)
         js(f, p->key);
         fprintf(f, ", \"app\": ");
         js(f, p->app);
+        fprintf(f, ", \"preset\": ");
+        js(f, p->preset);
         fprintf(f, ", \"engine\": ");
         js(f, engine_text(p, b1, sizeof(b1)));
         fprintf(f, ", \"alive\": %s, \"t_connect\": %.1f, \"t_device\": %.1f, \"t_first_frame\": %.1f, \"t_exit\": %.1f, \"devices\": %d, "

@@ -23,10 +23,12 @@ static pthread_mutex_t procs_lock = PTHREAD_MUTEX_INITIALIZER;
 static vkb_srv_proc *procs;
 
 static __thread vkb_srv_table *tls_table;
+static __thread vkb_srv_proc *tls_proc; /* the process this connection thread serves (its preset) */
 __thread const char *vkb_srv_current_cmd;
 
 vkb_srv_table *vkb_srv_current_table(void) { return tls_table; }
 void vkb_srv_set_current_table(vkb_srv_table *t) { tls_table = t; }
+vkb_srv_proc *vkb_srv_current_proc(void) { return tls_proc; }
 
 /* Server side of the generated encoders' helpers: handles are already the server's values. */
 uint64_t vkb_remote(const void *h) { return (uint64_t)(uintptr_t)h; }
@@ -167,6 +169,8 @@ static void proc_leave(vkb_srv_proc *p)
         vkb_report_gone(p);
         pthread_mutex_destroy(&p->olock);
         pthread_cond_destroy(&p->ocond);
+        if (tls_proc == p) tls_proc = NULL;
+        vkb_preset_free(p);
         free(p);
     } else {
         pthread_mutex_lock(&p->olock);
@@ -306,6 +310,7 @@ void vkb_sv_vkbHello(vkb_srv_call *c)
                 snprintf(pr->comm, sizeof(pr->comm), "%.*s", at ? (int)(at - comm) : (int)strlen(comm), comm);
                 if (at && at[1]) snprintf(pr->pkey, sizeof(pr->pkey), "%s", at + 1);
             }
+            vkb_preset_load(c->conn->proc); /* the app id is known: its preset, before its first request */
             vkb_report_hello(c->conn->proc);
         }
     }
@@ -555,6 +560,7 @@ static void *conn_main(void *arg)
         int nfds = 0;
         uint8_t *payload;
         if (srv_recv(conn, &h, &payload, fds, &nfds) < 0) break;
+        tls_proc = conn->proc; /* set by its hello */
         uint64_t wait_ns = 0;
         if (conn->proc && h.cmd < VKB_CMD_COUNT && h.cmd != VKB_CMD_vkbHello) {
             uint64_t t0 = st_period ? mono_ns() : 0;

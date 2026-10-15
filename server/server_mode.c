@@ -22,9 +22,11 @@
  * Where the mode comes from, first found wins:
  *   1. VKBRIDGE_MODE in <cache dir>/env (a developer override, read again at each device);
  *   2. VKBRIDGE_MODE in the server's environment;
- *   3. <cache dir>/mode, one word, written by the app from Setup's "Safe mode" switch before it
+ *   3. VKBRIDGE_MODE in the game's preset (server_presets.c: its file, then the built-in one), for
+ *      that game's devices: read on the client's connection thread;
+ *   4. <cache dir>/mode, one word, written by the app from Setup's "Safe mode" switch before it
  *      starts or reuses the server;
- *   4. the default, safe.
+ *   5. the default, safe.
  * Values: safe, performance (perf). Anything else is safe, with a warning. Re-read at each
  * vkbQueryServer and vkCreateDevice (one small file); a change is logged with its source.
  */
@@ -44,6 +46,8 @@ static const char *const source_names[] = {
     [VKB_MODE_SRC_FILE] = "Setup",
     [VKB_MODE_SRC_ENV] = "VKBRIDGE_MODE",
     [VKB_MODE_SRC_CACHE_ENV] = "VKBRIDGE_MODE in <cache dir>/env",
+    [VKB_MODE_SRC_PRESET_FILE] = "the game's preset file",
+    [VKB_MODE_SRC_PRESET_BUILTIN] = "the game's built-in preset",
 };
 
 const char *vkb_mode_name(int mode) { return mode == VKB_MODE_PERFORMANCE ? "performance" : "safe"; }
@@ -71,10 +75,13 @@ static void unknown(const char *where, const char *v)
 int vkb_mode_refresh(void)
 {
     int mode = -1, src = VKB_MODE_SRC_DEFAULT;
-    const char *v = vkb_srv_env("VKBRIDGE_MODE");
+    int es;
+    const char *v = vkb_srv_env_src("VKBRIDGE_MODE", &es);
     if (v && *v) {
-        const char *pe = getenv("VKBRIDGE_MODE");
-        src = v == pe ? VKB_MODE_SRC_ENV : VKB_MODE_SRC_CACHE_ENV;
+        src = es == VKB_ENV_SRC_ENV              ? VKB_MODE_SRC_ENV
+              : es == VKB_ENV_SRC_PRESET_FILE    ? VKB_MODE_SRC_PRESET_FILE
+              : es == VKB_ENV_SRC_PRESET_BUILTIN ? VKB_MODE_SRC_PRESET_BUILTIN
+                                                 : VKB_MODE_SRC_CACHE_ENV;
         mode = parse(v);
         if (mode == -2) unknown(source_names[src], v);
         if (mode < 0) mode = VKB_MODE_SAFE;

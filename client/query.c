@@ -65,8 +65,7 @@ static int mirror_enabled(void)
 {
     static int v = -1;
     if (v < 0) {
-        const char *e = getenv("VKBRIDGE_QUERY_MIRROR");
-        v = !(e && !strcmp(e, "0"));
+        v = vkb_query_mirror_wanted(); /* the guest's VKBRIDGE_QUERY_MIRROR, else the server's switch */
     }
     return v;
 }

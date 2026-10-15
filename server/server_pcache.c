@@ -169,14 +169,47 @@ const char *vkb_srv_env_list(char *out, size_t cap)
     return out;
 }
 
-const char *vkb_srv_env(const char *name)
+const char *vkb_srv_env_override(const char *name)
 {
     const char *v = NULL;
     pthread_mutex_lock(&env_lock);
     for (unsigned i = 0; i < env_n && !v; i++)
         if (!strcmp(env_tab[i].key, name)) v = env_tab[i].val;
     pthread_mutex_unlock(&env_lock);
+    return v;
+}
+
+/* First found wins: <cache dir>/env (the developer's and tester's override, read again at each
+ * device), the server's environment, then - on a client's connection thread - that game's preset
+ * (server_presets.c). The two global places beat the preset so that one line in <cache dir>/env
+ * overrides a stale preset for every game at once, without editing preset files. */
+const char *vkb_srv_env_src(const char *name, int *src)
+{
+    int s = VKB_ENV_SRC_CACHE_ENV;
+    const char *v = vkb_srv_env_override(name);
+    if (!v && (v = getenv(name))) s = VKB_ENV_SRC_ENV;
+    if (!v) v = vkb_preset_get(vkb_srv_current_proc(), name, &s);
+    if (src) *src = v ? s : VKB_ENV_SRC_NONE;
+    return v;
+}
+
+const char *vkb_srv_env(const char *name) { return vkb_srv_env_src(name, NULL); }
+
+const char *vkb_srv_env_global(const char *name)
+{
+    const char *v = vkb_srv_env_override(name);
     return v ? v : getenv(name);
+}
+
+const char *vkb_env_src_name(int src)
+{
+    switch (src) {
+    case VKB_ENV_SRC_CACHE_ENV: return "<cache dir>/env";
+    case VKB_ENV_SRC_ENV: return "the environment";
+    case VKB_ENV_SRC_PRESET_FILE: return "the game's preset file";
+    case VKB_ENV_SRC_PRESET_BUILTIN: return "the game's built-in preset";
+    default: return "the default";
+    }
 }
 
 /* mkdir -p: 0, or -1 with errno. */

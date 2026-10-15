@@ -61,8 +61,19 @@ typedef struct vkb_server_pd_info {
     uint32_t emu_available;        /* VKB_EMU_* the server could perform */
     uint32_t real_api_version;
     uint32_t missing;              /* VKB_EMU_* features the GPU lacks (emulated or not) */
-    uint32_t reserved[6];
+    uint32_t client_knobs;         /* VKB_KNOB_*: the client's switches from the server (per-game presets) */
+    uint32_t reserved[5];
 } vkb_server_pd_info;
+
+/* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an
+ * older server sent zeros here), else VKB_KNOB_OFF or VKB_KNOB_ON. What the server has for the
+ * client: <cache dir>/env, its own environment, the game's preset (server_presets.c). The guest's
+ * own environment still wins (client/conn.c). */
+#define VKB_KNOB_OFF 1u
+#define VKB_KNOB_ON 2u
+#define VKB_KNOB_DESC_BATCH_SHIFT 0   /* VKBRIDGE_DESC_BATCH / VKBRIDGE_NO_DESC_BATCH */
+#define VKB_KNOB_QUERY_MIRROR_SHIFT 2 /* VKBRIDGE_QUERY_MIRROR */
+#define VKB_KNOB_GET(word, shift) (((word) >> (shift)) & 3u)
 
 /* vkAllocateMemory wire extras (after VkMemoryAllocateInfo). */
 #define VKB_ALLOC_PLAIN 0u

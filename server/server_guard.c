@@ -88,6 +88,7 @@ typedef struct vkb_guard {
     PFN_vkCreateShaderModule module;
     int crashes;
     volatile int poisoned;
+    double limit; /* this device's interrupt (s; < 0: none), chosen at its creation: its game's preset counts */
 } vkb_guard;
 
 typedef struct guard_arm {
@@ -742,7 +743,7 @@ static void *watch_main(void *arg)
                 w->warned = 1;
                 stages_text(w->hash, w->stage, w->nstages, st, sizeof(st));
                 VKB_WARN("%s on device %u still running after %.1f s (the driver's compiler; stages %s)%s", w->call, w->device, el, st,
-                         timeout_s > 0 ? "" : " - VKBRIDGE_COMPILE_TIMEOUT_S=0: not interrupted");
+                         lim > 0 ? "" : " - VKBRIDGE_COMPILE_TIMEOUT_S=0: not interrupted");
                 for (uint32_t k = 0; k < w->nstages; k++) save_spirv(w->hash[k], w->code[k], w->size[k]);
             }
             if (lim > 0 && el >= lim && timeout_sig && !w->arm->timed_out) {
@@ -755,16 +756,23 @@ static void *watch_main(void *arg)
     return NULL;
 }
 
-double vkb_guard_timeout_s(int mode, const char **why)
+/* preset: with the game's preset on a client's thread (a device's own limit), else server-wide */
+static double timeout_for(int mode, const char **why, int preset)
 {
-    const char *v = vkb_srv_env("VKBRIDGE_COMPILE_TIMEOUT_S");
+    int src = VKB_ENV_SRC_NONE;
+    const char *v = preset ? vkb_srv_env_src("VKBRIDGE_COMPILE_TIMEOUT_S", &src) : vkb_srv_env_global("VKBRIDGE_COMPILE_TIMEOUT_S");
     if (v && *v) {
-        if (why) *why = "VKBRIDGE_COMPILE_TIMEOUT_S";
+        if (why)
+            *why = src == VKB_ENV_SRC_PRESET_FILE      ? "VKBRIDGE_COMPILE_TIMEOUT_S, the game's preset file"
+                   : src == VKB_ENV_SRC_PRESET_BUILTIN ? "VKBRIDGE_COMPILE_TIMEOUT_S, the game's built-in preset"
+                                                       : "VKBRIDGE_COMPILE_TIMEOUT_S";
         return atof(v);
     }
     if (why) *why = mode == VKB_MODE_PERFORMANCE ? "performance mode" : "safe mode";
     return mode == VKB_MODE_PERFORMANCE ? TIMEOUT_PERF_S : TIMEOUT_SAFE_S;
 }
+
+double vkb_guard_timeout_s(int mode, const char **why) { return timeout_for(mode, why, 0); }
 
 /* The switches again at each device (and probe): the mode or <cache dir>/env may have changed */
 static void watch_env(void)
@@ -798,8 +806,8 @@ static void watch_env(void)
     VKB_INFO("compile watchdog: warn after %.0f s, interrupt after %.0f s (%s; signal %d)", warn_s, timeout_s, why, timeout_sig);
 }
 
-static watch_slot *watch_begin(guard_arm *arm, const char *call, uint32_t device, const uint64_t *h, const uint32_t *stage, uint32_t n,
-                               const VkPipelineShaderStageCreateInfo *stages, uint32_t nst)
+static watch_slot *watch_begin(guard_arm *arm, const char *call, uint32_t device, double limit, const uint64_t *h, const uint32_t *stage,
+                               uint32_t n, const VkPipelineShaderStageCreateInfo *stages, uint32_t nst)
 {
     watch_slot *w = NULL;
     pthread_mutex_lock(&watch_lock);
@@ -813,6 +821,7 @@ static watch_slot *watch_begin(guard_arm *arm, const char *call, uint32_t device
         w->start = mono_s();
         w->call = call;
         w->device = device;
+        w->limit = limit;
         w->nstages = n < STAGES_MAX ? n : STAGES_MAX;
         if (h) memcpy(w->hash, h, w->nstages * sizeof(*h));
         if (stage) memcpy(w->stage, stage, w->nstages * sizeof(*stage));
@@ -896,7 +905,7 @@ __attribute__((noinline)) static VkResult armed_gfx(vkb_guard *g, VkDevice devic
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, "vkCreateGraphicsPipelines", g->t->id, h, stg, nh, n ? infos[0].pStages : NULL, n ? infos[0].stageCount : 0);
+    w = watch_begin(&arm, "vkCreateGraphicsPipelines", g->t->id, g->limit, h, stg, nh, n ? infos[0].pStages : NULL, n ? infos[0].stageCount : 0);
     for (uint32_t i = 0; i < n; i++) test_fault(infos[i].pStages, infos[i].stageCount, sizeof(*infos[i].pStages));
     VkResult r = g->gfx(device, cache, n, infos, a, out);
     tls_arm = arm.prev;
@@ -1051,7 +1060,7 @@ __attribute__((noinline)) static VkResult armed_compute(vkb_guard *g, VkDevice d
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, "vkCreateComputePipelines", g->t->id, h, stg, nh, n ? &infos[0].stage : NULL, 1);
+    w = watch_begin(&arm, "vkCreateComputePipelines", g->t->id, g->limit, h, stg, nh, n ? &infos[0].stage : NULL, 1);
     if (n) test_fault(&infos[0].stage, n, sizeof(*infos));
     VkResult r = g->compute(device, cache, n, infos, a, out);
     tls_arm = arm.prev;
@@ -1168,7 +1177,7 @@ static VkResult VKAPI_CALL gd_CreateShaderModule(VkDevice device, const VkShader
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, "vkCreateShaderModule", g->t->id, NULL, NULL, 0, NULL, 0);
+    w = watch_begin(&arm, "vkCreateShaderModule", g->t->id, g->limit, NULL, NULL, 0, NULL, 0);
     VkResult r = g->module(device, ci, a, out);
     tls_arm = arm.prev;
     watch_end(w);
@@ -1247,7 +1256,7 @@ int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *ar
         return arm.timed_out ? VKB_GUARD_TIMED_OUT : VKB_GUARD_CRASHED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, what, 0, NULL, NULL, 0, NULL, 0);
+    w = watch_begin(&arm, what, 0, 0, NULL, NULL, 0, NULL, 0);
     if (w) {
         pthread_mutex_lock(&watch_lock);
         w->limit = limit_s;
@@ -1270,6 +1279,12 @@ void vkb_guard_device_init(vkb_srv_table *t)
     vkb_guard *g = calloc(1, sizeof(*g));
     if (!g) return;
     g->t = t;
+    {
+        const char *why;
+        double lim = timeout_for(vkb_mode(), &why, 1);
+        g->limit = lim > 0 ? lim : -1;
+        if (lim != timeout_s) VKB_INFO("compile watchdog: device %u interrupts after %.0f s (%s)", t->id, lim, why);
+    }
     g->gfx = t->real.vkCreateGraphicsPipelines;
     g->compute = t->real.vkCreateComputePipelines;
     g->module = t->real.vkCreateShaderModule;

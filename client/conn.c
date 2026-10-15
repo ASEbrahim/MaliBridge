@@ -653,20 +653,55 @@ int vkb_client_mode(void)
     return v;
 }
 
-int vkb_desc_batch(void)
+/* The client's switches the server sent (vkb_server_pd_info.client_knobs, at the first
+ * vkbQueryServer): <cache dir>/env, the server's environment, the game's preset. The guest's own
+ * environment beats them; an older server sends none. */
+static uint32_t knobs_word;
+static int knobs_known;
+
+void vkb_client_knobs_set(uint32_t w)
+{
+    if (__atomic_exchange_n(&knobs_known, 1, __ATOMIC_ACQ_REL)) return;
+    __atomic_store_n(&knobs_word, w, __ATOMIC_RELEASE);
+    uint32_t db = VKB_KNOB_GET(w, VKB_KNOB_DESC_BATCH_SHIFT), qm = VKB_KNOB_GET(w, VKB_KNOB_QUERY_MIRROR_SHIFT);
+    if (db || qm)
+        VKB_INFO("switches from the server (the game's preset or <cache dir>/env):%s%s%s%s", db ? " descriptor batching " : "",
+                 db ? (db == VKB_KNOB_ON ? "on" : "off") : "", qm ? " query mirror " : "", qm ? (qm == VKB_KNOB_ON ? "on" : "off") : "");
+}
+
+/* 1 on, 0 off, -1 nothing from the server (yet: *known 0) */
+static int knob(int shift, int *known)
+{
+    *known = __atomic_load_n(&knobs_known, __ATOMIC_ACQUIRE);
+    uint32_t k = *known ? VKB_KNOB_GET(__atomic_load_n(&knobs_word, __ATOMIC_ACQUIRE), shift) : 0;
+    return k == VKB_KNOB_ON ? 1 : k == VKB_KNOB_OFF ? 0 : -1;
+}
+
+/* *final: 0 while the server's switches are not in yet (the answer may change once) */
+static int desc_batch(int *final)
 {
     static int v = -1;
-    if (v < 0) {
-        /* Off by default in both modes: Risk of Rain 2 showed black flickering with it on
-         * (2026-10-14, Mali-G720, v0.2) and no game measured faster. Performance mode turns it on
-         * here once that is fixed. VKBRIDGE_DESC_BATCH=1 turns it on, =0 off; VKBRIDGE_NO_DESC_BATCH=1
-         * still wins. */
-        static const int by_mode[2] = {[VKB_CLIENT_MODE_SAFE] = 0, [VKB_CLIENT_MODE_PERFORMANCE] = 0};
-        const char *on = getenv("VKBRIDGE_DESC_BATCH"), *off = getenv("VKBRIDGE_NO_DESC_BATCH");
-        v = on && *on ? strcmp(on, "0") != 0 : by_mode[vkb_client_mode()];
-        if (off && *off && strcmp(off, "0")) v = 0;
-    }
-    return v;
+    *final = 1;
+    if (v >= 0) return v;
+    /* Off by default in both modes: Risk of Rain 2 showed black flickering with it on
+     * (2026-10-14, Mali-G720, v0.2) and no game measured faster. Performance mode turns it on
+     * here once that is fixed. VKBRIDGE_DESC_BATCH=1 turns it on, =0 off; VKBRIDGE_NO_DESC_BATCH=1
+     * still wins. Neither in the guest: the server's switch (a game's preset), else the mode's. */
+    static const int by_mode[2] = {[VKB_CLIENT_MODE_SAFE] = 0, [VKB_CLIENT_MODE_PERFORMANCE] = 0};
+    const char *on = getenv("VKBRIDGE_DESC_BATCH"), *off = getenv("VKBRIDGE_NO_DESC_BATCH");
+    int r, known = 1;
+    if (on && *on) r = strcmp(on, "0") != 0;
+    else if ((r = knob(VKB_KNOB_DESC_BATCH_SHIFT, &known)) < 0) r = by_mode[vkb_client_mode()];
+    if (off && *off && strcmp(off, "0")) r = 0, known = 1;
+    if (known) v = r;
+    *final = known;
+    return r;
+}
+
+int vkb_desc_batch(void)
+{
+    int final;
+    return desc_batch(&final);
 }
 
 static int env_set(const char *name)
@@ -682,15 +717,28 @@ static int env_set(const char *name)
 int vkb_async_framed(void)
 {
     static int v = -1;
-    if (v < 0) v = vkb_desc_batch() && !env_set("VKBRIDGE_DESC_BATCH_NOFRAME");
-    return v;
+    if (v >= 0) return v;
+    int final, r = desc_batch(&final) && !env_set("VKBRIDGE_DESC_BATCH_NOFRAME");
+    if (final) v = r;
+    return r;
 }
 
 int vkb_desc_packed(void)
 {
     static int v = -1;
-    if (v < 0) v = vkb_desc_batch() && !env_set("VKBRIDGE_DESC_BATCH_NOPACK");
-    return v;
+    if (v >= 0) return v;
+    int final, r = desc_batch(&final) && !env_set("VKBRIDGE_DESC_BATCH_NOPACK");
+    if (final) v = r;
+    return r;
+}
+
+/* VKBRIDGE_QUERY_MIRROR in the guest, else the server's switch; on by default (query.c) */
+int vkb_query_mirror_wanted(void)
+{
+    const char *e = getenv("VKBRIDGE_QUERY_MIRROR");
+    if (e && *e) return strcmp(e, "0") != 0;
+    int known, k = knob(VKB_KNOB_QUERY_MIRROR_SHIFT, &known);
+    return k < 0 ? 1 : k;
 }
 
 /* Asynchronous variant: no reply is awaited (void commands without outputs). */
