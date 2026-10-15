@@ -1399,8 +1399,9 @@ const char *vkb_emu_bcn_transcoder_name(int i, uint32_t *flag)
     return probe_tx[i].name;
 }
 
-/* Transcoder i built (at the default quality) and destroyed again, on a device of the probe's. */
-VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, int i, double *ms)
+/* Transcoder i built (at the default quality) and destroyed again, on a device of the probe's,
+ * through cache (the probe's own persistent one: a re-probe then does not compile them again). */
+VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, VkPipelineCache cache, int i, double *ms)
 {
     int fam = probe_tx[i].fam;
     VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
@@ -1423,7 +1424,7 @@ VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, int i, 
         pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT,
                                                       m, "main", NULL};
         pci.layout = pl;
-        res = r->vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pci, NULL, &p);
+        res = r->vkCreateComputePipelines(d, cache, 1, &pci, NULL, &p);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     *ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;

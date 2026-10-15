@@ -976,6 +976,7 @@ static double sub_limit_s(void);
 
 typedef struct tx_build {
     pctx *c;
+    VkPipelineCache cache;
     int index;
     VkResult r;
     double ms;
@@ -984,7 +985,7 @@ typedef struct tx_build {
 static void tx_one(void *arg)
 {
     tx_build *b = arg;
-    b->r = vkb_emu_bcn_build_transcoder(&b->c->d, b->c->dev, b->index, &b->ms);
+    b->r = vkb_emu_bcn_build_transcoder(&b->c->d, b->c->dev, b->cache, b->index, &b->ms);
 }
 
 static void p_bc_transcoders(pctx *c)
@@ -999,11 +1000,15 @@ static void p_bc_transcoders(pctx *c)
         outcome(c, PS_SKIP);
         return;
     }
-    int n = vkb_emu_bcn_transcoders();
+    /* through a persistent cache of the probe's own: about 1.9 s of compiles on the G720 without
+     * it, at every probe (a re-probe after a stopped session included) */
+    char path[512];
+    VkPipelineCache cache = vkb_pcache_own_open(&c->d, &c->props, c->dev, "probe", path, sizeof(path));
+    int n = vkb_emu_bcn_transcoders(), stuck = 0;
     for (int k = 0; k < n; k++) {
         uint32_t flag = 0;
         const char *name = vkb_emu_bcn_transcoder_name(k, &flag);
-        tx_build b = {c, k, VK_ERROR_UNKNOWN, 0};
+        tx_build b = {c, cache, k, VK_ERROR_UNKNOWN, 0};
         int sig = 0;
         int g = vkb_guard_run("probe: BC transcoder", sub_limit_s(), tx_one, &b, &sig);
         if (g == VKB_GUARD_DONE && b.r == VK_SUCCESS) {
@@ -1013,8 +1018,13 @@ static void p_bc_transcoders(pctx *c)
         say(c, "%s%s %s", k ? ", " : "", name, g == VKB_GUARD_TIMED_OUT ? "HANG" : g == VKB_GUARD_CRASHED ? "CRASH" : "FAILED");
         c->want_flags |= flag;
         outcome(c, g == VKB_GUARD_TIMED_OUT ? PS_HANG : g == VKB_GUARD_CRASHED ? PS_CRASH : PS_FAIL);
-        if (g != VKB_GUARD_DONE) break; /* the driver may hold a lock now: no more compiles here */
+        if (g != VKB_GUARD_DONE) { /* the driver may hold a lock now: no more compiles here */
+            stuck = 1;
+            break;
+        }
     }
+    /* after a hang or a crash the cache is left as it is (the build may still be in it) */
+    if (!stuck) vkb_pcache_own_close(&c->d, c->dev, cache, path);
     if (c->want_flags) say(c, " - formats of a failed transcoder are decoded instead");
     outcome(c, PS_PASS);
 }

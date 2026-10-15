@@ -187,16 +187,22 @@ static vkb_pcache *cur(void)
 }
 
 /* The header every pipeline cache starts with (VkPipelineCacheHeaderVersionOne). */
-static int header_ok(const vkb_srv_table *t, const uint8_t *data, size_t size)
+static int header_for(const VkPhysicalDeviceProperties *p, const uint8_t *data, size_t size)
 {
     VkPipelineCacheHeaderVersionOne h;
     if (size < sizeof(h)) return 0;
     memcpy(&h, data, sizeof(h));
-    VkPhysicalDeviceProperties props;
-    t->real.vkGetPhysicalDeviceProperties(t->physical, &props);
+    const VkPhysicalDeviceProperties props = *p;
     return h.headerSize >= sizeof(h) && h.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
            h.vendorID == props.vendorID && h.deviceID == props.deviceID &&
            !memcmp(h.pipelineCacheUUID, props.pipelineCacheUUID, VK_UUID_SIZE);
+}
+
+static int header_ok(const vkb_srv_table *t, const uint8_t *data, size_t size)
+{
+    VkPhysicalDeviceProperties props;
+    t->real.vkGetPhysicalDeviceProperties(t->physical, &props);
+    return header_for(&props, data, size);
 }
 
 static void ident_of(const struct stat *st, pc_ident *id)
@@ -674,6 +680,55 @@ VkResult vkb_pcache_create_compute(vkb_srv_table *t, const VkComputePipelineCrea
     VkResult r = t->real.vkCreateComputePipelines(t->device, p->cache, 1, ci, NULL, out);
     pthread_rwlock_unlock(&p->use);
     return r;
+}
+
+/* ------------------------------------------------------------------ the server's own compiles */
+
+/* A cache for compiles the server makes on a device of its own (the startup probe's transcoder
+ * builds): <dir>/<vendor>-<device>-<cacheUUID>-<name>.vkpc, loaded here, written back by
+ * vkb_pcache_own_close. VK_NULL_HANDLE without a cache directory or with VKBRIDGE_NO_PCACHE. */
+VkPipelineCache vkb_pcache_own_open(const vkb_dispatch *r, const VkPhysicalDeviceProperties *gpu, VkDevice d, const char *name, char *path,
+                                    size_t cap)
+{
+    path[0] = 0;
+    const char *off = vkb_srv_env("VKBRIDGE_NO_PCACHE");
+    if (!pc_dir || (off && *off && strcmp(off, "0")) || !r->vkCreatePipelineCache || !r->vkGetPipelineCacheData) return VK_NULL_HANDLE;
+    const VkPhysicalDeviceProperties props = *gpu;
+    char uuid[2 * VK_UUID_SIZE + 1];
+    for (int i = 0; i < VK_UUID_SIZE; i++) snprintf(uuid + 2 * i, 3, "%02x", props.pipelineCacheUUID[i]);
+    snprintf(path, cap, "%s/%04x-%04x-%s-%s.vkpc", pc_dir, props.vendorID, props.deviceID, uuid, name);
+    size_t size = 0;
+    uint8_t *data = read_file(path, &size, NULL);
+    if (data && !header_for(&props, data, size)) {
+        free(data);
+        data = NULL;
+        size = 0;
+    }
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, data ? size : 0, data};
+    VkPipelineCache c = VK_NULL_HANDLE;
+    if (r->vkCreatePipelineCache(d, &ci, NULL, &c) != VK_SUCCESS && data) {
+        ci.initialDataSize = 0;
+        ci.pInitialData = NULL;
+        if (r->vkCreatePipelineCache(d, &ci, NULL, &c) != VK_SUCCESS) c = VK_NULL_HANDLE;
+    }
+    free(data);
+    return c;
+}
+
+/* Written back when it grew (the build added to it), then destroyed. */
+void vkb_pcache_own_close(const vkb_dispatch *r, VkDevice d, VkPipelineCache c, const char *path)
+{
+    if (!c) return;
+    size_t size = 0, had = 0;
+    struct stat st;
+    if (path[0] && stat(path, &st) == 0) had = (size_t)st.st_size;
+    if (path[0] && r->vkGetPipelineCacheData(d, c, &size, NULL) == VK_SUCCESS && size > had && size <= PC_MAX_FILE) {
+        uint8_t *buf = malloc(size);
+        if (buf && r->vkGetPipelineCacheData(d, c, &size, buf) == VK_SUCCESS && write_file(path, buf, size) == 0)
+            VKB_INFO("pipeline cache %s saved (%zu KB)", path, size >> 10);
+        free(buf);
+    }
+    r->vkDestroyPipelineCache(d, c, NULL);
 }
 
 /* Before the device is destroyed (by the app, or after its process went): what the app's caches
