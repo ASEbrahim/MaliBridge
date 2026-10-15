@@ -133,6 +133,10 @@ run_mode() {
     # DXVK's d3d11_check, with VKB_WINE_DIR), the fix over it passes, forced on a correct driver
     # it is invisible; the gate, the cost of the variants, the SPIR-V pass over the corpus
     timeout 900 ./viewport_test.sh >out/t-viewport.log 2>&1; result $? "viewport_test ($(tail -1 out/t-viewport.log))"
+    # Safe and performance mode: where the mode comes from, both modes' emulation masks from one
+    # probe (not run yet / error: emulated in safe mode only), switched under a running server, the
+    # watchdog's timeout, the report's first line, the client's defaults (a server of its own; once)
+    timeout 600 ./mode_test.sh >out/t-mode.log 2>&1; result $? "mode_test ($(tail -1 out/t-mode.log))"
   fi
   # Negative and positive viewports, static and dynamic, two of them, points, a geometry stage,
   # pipeline libraries: every pixel against the CPU's (facing, gl_FragCoord, dFdy) - MK-02's check
