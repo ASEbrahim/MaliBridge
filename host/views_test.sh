@@ -104,7 +104,7 @@ step $? "VKBRIDGE_VIEW_QUARANTINE=64: at most $held views held (of 64), $defer i
 # the other checks with the quarantine on: results unchanged
 for t in vkbridge-smoke recycle_check nulldesc_check view3d_check; do
   run VKBRIDGE_ERRATA=+view_quarantine -- $t
-  [ $rc = 0 ] && echo "$new" | grep -q "errata: view_quarantine ON (VKBRIDGE_ERRATA=+view_quarantine)"
+  [ $rc = 0 ] && echo "$new" | grep -q "errata: view_quarantine ON (VKBRIDGE_ERRATA=+view_quarantine[;)]"
   step $? "$t with +view_quarantine: $res"
 done
 

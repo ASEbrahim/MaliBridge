@@ -55,7 +55,7 @@ matrix() { # mode version expected
 matrix safe r44p1 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_counts
 matrix safe v1.r49p1-03bet0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts
 echo "$new" | grep -q "driver r49p1 beta (VKBRIDGE_FAKE_DRIVER_VERSION \"v1.r49p1-03bet0\")" &&
-  echo "$new" | grep -q "errata: view_quarantine ON (r49p1 in r49p1-r49p2; safe mode)"
+  echo "$new" | grep -q "errata: view_quarantine ON (r49p1 in r49p1-r49p2; safe mode[;)]"
 step $? "the beta driverInfo string decoded, the reason logged ($(echo "$new" | grep -o 'errata: view_quarantine ON.*'))"
 matrix safe r54p2 wait_retry,dyn_reemit,vb_split,view_counts
 matrix safe r54p3 wait_retry,dyn_reemit,vb_split,view_counts

@@ -60,7 +60,7 @@ envs=(VKBRIDGE_ERRATA_IMITATE=wait_retry VKBRIDGE_WAIT_FAKE_ERROR=once:fence+sem
 check 1 ok $all
 r=$?; missing=
 for k in $kinds; do grep -q "wait_retry: $k.*: the driver failed the wait (-3).*the app gets" "$log" || missing="$missing $k"; done
-[ $r = 0 ] && [ -z "$missing" ] && grep -q "errata: wait_retry ON (always; safe mode) - MK-01" "$log" &&
+[ $r = 0 ] && [ -z "$missing" ] && grep -q "errata: wait_retry ON (always; safe mode[;)].* - MK-01" "$log" &&
   grep -q "vkWaitForFences.*the app gets 2 (VK_TIMEOUT, its deadline)" "$log"
 step $? "each kind failed once: finite waits time out at 300 ms, the rest succeed; logged once per kind$([ -n "$missing" ] && echo ", not:$missing") ($(tail -1 $work/1.log))"
 # 2

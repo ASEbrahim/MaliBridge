@@ -5,9 +5,10 @@ profiles (<cache dir>/probe-*.json): S10+ against S11 Ultra, or a build before a
 
     tools/malibridge_report_diff.py A.json B.json [--regressions]
 
-Prints what differs - device and driver, probe results and the decisions they caused, issues only
-in one of them, and per game (matched by Steam key or process name): frame rate, compile time,
-device losses, long GPU waits, memory, log classes only in one. Numbers inside messages (counts,
+Prints what differs - device and driver, probe results (with their failed sub-cases) and the
+decisions they caused, each driver erratum's decision in either mode, issues only in one of them,
+and per game (matched by Steam key or process name): frame rate, compile time, device losses, long
+GPU waits, memory, log classes only in one. Numbers inside messages (counts,
 times, addresses) are ignored when matching issues and log lines. --regressions: exit 1 when B has
 an issue A does not, or a probe that passed in A does not pass in B.
 """
@@ -37,7 +38,7 @@ def diff_probes(a, b, out, label=""):
     regress = 0
     if a.get("gpu") != b.get("gpu") or a.get("driver") != b.get("driver"):
         out.append(f"{label}GPU/driver: {a.get('gpu')} [{a.get('driver')}]  ->  {b.get('gpu')} [{b.get('driver')}]")
-    for k in ("emu_before", "emu_after"):
+    for k in ("probe_version", "emu_before", "emu_after", "mode"):
         if a.get(k) != b.get(k):
             out.append(f"{label}{k}: {a.get(k)} -> {b.get(k)}")
     ra, rb = probe_results(a), probe_results(b)
@@ -51,7 +52,7 @@ def diff_probes(a, b, out, label=""):
             changes.append(f"{x['status']} -> {y['status']}")
             if x["status"] == "pass" and y["status"] not in ("pass", "skip"):
                 regress += 1
-        for k in ("emu", "flags"):
+        for k in ("emu", "flags", "failed"):
             if x.get(k) != y.get(k):
                 changes.append(f"{k} {x.get(k)} -> {y.get(k)}")
         mx, my = x.get("ms", 0), y.get("ms", 0)
@@ -62,6 +63,18 @@ def diff_probes(a, b, out, label=""):
             if x["detail"] != y["detail"]:
                 out.append(f"    A: {x['detail']}")
                 out.append(f"    B: {y['detail']}")
+    # the driver errata a report shows per profile: each one's decision in either mode
+    ea = {e["name"]: e for e in a.get("errata", [])}
+    eb = {e["name"]: e for e in b.get("errata", [])}
+    for name in list(ea) + [n for n in eb if n not in ea]:
+        x, y = ea.get(name), eb.get(name)
+        if not x or not y:
+            out.append(f"{label}erratum {name}: only in {'A' if x else 'B'}")
+            continue
+        for m in ("safe", "performance"):
+            if x[m]["on"] != y[m]["on"]:
+                out.append(f"{label}erratum {name}, {m} mode: {'on' if x[m]['on'] else 'off'} -> {'on' if y[m]['on'] else 'off'}"
+                           f" ({y[m]['why']})")
     return regress
 
 

@@ -125,6 +125,10 @@ run_mode() {
     # split vertex buffer binds, each failing with its bug imitated and the fix off and passing
     # with the fix; the two stride shapes the probe tells apart (a server of its own; once)
     timeout 300 ./cmdstate_test.sh >out/t-cmdstate.log 2>&1; result $? "cmdstate_test ($(tail -1 out/t-cmdstate.log))"
+    # The MK probes: each erratum's bug imitated beneath its probe makes it fail with the bug's
+    # pattern and the decision follow (probe-gated errata on in performance mode), none without;
+    # the report's errata table; the slow light probes in the background (a server of its own; once)
+    timeout 600 ./probe_mk_test.sh >out/t-probe-mk.log 2>&1; result $? "probe_mk_test ($(tail -1 out/t-probe-mk.log))"
   fi
   # Views with VK_REMAINING_* counts (3D images as 2D arrays: MK-07, always fixed) and views made,
   # rendered to and destroyed over and over (MK-06's pattern), through this mode's server
