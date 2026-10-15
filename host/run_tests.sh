@@ -121,11 +121,19 @@ run_mode() {
     # its bug imitated and the fix off and passing with the fix; the quarantine's caps and the
     # server's RSS over 40000 churned views (a server of its own; once)
     timeout 300 ./views_test.sh >out/t-views.log 2>&1; result $? "views_test ($(tail -1 out/t-views.log))"
+    # The command-buffer state errata: MK-04's dynamic state sent again after binds and MK-05's
+    # split vertex buffer binds, each failing with its bug imitated and the fix off and passing
+    # with the fix; the two stride shapes the probe tells apart (a server of its own; once)
+    timeout 300 ./cmdstate_test.sh >out/t-cmdstate.log 2>&1; result $? "cmdstate_test ($(tail -1 out/t-cmdstate.log))"
   fi
   # Views with VK_REMAINING_* counts (3D images as 2D arrays: MK-07, always fixed) and views made,
   # rendered to and destroyed over and over (MK-06's pattern), through this mode's server
   timeout 60 ./out/view3d_check >out/t-view3d.log 2>&1; result $? "view3d_check ($(tail -1 out/t-view3d.log))"
   timeout 60 ./out/viewchurn_check 500 >out/t-viewchurn.log 2>&1; result $? "viewchurn_check ($(tail -1 out/t-viewchurn.log))"
+  # Dynamic state across pipeline binds and vertex strides bound in one call or one per binding
+  # (MK-04 and MK-05, both on in safe mode), through this mode's server
+  timeout 60 ./out/dynstate_check >out/t-dynstate.log 2>&1; result $? "dynstate_check ($(tail -1 out/t-dynstate.log))"
+  timeout 60 ./out/vbstride_check >out/t-vbstride.log 2>&1; result $? "vbstride_check ($(tail -1 out/t-vbstride.log))"
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
   timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"
