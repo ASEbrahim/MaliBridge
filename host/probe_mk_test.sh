@@ -142,7 +142,7 @@ step $? "single-binding calls wrong too: option B told apart ($(grep -m1 -o 'pro
 # 5
 start flipsafe VKBRIDGE_ERRATA_IMITATE=viewport_flip
 device
-echo "$new" | grep -q "errata: viewport_flip ON (probe viewport_flip failed; safe mode) - MK-02, no fix in this build yet"
+echo "$new" | grep -q "errata: viewport_flip ON (probe viewport_flip failed; safe mode) - MK-02$"
 step $? "viewport_flip on a probe failure in safe mode too ($(echo "$new" | grep -o 'errata: viewport_flip ON.*' | cut -c1-90))"
 start flipcrash VKBRIDGE_MODE=performance VKBRIDGE_PROBE_FAKE=viewport_flip:crash,dyn_state:hang
 device

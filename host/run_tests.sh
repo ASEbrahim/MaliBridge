@@ -129,7 +129,16 @@ run_mode() {
     # pattern and the decision follow (probe-gated errata on in performance mode), none without;
     # the report's errata table; the slow light probes in the background (a server of its own; once)
     timeout 600 ./probe_mk_test.sh >out/t-probe-mk.log 2>&1; result $? "probe_mk_test ($(tail -1 out/t-probe-mk.log))"
+    # MK-02 viewport_flip: negative viewports drawn with the bug imitated fail viewport_check (and
+    # DXVK's d3d11_check, with VKB_WINE_DIR), the fix over it passes, forced on a correct driver
+    # it is invisible; the gate, the cost of the variants, the SPIR-V pass over the corpus
+    timeout 900 ./viewport_test.sh >out/t-viewport.log 2>&1; result $? "viewport_test ($(tail -1 out/t-viewport.log))"
   fi
+  # Negative and positive viewports, static and dynamic, two of them, points, a geometry stage,
+  # pipeline libraries: every pixel against the CPU's (facing, gl_FragCoord, dFdy) - MK-02's check
+  # (mali: multiViewport is emulated, one viewport drawn: no two-viewport cases)
+  timeout 60 ./out/viewport_check $([ "$mode" = mali ] && echo --no-multi) >out/t-viewport-check.log 2>&1
+  result $? "viewport_check ($(tail -1 out/t-viewport-check.log))"
   # Views with VK_REMAINING_* counts (3D images as 2D arrays: MK-07, always fixed) and views made,
   # rendered to and destroyed over and over (MK-06's pattern), through this mode's server
   timeout 60 ./out/view3d_check >out/t-view3d.log 2>&1; result $? "view3d_check ($(tail -1 out/t-view3d.log))"

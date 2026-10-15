@@ -86,7 +86,7 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_WAIT_RETRY] = {"wait_retry", "MK-01", "wait_eintr", 0, G_ALWAYS, G_ALWAYS,
         {{V(0, 0), V_MAX, FAM_ANY, NULL, "every blob driver"}}, vkb_wait_retry_install, vkb_wait_retry_imitate},
     [VKB_ERRATUM_VIEWPORT_FLIP] = {"viewport_flip", "MK-02", "viewport_flip", 1, G_PROBE_FAIL, G_PROBE_FAIL,
-        {{V(54, 2), V(54, 3), FAM_ANY, "G715", "a single report"}}},
+        {{V(54, 2), V(54, 3), FAM_ANY, "G715", "a single report"}}, vkb_errata_flip_install, vkb_errata_flip_imitate},
     [VKB_ERRATUM_BITWISE_SCALAR] = {"bitwise_scalar", "MK-03", "bitwise_vec", 1, G_PROBE_FAIL | G_IN_RANGE, G_PROBE_FAIL,
         {{V(18, 0), V(54, 0), FAM_ANY, NULL, NULL}}, vkb_errata_bitwise_install, vkb_errata_bitwise_imitate},
     [VKB_ERRATUM_DYN_REEMIT] = {"dyn_reemit", "MK-04", "dyn_state", 1, G_ALWAYS, G_PROBE_FAIL | G_IN_RANGE,
@@ -499,6 +499,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_views_destroy(t, e);
     vkb_errata_bitwise_destroy(t, e);
     vkb_errata_cmd_destroy(t, e);
+    vkb_errata_flip_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -578,29 +579,6 @@ static void example_imitate(vkb_srv_table *t, vkb_errata_dev *e)
 
 /* ------------------------------------------------------------------ the startup probe's imitations */
 
-/* viewport_flip's bug for the probe, until server_errata_flip.c (MK-02) brings an imitation of its
- * own into the table: a negative-height viewport drawn as the positive one over the same rows
- * (y + h, -h), so the picture comes out upside down - what Mali-G715 r54p2 was reported to do. */
-static PFN_vkCmdSetViewport flip_standin_next;
-
-static VKAPI_ATTR void VKAPI_CALL flip_standin_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport *vp)
-{
-    VkViewport v[16];
-    if (n > 16) n = 16;
-    for (uint32_t i = 0; i < n; i++) {
-        v[i] = vp[i];
-        if (v[i].height < 0) v[i].y += v[i].height, v[i].height = -v[i].height;
-    }
-    flip_standin_next(cb, first, n, v);
-}
-
-static void flip_standin_imitate(vkb_srv_table *t, vkb_errata_dev *e)
-{
-    (void)e;
-    flip_standin_next = t->real.vkCmdSetViewport;
-    ERRATA_HOOK(t, vkCmdSetViewport, flip_standin_CmdSetViewport);
-}
-
 typedef struct probe_imi {
     vkb_srv_table t;
     vkb_errata_dev *e;
@@ -610,7 +588,6 @@ void *vkb_errata_probe_begin(int id, vkb_dispatch *d, VkDevice dev, VkPhysicalDe
 {
     if (id < 0 || id >= VKB_ERRATA_COUNT || !(imitated_set(0) >> id & 1)) return NULL;
     void (*imitate)(vkb_srv_table *, vkb_errata_dev *) = errata[id].imitate;
-    if (!imitate && id == VKB_ERRATUM_VIEWPORT_FLIP) imitate = flip_standin_imitate;
     if (!imitate) return NULL;
     probe_imi *h = calloc(1, sizeof(*h));
     vkb_errata_dev *e = calloc(1, sizeof(*e));
@@ -644,6 +621,7 @@ void vkb_errata_probe_end(void *handle)
     vkb_errata_views_destroy(&h->t, h->e);
     vkb_errata_bitwise_destroy(&h->t, h->e);
     vkb_errata_cmd_destroy(&h->t, h->e);
+    vkb_errata_flip_destroy(&h->t, h->e);
     free(h->e);
     free(h);
 }
