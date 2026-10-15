@@ -111,9 +111,9 @@ uint64_t vkb_spv_app_hash(const uint32_t *code, size_t size)
     return r;
 }
 
-void vkb_errata_spv_origin(const uint32_t *out, size_t out_size, const uint32_t *in, size_t in_size)
+int vkb_errata_spv_origin(const uint32_t *out, size_t out_size, const uint32_t *in, size_t in_size)
 {
-    origin_add(fnv1a(out, out_size), vkb_spv_app_hash(in, in_size));
+    return origin_add(fnv1a(out, out_size), vkb_spv_app_hash(in, in_size));
 }
 
 static vkb_errata_bitwise *state(void)

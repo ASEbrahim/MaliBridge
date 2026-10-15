@@ -1,0 +1,29 @@
+#version 450
+// MK-32 (clampzero_check.c): min/max/clamp with a constant zero limit on values selected at run
+// time from constants - Godot's fullscreen-triangle constant array, glslang's if/else local, a
+// select, integer clamps, a zero upper limit, gl_Position-style read-back through a local - and
+// one clamp of a loaded value that is not the pattern. The index is the invocation, so nothing
+// folds. glslc -O0: the arrays, locals and selects must reach the driver as glslang wrote them.
+layout(local_size_x = 3) in;
+layout(push_constant) uniform PC { float f; } pc;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint i = gl_LocalInvocationID.x, b = i * 11u;
+    vec2 base_arr[3] = vec2[](vec2(-1.0, -1.0), vec2(-1.0, 3.0), vec2(3.0, -1.0));
+    vec2 a = clamp(base_arr[i], vec2(0.0, 0.0), vec2(1.0, 1.0));            // Godot (#92817)
+    o[b + 0u] = floatBitsToUint(a.x); o[b + 1u] = floatBitsToUint(a.y);
+    float v;                                                                // Godot's workaround form
+    if (i == 0u) v = -2.0; else if (i == 1u) v = 0.5; else v = 5.0;
+    o[b + 2u] = floatBitsToUint(clamp(v, 0.0, 1.0));
+    o[b + 3u] = floatBitsToUint(max(i == 1u ? -3.0 : 2.0, 0.0));           // select, max
+    o[b + 4u] = floatBitsToUint(min(i == 2u ? 4.0 : -1.0, 0.0));           // select, min
+    o[b + 5u] = floatBitsToUint(clamp(i == 0u ? 2.0 : -0.5, -1.0, 0.0));   // zero upper limit
+    o[b + 6u] = uint(clamp(i == 0u ? -5 : 7, 0, 3));                        // SClamp
+    o[b + 7u] = uint(max(i == 1u ? -9 : 4, 0));                             // SMax
+    o[b + 8u] = floatBitsToUint(clamp(pc.f, 0.0, 1.0));                     // loaded: not the pattern
+    vec4 pos = vec4(base_arr[i], 0.0, 1.0);                                 // read back, arithmetic
+    o[b + 9u] = floatBitsToUint(clamp(pos.y * 0.5 + 0.25, 0.0, 1.0));
+    o[b + 10u] = floatBitsToUint(clamp(pos.xy, vec2(0.0), vec2(2.0)).x);
+}

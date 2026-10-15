@@ -196,6 +196,7 @@ enum {
     VKB_ERRATUM_VB_SPLIT,        /* MK-05 vkCmdBindVertexBuffers2 strides by array index */
     VKB_ERRATUM_VIEW_QUARANTINE, /* MK-06 vkCmdBeginRendering reuses stale view state */
     VKB_ERRATUM_VIEW_COUNTS,     /* MK-07 3D image as 2D array with VK_REMAINING_ARRAY_LAYERS */
+    VKB_ERRATUM_CLAMP_ZERO,      /* MK-32 min/max/clamp with a zero limit on a constant-selected value */
     VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };

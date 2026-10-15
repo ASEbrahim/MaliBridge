@@ -11,6 +11,7 @@
 typedef struct vkb_errata_dev {
     uint32_t on;           /* 1 << VKB_ERRATUM_*: decided on */
     uint32_t imitated;
+    uint32_t forced;       /* on by VKBRIDGE_ERRATA=+name */
     uint32_t targeted;     /* on for a reason other than "always" alone: a probe, the range, an
                               unknown version, VKBRIDGE_ERRATA=+name (a fix may do more then) */
     vkb_dispatch next_fix; /* what each fix calls: the driver's functions, or the imitation's */
@@ -21,6 +22,7 @@ typedef struct vkb_errata_dev {
     struct vkb_errata_bitwise *bitwise; /* server_errata_bitwise.c (MK-03) */
     struct vkb_errata_cmd *cmd;     /* server_errata_cmd.c (MK-04, MK-05) */
     struct vkb_errata_flip *flip;       /* server_errata_flip.c (MK-02) */
+    struct vkb_errata_clampzero *clampzero; /* server_errata_clampzero.c (MK-32) */
     int probe; /* the startup probe's: an imitation only, for one probe (vkb_errata_probe_begin);
                   it publishes nothing a server thread without a table would fall back to, and logs
                   no totals */
@@ -72,8 +74,9 @@ void vkb_errata_vb_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 /* A module an erratum rewrote is named by the code it came from (vkb_spv_app_hash): registers
- * the new code's hash -> the app's hash of `in` (itself maybe an erratum's output) */
-void vkb_errata_spv_origin(const uint32_t *out, size_t out_size, const uint32_t *in, size_t in_size);
+ * the new code's hash -> the app's hash of `in` (itself maybe an erratum's output); 1 when the
+ * new code was not registered before (a module to log) */
+int vkb_errata_spv_origin(const uint32_t *out, size_t out_size, const uint32_t *in, size_t in_size);
 
 /* server_errata_flip.c: viewport_flip (MK-02), positive viewports and gl_Position.y negated in
  * the last pre-rasterization stage, pipeline variants picked at draw time; the imitation turns
@@ -81,5 +84,11 @@ void vkb_errata_spv_origin(const uint32_t *out, size_t out_size, const uint32_t 
 void vkb_errata_flip_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_flip_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_flip_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* before the driver's vkDestroyDevice */
+
+/* server_errata_clampzero.c: clamp_zero (MK-32), the SPIR-V rewrite on module and pipeline
+ * creation, chained above bitwise_scalar's; the imitation is the same hooks beneath it */
+void vkb_errata_clampzero_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_clampzero_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_clampzero_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 #endif
