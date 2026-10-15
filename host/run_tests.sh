@@ -140,9 +140,10 @@ run_mode() {
     # probe (not run yet / error: emulated in safe mode only), switched under a running server, the
     # watchdog's timeout, the report's first line, the client's defaults (a server of its own; once)
     timeout 600 ./mode_test.sh >out/t-mode.log 2>&1; result $? "mode_test ($(tail -1 out/t-mode.log))"
-    # Per-game presets by Steam app id: two games' own knobs, at once too; the precedence (built-in,
-    # file, environment, <cache dir>/env); VKBRIDGE_MODE per game; bad lines warned and skipped; the
-    # client's switch through vkbQueryServer; the report's preset per process (a server of its own; once)
+    # Per-game presets by Steam app id: two games' own knobs, at once too; the precedence (file,
+    # <cache dir>/env, environment, built-in); VKBRIDGE_MODE per game; bad lines warned and skipped;
+    # the client's switch through vkbQueryServer; the report's preset per process; a built-in preset
+    # only on a GPU it was tested on (a server of its own; once)
     timeout 600 ./presets_test.sh >out/t-presets.log 2>&1; result $? "presets_test ($(tail -1 out/t-presets.log))"
   fi
   # Negative and positive viewports, static and dynamic, two of them, points, a geometry stage,

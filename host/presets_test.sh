@@ -6,15 +6,20 @@
 #      only its game's pipeline cache off; a client without an app id gets neither; one log line
 #      per game; the session report lists each process's preset (Markdown and JSON);
 #   2  precedence, one key (VKBRIDGE_COMPILE_TIMEOUT_S): the built-in preset (imitated:
-#      VKBRIDGE_PRESET_FAKE_BUILTIN) over the mode's default, the file over the built-in preset
-#      key by key, the server's environment over both, <cache dir>/env over that;
+#      VKBRIDGE_PRESET_FAKE_BUILTIN, tested on this GPU) over the mode's default, the file over the
+#      built-in preset key by key, the file over the server's environment and over
+#      <cache dir>/env, <cache dir>/env over the environment and the environment over the built-in;
 #   3  VKBRIDGE_MODE in a preset: that game's devices in that mode over Setup's switch (their
-#      errata and watchdog by it), another game's in Setup's;
+#      errata and watchdog by it), another game's in Setup's; the file over <cache dir>/env,
+#      <cache dir>/env over the built-in;
 #   4  bad lines (not KEY=VALUE, a switch that is not per-game, too long) ignored with a warning,
 #      the good lines around them taken;
 #   5  the client's switch (VKBRIDGE_DESC_BATCH) from a preset reaches the client through
 #      vkbQueryServer (fewer messages), and the guest's own VKBRIDGE_DESC_BATCH=0 still wins;
-#   6  the protocol hash is unchanged.
+#   6  a built-in preset applied only on a GPU it was tested on: on another GPU, or with no GPU
+#      listed, it is not, said once per game in the log and in the session report with the lines
+#      to copy into <cache dir>/presets/<appid>.env;
+#   7  the protocol hash is unchanged.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -99,7 +104,7 @@ r4=$?
 step $? "two app ids: ${a%% (*} and ${b%% (*}, pipeline cache off for 111 only, none without an id ($r1); at once ($r2); logged once each ($r3); in the report ($r4)"
 
 # 2
-fake="VKBRIDGE_PRESET_FAKE_BUILTIN=333:VKBRIDGE_COMPILE_TIMEOUT_S=51 VKBRIDGE_NO_PCACHE=1;999:VKBRIDGE_COMPILE_TIMEOUT_S=9"
+fake="VKBRIDGE_PRESET_FAKE_BUILTIN=333@Mali-G720,RADV:VKBRIDGE_COMPILE_TIMEOUT_S=51 VKBRIDGE_NO_PCACHE=1;999@RADV:VKBRIDGE_COMPILE_TIMEOUT_S=9"
 start prec "$fake"
 device SteamAppId=333; p1=$(limit_of)
 echo "$new" | grep -q "persistent pipeline cache off"; p1pc=$?
@@ -109,27 +114,37 @@ start prec "$fake"
 device SteamAppId=333; p2=$(limit_of)
 echo "$new" | grep -q "persistent pipeline cache off"; p2pc=$?
 grep -q 'preset for steam333: VKBRIDGE_COMPILE_TIMEOUT_S=52 (from file), VKBRIDGE_NO_PCACHE=1 (from built-in)$' $log; p2l=$?
+# the file over the environment, then over <cache dir>/env too
 start prec "$fake" VKBRIDGE_COMPILE_TIMEOUT_S=53
 device SteamAppId=333; p3=$(limit_of)
-grep -q "interrupt after 53 s (VKBRIDGE_COMPILE_TIMEOUT_S;" $log && grep -q "; overridden: VKBRIDGE_COMPILE_TIMEOUT_S=53 from the environment$" $log; p3l=$?
+grep -q "interrupt after 53 s (VKBRIDGE_COMPILE_TIMEOUT_S;" $log && ! grep -q "overridden" $log; p3l=$?
 echo "VKBRIDGE_COMPILE_TIMEOUT_S=54" > $work/prec/c/env
 start prec "$fake" VKBRIDGE_COMPILE_TIMEOUT_S=53
 device SteamAppId=333; p4=$(limit_of)
-grep -q "interrupt after 54 s (VKBRIDGE_COMPILE_TIMEOUT_S;" $log && ! grep -q "interrupt after 53 s" $log; p4l=$?
-rm -f $work/prec/c/env $work/prec/c/presets/333.env
-start prec
+grep -q "interrupt after 54 s (VKBRIDGE_COMPILE_TIMEOUT_S;" $log && ! grep -q "overridden" $log; p4l=$?
+# without the file: <cache dir>/env over the environment and the built-in, the environment over the built-in
+rm -f $work/prec/c/presets/333.env
+start prec "$fake" VKBRIDGE_COMPILE_TIMEOUT_S=53
 device SteamAppId=333; p5=$(limit_of)
-grep -q "interrupt after 10 s (safe mode" $log && ! grep -q "preset for" $log; p5l=$?
+grep -q "interrupt after 54 s (VKBRIDGE_COMPILE_TIMEOUT_S;" $log && grep -q "; overridden: VKBRIDGE_COMPILE_TIMEOUT_S=54 from <cache dir>/env$" $log; p5l=$?
+rm -f $work/prec/c/env
+start prec "$fake" VKBRIDGE_COMPILE_TIMEOUT_S=53
+device SteamAppId=333; p6=$(limit_of)
+grep -q "interrupt after 53 s (VKBRIDGE_COMPILE_TIMEOUT_S;" $log && grep -q "; overridden: VKBRIDGE_COMPILE_TIMEOUT_S=53 from the environment$" $log; p6l=$?
+start prec
+device SteamAppId=333; p7=$(limit_of)
+grep -q "interrupt after 10 s (safe mode" $log && ! grep -q "preset for" $log; p7l=$?
+file52="52 s (VKBRIDGE_COMPILE_TIMEOUT_S, the game's preset file)"
 [ "$p1" = "51 s (VKBRIDGE_COMPILE_TIMEOUT_S, the game's built-in preset)" ] && [ $p1pc$p1l = 00 ] &&
-  [ "$p2" = "52 s (VKBRIDGE_COMPILE_TIMEOUT_S, the game's preset file)" ] && [ $p2pc$p2l = 00 ] &&
-  [ -z "$p3" ] && [ $p3l = 0 ] && [ -z "$p4" ] && [ $p4l = 0 ] && [ -z "$p5" ] && [ $p5l = 0 ]
-step $? "precedence: built-in ${p1%% (*}, file ${p2%% (*} (built-in's other key kept), environment 53 ($p3l), <cache dir>/env 54 ($p4l), none: the mode's 10 s ($p5l)"
+  [ "$p2" = "$file52" ] && [ $p2pc$p2l = 00 ] && [ "$p3" = "$file52" ] && [ $p3l = 0 ] && [ "$p4" = "$file52" ] && [ $p4l = 0 ] &&
+  [ -z "$p5" ] && [ $p5l = 0 ] && [ -z "$p6" ] && [ $p6l = 0 ] && [ -z "$p7" ] && [ $p7l = 0 ]
+step $? "precedence: built-in ${p1%% (*}, file ${p2%% (*} (built-in's other key kept), file over environment 53 (${p3%% (*}) and over <cache dir>/env 54 (${p4%% (*}), <cache dir>/env 54 over the built-in ($p5l), environment 53 over the built-in ($p6l), none: the mode's 10 s ($p7l)"
 
 # 3
 mkdir -p $work/mode/c/presets
 echo safe > $work/mode/c/mode
 echo "VKBRIDGE_MODE=performance" > $work/mode/c/presets/555.env
-start mode "VKBRIDGE_PRESET_FAKE_BUILTIN=556:VKBRIDGE_MODE=performance"
+start mode "VKBRIDGE_PRESET_FAKE_BUILTIN=556@RADV:VKBRIDGE_MODE=performance"
 device SteamAppId=555
 echo "$new" | grep -q "mode: performance (the game's preset file)" && echo "$new" | grep -q "errata: device .*performance mode" &&
   echo "$new" | grep -q "compile watchdog: interrupt after 20 s now (performance mode)"; m1l=$?
@@ -138,11 +153,13 @@ echo "$new" | grep -q "mode: safe (Setup) - changed" && echo "$new" | grep -q "e
 device SteamAppId=556
 echo "$new" | grep -q "mode: performance (the game's built-in preset)"; m3l=$?
 echo "VKBRIDGE_MODE=safe" > $work/mode/c/env
-start mode
+start mode "VKBRIDGE_PRESET_FAKE_BUILTIN=556@RADV:VKBRIDGE_MODE=performance"
 device SteamAppId=555
-echo "$new" | grep -q "mode: safe (VKBRIDGE_MODE in <cache dir>/env)" || grep -q "mode: safe (VKBRIDGE_MODE in <cache dir>/env)" $log; m4l=$?
-[ -z "$m2" ] && [ $m1l$m2l$m3l$m4l = 0000 ]
-step $? "VKBRIDGE_MODE in a preset: 555 performance, its errata and 20 s watchdog ($m1l), 777 Setup's safe ($m2l), built-in ($m3l), <cache dir>/env still wins ($m4l)"
+echo "$new" | grep -q "mode: performance (the game's preset file)"; m4l=$?
+device SteamAppId=556
+echo "$new" | grep -q "mode: safe (VKBRIDGE_MODE in <cache dir>/env)"; m5l=$?
+[ -z "$m2" ] && [ $m1l$m2l$m3l$m4l$m5l = 00000 ]
+step $? "VKBRIDGE_MODE in a preset: 555 performance, its errata and 20 s watchdog ($m1l), 777 Setup's safe ($m2l), built-in ($m3l), the file over <cache dir>/env ($m4l), <cache dir>/env over the built-in ($m5l)"
 
 # 4
 mkdir -p $work/bad/c/presets
@@ -181,6 +198,32 @@ mp=$(msgs SteamAppId=444); mn=$(msgs SteamAppId=445); mg=$(msgs SteamAppId=444 V
 step $? "client switch: VKBRIDGE_DESC_BATCH=1 in 444's preset $mp (guest's =1: $mb), none $mn, guest's =0 wins $mg"
 
 # 6
+start gpu "VKBRIDGE_PRESET_FAKE_BUILTIN=600@Mali-G925,RADV:VKBRIDGE_COMPILE_TIMEOUT_S=61;601@Mali-G720,Mali-G925:VKBRIDGE_COMPILE_TIMEOUT_S=62 VKBRIDGE_NO_PCACHE=1;602:VKBRIDGE_COMPILE_TIMEOUT_S=63"
+gpu=$(grep -o 'GPU: .* (vendor 0x' $log | sed 's/^GPU: //; s/ (vendor 0x$//' | paste -sd, - | sed 's/,/, /g')
+device SteamAppId=600; g1=$(limit_of)
+device SteamAppId=601; g2=$(limit_of); g2pc=$(echo "$new" | grep -c "persistent pipeline cache off")
+device SteamAppId=601
+device SteamAppId=602; g3=$(limit_of)
+n601="preset for steam601: a built-in preset exists but was not tested on $gpu; not applied. To try it, copy it to $work/gpu/c/presets/601.env: VKBRIDGE_COMPILE_TIMEOUT_S=62 VKBRIDGE_NO_PCACHE=1"
+n602="preset for steam602: a built-in preset exists but was not tested on $gpu; not applied. To try it, copy it to $work/gpu/c/presets/602.env: VKBRIDGE_COMPILE_TIMEOUT_S=63"
+[ "$g1" = "61 s (VKBRIDGE_COMPILE_TIMEOUT_S, the game's built-in preset)" ] && [ -z "$g2" ] && [ "$g2pc" = 0 ] && [ -z "$g3" ] &&
+  ! grep -q "preset for steam60[12]: VKBRIDGE" $log
+r1=$?
+[ -n "$gpu" ] && [ "$(grep -cF "$n601" $log)" = 1 ] && [ "$(grep -cF "$n602" $log)" = 1 ] && [ "$(grep -c "preset for steam600: a built-in" $log)" = 0 ]
+r2=$?
+rep=$(report gpu)
+for _ in $(seq 50); do grep -qF -- "- $n602" $rep 2>/dev/null && break; sleep 0.1; done
+grep -qxF -- "- $n601" $rep && grep -qxF -- "- $n602" $rep &&
+  python3 -c '
+import json, sys
+ps = {p["key"]: p for p in json.load(open(sys.argv[1]))["processes"]}
+assert ps["steam601"]["preset_note"] == sys.argv[2] and ps["steam601"]["preset"] == "", ps["steam601"]
+assert ps["steam600"]["preset_note"] == "" and ps["steam600"]["preset"] == "VKBRIDGE_COMPILE_TIMEOUT_S=61 (from built-in)", ps["steam600"]' ${rep%.md}.json "$n601"
+r3=$?
+[ $r1$r2$r3 = 000 ]
+step $? "built-in on the GPUs tested: on $gpu 600 ${g1%% (*}, 601 (Mali only) and 602 (none listed) not applied ($r1), said once each ($r2), in the report ($r3)"
+
+# 7
 stop
 grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
