@@ -469,8 +469,8 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_bvmap_device_init(t); /* last: client-named buffer views are driver views beneath */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);
-            VKB_INFO("device %u created on %s (%u extensions, memory sharing %s)", id, k ? k->name : "?", n,
-                     vkb_mem_strategy_name(strategy));
+            VKB_INFO("device %u created on %s (pid %d, %u extensions, memory sharing %s)", id, k ? k->name : "?",
+                     t->proc ? t->proc->pid : 0, n, vkb_mem_strategy_name(strategy));
             vkb_mem_log_types(t, id);
             for (uint32_t i = 0; i < n; i++) VKB_DBG("  device extension %s", exts[i]);
         }
