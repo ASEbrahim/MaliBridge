@@ -474,6 +474,7 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
         return;
     }
     vkb_table_unregister(t);
+    vkb_emu_device_quiesce(t);
     vkb_bvmap_device_destroy(t);
     vkb_gprof_device_destroy(t);
     vkb_trace_device_destroy(t);

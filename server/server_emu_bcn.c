@@ -90,6 +90,14 @@ typedef struct bcn_state {
     uint32_t quality;        /* the transcoders' search (bc_decode.comp's BC_QUALITY): 0 fast, 1 default, 2 high,
                               * QUALITY_AUTO: fast for large mip levels, default for the rest (level_quality) */
     pthread_mutex_t lock;
+    /* pipeline builds (pipeline()): one at a time per pipeline, the others wait for it; in auto, the
+     * other quality of a transcoder is built in the background once one is (warm) */
+    pthread_mutex_t plock;
+    pthread_cond_t pcond;
+    uint8_t building[3][FAM_COUNT], failed[3][FAM_COUNT];
+    uint32_t want[3];        /* per quality, a bit per family: for the warm thread */
+    pthread_t warm;
+    int warm_up, warm_stop;
     chunk *idle;             /* scratch no pending command buffer uses (bytes in g_idle) */
     uint32_t nidle, capidle;
 } bcn_state;
@@ -578,53 +586,122 @@ void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch)
 
 /* ------------------------------------------------------------------ decoder */
 
-/* The decoder or transcoder for fam; q: the transcoders' BC_QUALITY (0-2, ignored by decoders). */
-static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q)
+/* Builds the decoder or transcoder for fam at quality q, through the device's persistent pipeline
+ * cache (server_pcache.c): Mali takes hundreds of ms over some transcoders, and without the cache
+ * every process paid that again. */
+static VkPipeline build(vkb_emu_device *e, int fam, uint32_t q, int bg)
+{
+    static const uint32_t *const code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
+                                                    spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
+                                                    spv_bc7_astc};
+    static const size_t size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), sizeof(spv_bc3), sizeof(spv_bc4), sizeof(spv_bc5),
+                                           sizeof(spv_bc6h), sizeof(spv_bc7), sizeof(spv_bc1_16), sizeof(spv_bc1_etc2),
+                                           sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac),
+                                           sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc)};
+    const vkb_dispatch *r = &e->dev->real;
+    VkDevice d = e->dev->device;
+    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size[fam], code[fam]};
+    VkShaderModule m;
+    if (!code[fam] || r->vkCreateShaderModule(d, &mci, NULL, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    /* the transcoders' search: BC_QUALITY, specialization constant 0 (left at its default of 1
+     * when that is asked for) */
+    const VkSpecializationMapEntry me = {0, 0, sizeof(uint32_t)};
+    const VkSpecializationInfo si = {1, &me, sizeof(uint32_t), &q};
+    pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                                                  VK_SHADER_STAGE_COMPUTE_BIT, m, "main", q != 1 ? &si : NULL};
+    pci.layout = ((bcn_state *)e->bcn)->layout;
+    VkPipeline p;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (vkb_pcache_create_compute(e->dev, &pci, &p) != VK_SUCCESS) {
+        VKB_ERR("BC emulation: decoder pipeline %d (quality %u) failed to build", fam, q);
+        p = VK_NULL_HANDLE;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    /* built on the first upload that needs it (or beside it, bg): a load-time cost worth seeing */
+    if (p) VKB_INFO("BC emulation: %s pipeline %d%s built in %.1f ms%s", fam >= TX_BC1 ? "transcoder" : "decoder", fam,
+                    fam < TX_BC1 ? "" : q == 0 ? " (fast)" : q == 2 ? " (high)" : " (default)",
+                    (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, bg ? " in the background" : "");
+    r->vkDestroyShaderModule(d, m, NULL);
+    return p;
+}
+
+static void *warm_main(void *arg);
+
+/* The decoder or transcoder for fam; q: the transcoders' BC_QUALITY (0-2, ignored by decoders).
+ * Built once: a caller that finds it being built waits for that build. */
+static VkPipeline pipeline_bg(vkb_emu_device *e, int fam, uint32_t q, int bg)
 {
     bcn_state *s = e->bcn;
     if (fam < TX_BC1) q = 1;
     VkPipeline *pp = &s->pipes[q][fam], have = __atomic_load_n(pp, __ATOMIC_ACQUIRE);
     if (have) return have;
-    pthread_mutex_lock(&s->lock);
-    if (!*pp) {
-        static const uint32_t *const code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
-                                                        spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
-                                                        spv_bc7_astc};
-        static const size_t size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), sizeof(spv_bc3), sizeof(spv_bc4), sizeof(spv_bc5),
-                                               sizeof(spv_bc6h), sizeof(spv_bc7), sizeof(spv_bc1_16), sizeof(spv_bc1_etc2),
-                                               sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac),
-                                               sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc)};
-        const vkb_dispatch *r = &e->dev->real;
-        VkDevice d = e->dev->device;
-        VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size[fam], code[fam]};
-        VkShaderModule m;
-        if (code[fam] && r->vkCreateShaderModule(d, &mci, NULL, &m) == VK_SUCCESS) {
-            VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-            /* the transcoders' search: BC_QUALITY, specialization constant 0 (left at its default of 1
-             * when that is asked for) */
-            const VkSpecializationMapEntry me = {0, 0, sizeof(uint32_t)};
-            const VkSpecializationInfo si = {1, &me, sizeof(uint32_t), &q};
-            pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
-                                                          VK_SHADER_STAGE_COMPUTE_BIT, m, "main", q != 1 ? &si : NULL};
-            pci.layout = s->layout;
-            VkPipeline p;
-            struct timespec t0, t1;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            if (r->vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pci, NULL, &p) != VK_SUCCESS) {
-                VKB_ERR("BC emulation: decoder pipeline %d (quality %u) failed to build", fam, q);
-                p = VK_NULL_HANDLE;
-            }
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            /* built on the first upload that needs it: a load-time cost worth seeing on the device */
-            if (p) VKB_INFO("BC emulation: %s pipeline %d%s built in %.1f ms", fam >= TX_BC1 ? "transcoder" : "decoder", fam,
-                            fam < TX_BC1 ? "" : q == 0 ? " (fast)" : q == 2 ? " (high)" : " (default)",
-                            (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
-            __atomic_store_n(pp, p, __ATOMIC_RELEASE);
-            r->vkDestroyShaderModule(d, m, NULL);
-        }
+    pthread_mutex_lock(&s->plock);
+    while (!*pp && s->building[q][fam]) pthread_cond_wait(&s->pcond, &s->plock);
+    if (*pp || s->failed[q][fam]) {
+        have = *pp;
+        pthread_mutex_unlock(&s->plock);
+        return have;
     }
-    pthread_mutex_unlock(&s->lock);
-    return *pp;
+    s->building[q][fam] = 1;
+    pthread_mutex_unlock(&s->plock);
+    VkPipeline p = build(e, fam, q, bg);
+    pthread_mutex_lock(&s->plock);
+    __atomic_store_n(pp, p, __ATOMIC_RELEASE);
+    s->building[q][fam] = 0;
+    if (!p) s->failed[q][fam] = 1;
+    /* auto uses both fast and default for a format (by mip size): the first upload builds the one
+     * it needs, and the other is built beside it rather than in the middle of a later upload (on
+     * the G720 a 4096x4096x2 BC7 upload that was the fast transcoder's first use took 860 ms, 227
+     * at default with its transcoder built) */
+    uint32_t other = q ^ 1;
+    if (p && s->quality == QUALITY_AUTO && fam >= TX_BC1 && q < 2 && !s->pipes[other][fam] && !s->building[other][fam] &&
+        !s->failed[other][fam] && !s->warm_stop) {
+        s->want[other] |= 1u << fam;
+        if (!s->warm_up) s->warm_up = pthread_create(&s->warm, NULL, warm_main, e) == 0;
+    }
+    pthread_cond_broadcast(&s->pcond);
+    pthread_mutex_unlock(&s->plock);
+    return p;
+}
+
+static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q) { return pipeline_bg(e, fam, q, 0); }
+
+/* The warm thread: builds what pipeline_bg queued, until the device goes (vkb_emu_bcn_quiesce). */
+static void *warm_main(void *arg)
+{
+    vkb_emu_device *e = arg;
+    bcn_state *s = e->bcn;
+    vkb_srv_set_current_table(e->dev); /* the layers beneath (hang, gpuprof) find the device by it */
+    pthread_mutex_lock(&s->plock);
+    for (;;) {
+        while (!s->warm_stop && !s->want[0] && !s->want[1]) pthread_cond_wait(&s->pcond, &s->plock);
+        if (s->warm_stop) break;
+        uint32_t q = s->want[0] ? 0 : 1;
+        int fam = __builtin_ctz(s->want[q]);
+        s->want[q] &= ~(1u << fam);
+        pthread_mutex_unlock(&s->plock);
+        pipeline_bg(e, fam, q, 1);
+        pthread_mutex_lock(&s->plock);
+    }
+    pthread_mutex_unlock(&s->plock);
+    return NULL;
+}
+
+/* Before the device's layers go (vkDestroyDevice, or its process gone): the warm thread compiles
+ * through them and the pipeline cache. A build under way finishes first. */
+void vkb_emu_bcn_quiesce(vkb_srv_table *dev)
+{
+    bcn_state *s = dev->emu ? dev->emu->bcn : NULL;
+    if (!s) return;
+    pthread_mutex_lock(&s->plock);
+    s->warm_stop = 1;
+    int up = s->warm_up;
+    s->warm_up = 0;
+    pthread_cond_broadcast(&s->pcond);
+    pthread_mutex_unlock(&s->plock);
+    if (up) pthread_join(s->warm, NULL);
 }
 
 typedef struct region {
@@ -1117,6 +1194,8 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     if (!(e->flags & VKB_EMU_BCN)) return;
     bcn_state *s = calloc(1, sizeof(*s));
     pthread_mutex_init(&s->lock, NULL);
+    pthread_mutex_init(&s->plock, NULL);
+    pthread_cond_init(&s->pcond, NULL);
     VkPhysicalDeviceProperties p;
     dev->real.vkGetPhysicalDeviceProperties(dev->physical, &p);
     s->ssbo_align = p.limits.minStorageBufferOffsetAlignment ? p.limits.minStorageBufferOffsetAlignment : 4;
@@ -1169,6 +1248,9 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_t)};
     if (dev->real.vkCreateDescriptorSetLayout(dev->device, &dci, NULL, &s->dsl) != VK_SUCCESS) {
         VKB_ERR("BC emulation: cannot create the decoder's descriptor layout");
+        pthread_cond_destroy(&s->pcond);
+        pthread_mutex_destroy(&s->plock);
+        pthread_mutex_destroy(&s->lock);
         free(s);
         e->flags &= ~VKB_EMU_BCN;
         return;
@@ -1183,6 +1265,7 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
 {
     bcn_state *s = dev->emu->bcn;
     if (!s) return;
+    vkb_emu_bcn_quiesce(dev);
     for (int q = 0; q < 3; q++)
         for (int i = 0; i < FAM_COUNT; i++)
             if (s->pipes[q][i]) dev->real.vkDestroyPipeline(dev->device, s->pipes[q][i], NULL);
@@ -1195,6 +1278,8 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
         chunk_destroy(dev->emu, &s->idle[i]);
     }
     free(s->idle);
+    pthread_cond_destroy(&s->pcond);
+    pthread_mutex_destroy(&s->plock);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }

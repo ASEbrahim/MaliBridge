@@ -16,7 +16,9 @@
  * (photo, gradient, sky) and its blocks decoded here (astc_decode), so a GPU without ASTC HDR (RADV)
  * still measures it. `bcn_check hdr` runs only that. Then a 2048x2048 mip chain (BC7, BC1; with
  * BCN_BENCH=1 also BC3, BC4, BC5), uploaded a level at a time: each level's time and PSNR, which
- * show the server's per-level quality choice (VKBRIDGE_BC_TRANSCODE_QUALITY=auto).
+ * show the server's per-level quality choice (VKBRIDGE_BC_TRANSCODE_QUALITY=auto); BCN_NO_LEVELS=1
+ * leaves the chains out. The 4096x4096 uploads run twice: the first may include building its
+ * transcoder (the server does that at the first upload that needs it), the second is warm.
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -1381,6 +1383,13 @@ static void barrier_all(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkI
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
+static double ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1e3 + (t1.tv_nsec - t0->tv_nsec) / 1e6;
+}
+
 static void submit(VkCommandBuffer cb)
 {
     vkEndCommandBuffer(cb);
@@ -2002,7 +2011,8 @@ static void test_size(VkFormat f, const char *name, uint32_t texel_bytes, VkImag
 
 /* 4096x4096 BC7, 2 layers, in one region: 128 MiB decoded, more than the bridge decodes into one
  * command buffer's scratch before reusing it. BCN_BENCH=1: also BC1, BC3, BC4 and BC5, for the
- * upload times. */
+ * upload times. Uploaded twice: the first may be the first use of its pipeline (the server
+ * builds it while it replays the command buffer, inside the time), the second is warm. */
 static void test_large(VkFormat f, const char *name)
 {
     enum { S = 4096, LAYERS = 2 };
@@ -2021,16 +2031,18 @@ static void test_large(VkFormat f, const char *name)
         random_level(f, &lv[l], S, S);
         memcpy((uint8_t *)upp + per * l, lv[l].blocks, per);
     }
-    VkCommandBuffer cb = begin();
-    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, {0, 0, 0}, {S, S, 1}};
-    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    submit(cb);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("INFO %s 4096x4096x2 upload: %.1f ms (submit to idle)\n", name, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    for (int pass = 0; pass < 2; pass++) {
+        VkCommandBuffer cb = begin();
+        barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, {0, 0, 0}, {S, S, 1}};
+        vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        submit(cb);
+        double ms = ms_since(&t0);
+        printf("INFO %s 4096x4096x2 upload%s: %.1f ms (submit to idle)\n", name, pass ? " again (warm)" : "", ms);
+    }
     int bad = 0;
     for (uint32_t l = 0; l < LAYERS; l++) bad += compare_level(img, f, 0, l, &lv[l], 2.5f / 255.0f, name);
     if (bad) {
@@ -2212,9 +2224,12 @@ int main(int argc, char **argv)
             test_format(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat (all 14 modes, decoded)", 0.002f);
         }
         test_hdr_shader();
-        test_levels(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4");
-        test_levels(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB -> ETC2 RGB8");
-        if (getenv("BCN_BENCH")) {
+        /* BCN_NO_LEVELS=1: no mip chains, so (under auto) the 4096x4096 uploads below are the fast
+         * transcoders' first use, as before the chains were added */
+        int levels = !getenv("BCN_NO_LEVELS");
+        if (levels) test_levels(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4");
+        if (levels) test_levels(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB -> ETC2 RGB8");
+        if (levels && getenv("BCN_BENCH")) {
             test_levels(VK_FORMAT_BC3_UNORM_BLOCK, "BC3 -> ASTC 4x4");
             test_levels(VK_FORMAT_BC4_UNORM_BLOCK, "BC4 -> EAC R11");
             test_levels(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 -> EAC RG11");
