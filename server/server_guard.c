@@ -259,10 +259,7 @@ static double mono_s(void)
 
 static uint64_t spirv_hash(const uint32_t *code, size_t size)
 {
-    uint64_t h = 0xcbf29ce484222325ull;
-    const uint8_t *b = (const uint8_t *)code;
-    for (size_t i = 0; i < size; i++) h = (h ^ b[i]) * 0x100000001b3ull;
-    return h;
+    return vkb_spv_app_hash(code, size); /* FNV-1a; a module an erratum rewrote by the app's code */
 }
 
 /* Called with watch_lock held. */

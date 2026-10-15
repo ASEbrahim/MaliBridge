@@ -186,6 +186,9 @@ void vkb_errata_device_destroy(vkb_srv_table *t);
 int vkb_errata_on(const vkb_srv_table *t, int id); /* VKB_ERRATUM_* decided on for this device */
 const char *vkb_errata_name(int id);
 void vkb_errata_set_probe_source(int (*fn)(const char *probe)); /* the probe's record: VKB_ERRATA_PROBE_* */
+/* FNV-1a of a module's SPIR-V as the app made it: a module an erratum rewrote is named by the
+ * code it was rewritten from (server_errata_bitwise.c); what layers beneath the errata hash with */
+uint64_t vkb_spv_app_hash(const uint32_t *code, size_t size);
 int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta); /* r<major>p<minor> in s */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);

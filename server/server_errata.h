@@ -15,6 +15,7 @@ typedef struct vkb_errata_dev {
     vkb_dispatch next_imi; /* what each imitation calls: the driver's */
     uint64_t example_calls, example_imitated;
     struct vkb_errata_views *views; /* server_errata_views.c (MK-06, MK-07) */
+    struct vkb_errata_bitwise *bitwise; /* server_errata_bitwise.c (MK-03) */
 } vkb_errata_dev;
 
 /* The device a wrapper runs for: the call's table; on a thread without one (the server's own
@@ -46,5 +47,11 @@ void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e);
  * view_counts (MK-07), fixes and imitations alike (installed once, whichever asks first) */
 void vkb_errata_views_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_views_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* before the driver's vkDestroyDevice */
+
+/* server_errata_bitwise.c: bitwise_scalar (MK-03), the SPIR-V rewrite on module and pipeline
+ * creation; the imitation is the same hooks beneath it */
+void vkb_errata_bitwise_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_bitwise_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_bitwise_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 #endif

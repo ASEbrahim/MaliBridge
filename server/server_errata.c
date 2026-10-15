@@ -79,7 +79,7 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_VIEWPORT_FLIP] = {"viewport_flip", "MK-02", "viewport_flip", 1, G_PROBE_FAIL, G_PROBE_FAIL,
         {{V(54, 2), V(54, 3), FAM_ANY, "G715", "a single report"}}},
     [VKB_ERRATUM_BITWISE_SCALAR] = {"bitwise_scalar", "MK-03", "bitwise_vec", 1, G_PROBE_FAIL | G_IN_RANGE, G_PROBE_FAIL,
-        {{V(18, 0), V(54, 0), FAM_ANY, NULL, NULL}}},
+        {{V(18, 0), V(54, 0), FAM_ANY, NULL, NULL}}, vkb_errata_bitwise_install, vkb_errata_bitwise_imitate},
     [VKB_ERRATUM_DYN_REEMIT] = {"dyn_reemit", "MK-04", "dyn_state", 1, G_ALWAYS, G_PROBE_FAIL | G_IN_RANGE,
         {{V(38, 0), V(44, 1), FAM_ANY, NULL, "depth/stencil/cull/stride"},
          {V(48, 0), V(54, 0), FAM_ANY, NULL, "EDS3 conservative raster, line mode, sample mask"},
@@ -389,6 +389,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_dev *e = t->errata;
     if (!e) return;
     vkb_errata_views_destroy(t, e);
+    vkb_errata_bitwise_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
