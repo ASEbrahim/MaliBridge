@@ -114,6 +114,9 @@ run_mode() {
     # The driver-errata layer: decisions by driver version, mode, probe and switch; a fix with its
     # imitation beneath it, the bridge's own calls through both (a server of its own; once)
     timeout 300 ./errata_test.sh >out/t-errata.log 2>&1; result $? "errata_test ($(tail -1 out/t-errata.log))"
+    # MK-03 bitwise_scalar: the miscompile imitated fails bitwise_check, the SPIR-V rewrite over it
+    # passes; only modules with the pattern change; the corpus through the pass is spirv-val clean
+    timeout 600 ./bitwise_test.sh >out/t-bitwise.log 2>&1; result $? "bitwise_test ($(tail -1 out/t-bitwise.log); $(grep -o 'corpus: [0-9]* modules' out/t-bitwise.log))"
     # The image-view errata: MK-07's REMAINING counts and MK-06's view quarantine, each failing with
     # its bug imitated and the fix off and passing with the fix; the quarantine's caps and the
     # server's RSS over 40000 churned views (a server of its own; once)

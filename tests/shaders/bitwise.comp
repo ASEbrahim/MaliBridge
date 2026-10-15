@@ -1,0 +1,30 @@
+#version 450
+// MK-03 (bitwise_check.c): integer vector bitwise ops and shifts on swizzles and lane-built
+// vectors, with x from a push constant so nothing folds. glslc -O0: the shuffles and composites
+// must survive to the driver, as in unoptimised DXVK/dxil-spirv code.
+layout(local_size_x = 1) in;
+layout(push_constant) uniform PC { uint x; float f; uvec2 v; uvec2 m; } pc;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint x = pc.x;
+    uvec2 a = uvec2(x, 2u) | 1u;                                            // construct | splat
+    o[0] = a.x; o[1] = a.y;
+    uvec4 b = uvec4(x, x + 1u, x + 2u, x + 3u).wzyx & uvec4(0xF0u, 0x0Fu, 0xFFu, 0x01u); // shuffle & constant
+    o[2] = b.x; o[3] = b.y; o[4] = b.z; o[5] = b.w;
+    uvec2 c = uvec2(x, x + 1u).yx ^ 3u;                                     // shuffle ^ splat
+    o[6] = c.x; o[7] = c.y;
+    uvec3 d = ~uvec3(x, 1u, 2u).zyx;                                        // not of a shuffle
+    o[8] = d.x; o[9] = d.y; o[10] = d.z;
+    ivec2 e = ivec2(-int(x), int(x)).yx >> ivec2(1, 2);                     // arithmetic shift
+    o[11] = uint(e.x); o[12] = uint(e.y);
+    uvec2 g = uvec2(x, x + 5u).yx << uvec2(1u, 3u);                         // left shift
+    o[13] = g.x; o[14] = g.y;
+    uvec2 h = (uvec2(x, 1u) & 0xFFu) | uvec2(x + 7u, 4u).yx;                // cascade
+    o[15] = h.x; o[16] = h.y;
+    uvec2 k = floatBitsToUint(vec2(pc.f, 1.0).yx) & 0x7F800000u;            // bitcast of a shuffle
+    o[17] = k.x; o[18] = k.y;
+    uvec2 l = pc.v & pc.m;                                                  // loaded: not the pattern
+    o[19] = l.x; o[20] = l.y;
+}
