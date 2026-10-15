@@ -96,6 +96,9 @@ run_mode() {
     # The startup probe (imitated failures switch their emulations on, a dead start resumes, a
     # small budget defers to the background) and the session report with its diff tool
     timeout 300 ./probe_report_test.sh >out/t-probe.log 2>&1; result $? "probe_report_test ($(tail -1 out/t-probe.log))"
+    # A start that ends inside a probe: a stop or a kill runs it again, an abort or a hang past the
+    # watchdog is died and decided; the default budget defers the heavy probes, both parts timed
+    timeout 300 ./probe_end_test.sh >out/t-probe-end.log 2>&1; result $? "probe_end_test ($(tail -1 out/t-probe-end.log))"
   fi
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali

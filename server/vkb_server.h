@@ -134,6 +134,10 @@ void vkb_probe_start_background(void); /* what did not fit the start's budget */
 void vkb_probe_write_md(FILE *f);
 void vkb_probe_write_json(FILE *f);
 int vkb_probe_issues(void (*cb)(void *arg, const char *line), void *arg);
+/* How the process ends, for a probe in flight (async-signal-safe): a stop (SIGTERM, the app gone)
+ * leaves it to be run again, a crash outside the probe's guard makes it died. */
+void vkb_probe_mark_end(int sig, int crashed);
+void vkb_probe_crash_marks(int all); /* 1: every fatal signal but SIGKILL reaches vkb_probe_mark_end */
 
 /* server_report.c: the session report (<log dir>/malibridge-report.md and .json) */
 void vkb_report_session(const char *log_path); /* a session starts (its server log's path; NULL: none) */

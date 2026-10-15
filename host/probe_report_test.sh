@@ -10,7 +10,9 @@
 #      gets the stand-in at once - checked through the bridge by divisor_check, gsfold_check (fold
 #      up front) and gsfold_check --lut (stand-in texels, no timeout);
 #   4  VKBRIDGE_PROBE_APPLY=0: the same failures recorded, nothing switched on (negative control);
-#   5  a start that dies inside a probe: the next start records it as died and finishes the rest;
+#   5  a start that ends inside a probe without a word (_exit): run again, and recorded as died
+#      when it ends so 3 starts in a row (the separate server marks its aborts; a kill does not
+#      count at once), the rest finished (probe_end_test.sh: stops, kills, aborts, hangs);
 #   6  a start budget too small for the probes: the rest runs in the background, the profile
 #      completes;
 #   7  the session report: summary with the probe's issues, the clients (smoke, vkcube with its
@@ -28,7 +30,7 @@ start() { # start <cache dir> <session dir> [env...]
   stop
   rm -f "$sock"
   mkdir -p "$cache" "$sess"
-  env "$@" VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= VKBRIDGE_PROBE_TIMEOUT_S=1 \
+  env VKBRIDGE_PROBE_TIMEOUT_S=1 "$@" VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
     "$out/vkbridge-server" --socket "$sock" --log "$sess/vkbridge-server.log" --cache-dir "$cache" >/dev/null 2>&1 &
   srv=$!
   for _ in $(seq 150); do [ -S "$sock" ] && break; kill -0 $srv 2>/dev/null || break; sleep 0.1; done
@@ -82,8 +84,8 @@ sleep 0.5
 died=0; kill -0 $srv 2>/dev/null || died=1
 srv=
 grep -q '"running": "waits"' $work/c5/probe-*.json 2>/dev/null; marked=$?
-# (each GPU dies once: a desktop with two takes three starts)
-for k in 1 2 3; do
+# (each GPU ends there 3 times: a desktop with two takes seven starts)
+for k in 1 2 3 4 5 6 7 8; do
   start $work/c5 $work/s5$k VKBRIDGE_PROBE_BUDGET_S=0 VKBRIDGE_PROBE_FAKE=waits:die
   [ -S "$sock" ] && break
   srv=
@@ -91,8 +93,9 @@ done
 log=$work/s5$k/vkbridge-server.log
 ok=1
 for f in $work/c5/probe-*.json; do grep -q '"name": "waits", "status": "died"' $f && grep -q '"complete": true' $f || ok=0; done
-[ $died = 1 ] && [ $marked = 0 ] && [ -S "$sock" ] && grep -q 'died inside the "waits" probe' $work/s5*/vkbridge-server.log && [ $ok = 1 ]
-step $? "a start that died inside a probe: the next records it as died and completes the profile"
+[ $died = 1 ] && [ $marked = 0 ] && [ -S "$sock" ] && grep -q 'ended inside the "waits" probe (ended after [0-9]* ms without a word.*1 of 3' $work/s5*/vkbridge-server.log &&
+  grep -q 'died inside the "waits" probe (.*on 3 starts in a row' $work/s5*/vkbridge-server.log && [ $ok = 1 ]
+step $? "a start that ended inside a probe without a word: run again, died on the 3rd in a row, profile completed ($k starts)"
 # 6
 start $work/c6 $work/s6 VKBRIDGE_PROBE_BUDGET_S=0.000001
 log=$work/s6/vkbridge-server.log

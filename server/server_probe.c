@@ -15,9 +15,22 @@
  * Each probe runs armed like a driver compile (vkb_guard_run, server_guard.c): a fault inside it,
  * or a run past its time limit, jumps back and becomes its result; the probe device is then
  * abandoned (not destroyed: the driver may hold a lock) and a new one made for the next probe.
- * Before each probe the profile is rewritten with "running": <name>, so a process that dies in
- * one (a driver abort, a kill) leaves that name behind: the next start records it as "died",
- * skips it and goes on with the rest.
+ * Before each probe the profile is rewritten with "running": <name>, so a process that ends in
+ * one leaves that name behind. Ending there is not always the probe's doing: the app ends a
+ * session with SIGKILL (Process.killProcess), Android force-stops with it, and a session may end
+ * while the background part still runs. So while a probe runs, <profile>.beat holds its name and
+ * how long it has run (not counting time the process was stopped), rewritten every 200 ms, and a
+ * mark of how the process ended where it could write one; the next start reads it:
+ *   stop mark (SIGTERM/SIGINT/SIGHUP, the app gone)      interrupted: run again, nothing decided
+ *   crash mark (a fatal signal outside the probe's guard, died (on another thread: interrupted)
+ *     on the probe's thread)
+ *   no mark, still inside past its limit + 2 s           died (the watchdog could not interrupt it)
+ *   no mark, within its limit                            a kill or an abort: run again; died only
+ *                                                        when it ends so 2 times in a row (3 in
+ *                                                        the separate server, which marks aborts
+ *                                                        too: there it is almost always a kill)
+ * A probe interrupted at its limit after the process was stopped (SIGSTOP) during it is not
+ * counted either. A died probe is skipped and its decision applies; the start goes on with the rest.
  *
  * Fed back: a native feature whose probe did not pass gets its emulation instead (logged with the
  * probe's evidence), where the bridge has one - a known bug pattern heals itself on a device
@@ -32,9 +45,10 @@
  * decisions apply from the next start (its runtime flags at once). With a profile cached the start
  * only reads it. VKBRIDGE_PROBE=0 turns the probe off, =force re-runs it.
  *
- * Imitation for host tests: VKBRIDGE_PROBE_FAKE=<probe>:<fail|crash|hang|die>,... makes a probe
- * that applies fail, fault, spin until its limit, or end the process (in which case the next start
- * records "died"); VKBRIDGE_FAKE_MISSING applies as everywhere (a feature taken as missing is
+ * Imitation for host tests: VKBRIDGE_PROBE_FAKE=<probe>:<fail|crash|hang|die|abort|stall|slow>,...
+ * makes a probe that applies fail, fault, spin until its limit, end the process without a word
+ * (_exit), abort, spin with the watchdog's signal blocked (only a kill ends it), or take 3 s
+ * longer (to stop a session inside it); VKBRIDGE_FAKE_MISSING applies as everywhere (a feature taken as missing is
  * already emulated, so its probe is skipped).
  */
 #define _GNU_SOURCE
@@ -47,6 +61,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +105,13 @@ typedef struct pprofile {
     int deferred;    /* probes left to the background thread */
     uint32_t emu_before, emu_after;
     char running[32];
+    double start_ms, bg_ms; /* wall time of the start's part and of the background part */
+    /* the probe in flight: <path>.beat (probe_begin) */
+    int beat_fd, beat_tid;
+    double beat_last, beat_active, beat_gap;
+    /* a probe an earlier start ended inside without a word, and how many times in a row */
+    char suspect[32];
+    int suspect_n;
 } pprofile;
 
 static pthread_mutex_t plock = PTHREAD_MUTEX_INITIALIZER;
@@ -1670,6 +1692,9 @@ static int fake_mode(const char *probe)
         if (!strncmp(m, "crash", 5)) return 2;
         if (!strncmp(m, "hang", 4)) return 3;
         if (!strncmp(m, "die", 3)) return 4;
+        if (!strncmp(m, "abort", 5)) return 5;
+        if (!strncmp(m, "stall", 5)) return 6;
+        if (!strncmp(m, "slow", 4)) return 7;
     }
     return 0;
 }
@@ -1747,6 +1772,9 @@ static void write_profile(pprofile *pf)
     fprintf(f, ",\n  \"probe_version\": %d,\n  \"protocol\": \"%016llx\",\n", PROBE_VERSION, (unsigned long long)VKB_PROTOCOL_HASH);
     fprintf(f, "  \"complete\": %s,\n  \"running\": ", pf->complete ? "true" : "false");
     json_str(f, pf->running);
+    fprintf(f, ",\n  \"suspect\": ");
+    json_str(f, pf->suspect);
+    fprintf(f, ",\n  \"suspect_n\": %d", pf->suspect_n);
     fprintf(f, ",\n  \"cost_ms\": %.1f,\n  \"emu_before\": \"0x%x\",\n  \"emu_after\": \"0x%x\",\n  \"results\": [\n", pf->cost_ms, pf->emu_before,
             pf->emu_after);
     for (int i = 0; i < pf->n; i++) {
@@ -1765,8 +1793,201 @@ static void write_profile(pprofile *pf)
     if (rename(tmp, pf->path) != 0) VKB_WARN("probe: cannot rename %s: %s", tmp, strerror(errno));
 }
 
-/* The cached profile, if it is this driver's and this bridge's; results of a run that died in a
- * probe are kept (with that probe recorded as died). Returns 1 when complete. */
+/* ------------------------------------------------------------------ how a process ended in a probe */
+
+#define BEAT_MARK_AT 64 /* the end mark's place in the .beat file, after the beat line */
+static int crash_marks_all; /* every fatal signal but SIGKILL reaches vkb_probe_mark_end (the separate server) */
+static pthread_once_t beat_once = PTHREAD_ONCE_INIT;
+
+void vkb_probe_crash_marks(int all)
+{
+    crash_marks_all = all;
+}
+
+static double sub_limit_s(void);
+
+/* A probe's own time limit in s (< 0: none - the transcoders arm each build themselves). */
+static double probe_limit_s(const probe_def *p)
+{
+    if (p->fn == p_bc_transcoders) return -1;
+    return p->heavy ? 2 * sub_limit_s() : sub_limit_s();
+}
+
+/* With plock held. */
+static void beat_write(pprofile *pf)
+{
+    char line[BEAT_MARK_AT];
+    int n = snprintf(line, sizeof(line), "beat %-31s %9.0f %9.0f %d\n", pf->running, pf->beat_active, pf->beat_gap, crash_marks_all);
+    if (n > 0 && n < (int)sizeof(line) && pwrite(pf->beat_fd, line, (size_t)n, 0) < 0) {}
+}
+
+/* With plock held: time since the last beat counts as run, unless it is so long the process (all
+ * its threads) must have been stopped meanwhile. */
+static void beat_tick(pprofile *pf, double now)
+{
+    double d = now - pf->beat_last;
+    pf->beat_last = now;
+    if (d > 2000) pf->beat_gap += d;
+    else pf->beat_active += d;
+}
+
+static void *beat_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        struct timespec ts = {0, 200000000};
+        nanosleep(&ts, NULL);
+        double now = mono_ms();
+        pthread_mutex_lock(&plock);
+        for (int i = 0; i < nprofiles; i++)
+            if (profiles[i].beat_fd >= 0) {
+                beat_tick(&profiles[i], now);
+                beat_write(&profiles[i]);
+            }
+        pthread_mutex_unlock(&plock);
+    }
+    return NULL;
+}
+
+static void beat_start(void)
+{
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, beat_main, NULL) != 0) VKB_WARN("probe: no heartbeat thread; a start that ends inside a probe is judged without it");
+    pthread_attr_destroy(&a);
+}
+
+/* After the profile names pf->running: its heartbeat starts. */
+static void probe_begin(pprofile *pf)
+{
+    if (!pf->path[0]) return;
+    pthread_once(&beat_once, beat_start);
+    char path[700];
+    snprintf(path, sizeof(path), "%s.beat", pf->path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    pthread_mutex_lock(&plock);
+    pf->beat_last = mono_ms();
+    pf->beat_active = pf->beat_gap = 0;
+    pf->beat_tid = (int)gettid();
+    if (fd >= 0) {
+        __atomic_store_n(&pf->beat_fd, fd, __ATOMIC_RELEASE);
+        beat_write(pf);
+    }
+    pthread_mutex_unlock(&plock);
+}
+
+/* The probe returned: "done" (a process that ends before the profile has its result runs it
+ * again). Returns the time the process was stopped during it (ms). */
+static double probe_end(pprofile *pf)
+{
+    pthread_mutex_lock(&plock);
+    beat_tick(pf, mono_ms());
+    double gap = pf->beat_gap;
+    int fd = pf->beat_fd;
+    __atomic_store_n(&pf->beat_fd, -1, __ATOMIC_RELEASE);
+    if (fd >= 0) {
+        beat_write(pf);
+        if (pwrite(fd, "done\n", 5, BEAT_MARK_AT) < 0) {}
+        close(fd);
+    }
+    pthread_mutex_unlock(&plock);
+    return gap;
+}
+
+/* A crash counts against the probe only on the probe's own thread: one elsewhere (a game's
+ * compile in the same process) only interrupts it. */
+void vkb_probe_mark_end(int sig, int crashed)
+{
+    int tid = crashed ? (int)gettid() : 0;
+    int np = __atomic_load_n(&nprofiles, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < np && i < VKB_MAX_PDS; i++) {
+        int fd = __atomic_load_n(&profiles[i].beat_fd, __ATOMIC_ACQUIRE);
+        if (fd < 0) continue;
+        char m[24];
+        const char *w = !crashed ? "stop " : tid == profiles[i].beat_tid ? "crash " : "away ";
+        size_t n = 0;
+        while (*w) m[n++] = *w++;
+        char d[8];
+        int k = 0, v = sig < 0 ? 0 : sig;
+        do d[k++] = (char)('0' + v % 10);
+        while ((v /= 10) && k < 7);
+        while (k) m[n++] = d[--k];
+        m[n++] = '\n';
+        if (pwrite(fd, m, n, BEAT_MARK_AT) < 0) {}
+    }
+}
+
+enum { END_INTERRUPTED, END_UNEXPLAINED, END_DIED };
+
+/* How an earlier start ended inside the probe the profile names as running; the .beat file is
+ * consumed. *detail: why. */
+static int judge_end(pprofile *pf, const char *name, char *detail, size_t cap)
+{
+    char path[700], buf[160] = "";
+    snprintf(path, sizeof(path), "%s.beat", pf->path);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t got = fd >= 0 ? pread(fd, buf, sizeof(buf) - 1, 0) : -1;
+    if (fd >= 0) close(fd);
+    unlink(path);
+    buf[got > 0 ? got : 0] = 0;
+    char bname[40] = "";
+    double ms = -1, gap = 0;
+    int all = crash_marks_all, sig = 0;
+    int have = got > 0 && sscanf(buf, "beat %39s %lf %lf %d", bname, &ms, &gap, &all) >= 2 && !strcmp(bname, name);
+    const char *mark = got > BEAT_MARK_AT ? buf + BEAT_MARK_AT : "";
+    const probe_def *p = NULL;
+    for (size_t i = 0; i < NPROBES; i++)
+        if (!strcmp(probes[i].name, name)) p = &probes[i];
+    double limit = p ? probe_limit_s(p) : -1;
+    int need = all ? 3 : 2;
+    if (got > 0 && !have) {
+        /* the beat names the probe before: this one had not started */
+        snprintf(detail, cap, "before it started");
+        return END_INTERRUPTED;
+    }
+    if (have && !strncmp(mark, "done", 4)) {
+        snprintf(detail, cap, "after it returned (%.0f ms), before its result was saved", ms);
+        return END_INTERRUPTED;
+    }
+    if (have && !strncmp(mark, "stop", 4)) {
+        sig = atoi(mark + 5);
+        snprintf(detail, cap, "stopped after %.0f ms (%s)", ms, sig ? strsignal(sig) : "the app was gone");
+        return END_INTERRUPTED;
+    }
+    if (have && !strncmp(mark, "away", 4)) {
+        sig = atoi(mark + 5);
+        snprintf(detail, cap, "the process crashed elsewhere (signal %d) after %.0f ms", sig, ms);
+        return END_INTERRUPTED;
+    }
+    if (have && !strncmp(mark, "crash", 5)) {
+        sig = atoi(mark + 6);
+        snprintf(detail, cap, "the process ended with signal %d (%s) inside this probe, outside its guard, after %.0f ms on an earlier start", sig,
+                 strsignal(sig), ms);
+        return END_DIED;
+    }
+    if (have && limit > 0 && ms >= limit * 1000 + 2000) {
+        snprintf(detail, cap, "the process was still inside this probe %.1f s after it began (its limit: %.0f s; the watchdog could not interrupt it) when it was ended on an earlier start",
+                 ms / 1000, limit);
+        return END_DIED;
+    }
+    int n = !strcmp(pf->suspect, name) ? pf->suspect_n + 1 : 1;
+    snprintf(pf->suspect, sizeof(pf->suspect), "%s", name);
+    pf->suspect_n = n;
+    if (n >= need) {
+        snprintf(detail, cap, "the process ended inside this probe without a word (a driver abort or a kill) on %d starts in a row, the last after %s", n,
+                 have ? "" : "an unknown time");
+        if (have) snprintf(detail + strlen(detail), cap - strlen(detail), "%.0f ms", ms);
+        return END_DIED;
+    }
+    if (have) snprintf(detail, cap, "ended after %.0f ms without a word (a kill from outside, or an abort): %d of %d in a row before it counts as died", ms, n, need);
+    else snprintf(detail, cap, "ended without a word and without a heartbeat (a kill, or an abort): %d of %d in a row before it counts as died", n, need);
+    return END_UNEXPLAINED;
+}
+
+/* The cached profile, if it is this driver's and this bridge's; results of a run that ended in a
+ * probe are kept, and that probe is judged (judge_end). Returns 1 when complete. */
 static int read_profile(pprofile *pf)
 {
     FILE *f = fopen(pf->path, "re");
@@ -1779,6 +2000,8 @@ static int read_profile(pprofile *pf)
         if (jget(line, "key", v, sizeof(v))) key_ok = !strcmp(v, pf->key);
         else if (jget(line, "complete", v, sizeof(v))) complete = !strcmp(v, "true");
         else if (!strstr(line, "\"name\"") && jget(line, "running", v, sizeof(v))) snprintf(running, sizeof(running), "%.31s", v);
+        else if (!strstr(line, "\"name\"") && jget(line, "suspect", v, sizeof(v))) snprintf(pf->suspect, sizeof(pf->suspect), "%.31s", v);
+        else if (!strstr(line, "\"name\"") && jget(line, "suspect_n", v, sizeof(v))) pf->suspect_n = atoi(v);
         else if (key_ok && pf->n < MAX_RESULTS && jget(line, "name", v, sizeof(v))) {
             presult *r = &pf->res[pf->n++];
             memset(r, 0, sizeof(*r));
@@ -1793,16 +2016,27 @@ static int read_profile(pprofile *pf)
     fclose(f);
     if (!key_ok) {
         pf->n = 0;
+        pf->suspect[0] = 0;
+        pf->suspect_n = 0;
         VKB_INFO("probe: %s is for another driver or bridge build; probing again", pf->path);
         return 0;
     }
     if (running[0] && pf->n < MAX_RESULTS) {
-        presult *r = &pf->res[pf->n++];
-        memset(r, 0, sizeof(*r));
-        snprintf(r->name, sizeof(r->name), "%s", running);
-        r->status = PS_DIED;
-        snprintf(r->detail, sizeof(r->detail), "the process ended inside this probe on an earlier start (a driver abort or a kill)");
-        VKB_ERR("probe: an earlier start died inside the \"%s\" probe; recorded as died, not run again", running);
+        char why[DETAIL];
+        int end = judge_end(pf, running, why, sizeof(why));
+        if (end == END_DIED) {
+            presult *r = &pf->res[pf->n++];
+            memset(r, 0, sizeof(*r));
+            snprintf(r->name, sizeof(r->name), "%s", running);
+            r->status = PS_DIED;
+            snprintf(r->detail, sizeof(r->detail), "%s", why);
+            pf->suspect[0] = 0;
+            pf->suspect_n = 0;
+            VKB_ERR("probe: an earlier start died inside the \"%s\" probe (%s); recorded as died, not run again", running, why);
+        } else {
+            VKB_WARN("probe: an earlier start %s inside the \"%s\" probe (%s); running it again, nothing decided from it",
+                     end == END_INTERRUPTED ? "was stopped" : "ended", running, why);
+        }
         complete = 0;
     }
     return complete;
@@ -1846,6 +2080,26 @@ static void run_one(void *arg)
         VKB_WARN("probe: %s ends the process on purpose (VKBRIDGE_PROBE_FAKE)", a->p->name);
         _exit(3);
     }
+    if (a->fake == 5) {
+        VKB_WARN("probe: %s aborts on purpose (VKBRIDGE_PROBE_FAKE)", a->p->name);
+        abort();
+    }
+    if (a->fake == 6) {
+        /* a hang the watchdog cannot interrupt: only the app's kill ends it */
+        VKB_WARN("probe: %s spins past its watchdog on purpose (VKBRIDGE_PROBE_FAKE)", a->p->name);
+        sigset_t all;
+        sigfillset(&all);
+        sigdelset(&all, SIGTERM);
+        pthread_sigmask(SIG_BLOCK, &all, NULL);
+        for (volatile unsigned long k = 0;; k++) {
+        }
+    }
+    if (a->fake == 7) {
+        VKB_WARN("probe: %s takes 3 s longer on purpose (VKBRIDGE_PROBE_FAKE)", a->p->name);
+        struct timespec ts = {3, 0};
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+        }
+    }
     a->p->fn(a->c);
 }
 
@@ -1888,9 +2142,8 @@ static int probe_one(pctx *c, const probe_def *p, presult *r, int *dev_lost)
         return 0;
     }
     run_arg a = {c, p, applies(c, p) ? fake_mode(p->name) : 0};
-    double limit = p->heavy ? 2 * sub_limit_s() : sub_limit_s();
     /* the transcoders arm each build themselves (a hang there must not end the whole probe) */
-    if (p->fn == p_bc_transcoders) limit = -1;
+    double limit = probe_limit_s(p);
     int sig = 0;
     double t0 = mono_ms();
     int g = vkb_guard_run(p->name, limit, run_one, &a, &sig);
@@ -2021,13 +2274,29 @@ static int run_probes(pctx *c, pprofile *pf, uint32_t *emu, double budget_ms, in
         c->layer_vs_passed = vs && vs->status == PS_PASS;
         snprintf(pf->running, sizeof(pf->running), "%s", p->name);
         write_profile(pf);
+        probe_begin(pf);
         presult r;
         int lost = 0;
         probe_one(c, p, &r, &lost);
+        double gap = probe_end(pf);
+        if (r.status == PS_HANG && gap > 0) {
+            /* the watchdog's clock ran on while the process was stopped (a suspended session) */
+            VKB_WARN("probe: %s reached its time limit after %.1f s, %.1f s of them with the process stopped; not counted, run again at the next start",
+                     p->name, r.ms / 1000, gap / 1000);
+            pthread_mutex_lock(&plock);
+            pf->running[0] = 0;
+            pthread_mutex_unlock(&plock);
+            left++;
+            continue;
+        }
         decide(c, p, &r, emu, log);
         pthread_mutex_lock(&plock);
         pf->res[pf->n++] = r;
         pf->running[0] = 0;
+        if (!strcmp(pf->suspect, r.name)) {
+            pf->suspect[0] = 0;
+            pf->suspect_n = 0;
+        }
         pthread_mutex_unlock(&plock);
         if (log && r.status != PS_SKIP) VKB_INFO("probe: %-20s %-5s %6.1f ms  %s", r.name, ps_name[r.status], r.ms, r.detail);
         else VKB_DBG("probe: %s %s %s", r.name, ps_name[r.status], r.detail);
@@ -2068,6 +2337,7 @@ static void *background(void *arg)
 {
     bg_job *j = arg;
     pprofile *pf = &profiles[j->pf_index];
+    double t0 = mono_ms();
     uint32_t api = VK_API_VERSION_1_0;
     if (vkb_global_dt.vkEnumerateInstanceVersion) vkb_global_dt.vkEnumerateInstanceVersion(&api);
     if (api > VK_API_VERSION_1_3) api = VK_API_VERSION_1_3;
@@ -2094,15 +2364,17 @@ static void *background(void *arg)
         ctx_init(&c, &dt, inst, pds[i], j->emu);
         uint32_t emu = j->emu;
         VKB_INFO("probe: %d probe(s) continue in the background (their emulation decisions apply from the next start)", pf->deferred);
-        run_probes(&c, pf, &emu, 0, 1);
+        int left = run_probes(&c, pf, &emu, 0, 1);
         pthread_mutex_lock(&plock);
-        pf->complete = 1;
+        pf->complete = !left;
         pf->deferred = 0;
         pf->emu_after = emu; /* for the next start; this one keeps what clients were told */
+        pf->bg_ms = mono_ms() - t0;
         pthread_mutex_unlock(&plock);
         uint32_t fl = apply_flags(pf);
         write_profile(pf);
-        VKB_INFO("probe: background probes done (%.0f ms in all); runtime flags 0x%x", pf->cost_ms, fl);
+        VKB_INFO("probe: background probes done (%.0f ms background, %.0f ms in all)%s; runtime flags 0x%x", pf->bg_ms, pf->start_ms + pf->bg_ms,
+                 left ? "; some left for the next start" : "", fl);
         ctx_free(&c);
         break;
     }
@@ -2123,8 +2395,10 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         return;
     }
     if (nprofiles >= VKB_MAX_PDS || !idt->vkGetPhysicalDeviceProperties2) return;
+    double t0 = mono_ms();
     pprofile *pf = &profiles[nprofiles];
     memset(pf, 0, sizeof(*pf));
+    pf->beat_fd = -1;
     VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
     VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
@@ -2140,7 +2414,7 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     pf->driver_version = p2.properties.driverVersion;
     profile_key(pf, &p2.properties, id.driverUUID);
     pf->emu_before = k->info.emu;
-    nprofiles++;
+    __atomic_store_n(&nprofiles, nprofiles + 1, __ATOMIC_RELEASE);
 
     int force = mode && !strcmp(mode, "force");
     int complete = !force && pf->path[0] && read_profile(pf);
@@ -2165,7 +2439,6 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         pf->complete = !pf->deferred;
         pf->emu_after = emu;
         write_profile(pf);
-        VKB_INFO("probe: %.0f ms at start%s", pf->cost_ms, pf->deferred ? "; the rest continues after the server listens" : "");
     }
     ctx_free(&c);
     pf->emu_after = emu;
@@ -2178,6 +2451,11 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     }
     uint32_t fl = apply_flags(pf);
     if (fl) VKB_INFO("probe: runtime flags 0x%x from the probe", fl);
+    pf->start_ms = mono_ms() - t0;
+    if (complete) VKB_INFO("probe: cached profile, %.1f ms at start", pf->start_ms);
+    else
+        VKB_INFO("probe: %.0f ms at start%s", pf->start_ms,
+                 pf->deferred ? (pf->n ? "; the rest continues after the server listens" : "; all of it continues after the server listens") : "");
     if (pf->deferred) {
         /* started once the self-test's instance is gone (vkb_probe_start_background) */
         bg_job *j = calloc(1, sizeof(*j));
@@ -2220,8 +2498,11 @@ void vkb_probe_write_md(FILE *f)
     if (!nprofiles) fprintf(f, "No probe ran (no cache directory, or VKBRIDGE_PROBE=0).\n\n");
     for (int i = 0; i < nprofiles; i++) {
         const pprofile *pf = &profiles[i];
-        fprintf(f, "Profile `%s` - %s, %s; %s, %.0f ms this start%s.\n\n", pf->path[0] ? pf->path : "(not saved)", pf->gpu, pf->driver,
-                pf->cached ? "from the cache" : "probed now", pf->cost_ms, pf->complete ? "" : pf->running[0] ? " (running)" : " (background part pending)");
+        fprintf(f, "Profile `%s` - %s, %s; %s, %.0f ms at start", pf->path[0] ? pf->path : "(not saved)", pf->gpu, pf->driver,
+                !pf->cached ? "probed now" : pf->cost_ms > 0 ? "continued from the cache" : "from the cache",
+                pf->start_ms);
+        if (pf->bg_ms) fprintf(f, ", %.0f ms in the background", pf->bg_ms);
+        fprintf(f, "%s.\n\n", pf->complete ? "" : pf->running[0] ? " (running)" : " (background part pending)");
         fprintf(f, "Emulation mask: 0x%x before the probe, 0x%x after.\n\n", pf->emu_before, pf->emu_after);
         fprintf(f, "| probe | result | ms | decision | detail |\n|---|---|---:|---|---|\n");
         for (int r = 0; r < pf->n; r++) {
@@ -2253,8 +2534,8 @@ void vkb_probe_write_json(FILE *f)
         json_str(f, pf->driver);
         fprintf(f, ", \"key\": ");
         json_str(f, pf->key);
-        fprintf(f, ", \"cached\": %s, \"complete\": %s, \"cost_ms\": %.1f, \"emu_before\": \"0x%x\", \"emu_after\": \"0x%x\", \"results\": [",
-                pf->cached ? "true" : "false", pf->complete ? "true" : "false", pf->cost_ms, pf->emu_before, pf->emu_after);
+        fprintf(f, ", \"cached\": %s, \"complete\": %s, \"cost_ms\": %.1f, \"start_ms\": %.1f, \"background_ms\": %.1f, \"emu_before\": \"0x%x\", \"emu_after\": \"0x%x\", \"results\": [",
+                pf->cached ? "true" : "false", pf->complete ? "true" : "false", pf->cost_ms, pf->start_ms, pf->bg_ms, pf->emu_before, pf->emu_after);
         for (int r = 0; r < pf->n; r++) {
             const presult *x = &pf->res[r];
             fprintf(f, "%s\n      {\"name\": ", r ? "," : "");

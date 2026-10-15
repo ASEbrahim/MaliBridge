@@ -82,6 +82,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
 {
     /* Inside a guarded shader/pipeline compile (server_guard.c): that call fails instead. */
     if (sig != SIGABRT) vkb_guard_fault(sig, si ? si->si_addr : NULL);
+    vkb_probe_mark_end(sig, 1); /* a startup probe in flight died of it (server_probe.c) */
     char buf[256];
     const char *cmd = vkb_srv_current_cmd ? vkb_srv_current_cmd : "(no Vulkan call)";
     int n = snprintf(buf, sizeof(buf), "vkbridge-server E crashed with signal %d (code %d, address %p) in %s\n", sig,
@@ -314,10 +315,20 @@ static void *parent_watch(void *arg)
         sleep(1);
         if (getppid() != parent_pid) {
             VKB_INFO("the app (pid %d) is gone; exiting", (int)parent_pid);
+            vkb_probe_mark_end(0, 0);
             _exit(0);
         }
     }
     return NULL;
+}
+
+/* A stop (the session's end, a shell's ^C): a startup probe in flight is run again at the next
+ * start rather than taken for a crash (server_probe.c). */
+static void on_stop(int sig)
+{
+    vkb_probe_mark_end(sig, 0);
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static void start_parent_watch(void)
@@ -360,6 +371,10 @@ int main(int argc, char **argv)
     catch_crash(SIGABRT);
     catch_crash(SIGILL);
     catch_crash(SIGFPE);
+    signal(SIGTERM, on_stop);
+    signal(SIGINT, on_stop);
+    signal(SIGHUP, on_stop);
+    vkb_probe_crash_marks(1);
     /* The server is the app's child: when the app dies, so does the session's GPU. Not with
      * PR_SET_PDEATHSIG: that fires when the parent THREAD exits, and Android's ProcessBuilder forks
      * from the session's start-up thread, which ends right after starting the guest (the server
