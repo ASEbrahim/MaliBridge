@@ -18,7 +18,7 @@ COMMON_SRC := $(VKB)/common/vkb_wire.c $(VKB)/common/gen/vkb_gen_structs.c
 SERVER_SRC := $(wildcard $(SRV)/*.c) $(VKB)/common/gen/vkb_gen_server.c $(COMMON_SRC)
 CLIENT_SRC := $(wildcard $(VKB)/client/*.c) $(VKB)/common/gen/vkb_gen_client.c $(COMMON_SRC)
 
-TESTS := vkbridge-smoke bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus
+TESTS := vkbridge-smoke bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus viewport_check flip_corpus
 
 all: $(OUT)/vkbridge-server $(OUT)/libvulkan_droidbridge.so $(OUT)/vkbridge_icd.json $(addprefix $(OUT)/,$(TESTS))
 
@@ -53,6 +53,13 @@ $(OUT)/divisor_check: $(VKB)/tests/divisor_vert.inc $(VKB)/tests/divisor_frag.in
 $(OUT)/gsfold_check: $(VKB)/tests/gsfold_vert.inc $(VKB)/tests/gsfold_geom.inc $(VKB)/tests/gsfold_frag.inc $(VKB)/tests/gsfold_lut.inc
 
 $(OUT)/bitwise_check: $(VKB)/tests/bitwise_comp.inc
+
+$(OUT)/viewport_check: $(VKB)/tests/viewport_vert.inc $(VKB)/tests/viewport_vert_mv.inc $(VKB)/tests/viewport_geom.inc $(VKB)/tests/viewport_frag.inc
+
+# The MK-02 SPIR-V pass alone, over a corpus (host/viewport_test.sh)
+$(OUT)/flip_corpus: $(VKB)/tests/flip_corpus.c $(SRV)/spirv_flip.c $(SRV)/spirv_flip.h $(SRV)/spirv_edit.c $(SRV)/spirv_edit.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -o $@ $(VKB)/tests/flip_corpus.c $(SRV)/spirv_flip.c $(SRV)/spirv_edit.c
 
 # The MK-03 SPIR-V pass alone, over a corpus (host/bitwise_test.sh)
 $(OUT)/bitwise_corpus: $(VKB)/tests/bitwise_corpus.c $(SRV)/spirv_bitwise.c $(SRV)/spirv_bitwise.h $(SRV)/spirv_opclass.inc
