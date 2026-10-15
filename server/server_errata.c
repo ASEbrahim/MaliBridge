@@ -34,7 +34,7 @@
  * counts the calls reaching it (and its imitation the calls beneath it), the pattern a fix follows.
  */
 #define _GNU_SOURCE
-#include "vkb_server.h"
+#include "server_errata.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -54,8 +54,6 @@ typedef struct {
     const char *gpu;      /* a deviceName substring, or NULL */
     const char *note;
 } erratum_range;
-
-typedef struct vkb_errata_dev vkb_errata_dev;
 
 typedef struct {
     const char *name, *mk;
@@ -87,18 +85,11 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_VB_SPLIT] = {"vb_split", "MK-05", "vb_strides", 0, G_ALWAYS, G_ALWAYS,
         {{V(42, 0), V(48, 0), FAM_ANY, NULL, NULL}}},
     [VKB_ERRATUM_VIEW_QUARANTINE] = {"view_quarantine", "MK-06", "rendering_churn", 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
-        {{V(49, 1), V(49, 3), FAM_ANY, NULL, NULL}, {V(50, 0), V(51, 1), FAM_ANY, NULL, NULL}}},
+        {{V(49, 1), V(49, 3), FAM_ANY, NULL, NULL}, {V(50, 0), V(51, 1), FAM_ANY, NULL, NULL}},
+        vkb_errata_views_install, vkb_errata_views_install},
     [VKB_ERRATUM_VIEW_COUNTS] = {"view_counts", "MK-07", "view3d_layers", 0, G_ALWAYS, G_ALWAYS,
-        {{V(19, 0), V(54, 1), FAM_ANY, NULL, NULL}}},
+        {{V(19, 0), V(54, 1), FAM_ANY, NULL, NULL}}, vkb_errata_views_install, vkb_errata_views_install},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
-};
-
-struct vkb_errata_dev {
-    uint32_t on;           /* 1 << VKB_ERRATUM_*: decided on */
-    uint32_t imitated;
-    vkb_dispatch next_fix; /* what each fix calls: the driver's functions, or the imitation's */
-    vkb_dispatch next_imi; /* what each imitation calls: the driver's */
-    uint64_t example_calls, example_imitated;
 };
 
 /* The driver, as the version gates see it */
@@ -377,6 +368,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
 {
     vkb_errata_dev *e = t->errata;
     if (!e) return;
+    vkb_errata_views_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -386,19 +378,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     free(e);
 }
 
-/* Puts fn in place of the driver-level function at *real (and of the app-facing one, when nothing
- * above has wrapped it yet). */
-#define ERRATA_HOOK(t, field, fn)                                                                        \
-    do {                                                                                                 \
-        if ((t)->real.field) {                                                                           \
-            if ((t)->dt.field == (t)->real.field) (t)->dt.field = (fn);                                  \
-            (t)->real.field = (fn);                                                                      \
-        }                                                                                                \
-    } while (0)
-
-/* The device a wrapper runs for: the call's table; on a thread without one (the server's own
- * threads), the last device made (last_dev) - the driver's functions are the same for every device. */
-static vkb_errata_dev *cur(void)
+vkb_errata_dev *vkb_errata_cur(void)
 {
     vkb_srv_table *t = vkb_srv_current_table();
     return t && t->errata ? t->errata : __atomic_load_n(&last_dev, __ATOMIC_ACQUIRE);
@@ -408,7 +388,7 @@ static vkb_errata_dev *cur(void)
 static VKAPI_ATTR VkResult VKAPI_CALL ex_CreateImageView(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a,
                                                          VkImageView *out)
 {
-    vkb_errata_dev *e = cur();
+    vkb_errata_dev *e = vkb_errata_cur();
     __atomic_add_fetch(&e->example_calls, 1, __ATOMIC_RELAXED);
     return e->next_fix.vkCreateImageView(d, ci, a, out);
 }
@@ -416,7 +396,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL ex_CreateImageView(VkDevice d, const VkIma
 static VKAPI_ATTR VkResult VKAPI_CALL ex_imi_CreateImageView(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a,
                                                              VkImageView *out)
 {
-    vkb_errata_dev *e = cur();
+    vkb_errata_dev *e = vkb_errata_cur();
     __atomic_add_fetch(&e->example_imitated, 1, __ATOMIC_RELAXED);
     return e->next_imi.vkCreateImageView(d, ci, a, out);
 }
