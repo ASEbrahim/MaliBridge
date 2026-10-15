@@ -7,8 +7,9 @@
  * the app's.
  *
  * Which errata are on is decided once per device, at vkCreateDevice, from:
- *   1  the startup probe's result for the erratum's probe, where it has one (pass / fail / not
- *      run; see vkb_errata_set_probe_source);
+ *   1  the startup probe's result for the erratum's probe, where it has one (server_probe.c,
+ *      through vkb_errata_set_probe_source: fail where the probe saw the bug's own pattern, pass,
+ *      or not run - a probe that crashed, hung or could not run decides nothing);
  *   2  the Mali driver version, decoded from driverVersion ((r << 22) | (p << 12)) and from the
  *      driverInfo build string ("v1.r44p1-01eac0", "v1.r49p1-03bet0" for a beta), against the
  *      erratum's affected ranges, some of them for one GPU family only (job manager GPUs, told by
@@ -25,10 +26,18 @@
  *                                     so a test shows the bug without the fix and none with it
  *   VKBRIDGE_FAKE_DRIVER_VERSION=r49p1[:jm|:csf]   the version gates believe another driver (also
  *                                     a driverInfo string, "v1.r49p1-03bet0"); the GPU counts as Arm
- *   VKBRIDGE_ERRATA_PROBE=probe:pass|fail,...      probe results as if the probe had recorded
- *                                     them (host tests of the decisions)
+ *   VKBRIDGE_ERRATA_PROBE=probe:pass|fail,...      host builds only: probe results as if the
+ *                                     probe had recorded them (tests of the decisions; on a device
+ *                                     VKBRIDGE_PROBE_FAKE=<probe>:fail fails the real probe)
  *   VKBRIDGE_WAIT_FIX=0               v0.4's name for -wait_retry; VKBRIDGE_WAIT_FAKE_ERROR (how the
  *                                     wait imitation fails, server_wait.c) imitates on any build
+ *
+ * The probe sees the imitations too: an erratum's probe runs with that erratum's imitation
+ * beneath it when VKBRIDGE_ERRATA_IMITATE names it (vkb_errata_probe_begin), so a host test shows
+ * the probe telling the bug, and the decision following it, on a driver without it.
+ *
+ * The decisions are a function of (driver, mode, probe results, switches) and nothing else, so the
+ * session report shows them for both modes (vkb_errata_explain) whether or not a device was made.
  *
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
@@ -175,22 +184,13 @@ int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta)
     return 0;
 }
 
-static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_version *d, char *name, size_t name_cap)
+/* The driver as the version gates see it, from its properties and driverInfo string */
+static void version_from(const VkPhysicalDeviceProperties *pr, const char *info, drv_version *d)
 {
     memset(d, 0, sizeof(*d));
-    VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
-    if (t->real.vkGetPhysicalDeviceProperties2 && t->api_version >= VK_API_VERSION_1_2)
-        t->real.vkGetPhysicalDeviceProperties2(pd, &p2);
-    else {
-        p2.pNext = NULL;
-        t->real.vkGetPhysicalDeviceProperties(pd, &p2.properties);
-    }
-    const VkPhysicalDeviceProperties *pr = &p2.properties;
-    snprintf(name, name_cap, "%s", pr->deviceName);
     d->family = pr->limits.maxDrawIndirectCount <= 1 ? FAM_JM : FAM_CSF;
     d->arm = pr->vendorID == ARM_VENDOR;
-    snprintf(d->build, sizeof(d->build), "%s", dp.driverInfo);
+    snprintf(d->build, sizeof(d->build), "%s", info ? info : "");
 
     const char *fake = vkb_srv_env("VKBRIDGE_FAKE_DRIVER_VERSION");
     if (fake && *fake) {
@@ -206,17 +206,31 @@ static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_vers
     if (!d->arm) return;
     uint32_t vr = pr->driverVersion >> 22, vp = (pr->driverVersion >> 12) & 0x3ff;
     uint32_t ir, ip;
-    int ib = 0, info = vkb_errata_parse_version(dp.driverInfo, &ir, &ip, &ib);
-    if (info) {
+    int ib = 0, have = info && vkb_errata_parse_version(info, &ir, &ip, &ib);
+    if (have) {
         d->known = 1, d->r = ir, d->p = ip, d->beta = ib;
         d->from = "driverInfo";
         if (ir != vr || ip != vp)
             VKB_WARN("errata: driverInfo \"%s\" says r%up%u, driverVersion 0x%08x says r%up%u; going by driverInfo",
-                     dp.driverInfo, ir, ip, pr->driverVersion, vr, vp);
+                     info, ir, ip, pr->driverVersion, vr, vp);
     } else if (vr >= 1 && vr < 100) {
         d->known = 1, d->r = vr, d->p = vp;
         d->from = "driverVersion";
     }
+}
+
+static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_version *d, char *name, size_t name_cap)
+{
+    VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+    if (t->real.vkGetPhysicalDeviceProperties2 && t->api_version >= VK_API_VERSION_1_2)
+        t->real.vkGetPhysicalDeviceProperties2(pd, &p2);
+    else {
+        p2.pNext = NULL;
+        t->real.vkGetPhysicalDeviceProperties(pd, &p2.properties);
+    }
+    snprintf(name, name_cap, "%s", p2.properties.deviceName);
+    version_from(&p2.properties, dp.driverInfo, d);
 }
 
 static const erratum_range *in_range(const erratum *e, const drv_version *d, const char *gpu)
@@ -252,10 +266,15 @@ static void range_str(const erratum_range *g, char *out, size_t cap)
     }
 }
 
-/* VKBRIDGE_ERRATA_PROBE=name:pass|fail,... (host tests), else the probe's record */
+/* VKBRIDGE_ERRATA_PROBE=name:pass|fail,... (host builds: tests of the decisions), else the probe's
+ * record */
 static int probe_result(const char *probe)
 {
+#ifdef __ANDROID__
+    const char *v = NULL;
+#else
     const char *v = vkb_srv_env("VKBRIDGE_ERRATA_PROBE");
+#endif
     size_t pl = strlen(probe);
     for (const char *c = v; c && *c;) {
         while (*c == ',' || *c == ' ') c++;
@@ -269,16 +288,137 @@ static int probe_result(const char *probe)
     return probe_source ? probe_source(probe) : VKB_ERRATA_PROBE_NOT_RUN;
 }
 
-static int performance_mode(void)
+/* VKBRIDGE_MODE: safe (the default) or performance. (feat/safe-mode: server_mode.c, with the mode
+ * file and the source in the log.) */
+int vkb_mode(void)
 {
     const char *m = vkb_srv_env("VKBRIDGE_MODE");
-    if (!m || !*m || !strcmp(m, "safe")) return 0;
-    if (!strcmp(m, "performance") || !strcmp(m, "perf")) return 1;
-    VKB_WARN("errata: VKBRIDGE_MODE=%s is neither safe nor performance; safe", m);
-    return 0;
+    if (!m || !*m || !strcmp(m, "safe")) return VKB_MODE_SAFE;
+    if (!strcmp(m, "performance") || !strcmp(m, "perf")) return VKB_MODE_PERFORMANCE;
+    VKB_ONCE(VKB_LOG_WARN, "errata: VKBRIDGE_MODE=%s is neither safe nor performance; safe", m);
+    return VKB_MODE_SAFE;
 }
 
-#define CAT(...) (o += o < sizeof(why) ? (size_t)snprintf(why + o, sizeof(why) - o, __VA_ARGS__) : 0)
+static int performance_mode(void)
+{
+    return vkb_mode() == VKB_MODE_PERFORMANCE;
+}
+
+/* The bugs VKBRIDGE_ERRATA_IMITATE names (host builds), and VKBRIDGE_WAIT_FAKE_ERROR's on any */
+static uint32_t imitated_set(int warn)
+{
+    uint32_t imitate = 0;
+    const char *imi = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE");
+#ifdef __ANDROID__
+    if (warn && imi && *imi) VKB_WARN("errata: VKBRIDGE_ERRATA_IMITATE is for host tests; ignored");
+#else
+    if (warn) parse_names("VKBRIDGE_ERRATA_IMITATE", imi, &imitate, NULL);
+    else
+        for (const char *v = imi; v && *v;) { /* quietly: the probe asks before every probe */
+            while (*v == ',' || *v == ' ' || *v == '+') v++;
+            size_t len = strcspn(v, ", ");
+            int id = len ? find(v, len) : -1;
+            if (id >= 0) imitate |= 1u << id;
+            v += len;
+        }
+#endif
+    const char *wfake = vkb_srv_env("VKBRIDGE_WAIT_FAKE_ERROR");
+    if (wfake && *wfake && strcmp(wfake, "0")) imitate |= 1u << VKB_ERRATUM_WAIT_RETRY;
+    return imitate;
+}
+
+/* The switches every decision reads: VKBRIDGE_ERRATA, and v0.4's VKBRIDGE_WAIT_FIX=0 */
+typedef struct {
+    uint32_t plus, minus;
+    int wait_fix_off;
+} switches;
+
+static void read_switches(switches *w)
+{
+    w->plus = w->minus = 0;
+    parse_names("VKBRIDGE_ERRATA", vkb_srv_env("VKBRIDGE_ERRATA"), &w->plus, &w->minus);
+    /* v0.4's switch for the wait fix: VKBRIDGE_WAIT_FIX=0 is -wait_retry */
+    const char *wfix = vkb_srv_env("VKBRIDGE_WAIT_FIX");
+    w->wait_fix_off = wfix && !strcmp(wfix, "0") && !(w->plus >> VKB_ERRATUM_WAIT_RETRY & 1);
+    if (w->wait_fix_off) w->minus |= 1u << VKB_ERRATUM_WAIT_RETRY;
+}
+
+#define CAT(...) (o += o < cap ? (size_t)snprintf(why + o, cap - o, __VA_ARGS__) : 0)
+
+/* One erratum's decision: 1 when on; *targeted: on for more than "always" alone; why: the reason
+ * (the one logged and shown in the report); *forced_off: VKBRIDGE_ERRATA (or VKBRIDGE_WAIT_FIX=0)
+ * turned it off where it would be on for why */
+static int decide_erratum(int i, const drv_version *d, const char *gpu, int perf, const switches *w, int *targeted, char *why, size_t cap,
+                          int *forced_off)
+{
+    const erratum *x = &errata[i];
+    unsigned gates = perf ? x->perf : x->safe;
+    const char *mode = perf ? "performance mode" : "safe mode";
+    size_t o = 0;
+    why[0] = 0;
+    int pr = x->probe ? probe_result(x->probe) : VKB_ERRATA_PROBE_NOT_RUN;
+    const erratum_range *g = in_range(x, d, gpu);
+    int want = 0;
+    if (gates & G_ALWAYS) want = 1, CAT("always");
+    int by_probe = (gates & G_PROBE_FAIL) && x->probe_gates && pr == VKB_ERRATA_PROBE_FAIL;
+    if (by_probe) want = 1, CAT("%sprobe %s failed", o ? "; " : "", x->probe);
+    if ((gates & G_IN_RANGE) && g) {
+        char rs[128];
+        range_str(g, rs, sizeof(rs));
+        want = 1, CAT("%sr%up%u in %s", o ? "; " : "", d->r, d->p, rs);
+    }
+    if ((gates & G_VERSION_UNKNOWN) && d->arm && !d->known) want = 1, CAT("%sdriver version unknown", o ? "; " : "");
+    if (want) CAT("; %s", mode);
+    int on = want;
+    *forced_off = 0;
+    if (w->plus >> i & 1) {
+        if (!want) o = 0, why[0] = 0;
+        CAT("%sVKBRIDGE_ERRATA=+%s", o ? "; " : "", x->name);
+        on = 1;
+    }
+    if (w->minus >> i & 1) {
+        *forced_off = want ? 1 : 0;
+        on = 0;
+    }
+    if (x->probe && pr != VKB_ERRATA_PROBE_NOT_RUN && on && !(by_probe && !(w->plus >> i & 1)))
+        CAT("; probe %s %s%s", x->probe, pr == VKB_ERRATA_PROBE_FAIL ? "failed" : "passed", x->probe_gates ? "" : ", recorded only");
+    /* the driver is affected as far as is known, not only "always" */
+    *targeted = on && (g || pr == VKB_ERRATA_PROBE_FAIL || (d->arm && !d->known) || (w->plus >> i & 1));
+    return on;
+}
+
+int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driver_info, vkb_errata_row rows[VKB_ERRATA_COUNT])
+{
+    drv_version d;
+    version_from(props, driver_info, &d);
+    switches w;
+    read_switches(&w);
+    int n = 0;
+    for (int i = 0; i < VKB_ERRATA_COUNT; i++) {
+        const erratum *x = &errata[i];
+        if (!x->mk) continue;
+        vkb_errata_row *r = &rows[n++];
+        memset(r, 0, sizeof(*r));
+        r->id = i;
+        r->name = x->name;
+        r->mk = x->mk;
+        r->probe = x->probe;
+        r->probe_gates = x->probe_gates;
+        r->probe_result = x->probe ? probe_result(x->probe) : VKB_ERRATA_PROBE_NOT_RUN;
+        r->has_fix = x->install != NULL;
+        for (int m = 0; m < 2; m++) {
+            int targeted, forced_off;
+            r->on[m] = decide_erratum(i, &d, props->deviceName, m, &w, &targeted, r->why[m], sizeof(r->why[m]), &forced_off);
+            if (forced_off) {
+                char was[sizeof(r->why[m])];
+                snprintf(was, sizeof(was), "%s", r->why[m]);
+                snprintf(r->why[m], sizeof(r->why[m]), "VKBRIDGE_ERRATA=-%s; it would be on: %.200s", x->name, was);
+            } else if (!r->on[m] && !r->why[m][0])
+                snprintf(r->why[m], sizeof(r->why[m]), "%s", "not needed here");
+        }
+    }
+    return n;
+}
 
 void vkb_errata_device_init(vkb_srv_table *t)
 {
@@ -291,21 +431,9 @@ void vkb_errata_device_init(vkb_srv_table *t)
     int perf = performance_mode();
     const char *mode = perf ? "performance mode" : "safe mode";
 
-    uint32_t plus = 0, minus = 0, imitate = 0;
-    parse_names("VKBRIDGE_ERRATA", vkb_srv_env("VKBRIDGE_ERRATA"), &plus, &minus);
-    const char *imi = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE");
-#ifdef __ANDROID__
-    if (imi && *imi) VKB_WARN("errata: VKBRIDGE_ERRATA_IMITATE is for host tests; ignored");
-#else
-    parse_names("VKBRIDGE_ERRATA_IMITATE", imi, &imitate, NULL);
-#endif
-    /* v0.4's switches for the wait fix: VKBRIDGE_WAIT_FIX=0 is -wait_retry; VKBRIDGE_WAIT_FAKE_ERROR
-     * (which says how the imitation fails) imitates the bug on any build, as it did. */
-    const char *wfix = vkb_srv_env("VKBRIDGE_WAIT_FIX");
-    int wait_fix_off = wfix && !strcmp(wfix, "0") && !(plus >> VKB_ERRATUM_WAIT_RETRY & 1);
-    if (wait_fix_off) minus |= 1u << VKB_ERRATUM_WAIT_RETRY;
-    const char *wfake = vkb_srv_env("VKBRIDGE_WAIT_FAKE_ERROR");
-    if (wfake && *wfake && strcmp(wfake, "0")) imitate |= 1u << VKB_ERRATUM_WAIT_RETRY;
+    switches w;
+    read_switches(&w);
+    uint32_t imitate = imitated_set(1);
 
     char drv[400];
     if (!d.arm)
@@ -319,44 +447,21 @@ void vkb_errata_device_init(vkb_srv_table *t)
     char on_list[256] = "", off_list[256] = "";
     for (int i = 0; i < VKB_ERRATA_COUNT; i++) {
         const erratum *x = &errata[i];
-        unsigned gates = perf ? x->perf : x->safe;
         char why[320];
-        size_t o = 0;
-        why[0] = 0;
-        int pr = x->probe ? probe_result(x->probe) : VKB_ERRATA_PROBE_NOT_RUN;
-        const erratum_range *g = in_range(x, &d, gpu);
-        int want = 0;
-        if (gates & G_ALWAYS) want = 1, CAT("always");
-        if ((gates & G_PROBE_FAIL) && x->probe_gates && pr == VKB_ERRATA_PROBE_FAIL) want = 1, CAT("%sprobe %s failed", o ? "; " : "", x->probe);
-        if ((gates & G_IN_RANGE) && g) {
-            char rs[128];
-            range_str(g, rs, sizeof(rs));
-            want = 1, CAT("%sr%up%u in %s", o ? "; " : "", d.r, d.p, rs);
-        }
-        if ((gates & G_VERSION_UNKNOWN) && d.arm && !d.known) want = 1, CAT("%sdriver version unknown", o ? "; " : "");
-        if (want) CAT("; %s", mode);
-        int on = want;
-        if (plus >> i & 1) {
-            if (!want) o = 0, why[0] = 0;
-            CAT("%sVKBRIDGE_ERRATA=+%s", o ? "; " : "", x->name);
-            on = 1;
-        }
-        if (minus >> i & 1) {
-            if (want && i == VKB_ERRATUM_WAIT_RETRY && wait_fix_off)
+        int targeted, forced_off;
+        int on = decide_erratum(i, &d, gpu, perf, &w, &targeted, why, sizeof(why), &forced_off);
+        if (forced_off) {
+            if (i == VKB_ERRATUM_WAIT_RETRY && w.wait_fix_off)
                 VKB_INFO("errata: %s OFF (VKBRIDGE_WAIT_FIX=0; it would be on: %s)", x->name, why);
-            else if (want)
+            else
                 VKB_INFO("errata: %s OFF (VKBRIDGE_ERRATA=-%s; it would be on: %s)", x->name, x->name, why);
-            on = 0;
         }
-        if (x->probe && pr != VKB_ERRATA_PROBE_NOT_RUN && on)
-            CAT("; probe %s %s%s", x->probe, pr == VKB_ERRATA_PROBE_FAIL ? "failed" : "passed", x->probe_gates ? "" : ", recorded only");
         char *l = on ? on_list : off_list;
         size_t n = strlen(l);
         snprintf(l + n, 256 - n, "%s%s", n ? "," : "", x->name);
         if (on) {
             e->on |= 1u << i;
-            /* the driver is affected as far as is known, not only "always" */
-            if (g || pr == VKB_ERRATA_PROBE_FAIL || (d.arm && !d.known) || (plus >> i & 1)) e->targeted |= 1u << i;
+            if (targeted) e->targeted |= 1u << i;
             if (x->install)
                 VKB_INFO("errata: %s ON (%s)%s%s", x->name, why, x->mk ? " - " : "", x->mk ? x->mk : "");
             else if (x->elsewhere)
@@ -403,8 +508,13 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     free(e);
 }
 
+/* The startup probe's erratum device on the probe's thread while one of its probes runs with an
+ * imitation beneath it (vkb_errata_probe_begin) */
+static __thread vkb_errata_dev *probe_cur;
+
 vkb_errata_dev *vkb_errata_cur(void)
 {
+    if (probe_cur) return probe_cur;
     vkb_srv_table *t = vkb_srv_current_table();
     return t && t->errata ? t->errata : __atomic_load_n(&last_dev, __ATOMIC_ACQUIRE);
 }
@@ -464,4 +574,76 @@ static void example_imitate(vkb_srv_table *t, vkb_errata_dev *e)
 {
     e->example_imi_next = t->real.vkCreateImageView;
     ERRATA_HOOK(t, vkCreateImageView, ex_imi_CreateImageView);
+}
+
+/* ------------------------------------------------------------------ the startup probe's imitations */
+
+/* viewport_flip's bug for the probe, until server_errata_flip.c (MK-02) brings an imitation of its
+ * own into the table: a negative-height viewport drawn as the positive one over the same rows
+ * (y + h, -h), so the picture comes out upside down - what Mali-G715 r54p2 was reported to do. */
+static PFN_vkCmdSetViewport flip_standin_next;
+
+static VKAPI_ATTR void VKAPI_CALL flip_standin_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport *vp)
+{
+    VkViewport v[16];
+    if (n > 16) n = 16;
+    for (uint32_t i = 0; i < n; i++) {
+        v[i] = vp[i];
+        if (v[i].height < 0) v[i].y += v[i].height, v[i].height = -v[i].height;
+    }
+    flip_standin_next(cb, first, n, v);
+}
+
+static void flip_standin_imitate(vkb_srv_table *t, vkb_errata_dev *e)
+{
+    (void)e;
+    flip_standin_next = t->real.vkCmdSetViewport;
+    ERRATA_HOOK(t, vkCmdSetViewport, flip_standin_CmdSetViewport);
+}
+
+typedef struct probe_imi {
+    vkb_srv_table t;
+    vkb_errata_dev *e;
+} probe_imi;
+
+void *vkb_errata_probe_begin(int id, vkb_dispatch *d, VkDevice dev, VkPhysicalDevice pd, uint32_t api)
+{
+    if (id < 0 || id >= VKB_ERRATA_COUNT || !(imitated_set(0) >> id & 1)) return NULL;
+    void (*imitate)(vkb_srv_table *, vkb_errata_dev *) = errata[id].imitate;
+    if (!imitate && id == VKB_ERRATUM_VIEWPORT_FLIP) imitate = flip_standin_imitate;
+    if (!imitate) return NULL;
+    probe_imi *h = calloc(1, sizeof(*h));
+    vkb_errata_dev *e = calloc(1, sizeof(*e));
+    if (!h || !e) {
+        free(h);
+        free(e);
+        return NULL;
+    }
+    h->t.id = 0xffff;
+    h->t.is_device = 1;
+    h->t.device = dev;
+    h->t.physical = pd;
+    h->t.api_version = api;
+    h->t.real = h->t.dt = *d;
+    e->probe = 1;
+    e->imitated = 1u << id;
+    e->next_imi = h->t.real;
+    imitate(&h->t, e);
+    e->next_fix = h->t.real;
+    h->e = e;
+    probe_cur = e;
+    *d = h->t.real;
+    return h;
+}
+
+void vkb_errata_probe_end(void *handle)
+{
+    probe_imi *h = handle;
+    if (!h) return;
+    probe_cur = NULL;
+    vkb_errata_views_destroy(&h->t, h->e);
+    vkb_errata_bitwise_destroy(&h->t, h->e);
+    vkb_errata_cmd_destroy(&h->t, h->e);
+    free(h->e);
+    free(h);
 }

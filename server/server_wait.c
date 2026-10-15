@@ -382,6 +382,9 @@ static __thread unsigned imi_flip[K_COUNT];
 /* 1: this blocking call is failed */
 static int imi_take(int kind)
 {
+    /* the startup probe's wait_eintr: its fence and semaphore waits fail, the app's counts untouched */
+    vkb_errata_dev *pe = vkb_errata_cur();
+    if (pe && pe->probe) return kind == K_FENCE || kind == K_SEM;
     if (!(imi_kinds >> kind & 1)) return 0;
     if (imi_how == HOW_ALL) return 1;
     if (imi_how == HOW_ONCE) return !retrying;
@@ -437,7 +440,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL imi_GetFenceStatus(VkDevice d, VkFence f)
 
 void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e)
 {
-    (void)e;
+    if (e->probe) { /* the probe's own waits only (imi_take): nothing here changes */
+        ERRATA_HOOK(t, vkWaitForFences, imi_WaitForFences);
+        ERRATA_HOOK(t, vkWaitSemaphores, imi_WaitSemaphores);
+        return;
+    }
     const char *v = vkb_srv_env("VKBRIDGE_WAIT_FAKE_ERROR");
     if (!v) v = "";
     long n = 0;

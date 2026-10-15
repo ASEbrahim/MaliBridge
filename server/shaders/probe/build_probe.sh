@@ -16,6 +16,16 @@ echo "#include <stdint.h>" >> "$out"
 shader() {
   local name=$1 file=$2 env=$3; shift 3
   "$glslc" --target-env="$env" "$@" -o "$tmp/$name.spv" "$file"
+  if [ "$name" = bitwise ]; then
+    # MK-03's pattern must reach the driver: a vector bitwise op (and a shift) fed by an
+    # OpVectorShuffle and by an OpCompositeConstruct (built with -O0, nothing folded)
+    local dis=${SPIRV_DIS:-$(dirname "$glslc")/spirv-dis}
+    [ -x "$dis" ] || dis=spirv-dis
+    "$dis" "$tmp/$name.spv" > "$tmp/$name.txt"
+    for op in OpVectorShuffle OpCompositeConstruct OpBitwiseOr OpBitwiseAnd OpBitwiseXor OpNot OpShiftRightArithmetic OpShiftLeftLogical; do
+      grep -q "$op" "$tmp/$name.txt" || { echo "bitwise.comp: no $op left in the SPIR-V" >&2; exit 1; }
+    done
+  fi
   if [ "$name" = spec ]; then
     # DXVK's form: the composite of specialization constants declared OpConstantComposite (44)
     # instead of OpSpecConstantComposite (51) - what server_spvfix.c undoes for the driver.
@@ -55,4 +65,9 @@ shader null null.comp vulkan1.0
 shader tex tex.comp vulkan1.0
 shader spec spec.comp vulkan1.0 -O
 shader aces aces.frag vulkan1.0
+shader quad quad.vert vulkan1.0
+shader quad_vp quad_vp.vert vulkan1.2
+shader face face.frag vulkan1.0
+shader vbs vbs.vert vulkan1.0
+shader bitwise bitwise.comp vulkan1.0 -O0
 echo "wrote $out"

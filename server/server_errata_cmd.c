@@ -687,7 +687,7 @@ static vkb_errata_cmd *cmd_get(vkb_srv_table *t, vkb_errata_dev *e)
     c->owner = e;
     c->gen = __atomic_add_fetch(&gen_base, 1ull << 32, __ATOMIC_RELAXED);
     e->cmd = c;
-    __atomic_store_n(&last_cmd, c, __ATOMIC_RELEASE);
+    if (!e->probe) __atomic_store_n(&last_cmd, c, __ATOMIC_RELEASE);
     return c;
 }
 
@@ -735,7 +735,7 @@ void vkb_errata_vb_imitate(vkb_srv_table *t, vkb_errata_dev *e)
     c->imi_vb_bug = 1;
     const char *shape = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE_VB");
     c->imi_vb_single = shape && !strcmp(shape, "single");
-    if (c->imi_vb_single) VKB_WARN("errata: vb_split imitated on single-binding calls too (VKBRIDGE_ERRATA_IMITATE_VB=single)");
+    if (c->imi_vb_single && !e->probe) VKB_WARN("errata: vb_split imitated on single-binding calls too (VKBRIDGE_ERRATA_IMITATE_VB=single)");
 }
 
 void vkb_errata_dyn_install(vkb_srv_table *t, vkb_errata_dev *e)
@@ -774,14 +774,14 @@ void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e)
 {
     vkb_errata_cmd *c = e->cmd;
     if (!c) return;
-    if (((e->on | e->imitated) >> VKB_ERRATUM_DYN_REEMIT & 1) && (c->binds || c->imi_resets || c->imi_stale))
+    if (!e->probe && ((e->on | e->imitated) >> VKB_ERRATUM_DYN_REEMIT & 1) && (c->binds || c->imi_resets || c->imi_stale))
         VKB_INFO("errata: dyn_reemit: %llu graphics bind(s), %llu with state sent again: %llu value(s), %llu vertex buffer "
                  "binding(s), %llu static value(s) (3893903); %llu of an unknown pipeline; imitated: %llu bind(s) reset, %llu "
                  "stale static value(s)",
                  (unsigned long long)c->binds, (unsigned long long)c->binds_resent, (unsigned long long)c->resent,
                  (unsigned long long)c->resent_vb, (unsigned long long)c->resent_static, (unsigned long long)c->nopipe,
                  (unsigned long long)c->imi_resets, (unsigned long long)c->imi_stale);
-    if (((e->on | e->imitated) >> VKB_ERRATUM_VB_SPLIT & 1) && (c->split || c->imi_vb_wrong))
+    if (!e->probe && ((e->on | e->imitated) >> VKB_ERRATUM_VB_SPLIT & 1) && (c->split || c->imi_vb_wrong))
         VKB_INFO("errata: vb_split: %llu vkCmdBindVertexBuffers2 call(s) split into %llu; %llu imitated wrong",
                  (unsigned long long)c->split, (unsigned long long)c->split_into, (unsigned long long)c->imi_vb_wrong);
     for (unsigned h = 0; h < CB_BUCKETS; h++)

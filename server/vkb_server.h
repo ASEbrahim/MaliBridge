@@ -129,12 +129,27 @@ const uint32_t *vkb_guard_lut_standin(size_t *size); /* the compile watchdog's U
 #define VKB_PROBE_FLAG_TX_ASTC 0x20u
 #define VKB_PROBE_FLAG_TX_ASTC_HDR 0x40u
 #define VKB_PROBE_FLAG_TX_ALL 0x78u
+/* The MK probes (one per Mali driver erratum it can tell): the bug's own pattern was seen. Their
+ * results reach the errata decisions (server_errata.c) through vkb_errata_set_probe_source. */
+#define VKB_PROBE_FLAG_MK_WAIT 0x80u        /* wait_eintr: a wait failed or ended early after a signal (MK-01) */
+#define VKB_PROBE_FLAG_MK_FLIP 0x100u       /* viewport_flip: a negative-height viewport drawn upside down (MK-02) */
+#define VKB_PROBE_FLAG_MK_BITWISE 0x200u    /* bitwise_vec: wrong lanes from swizzle-fed vector bitwise ops (MK-03) */
+#define VKB_PROBE_FLAG_MK_DYN 0x400u        /* dyn_state: dynamic state lost or stale across a pipeline bind (MK-04) */
+#define VKB_PROBE_FLAG_MK_VB 0x800u         /* vb_strides: multi-binding strides applied by array index (MK-05) */
+#define VKB_PROBE_FLAG_MK_VB_SINGLE 0x1000u /* vb_strides: single-binding calls wrong too - the split cannot fix it (option B) */
+#define VKB_PROBE_FLAG_MK_CHURN 0x2000u     /* rendering_churn: a re-made view rendered with stale state (MK-06) */
+#define VKB_PROBE_FLAG_MK_VIEW3D 0x4000u    /* view3d_layers: a 3D image's REMAINING slices view wrong (MK-07) */
+#define VKB_PROBE_FLAG_MK_ALL 0x7f80u
 int vkb_probe_flag(uint32_t f);
 void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd);
 void vkb_probe_start_background(void); /* what did not fit the start's budget */
 void vkb_probe_write_md(FILE *f);
 void vkb_probe_write_json(FILE *f);
 int vkb_probe_issues(void (*cb)(void *arg, const char *line), void *arg);
+/* What a GPU's probe results decide in a mode (VKB_MODE_*), re-run on the raw results as recorded
+ * (switching mode never re-probes): the emulation mask (from what the GPU had before the probe)
+ * and the runtime flags. 0 when the GPU has no profile. For feat/safe-mode's per-mode masks. */
+int vkb_probe_decide_mode(const uint8_t uuid[VK_UUID_SIZE], int mode, uint32_t *emu, uint32_t *flags);
 /* How the process ends, for a probe in flight (async-signal-safe): a stop (SIGTERM, the app gone)
  * leaves it to be run again, a crash outside the probe's guard makes it died. */
 void vkb_probe_mark_end(int sig, int crashed);
@@ -186,6 +201,24 @@ void vkb_errata_device_destroy(vkb_srv_table *t);
 int vkb_errata_on(const vkb_srv_table *t, int id); /* VKB_ERRATUM_* decided on for this device */
 const char *vkb_errata_name(int id);
 void vkb_errata_set_probe_source(int (*fn)(const char *probe)); /* the probe's record: VKB_ERRATA_PROBE_* */
+/* The mode (VKBRIDGE_MODE): safe, the default, or performance */
+enum { VKB_MODE_SAFE, VKB_MODE_PERFORMANCE };
+int vkb_mode(void);
+/* Each MK erratum's decision in both modes ([VKB_MODE_*]) for a GPU and driver, with the reason,
+ * as vkCreateDevice would make it now (the session report); returns the rows filled */
+typedef struct vkb_errata_row {
+    int id;
+    const char *name, *mk, *probe;
+    int probe_gates, probe_result, has_fix;
+    int on[2];
+    char why[2][320];
+} vkb_errata_row;
+int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driver_info, vkb_errata_row rows[VKB_ERRATA_COUNT]);
+/* The startup probe of erratum id on its probe device: when VKBRIDGE_ERRATA_IMITATE names it (host
+ * builds), its imitation goes beneath *d, which the probe then calls - the probe sees the bug an
+ * affected driver has. Returns what vkb_errata_probe_end takes (NULL: nothing imitated). */
+void *vkb_errata_probe_begin(int id, vkb_dispatch *d, VkDevice dev, VkPhysicalDevice pd, uint32_t api);
+void vkb_errata_probe_end(void *h);
 /* FNV-1a of a module's SPIR-V as the app made it: a module an erratum rewrote is named by the
  * code it was rewritten from (server_errata_bitwise.c); what layers beneath the errata hash with */
 uint64_t vkb_spv_app_hash(const uint32_t *code, size_t size);

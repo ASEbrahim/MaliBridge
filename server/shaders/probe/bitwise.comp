@@ -1,0 +1,24 @@
+#version 450
+// bitwise_vec (MK-03, Arm erratum 3843237): integer vector bitwise ops and shifts whose operand is
+// a lane swizzle or a vector built lane by lane. x comes from a push constant (0x10) so nothing
+// folds; built with -O0 so the composites and shuffles reach the driver (build_probe.sh checks).
+// Lanes go to b.v[0..18], then a marker; server_probe.c compares them with the CPU's.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer B { uint v[]; } b;
+layout(push_constant) uniform P { uint x; } pc;
+void main() {
+    uint x = pc.x;
+    uvec2 a = uvec2(x, 2u) | 1u;
+    uvec4 c = uvec4(x, x + 1u, x + 2u, x + 3u).wzyx & uvec4(0xF0u, 0x0Fu, 0xFFu, 0x01u);
+    uvec2 d = uvec2(x, x + 1u).yx ^ 3u;
+    uvec3 e = ~uvec3(x, 1u, 2u).zyx;
+    ivec2 f = ivec2(int(x), -int(x)).yx >> ivec2(1, 2);
+    uvec2 g = uvec2(x, x + 5u).yx << uvec2(1u, 3u);
+    b.v[0] = a.x; b.v[1] = a.y;
+    b.v[2] = c.x; b.v[3] = c.y; b.v[4] = c.z; b.v[5] = c.w;
+    b.v[6] = d.x; b.v[7] = d.y;
+    b.v[8] = e.x; b.v[9] = e.y; b.v[10] = e.z;
+    b.v[11] = uint(f.x); b.v[12] = uint(f.y);
+    b.v[13] = g.x; b.v[14] = g.y;
+    b.v[15] = 0xc0deu;
+}

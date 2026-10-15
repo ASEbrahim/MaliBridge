@@ -20,6 +20,9 @@ typedef struct vkb_errata_dev {
     struct vkb_errata_views *views; /* server_errata_views.c (MK-06, MK-07) */
     struct vkb_errata_bitwise *bitwise; /* server_errata_bitwise.c (MK-03) */
     struct vkb_errata_cmd *cmd;     /* server_errata_cmd.c (MK-04, MK-05) */
+    int probe; /* the startup probe's: an imitation only, for one probe (vkb_errata_probe_begin);
+                  it publishes nothing a server thread without a table would fall back to, and logs
+                  no totals */
 } vkb_errata_dev;
 
 /* The device a wrapper runs for: the call's table; on a thread without one (the server's own

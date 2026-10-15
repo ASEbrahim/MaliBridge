@@ -452,7 +452,7 @@ static VKAPI_ATTR void VKAPI_CALL v_CmdBeginRendering(VkCommandBuffer cb, const 
                     ri = *info;
                     ri.pColorAttachments = atts;
                     use = &ri;
-                    if (!v->logged_imi) {
+                    if (!v->logged_imi && !e->probe) {
                         v->logged_imi = 1;
                         VKB_WARN("errata: view_quarantine (imitated): a view handle value came back on another image; its "
                                  "attachment is left unwritten");
@@ -524,12 +524,12 @@ void vkb_errata_views_destroy(vkb_srv_table *t, vkb_errata_dev *e)
             free(r);
         }
     pthread_mutex_unlock(&v->lock);
-    if ((ON(e, VKB_ERRATUM_VIEW_COUNTS) || IMI(e, VKB_ERRATUM_VIEW_COUNTS)) && (v->resolved || v->unknown_image || v->imi_counts))
+    if (!e->probe && (ON(e, VKB_ERRATUM_VIEW_COUNTS) || IMI(e, VKB_ERRATUM_VIEW_COUNTS)) && (v->resolved || v->unknown_image || v->imi_counts))
         VKB_INFO("errata: view_counts: %llu view(s) given explicit counts (%llu of 3D images as 2D/2D array), %llu of an image "
                  "not seen; %llu imitated",
                  (unsigned long long)v->resolved, (unsigned long long)v->resolved_3d, (unsigned long long)v->unknown_image,
                  (unsigned long long)v->imi_counts);
-    if (ON(e, VKB_ERRATUM_VIEW_QUARANTINE) || IMI(e, VKB_ERRATUM_VIEW_QUARANTINE))
+    if (!e->probe && (ON(e, VKB_ERRATUM_VIEW_QUARANTINE) || IMI(e, VKB_ERRATUM_VIEW_QUARANTINE)))
         VKB_INFO("errata: view_quarantine: %llu view(s) held back, %llu destroyed late, at most %llu held (of %u); %llu image(s) "
                  "deferred, at most %llu at once (of %u); %u view(s) and %u image(s) released at vkDestroyDevice; %llu stale "
                  "hit(s) imitated",

@@ -291,7 +291,7 @@ void vkb_errata_bitwise_install(vkb_srv_table *t, vkb_errata_dev *e)
     ERRATA_HOOK(t, vkCreateShaderModule, bw_CreateShaderModule);
     ERRATA_HOOK(t, vkCreateGraphicsPipelines, bw_CreateGraphicsPipelines);
     ERRATA_HOOK(t, vkCreateComputePipelines, bw_CreateComputePipelines);
-    __atomic_store_n(&last_state, s, __ATOMIC_RELEASE);
+    if (!e->probe) __atomic_store_n(&last_state, s, __ATOMIC_RELEASE);
 }
 
 void vkb_errata_bitwise_imitate(vkb_srv_table *t, vkb_errata_dev *e)
@@ -305,7 +305,7 @@ void vkb_errata_bitwise_imitate(vkb_srv_table *t, vkb_errata_dev *e)
     ERRATA_HOOK(t, vkCreateShaderModule, bwi_CreateShaderModule);
     ERRATA_HOOK(t, vkCreateGraphicsPipelines, bwi_CreateGraphicsPipelines);
     ERRATA_HOOK(t, vkCreateComputePipelines, bwi_CreateComputePipelines);
-    __atomic_store_n(&last_state, s, __ATOMIC_RELEASE);
+    if (!e->probe) __atomic_store_n(&last_state, s, __ATOMIC_RELEASE);
 }
 
 void vkb_errata_bitwise_destroy(vkb_srv_table *t, vkb_errata_dev *e)
@@ -315,9 +315,9 @@ void vkb_errata_bitwise_destroy(vkb_srv_table *t, vkb_errata_dev *e)
     if (e->on >> VKB_ERRATUM_BITWISE_SCALAR & 1)
         VKB_INFO("errata: bitwise_scalar: device %u: %lu of %lu module(s) rewritten (%lu op(s) scalarised), %lu left as they were",
                  t->id, s->rewritten, s->seen, s->ops, s->failed);
-    if (e->imitated >> VKB_ERRATUM_BITWISE_SCALAR & 1)
+    if ((e->imitated >> VKB_ERRATUM_BITWISE_SCALAR & 1) && !e->probe)
         VKB_INFO("errata: bitwise_scalar: device %u: the imitation broke %lu module(s)", t->id, s->imitated);
     e->bitwise = NULL;
     /* the last one made stays: a server thread that finds no table falls back to it */
-    if (__atomic_load_n(&last_state, __ATOMIC_ACQUIRE) != s) free(s);
+    if (e->probe || __atomic_load_n(&last_state, __ATOMIC_ACQUIRE) != s) free(s);
 }
