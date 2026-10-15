@@ -95,8 +95,9 @@ run_mode() {
   if [ "$mode" = plain ] && [ -x out/pcache_check ]; then
     timeout 120 ./pcache_test.sh >out/t-pcache.log 2>&1; result $? "pcache_test ($(tail -1 out/t-pcache.log))"
   fi
-  # A wait the driver fails with a stray error (Mali-G925: -3) and the server-side imitation of an
-  # older Mali's feature set, both from <cache dir>/env (a server of its own; once)
+  # Waits the driver fails with -3 after a signal (wait_retry, MK-01): every kind the bridge
+  # forwards, the bug imitated beneath the fix, with it and without; and the server-side imitation
+  # of an older Mali's feature set, both from <cache dir>/env (a server of its own; once)
   if [ "$mode" = plain ]; then
     timeout 300 ./wait_imitate_test.sh >out/t-wait.log 2>&1; result $? "wait_imitate_test ($(tail -1 out/t-wait.log))"
     # A pipeline compile that never ends (the G925's compiler on Stray): interrupted, the call fails

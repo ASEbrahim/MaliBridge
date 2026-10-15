@@ -27,6 +27,8 @@
  *                                     a driverInfo string, "v1.r49p1-03bet0"); the GPU counts as Arm
  *   VKBRIDGE_ERRATA_PROBE=probe:pass|fail,...      probe results as if the probe had recorded
  *                                     them (host tests of the decisions)
+ *   VKBRIDGE_WAIT_FIX=0               v0.4's name for -wait_retry; VKBRIDGE_WAIT_FAKE_ERROR (how the
+ *                                     wait imitation fails, server_wait.c) imitates on any build
  *
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
@@ -73,7 +75,7 @@ static void example_imitate(vkb_srv_table *t, vkb_errata_dev *e);
  * which is why a probe result, where there is one, outranks the range in performance mode. */
 static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_WAIT_RETRY] = {"wait_retry", "MK-01", "wait_eintr", 0, G_ALWAYS, G_ALWAYS,
-        {{V(0, 0), V_MAX, FAM_ANY, NULL, "every blob driver"}}, .elsewhere = "server_wait.c, VKBRIDGE_WAIT_FIX"},
+        {{V(0, 0), V_MAX, FAM_ANY, NULL, "every blob driver"}}, vkb_wait_retry_install, vkb_wait_retry_imitate},
     [VKB_ERRATUM_VIEWPORT_FLIP] = {"viewport_flip", "MK-02", "viewport_flip", 1, G_PROBE_FAIL, G_PROBE_FAIL,
         {{V(54, 2), V(54, 3), FAM_ANY, "G715", "a single report"}}},
     [VKB_ERRATUM_BITWISE_SCALAR] = {"bitwise_scalar", "MK-03", "bitwise_vec", 1, G_PROBE_FAIL | G_IN_RANGE, G_PROBE_FAIL,
@@ -105,6 +107,10 @@ typedef struct {
 
 static int (*probe_source)(const char *probe);
 static vkb_errata_dev *last_dev;
+/* The last device's next_fix / next_imi, for a call with no device left to go by (the driver's
+ * functions are the same for every device) */
+static vkb_dispatch last_next_fix, last_next_imi;
+static pthread_mutex_t last_next_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void vkb_errata_set_probe_source(int (*fn)(const char *probe))
 {
@@ -292,6 +298,13 @@ void vkb_errata_device_init(vkb_srv_table *t)
 #else
     parse_names("VKBRIDGE_ERRATA_IMITATE", imi, &imitate, NULL);
 #endif
+    /* v0.4's switches for the wait fix: VKBRIDGE_WAIT_FIX=0 is -wait_retry; VKBRIDGE_WAIT_FAKE_ERROR
+     * (which says how the imitation fails) imitates the bug on any build, as it did. */
+    const char *wfix = vkb_srv_env("VKBRIDGE_WAIT_FIX");
+    int wait_fix_off = wfix && !strcmp(wfix, "0") && !(plus >> VKB_ERRATUM_WAIT_RETRY & 1);
+    if (wait_fix_off) minus |= 1u << VKB_ERRATUM_WAIT_RETRY;
+    const char *wfake = vkb_srv_env("VKBRIDGE_WAIT_FAKE_ERROR");
+    if (wfake && *wfake && strcmp(wfake, "0")) imitate |= 1u << VKB_ERRATUM_WAIT_RETRY;
 
     char drv[400];
     if (!d.arm)
@@ -328,7 +341,10 @@ void vkb_errata_device_init(vkb_srv_table *t)
             on = 1;
         }
         if (minus >> i & 1) {
-            if (want) VKB_INFO("errata: %s OFF (VKBRIDGE_ERRATA=-%s; it would be on: %s)", x->name, x->name, why);
+            if (want && i == VKB_ERRATUM_WAIT_RETRY && wait_fix_off)
+                VKB_INFO("errata: %s OFF (VKBRIDGE_WAIT_FIX=0; it would be on: %s)", x->name, why);
+            else if (want)
+                VKB_INFO("errata: %s OFF (VKBRIDGE_ERRATA=-%s; it would be on: %s)", x->name, x->name, why);
             on = 0;
         }
         if (x->probe && pr != VKB_ERRATA_PROBE_NOT_RUN && on)
@@ -359,6 +375,10 @@ void vkb_errata_device_init(vkb_srv_table *t)
     e->next_fix = t->real;
     for (int i = 0; i < VKB_ERRATA_COUNT; i++)
         if ((e->on >> i & 1) && errata[i].install) errata[i].install(t, e);
+    pthread_mutex_lock(&last_next_lock);
+    last_next_fix = e->next_fix;
+    last_next_imi = e->next_imi;
+    pthread_mutex_unlock(&last_next_lock);
     __atomic_store_n(&last_dev, e, __ATOMIC_RELEASE);
     VKB_INFO("errata: device %u, %s, %s, %s: on %s; off %s", t->id, gpu, drv, mode, *on_list ? on_list : "none",
              *off_list ? off_list : "none");
@@ -382,6 +402,15 @@ vkb_errata_dev *vkb_errata_cur(void)
 {
     vkb_srv_table *t = vkb_srv_current_table();
     return t && t->errata ? t->errata : __atomic_load_n(&last_dev, __ATOMIC_ACQUIRE);
+}
+
+/* What a fix (imitation 0) or an imitation (1) calls next for the call's device: the driver's
+ * functions, or for a fix the imitation's beneath it. With no device to go by, the last one's. */
+const vkb_dispatch *vkb_errata_next(int imitation)
+{
+    vkb_errata_dev *e = vkb_errata_cur();
+    if (e) return imitation ? &e->next_imi : &e->next_fix;
+    return imitation ? &last_next_imi : &last_next_fix;
 }
 
 /* example: what a fix looks like. Its wrapper calls e->next_fix; an imitation calls e->next_imi. */

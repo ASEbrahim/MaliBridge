@@ -467,7 +467,6 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_trace_device_init(t);
             vkb_gprof_device_init(t); /* wraps what the client's calls reach, emulations included */
             vkb_bvmap_device_init(t); /* last: client-named buffer views are driver views beneath */
-            vkb_wait_device_init(t);  /* waits the driver fails with a stray error (server_wait.c) */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);
             VKB_INFO("device %u created on %s (%u extensions, memory sharing %s)", id, k ? k->name : "?", n,

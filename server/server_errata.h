@@ -33,6 +33,15 @@ vkb_errata_dev *vkb_errata_cur(void);
         }                                                                                                \
     } while (0)
 
+/* What a fix's wrapper calls next (imitation 0: e->next_fix) or an imitation's (1: next_imi), for
+ * the call's device; with no device left (a server thread after the last vkDestroyDevice), the
+ * last device's. */
+const vkb_dispatch *vkb_errata_next(int imitation);
+
+/* server_wait.c: wait_retry (MK-01), waits the driver fails with -3 after a signal */
+void vkb_wait_retry_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+
 /* server_errata_views.c: one set of image and image-view wrappers for view_quarantine (MK-06) and
  * view_counts (MK-07), fixes and imitations alike (installed once, whichever asks first) */
 void vkb_errata_views_install(vkb_srv_table *t, vkb_errata_dev *e);
