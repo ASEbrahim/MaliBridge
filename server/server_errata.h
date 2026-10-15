@@ -16,6 +16,7 @@ typedef struct vkb_errata_dev {
     uint64_t example_calls, example_imitated;
     struct vkb_errata_views *views; /* server_errata_views.c (MK-06, MK-07) */
     struct vkb_errata_bitwise *bitwise; /* server_errata_bitwise.c (MK-03) */
+    struct vkb_errata_flip *flip;       /* server_errata_flip.c (MK-02) */
 } vkb_errata_dev;
 
 /* The device a wrapper runs for: the call's table; on a thread without one (the server's own
@@ -53,5 +54,15 @@ void vkb_errata_views_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* before th
 void vkb_errata_bitwise_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_bitwise_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_bitwise_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+/* A module an erratum rewrote is named by the code it came from (vkb_spv_app_hash): registers
+ * the new code's hash -> the app's hash of `in` (itself maybe an erratum's output) */
+void vkb_errata_spv_origin(const uint32_t *out, size_t out_size, const uint32_t *in, size_t in_size);
+
+/* server_errata_flip.c: viewport_flip (MK-02), positive viewports and gl_Position.y negated in
+ * the last pre-rasterization stage, pipeline variants picked at draw time; the imitation turns
+ * negative viewports into positive ones over the same rows, beneath the fix */
+void vkb_errata_flip_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_flip_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_flip_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* before the driver's vkDestroyDevice */
 
 #endif
