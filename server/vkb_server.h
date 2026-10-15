@@ -55,7 +55,9 @@ typedef struct vkb_srv_conn {
 typedef struct vkb_pd_knowledge {
     uint8_t uuid[VK_UUID_SIZE];
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
-    vkb_server_pd_info info;
+    vkb_server_pd_info info;      /* in force: the mode's (vkb_pds_select_mode) */
+    vkb_server_pd_info info_mode[2]; /* per VKB_MODE_*: the probe's decisions in each mode */
+    int per_mode;                 /* info_mode filled (the probe ran) */
     int valid;
 } vkb_pd_knowledge;
 
@@ -118,6 +120,8 @@ void vkb_guard_fault(int sig, void *addr); /* crash handler: jumps back into a g
 enum { VKB_GUARD_DONE = 0, VKB_GUARD_CRASHED = 1, VKB_GUARD_TIMED_OUT = 2 };
 int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *arg, int *sig);
 const uint32_t *vkb_guard_lut_standin(size_t *size); /* the compile watchdog's UE4 LUT stand-in */
+/* The compile watchdog's interrupt in a mode (VKBRIDGE_COMPILE_TIMEOUT_S wins); why: its source */
+double vkb_guard_timeout_s(int mode, const char **why);
 
 /* server_probe.c: the startup capability probe (device profile in the cache directory). Runtime
  * flags its results set: */
@@ -201,9 +205,16 @@ void vkb_errata_device_destroy(vkb_srv_table *t);
 int vkb_errata_on(const vkb_srv_table *t, int id); /* VKB_ERRATUM_* decided on for this device */
 const char *vkb_errata_name(int id);
 void vkb_errata_set_probe_source(int (*fn)(const char *probe)); /* the probe's record: VKB_ERRATA_PROBE_* */
-/* The mode (VKBRIDGE_MODE): safe, the default, or performance */
+/* server_mode.c: the mode, safe (the default) or performance - VKBRIDGE_MODE in <cache dir>/env,
+ * then in the environment, then <cache dir>/mode (Setup), then the default */
 enum { VKB_MODE_SAFE, VKB_MODE_PERFORMANCE };
-int vkb_mode(void);
+enum { VKB_MODE_SRC_DEFAULT, VKB_MODE_SRC_FILE, VKB_MODE_SRC_ENV, VKB_MODE_SRC_CACHE_ENV };
+int vkb_mode(void);         /* as last read (the first call reads it) */
+int vkb_mode_refresh(void); /* read again (each vkbQueryServer and vkCreateDevice); logs a change */
+int vkb_mode_source(void);  /* VKB_MODE_SRC_* */
+const char *vkb_mode_name(int mode);
+const char *vkb_mode_source_name(void); /* "Setup", "the default", ... */
+const char *vkb_mode_summary(int mode);
 /* Each MK erratum's decision in both modes ([VKB_MODE_*]) for a GPU and driver, with the reason,
  * as vkCreateDevice would make it now (the session report); returns the rows filled */
 typedef struct vkb_errata_row {
@@ -282,6 +293,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p);
 void vkb_selftest_all(void);
 const vkb_pd_knowledge *vkb_pd_lookup(const vkb_dispatch *dt, VkPhysicalDevice pd);
 extern vkb_pd_knowledge vkb_pds[VKB_MAX_PDS];
+int vkb_pds_select_mode(void); /* the mode read again, its emulation masks in force; returns it */
 extern int vkb_npds;
 
 /* server_memory.c */

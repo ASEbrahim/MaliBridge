@@ -638,15 +638,33 @@ int vkb_async_results(void)
     return v;
 }
 
+/* The mode, from the guest's VKBRIDGE_MODE (DroidDeck passes Setup's "Safe mode" switch;
+ * /root/.vkbridge-env can override it): safe (the default) or performance. The server reads its
+ * own (server_mode.c); here it only picks the client's defaults by mode. */
+int vkb_client_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *m = getenv("VKBRIDGE_MODE");
+        v = m && (!strcmp(m, "performance") || !strcmp(m, "perf")) ? VKB_CLIENT_MODE_PERFORMANCE : VKB_CLIENT_MODE_SAFE;
+        if (m && *m && strcmp(m, "safe") && v == VKB_CLIENT_MODE_SAFE) VKB_WARN("VKBRIDGE_MODE=%s is neither safe nor performance; safe", m);
+        VKB_DBG("mode: %s", v == VKB_CLIENT_MODE_PERFORMANCE ? "performance" : "safe");
+    }
+    return v;
+}
+
 int vkb_desc_batch(void)
 {
     static int v = -1;
     if (v < 0) {
-        /* Off by default: Risk of Rain 2 showed black flickering with it on (2026-10-14, Mali-G720,
-         * v0.2) and no game measured faster. VKBRIDGE_DESC_BATCH=1 turns it on; VKBRIDGE_NO_DESC_BATCH=1
+        /* Off by default in both modes: Risk of Rain 2 showed black flickering with it on
+         * (2026-10-14, Mali-G720, v0.2) and no game measured faster. Performance mode turns it on
+         * here once that is fixed. VKBRIDGE_DESC_BATCH=1 turns it on, =0 off; VKBRIDGE_NO_DESC_BATCH=1
          * still wins. */
+        static const int by_mode[2] = {[VKB_CLIENT_MODE_SAFE] = 0, [VKB_CLIENT_MODE_PERFORMANCE] = 0};
         const char *on = getenv("VKBRIDGE_DESC_BATCH"), *off = getenv("VKBRIDGE_NO_DESC_BATCH");
-        v = on && *on && strcmp(on, "0") && !(off && *off && strcmp(off, "0"));
+        v = on && *on ? strcmp(on, "0") != 0 : by_mode[vkb_client_mode()];
+        if (off && *off && strcmp(off, "0")) v = 0;
     }
     return v;
 }

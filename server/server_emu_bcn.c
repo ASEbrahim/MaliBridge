@@ -178,7 +178,9 @@ int vkb_emu_bcn_transcode_wanted(void)
     return !v || strcmp(v, "0");
 }
 
-/* VKBRIDGE_BC_TRANSCODE_QUALITY: auto (the default), fast, default or high (unknown values: auto). */
+/* VKBRIDGE_BC_TRANSCODE_QUALITY: auto (the default), fast, default or high (unknown values: auto).
+ * The same in both modes (server_mode.c): below 1024x1024 auto is default's search (the same
+ * picture), and it measured 1.3-4x faster than default on both test tablets. */
 #define QUALITY_AUTO 3u
 static uint32_t transcode_quality(void)
 {

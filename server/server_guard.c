@@ -34,8 +34,8 @@
  * the game's thread waited for the reply for ever (UE "RenderThread timed out after 120 s"), and
  * no GPU work was involved. A watchdog thread now looks at every guarded call: one running past
  * VKBRIDGE_COMPILE_WARN_S (5) is logged with its stages' SPIR-V hashes (and the SPIR-V saved to
- * <cache dir>/stuck-spirv/), and one running past VKBRIDGE_COMPILE_TIMEOUT_S (10; 0 = only log)
- * is interrupted with a signal that jumps out of the driver as a contained crash does. Unreal
+ * <cache dir>/stuck-spirv/), and one running past VKBRIDGE_COMPILE_TIMEOUT_S (by the mode,
+ * server_mode.c: 10 in safe mode, 20 in performance mode; 0 = only log) is interrupted with a signal that jumps out of the driver as a contained crash does. Unreal
  * Engine takes a failed pipeline as fatal ("Fatal error!"), and a game that survives it draws
  * black, so the pipeline is then rebuilt with a fallback, each under the same watchdog:
  *   - UE4's colour-grading LUT fragment shader (CombineLUTs; spirv_gsfold.c recognizes it) is
@@ -236,7 +236,12 @@ static size_t code_bytes;
 
 static pthread_mutex_t watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static watch_slot slots[WATCH_SLOTS];
-static double warn_s = 5, timeout_s = 10; /* the G925's normal compiles of Stray's shaders took < 2 s */
+/* The G925's normal compiles of Stray's shaders took < 2 s. Performance mode waits longer before
+ * it gives a pipeline a fallback (a slow compile there is more likely to finish than to spin). */
+#define WARN_S 5.0
+#define TIMEOUT_SAFE_S 10.0
+#define TIMEOUT_PERF_S 20.0
+static double warn_s = WARN_S, timeout_s = TIMEOUT_SAFE_S;
 static int watch_started, timeout_sig;
 static mod_hash mods[MOD_BUCKETS];
 static uint64_t stuck[STUCK_MAX][STAGES_MAX];
@@ -750,12 +755,26 @@ static void *watch_main(void *arg)
     return NULL;
 }
 
+double vkb_guard_timeout_s(int mode, const char **why)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_COMPILE_TIMEOUT_S");
+    if (v && *v) {
+        if (why) *why = "VKBRIDGE_COMPILE_TIMEOUT_S";
+        return atof(v);
+    }
+    if (why) *why = mode == VKB_MODE_PERFORMANCE ? "performance mode" : "safe mode";
+    return mode == VKB_MODE_PERFORMANCE ? TIMEOUT_PERF_S : TIMEOUT_SAFE_S;
+}
+
+/* The switches again at each device (and probe): the mode or <cache dir>/env may have changed */
 static void watch_env(void)
 {
     const char *v = vkb_srv_env("VKBRIDGE_COMPILE_WARN_S");
-    if (v && *v) warn_s = atof(v);
-    v = vkb_srv_env("VKBRIDGE_COMPILE_TIMEOUT_S");
-    if (v && *v) timeout_s = atof(v);
+    warn_s = v && *v ? atof(v) : WARN_S;
+    const char *why;
+    double t = vkb_guard_timeout_s(vkb_mode(), &why);
+    if (watch_started && t != timeout_s) VKB_INFO("compile watchdog: interrupt after %.0f s now (%s)", t, why);
+    timeout_s = t;
     if (watch_started) return;
     watch_started = 1;
     /* A real-time signal nobody else handles (ART and bionic keep the first few). */
@@ -776,7 +795,7 @@ static void watch_env(void)
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&th, &at, watch_main, NULL) != 0) VKB_WARN("compile watchdog: no thread");
     pthread_attr_destroy(&at);
-    VKB_INFO("compile watchdog: warn after %.0f s, interrupt after %.0f s (signal %d)", warn_s, timeout_s, timeout_sig);
+    VKB_INFO("compile watchdog: warn after %.0f s, interrupt after %.0f s (%s; signal %d)", warn_s, timeout_s, why, timeout_sig);
 }
 
 static watch_slot *watch_begin(guard_arm *arm, const char *call, uint32_t device, const uint64_t *h, const uint32_t *stage, uint32_t n,

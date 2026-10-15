@@ -14,7 +14,7 @@
  *      driverInfo build string ("v1.r44p1-01eac0", "v1.r49p1-03bet0" for a beta), against the
  *      erratum's affected ranges, some of them for one GPU family only (job manager GPUs, told by
  *      maxDrawIndirectCount <= 1, or command stream frontend ones) or one GPU;
- *   3  the mode: safe (the default) or performance (VKBRIDGE_MODE).
+ *   3  the mode: safe (the default) or performance (server_mode.c).
  * Each erratum says per mode which of these turn it on: always, a failed probe, the driver in an
  * affected range, an Arm driver whose version cannot be decoded. One line per erratum that ends up
  * on says why, and one line sums up the device.
@@ -286,17 +286,6 @@ static int probe_result(const char *probe)
         c += len;
     }
     return probe_source ? probe_source(probe) : VKB_ERRATA_PROBE_NOT_RUN;
-}
-
-/* VKBRIDGE_MODE: safe (the default) or performance. (feat/safe-mode: server_mode.c, with the mode
- * file and the source in the log.) */
-int vkb_mode(void)
-{
-    const char *m = vkb_srv_env("VKBRIDGE_MODE");
-    if (!m || !*m || !strcmp(m, "safe")) return VKB_MODE_SAFE;
-    if (!strcmp(m, "performance") || !strcmp(m, "perf")) return VKB_MODE_PERFORMANCE;
-    VKB_ONCE(VKB_LOG_WARN, "errata: VKBRIDGE_MODE=%s is neither safe nor performance; safe", m);
-    return VKB_MODE_SAFE;
 }
 
 static int performance_mode(void)

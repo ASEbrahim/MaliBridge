@@ -7,6 +7,7 @@
 #include "server_emu.h"
 #include "vkb_ext_alias.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,28 @@ const vkb_pd_knowledge *vkb_pd_lookup(const vkb_dispatch *dt, VkPhysicalDevice p
     for (int i = 0; i < vkb_npds; i++)
         if (vkb_pds[i].valid && !memcmp(vkb_pds[i].uuid, id.deviceUUID, VK_UUID_SIZE)) return &vkb_pds[i];
     return NULL;
+}
+
+/* The mode read again and its emulation masks put in force (made by the probe for both modes at
+ * start, server_probe.c), so a switch applies from the next client without a re-probe. Only the
+ * mask fields change; a client already running keeps what it was told. */
+int vkb_pds_select_mode(void)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    int mode = vkb_mode_refresh();
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < vkb_npds; i++) {
+        vkb_pd_knowledge *k = &vkb_pds[i];
+        if (!k->valid || !k->per_mode) continue;
+        const vkb_server_pd_info *m = &k->info_mode[mode];
+        if (k->info.emu == m->emu && k->info.emu_available == m->emu_available && k->info.missing == m->missing) continue;
+        VKB_INFO("%s: %s mode: emulating 0x%x (was 0x%x)", k->name, vkb_mode_name(mode), m->emu, k->info.emu);
+        k->info.emu = m->emu;
+        k->info.emu_available = m->emu_available;
+        k->info.missing = m->missing;
+    }
+    pthread_mutex_unlock(&lock);
+    return mode;
 }
 
 /* What the self-test found, for a later session's log (the in-app server tests once). */
@@ -228,6 +251,7 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
+    vkb_pds_select_mode();
     const vkb_pd_knowledge *k = vkb_pd_lookup(c->dt, pd);
     vkb_server_pd_info info;
     memset(&info, 0, sizeof(info));
@@ -259,11 +283,12 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
+    vkb_srv_env_reload(); /* <cache dir>/env: per-device test toggles without restarting the app */
+    vkb_srv_stats_reload();
+    vkb_pds_select_mode(); /* after the overrides: VKBRIDGE_MODE may be one */
     const vkb_pd_knowledge *k = vkb_pd_lookup(&inst->real, pd);
     uint32_t strategy = k ? k->info.strategy : VKB_MEM_NONE;
     uint32_t emu = k ? k->info.emu : 0;
-    vkb_srv_env_reload(); /* <cache dir>/env: per-device test toggles without restarting the app */
-    vkb_srv_stats_reload();
     {
         /* VKBRIDGE_EMU_OFF=<hex mask of VKB_EMU_* bits>: this device runs without those emulations
          * (the client still reports their features: for bisecting, not for games). */

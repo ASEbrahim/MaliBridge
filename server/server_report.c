@@ -853,6 +853,11 @@ static void write_md(FILE *f, int final)
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
     localtime_r(&t0_wall, &tm);
     strftime(ts0, sizeof(ts0), "%Y-%m-%d %H:%M:%S", &tm);
+    /* line 1: the mode, so two reports are compared like for like (malibridge_report_diff.py) */
+    int mode = vkb_mode();
+    const char *tw;
+    double to = vkb_guard_timeout_s(mode, &tw);
+    fprintf(f, "Mode: %s (%s) - %s; compile watchdog %.0f s (%s).\n\n", vkb_mode_name(mode), vkb_mode_source_name(), vkb_mode_summary(mode), to, tw);
     fprintf(f, "# MaliBridge session report\n\n");
     fprintf(f, "Session started %s, report written %s (%.0f s in)%s. Machine-readable: `malibridge-report.json`.\n\n", ts0, ts, now_s(),
             final ? ", final" : "; rewritten every 5 s");
@@ -982,6 +987,10 @@ static void write_json(FILE *f, int final)
     char nm[120], b1[200];
     fprintf(f, "{\n  \"malibridge_report\": 1,\n  \"final\": %s,\n  \"seconds\": %.1f,\n  \"started\": %lld,\n", final ? "true" : "false", now_s(),
             (long long)t0_wall);
+    int mode = vkb_mode();
+    fprintf(f, "  \"mode\": {\"value\": \"%s\", \"source\": ", vkb_mode_name(mode));
+    js(f, vkb_mode_source_name());
+    fprintf(f, ", \"compile_timeout_s\": %.1f},\n", vkb_guard_timeout_s(mode, NULL));
     fprintf(f, "  \"issue_count\": %d,\n  \"issues\": [", list_issues(NULL, 1));
     list_issues(f, 1);
     struct utsname u;

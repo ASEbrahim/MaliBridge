@@ -59,10 +59,11 @@
  * (wait_eintr's 1 s of waits, rendering_churn's submissions) always go there. With a profile cached the start
  * only reads it. VKBRIDGE_PROBE=0 turns the probe off, =force re-runs it.
  *
- * Imitation for host tests: VKBRIDGE_PROBE_FAKE=<probe>:<fail|crash|hang|die|abort|stall|slow>,...
+ * Imitation for host tests: VKBRIDGE_PROBE_FAKE=<probe>:<fail|crash|hang|die|abort|stall|slow|error>,...
  * makes a probe that applies fail, fault, spin until its limit, end the process without a word
  * (_exit), abort, spin with the watchdog's signal blocked (only a kill ends it), or take 3 s
- * longer (to stop a session inside it); VKBRIDGE_FAKE_MISSING applies as everywhere (a feature taken as missing is
+ * longer (to stop a session inside it), or end in error without running (could not set up: what
+ * safe mode does not take as verified); VKBRIDGE_FAKE_MISSING applies as everywhere (a feature taken as missing is
  * already emulated, so its probe is skipped).
  */
 #define _GNU_SOURCE
@@ -135,6 +136,7 @@ typedef struct pprofile {
     VkPhysicalDeviceProperties props;
     char driver_info[VK_MAX_DRIVER_INFO_SIZE];
     uint32_t possible; /* emulations the bridge can stand in with on this GPU */
+    uint32_t missing_before; /* VKB_EMU_* features the GPU lacks (no native path to verify) */
 } pprofile;
 
 static pthread_mutex_t plock = PTHREAD_MUTEX_INITIALIZER;
@@ -2610,6 +2612,7 @@ static int fake_mode(const char *probe)
         if (!strncmp(m, "abort", 5)) return 5;
         if (!strncmp(m, "stall", 5)) return 6;
         if (!strncmp(m, "slow", 4)) return 7;
+        if (!strncmp(m, "error", 5)) return 8;
     }
     return 0;
 }
@@ -3094,7 +3097,13 @@ static int probe_one(pctx *c, const probe_def *p, presult *r, int *dev_lost)
     double limit = probe_limit_s(p);
     int sig = 0;
     double t0 = mono_ms();
-    int g = vkb_guard_run(p->name, limit, run_one, &a, &sig);
+    int g = VKB_GUARD_DONE;
+    if (a.fake == 8) {
+        c->st = PS_ERROR;
+        say(c, "could not set up [imitated: VKBRIDGE_PROBE_FAKE]");
+    } else {
+        g = vkb_guard_run(p->name, limit, run_one, &a, &sig);
+    }
     r->ms = mono_ms() - t0;
     if (imi) {
         c->d = saved;
@@ -3142,15 +3151,23 @@ static uint32_t emu_possible(const pctx *c)
     return m;
 }
 
-/* What a result switches on in a mode: emulation bits and runtime flags (only for outcomes other
- * than pass/skip/error), from the raw result (status, want) alone - re-run on cached results, so a
- * mode switch never re-probes. Both modes decide alike so far; the place where safe mode will
- * differ (feat/safe-mode: a probe that did not pass - skip, error, not run yet - keeps its
- * emulation) is marked below. The MK probes' flags reach the errata decisions (errata_source),
- * whose own per-mode rules are in server_errata.c. */
-static void decide(const probe_def *p, presult *r, uint32_t *emu, uint32_t possible, int mode, int log)
+/* Safe mode keeps a probe-gated emulation on until its probe has verified the native path: where
+ * the GPU has that path (its feature not missing; dma-buf export, whose native side only its probe
+ * tells, is left to the probe) and the probe has not run yet or could not run (error). A skipped
+ * probe found no native path to verify: what the bridge does without one stands (vkb_emu_detect). */
+static int safe_gated(const probe_def *p, uint32_t missing, int mode)
 {
-    (void)mode; /* safe mode, unverified: here */
+    return mode == VKB_MODE_SAFE && p->emu && p->emu != VKB_EMU_DMABUF_EXPORT && !(missing & p->emu);
+}
+
+/* What a result switches on in a mode: emulation bits and runtime flags, from the raw result
+ * (status, want) alone - re-run on cached results, so a mode switch never re-probes. Both modes:
+ * a probe that failed, crashed, hung or died gets its emulation and its runtime flags. Safe mode
+ * also: one that ended in error keeps its emulation (safe_gated; one not run yet: decide_unrun).
+ * The MK probes' flags reach the errata decisions (errata_source), whose own per-mode rules are in
+ * server_errata.c. */
+static void decide(const probe_def *p, presult *r, uint32_t *emu, uint32_t possible, uint32_t missing, int mode, int log)
+{
     int bad = r->status == PS_FAIL || r->status == PS_CRASH || r->status == PS_HANG || r->status == PS_DIED;
     uint32_t flags = r->want & p->flags;
     if (p->fn == p_compile_aces) flags = (r->status == PS_HANG || r->status == PS_DIED) ? VKB_PROBE_FLAG_LUT_NOW : 0;
@@ -3158,7 +3175,8 @@ static void decide(const probe_def *p, presult *r, uint32_t *emu, uint32_t possi
     if (p->fn == p_bc_transcoders && r->status == PS_DIED) flags = VKB_PROBE_FLAG_TX_ALL;
     r->flags = flags;
     r->emu = 0;
-    if (!bad) return;
+    int unverified = !bad && r->status == PS_ERROR && safe_gated(p, missing, mode);
+    if (!bad && !unverified) return;
     int apply = env_on("VKBRIDGE_PROBE_APPLY", 1) && env_on("VKBRIDGE_EMULATE", 1);
     if (p->emu && !(*emu & p->emu)) {
         const char *env = NULL;
@@ -3169,8 +3187,9 @@ static void decide(const probe_def *p, presult *r, uint32_t *emu, uint32_t possi
             *emu |= p->emu;
         }
         if (log)
-            VKB_WARN("probe: %s %s (%s): %s %s", p->name, ps_name[r->status], r->detail, what,
-                     !ok ? "cannot be emulated here" : apply ? "EMULATED instead of the driver's" : "would be emulated (VKBRIDGE_PROBE_APPLY=0)");
+            VKB_WARN("probe: %s %s (%s): %s %s%s", p->name, ps_name[r->status], r->detail, what,
+                     !ok ? "cannot be emulated here" : apply ? "EMULATED instead of the driver's" : "would be emulated (VKBRIDGE_PROBE_APPLY=0)",
+                     unverified ? " (not verified: safe mode)" : "");
     }
     if (flags) {
         if (log)
@@ -3178,6 +3197,50 @@ static void decide(const probe_def *p, presult *r, uint32_t *emu, uint32_t possi
         if (!apply) r->flags = 0;
     }
     if (log && !p->emu && !flags) VKB_WARN("probe: %s %s: %s", p->name, ps_name[r->status], r->detail);
+}
+
+/* Safe mode: the probe-gated emulations whose probe has no result yet (left to the background
+ * part, or a start that ended before it) stay on until it passes. Returns the bits added. */
+static uint32_t decide_unrun(pprofile *pf, uint32_t *emu, int mode, int log)
+{
+    uint32_t added = 0;
+    if (mode != VKB_MODE_SAFE) return 0;
+    int apply = env_on("VKBRIDGE_PROBE_APPLY", 1) && env_on("VKBRIDGE_EMULATE", 1);
+    for (size_t i = 0; i < NPROBES; i++) {
+        const probe_def *p = &probes[i];
+        if (!safe_gated(p, pf->missing_before, mode) || (*emu & p->emu) || find_result(pf, p->name)) continue;
+        const char *env = NULL;
+        const char *what = emu_name(p->emu, &env);
+        int ok = (pf->possible & p->emu) && env_on(env, 1);
+        if (ok && apply) {
+            *emu |= p->emu;
+            added |= p->emu;
+        }
+        if (log)
+            VKB_INFO("probe: %s not run yet: %s %s", p->name, what,
+                     !ok ? "cannot be emulated here" : apply ? "EMULATED until it passes (safe mode)" : "would be emulated (VKBRIDGE_PROBE_APPLY=0)");
+    }
+    return added;
+}
+
+/* The decisions of every result in pf in a mode, on copies (the raw results stay): the emulation
+ * mask from what the GPU had before the probe and the runtime flags; out (pf->n entries, may be
+ * NULL) gets each result as decided. */
+static void decide_all(pprofile *pf, int mode, uint32_t *emu, uint32_t *flags, presult *out)
+{
+    uint32_t e = pf->emu_before, f = 0;
+    for (int k = 0; k < pf->n; k++) {
+        presult r = pf->res[k];
+        const probe_def *p = NULL;
+        for (size_t j = 0; j < NPROBES && !p; j++)
+            if (!strcmp(probes[j].name, r.name)) p = &probes[j];
+        if (p) decide(p, &r, &e, pf->possible, pf->missing_before, mode, 0);
+        f |= r.flags;
+        if (out) out[k] = r;
+    }
+    decide_unrun(pf, &e, mode, 0);
+    if (emu) *emu = e;
+    if (flags) *flags = f;
 }
 
 static uint32_t apply_flags(pprofile *pf)
@@ -3261,7 +3324,7 @@ static int run_probes(pctx *c, pprofile *pf, uint32_t *emu, double budget_ms, in
             left++;
             continue;
         }
-        decide(p, &r, emu, c->possible, vkb_mode(), log);
+        decide(p, &r, emu, c->possible, pf->missing_before, vkb_mode(), log);
         pthread_mutex_lock(&plock);
         pf->res[pf->n++] = r;
         pf->running[0] = 0;
@@ -3391,16 +3454,7 @@ int vkb_probe_decide_mode(const uint8_t uuid[VK_UUID_SIZE], int mode, uint32_t *
         pprofile *pf = &profiles[i];
         if (memcmp(pf->uuid, uuid, VK_UUID_SIZE)) continue;
         found = 1;
-        uint32_t e = pf->emu_before, f = 0;
-        for (int k = 0; k < pf->n; k++) {
-            const probe_def *p = def_of(pf->res[k].name);
-            if (!p) continue;
-            presult r = pf->res[k];
-            decide(p, &r, &e, pf->possible, mode, 0);
-            f |= r.flags;
-        }
-        if (emu) *emu = e;
-        if (flags) *flags = f;
+        decide_all(pf, mode, emu, flags, NULL);
     }
     pthread_mutex_unlock(&plock);
     return found;
@@ -3441,6 +3495,7 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     vkb_errata_set_probe_source(errata_source);
     profile_key(pf, &p2.properties, id.driverUUID);
     pf->emu_before = k->info.emu;
+    pf->missing_before = k->info.missing;
     __atomic_store_n(&nprofiles, nprofiles + 1, __ATOMIC_RELEASE);
 
     int force = mode && !strcmp(mode, "force");
@@ -3455,7 +3510,8 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         for (int i = 0; i < pf->n; i++)
             for (size_t j = 0; j < NPROBES; j++)
                 if (!strcmp(probes[j].name, pf->res[i].name))
-                    decide(&probes[j], &pf->res[i], &emu, c.possible, vkb_mode(), pf->res[i].status != PS_PASS && pf->res[i].status != PS_SKIP);
+                    decide(&probes[j], &pf->res[i], &emu, c.possible, pf->missing_before, vkb_mode(),
+                           pf->res[i].status != PS_PASS && pf->res[i].status != PS_SKIP);
     }
     if (complete) {
         int bad = 0;
@@ -3470,14 +3526,27 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         write_profile(pf);
     }
     ctx_free(&c);
+    int cur = vkb_mode();
+    decide_unrun(pf, &emu, cur, 1);
     pf->emu_after = emu;
-    uint32_t added = emu & ~k->info.emu;
-    if (added) {
-        k->info.emu |= added;
-        k->info.emu_available |= added;
-        k->info.missing |= added;
-        VKB_WARN("probe: emulations switched on by the probe: 0x%x (emulating 0x%x now)", added, k->info.emu);
+    /* both modes' masks, the one in force picked at each vkbQueryServer and vkCreateDevice
+     * (vkb_pds_select_mode): a switch applies from the next client */
+    vkb_server_pd_info base = k->info;
+    for (int m = 0; m < 2; m++) {
+        uint32_t e = 0;
+        decide_all(pf, m, &e, NULL, NULL);
+        uint32_t add = e & ~base.emu;
+        k->info_mode[m] = base;
+        k->info_mode[m].emu |= add;
+        k->info_mode[m].emu_available |= add;
+        k->info_mode[m].missing |= add;
     }
+    k->per_mode = 1;
+    uint32_t added = k->info_mode[cur].emu & ~base.emu;
+    k->info = k->info_mode[cur];
+    if (added) VKB_WARN("probe: emulations switched on by the probe: 0x%x (emulating 0x%x now, %s mode)", added, k->info.emu, vkb_mode_name(cur));
+    if (k->info_mode[!cur].emu != k->info.emu)
+        VKB_INFO("probe: %s mode would emulate 0x%x (this mode 0x%x)", vkb_mode_name(!cur), k->info_mode[!cur].emu, k->info.emu);
     uint32_t fl = apply_flags(pf);
     if (fl) VKB_INFO("probe: runtime flags 0x%x from the probe", fl);
     pf->start_ms = mono_ms() - t0;
@@ -3491,7 +3560,9 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         if (j) {
             j->pf_index = (int)(pf - profiles);
             memcpy(j->uuid, id.deviceUUID, VK_UUID_SIZE);
-            j->emu = k->info.emu;
+            /* what the probes see as emulated: not safe mode's stand-ins for them, or they would
+             * skip instead of verifying the native path */
+            j->emu = k->info_mode[VKB_MODE_PERFORMANCE].emu;
             pthread_mutex_lock(&plock);
             pending[j->pf_index] = j;
             pthread_mutex_unlock(&plock);
@@ -3588,20 +3659,39 @@ void vkb_probe_write_md(FILE *f)
     pthread_mutex_lock(&plock);
     int np = nprofiles;
     for (int i = 0; i < np; i++) props[i] = profiles[i].props, memcpy(info[i], profiles[i].driver_info, sizeof(info[i]));
-    if (!nprofiles) fprintf(f, "No probe ran (no cache directory, or VKBRIDGE_PROBE=0).\n\n");
+    if (!nprofiles) fprintf(f, "No probe ran (no cache directory, or VKBRIDGE_PROBE=0); no probe decisions in either mode.\n\n");
+    int mode = vkb_mode();
     for (int i = 0; i < nprofiles; i++) {
-        const pprofile *pf = &profiles[i];
+        pprofile *pf = &profiles[i];
+        presult decd[MAX_RESULTS];
+        uint32_t emu_m[2];
+        decide_all(pf, !mode, &emu_m[!mode], NULL, NULL);
+        decide_all(pf, mode, &emu_m[mode], NULL, decd); /* the decisions of the mode in force */
         fprintf(f, "Profile `%s` - %s, %s; %s, %.0f ms at start", pf->path[0] ? pf->path : "(not saved)", pf->gpu, pf->driver,
                 !pf->cached ? "probed now" : pf->cost_ms > 0 ? "continued from the cache" : "from the cache",
                 pf->start_ms);
         if (pf->bg_ms) fprintf(f, ", %.0f ms in the background", pf->bg_ms);
         fprintf(f, "%s.\n\n", pf->complete ? "" : pf->running[0] ? " (running)" : " (background part pending)");
-        fprintf(f, "Emulation mask: 0x%x before the probe, 0x%x after.\n\n", pf->emu_before, pf->emu_after);
-        fprintf(f, "| probe | result | ms | decision | detail |\n|---|---|---:|---|---|\n");
+        fprintf(f, "Emulation mask: 0x%x before the probe; after it 0x%x in safe mode, 0x%x in performance mode (%s mode in force%s).\n\n",
+                pf->emu_before, emu_m[VKB_MODE_SAFE], emu_m[VKB_MODE_PERFORMANCE], vkb_mode_name(mode),
+                mode == VKB_MODE_SAFE ? ": a probe that has not verified the native path keeps its emulation" : "");
+        if (mode == VKB_MODE_SAFE) {
+            char unrun[400] = "";
+            size_t ul = 0;
+            for (size_t j = 0; j < NPROBES; j++) {
+                const probe_def *p = &probes[j];
+                if (!safe_gated(p, pf->missing_before, mode) || (pf->emu_before & p->emu) || !(emu_m[mode] & p->emu) || find_result(pf, p->name)) continue;
+                ul += (size_t)snprintf(unrun + ul, sizeof(unrun) - ul, "%s%s (%s)", ul ? ", " : "", emu_name(p->emu, NULL), p->name);
+                if (ul >= sizeof(unrun)) break;
+            }
+            if (unrun[0]) fprintf(f, "Emulated until their probe passes (not run yet, safe mode): %s.\n\n", unrun);
+        }
+        fprintf(f, "| probe | result | ms | decision (%s mode) | detail |\n|---|---|---:|---|---|\n", vkb_mode_name(mode));
         for (int r = 0; r < pf->n; r++) {
-            const presult *x = &pf->res[r];
+            const presult *x = &decd[r];
             char dec[160] = "";
-            if (x->emu) snprintf(dec, sizeof(dec), "emulate %s (0x%x)", emu_name(x->emu, NULL), x->emu);
+            if (x->emu)
+                snprintf(dec, sizeof(dec), "emulate %s (0x%x)%s", emu_name(x->emu, NULL), x->emu, x->status == PS_ERROR ? ": not verified, safe mode" : "");
             if (x->flags) snprintf(dec + strlen(dec), sizeof(dec) - strlen(dec), "%s%s", dec[0] ? "; " : "", flag_text(x->flags));
             fprintf(f, "| %s | %s%s%s | %.1f | %s | ", x->name, x->status == PS_PASS || x->status == PS_SKIP ? "" : "**", ps_name[x->status],
                     x->status == PS_PASS || x->status == PS_SKIP ? "" : "**", x->ms, dec);
@@ -3660,6 +3750,10 @@ void vkb_probe_write_json(FILE *f)
         json_str(f, pf->driver);
         fprintf(f, ", \"key\": ");
         json_str(f, pf->key);
+        uint32_t es = 0, ep = 0;
+        decide_all(&profiles[i], VKB_MODE_SAFE, &es, NULL, NULL);
+        decide_all(&profiles[i], VKB_MODE_PERFORMANCE, &ep, NULL, NULL);
+        fprintf(f, ", \"emu_safe\": \"0x%x\", \"emu_performance\": \"0x%x\"", es, ep);
         fprintf(f, ", \"cached\": %s, \"complete\": %s, \"cost_ms\": %.1f, \"start_ms\": %.1f, \"background_ms\": %.1f, \"emu_before\": \"0x%x\", \"emu_after\": \"0x%x\", \"results\": [",
                 pf->cached ? "true" : "false", pf->complete ? "true" : "false", pf->cost_ms, pf->start_ms, pf->bg_ms, pf->emu_before, pf->emu_after);
         for (int r = 0; r < pf->n; r++) {
@@ -3688,10 +3782,13 @@ void vkb_probe_write_json(FILE *f)
 int vkb_probe_issues(void (*cb)(void *arg, const char *line), void *arg)
 {
     int n = 0;
+    int mode = vkb_mode();
     pthread_mutex_lock(&plock);
-    for (int i = 0; i < nprofiles; i++)
+    for (int i = 0; i < nprofiles; i++) {
+        presult decd[MAX_RESULTS];
+        decide_all(&profiles[i], mode, NULL, NULL, decd); /* the decisions of the mode in force */
         for (int r = 0; r < profiles[i].n; r++) {
-            const presult *x = &profiles[i].res[r];
+            const presult *x = &decd[r];
             if (x->status == PS_PASS || x->status == PS_SKIP) continue;
             char line[700], gpu[16] = "";
             if (nprofiles > 1) snprintf(gpu, sizeof(gpu), " (GPU %d)", i);
@@ -3702,6 +3799,7 @@ int vkb_probe_issues(void (*cb)(void *arg, const char *line), void *arg)
             cb(arg, line);
             n++;
         }
+    }
     pthread_mutex_unlock(&plock);
     return n;
 }

@@ -158,9 +158,12 @@ void vkb_call_end(vkb_call *c);
 int vkb_call_exec_async(vkb_call *c);
 int vkb_async_results(void);
 /* Asynchronous requests framed as one vkbBatch message, vkUpdateDescriptorSets packed: off unless
- * VKBRIDGE_DESC_BATCH=1; vkb_async_framed and vkb_desc_packed are its two halves (each can be
+ * VKBRIDGE_DESC_BATCH=1 (in both modes for now); vkb_async_framed and vkb_desc_packed are its two halves (each can be
  * turned off alone, conn.c). */
 int vkb_desc_batch(void);
+/* VKBRIDGE_MODE in the guest: safe (the default) or performance (the client's defaults by mode) */
+enum { VKB_CLIENT_MODE_SAFE, VKB_CLIENT_MODE_PERFORMANCE };
+int vkb_client_mode(void);
 int vkb_async_framed(void);
 int vkb_desc_packed(void);
 void vkb_stats_count(uint32_t cmd, int async, size_t bytes);

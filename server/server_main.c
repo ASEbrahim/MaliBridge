@@ -207,6 +207,7 @@ static int server_init(const char *vk_lib, const char *cache_dir)
     vkb_dispatch_load_instance(&vkb_global_dt, vkb_gipa, VK_NULL_HANDLE);
     vkb_pcache_set_dir(cache_dir);
     vkb_srv_env_reload(); /* <cache dir>/env: VKBRIDGE_FAKE_MISSING and the like reach the self-test */
+    vkb_mode_refresh();   /* logged with its source; the probe decides for both modes */
     vkb_selftest_all();
     return 1;
 }
@@ -269,6 +270,9 @@ JNIEXPORT jint JNICALL Java_com_droiddeck_launcher_gpu_VkBridgeNative_nativeStar
     int ok = 0;
     if (jni_state == 1 && sock && !strcmp(sock, jni_socket) && access(sock, F_OK) == 0) {
         VKB_INFO("in-app server already serving at %s (pid %d); this session's log continues here", sock, getpid());
+        vkb_srv_env_reload();
+        int mode = vkb_pds_select_mode(); /* Setup's switch may have changed: <cache dir>/mode */
+        VKB_INFO("mode: %s (%s) for this session", vkb_mode_name(mode), vkb_mode_source_name());
         vkb_log_summary();
         ok = 1;
     } else if (jni_state == 1) {

@@ -5,7 +5,7 @@ profiles (<cache dir>/probe-*.json): S10+ against S11 Ultra, or a build before a
 
     tools/malibridge_report_diff.py A.json B.json [--regressions]
 
-Prints what differs - device and driver, probe results (with their failed sub-cases) and the
+Prints what differs - the mode first (a warning when they differ), device and driver, probe results (with their failed sub-cases) and the
 decisions they caused, each driver erratum's decision in either mode, issues only in one of them,
 and per game (matched by Steam key or process name): frame rate, compile time, device losses, long
 GPU waits, memory, log classes only in one. Numbers inside messages (counts,
@@ -87,8 +87,20 @@ def num(p, k):
     return v if isinstance(v, (int, float)) else 0
 
 
+def mode_text(report):
+    m = report.get("mode")
+    if not m:
+        return "safe (a report from before modes: no switch)"
+    return f"{m.get('value')} ({m.get('source')})"
+
+
 def diff_reports(a, b, out):
     regress = 0
+    # first: two modes differ by design (emulations, errata, the compile watchdog), so the rest
+    # of the comparison is not like for like
+    ma, mb = (a.get("mode") or {}).get("value", "safe"), (b.get("mode") or {}).get("value", "safe")
+    if ma != mb:
+        out.append(f"WARNING: the reports differ in mode: {mode_text(a)} -> {mode_text(b)}; differences below may be the mode's")
     for k in ("model", "soc", "android", "kernel", "mem_total_mb"):
         if a["device"].get(k) != b["device"].get(k):
             out.append(f"device {k}: {a['device'].get(k)} -> {b['device'].get(k)}")
