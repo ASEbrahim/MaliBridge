@@ -64,6 +64,7 @@ void vkb_emu_gfx_free(void *gfx);
 /* BCn (server_emu_bcn.c) */
 void vkb_emu_bcn_install(vkb_srv_table *dev);
 void vkb_emu_bcn_uninstall(vkb_srv_table *dev);
+void vkb_emu_bcn_quiesce(vkb_srv_table *dev);
 VkFormat vkb_emu_bcn_view_format(vkb_emu_device *e, VkImage image, VkFormat requested);
 void vkb_emu_bcn_buffer_usage(vkb_emu_device *e, VkBufferCreateInfo *ci);
 int vkb_emu_bcn_blocks_readback(vkb_emu_device *e, VkImage img);
@@ -73,7 +74,7 @@ VkDeviceSize vkb_emu_bcn_scratch_live(void);
 /* the startup probe builds each transcoder on the driver (server_probe.c) */
 int vkb_emu_bcn_transcoders(void);
 const char *vkb_emu_bcn_transcoder_name(int i, uint32_t *probe_flag);
-VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, int i, double *ms);
+VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, VkPipelineCache cache, int i, double *ms);
 
 /* layer (server_emu_layer.c) */
 void vkb_emu_depth_clip_pipeline(vkb_emu_device *e, VkGraphicsPipelineCreateInfo *ci);

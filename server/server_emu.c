@@ -385,6 +385,11 @@ void vkb_emu_device_init(vkb_srv_table *dev, uint32_t emu)
     vkb_emu_install(dev);
 }
 
+void vkb_emu_device_quiesce(vkb_srv_table *dev)
+{
+    if (dev->emu) vkb_emu_bcn_quiesce(dev);
+}
+
 void vkb_emu_device_destroy(vkb_srv_table *dev)
 {
     if (!dev->emu) return;

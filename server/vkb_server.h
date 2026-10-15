@@ -219,6 +219,12 @@ void vkb_srv_env_reload(void);             /* <cache dir>/env overrides, read at
 const char *vkb_srv_env(const char *name); /* an override, else getenv */
 void vkb_pcache_device_init(vkb_srv_table *t);
 void vkb_pcache_device_destroy(vkb_srv_table *t);
+/* a pipeline the server builds for itself, through the device's cache (VK_NULL_HANDLE without one) */
+VkResult vkb_pcache_create_compute(vkb_srv_table *t, const VkComputePipelineCreateInfo *ci, VkPipeline *out);
+/* a cache for the server's own compiles on a device without a table (the startup probe's) */
+VkPipelineCache vkb_pcache_own_open(const vkb_dispatch *r, const VkPhysicalDeviceProperties *gpu, VkDevice d, const char *name, char *path,
+                                    size_t cap);
+void vkb_pcache_own_close(const vkb_dispatch *r, VkDevice d, VkPipelineCache c, const char *path);
 
 /* server_conn.c */
 void vkb_srv_serve(int listen_fd);
@@ -275,5 +281,7 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
                                 VkDeviceCreateInfo *ci, vkb_arena *a);
 void vkb_emu_device_init(vkb_srv_table *dev, uint32_t emu);
 void vkb_emu_device_destroy(vkb_srv_table *dev);
+/* first when a device goes: stops the emulations' threads, which call through the layers */
+void vkb_emu_device_quiesce(vkb_srv_table *dev);
 
 #endif
