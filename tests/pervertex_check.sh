@@ -44,7 +44,7 @@ if [ -x ../host/out/vkbridge-server ]; then
         . ../host/mali_env.sh >/dev/null
         r=0; draw "bridge (mali_env), server rewrite" "$gs" || r=1
         grep -E "per-vertex|loose built-ins" ../host/out/server.log || true
-        kill "$(pgrep -x vkbridge-server)" 2>/dev/null
+        vkb_server_stop
         exit $r
     )
 fi

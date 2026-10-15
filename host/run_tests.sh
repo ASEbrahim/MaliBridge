@@ -4,33 +4,44 @@
 #   mali    the desktop driver with Mali-G720's known gaps imitated (mali_env.sh)
 # Needs: make (out/), Proton Experimental for the DXVK check (VKB_WINE_DIR prepared, see README),
 # docker image vkb-arch-gamescope for the gamescope/Zink check (skipped if absent).
+# Runs side by side with other runs (other worktrees, other agents): each run has a directory of its
+# own for its server's socket and log (VKB_RUN_DIR; the log is copied to out/server.log at the end)
+# and stops only the servers it started. Two runs in one worktree take turns (out/ is shared).
 cd "$(dirname "$0")"
+mkdir -p out
+exec 9>out/.run_tests.lock
+flock -n 9 || { echo "(another run in this worktree; waiting)"; flock 9; }
+VKB_RUN_DIR=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/vkbridge-suite-$(basename "$(cd .. && pwd)")-$$.XXXX")
+export VKB_RUN_DIR VKBRIDGE_SOCKET=$VKB_RUN_DIR/server.sock VKB_SERVER_LOG=$VKB_RUN_DIR/server.log
+unset VKBRIDGE_CACHE_DIR VKB_SERVER_PID
+. ./server_start.sh
+trap 'vkb_server_stop; cp -f "$VKB_SERVER_LOG" out/server.log 2>/dev/null; rm -rf "$VKB_RUN_DIR"' EXIT
 pass=0; fail=0
 result() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "  ok   $2"; else fail=$((fail+1)); echo "  FAIL $2"; fi; }
 # A server-side protocol error fails the run even when the desktop driver shrugs it off (a missing
 # count in vkBeginCommandBuffer's encoding passed every check on RADV and crashed Mali).
 server_errors() {
-  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" out/server.log 2>/dev/null)
-  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" out/server.log)"; return 1; }
+  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG" 2>/dev/null)
+  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG")"; return 1; }
 }
 run_mode() {
   local mode=$1
   echo "== $mode"
-  : > out/server.log
+  : > "$VKB_SERVER_LOG"
   if [ "$mode" = mali ]; then . ./mali_env.sh >/dev/null; else unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API; . ./bridge_env.sh >/dev/null; fi
   timeout 120 ./out/vkbridge-smoke >out/t-smoke.log 2>&1; result $? "smoke ($(tail -1 out/t-smoke.log))"
   if [ "$mode" = mali ]; then
     # Mali's memory types (lazymem): images get an ordinary device-local type, never the lazily
     # allocated one (an older client did: image checks failed at "setup", gamescope got -2)
-    grep -q "imitating Mali's memory types" out/server.log && ! grep -q "lazily allocated, imitated" out/server.log &&
+    grep -q "imitating Mali's memory types" "$VKB_SERVER_LOG" && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG" &&
       ! grep -q "no ordinary device-local type" out/t-smoke.log
-    result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' out/server.log))"
+    result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' "$VKB_SERVER_LOG"))"
     # Other Mali drivers: push descriptors but not robustness2 (nulls in push descriptor writes are
     # replaced too), no multiDrawIndirect (Mali-G57 r32/r38: indirect draws are split)
     VKB_MISSING=robustness2,multidraw . ./mali_env.sh >/dev/null
     VKBRIDGE_HIDE_EXTS=VK_EXT_robustness2,VK_KHR_robustness2 timeout 120 ./out/vkbridge-smoke >out/t-smoke-push.log 2>&1 &&
-      grep -q "null descriptors in push descriptor writes replaced" out/server.log &&
-      grep -q "indirect draws split" out/server.log
+      grep -q "null descriptors in push descriptor writes replaced" "$VKB_SERVER_LOG" &&
+      grep -q "indirect draws split" "$VKB_SERVER_LOG"
     result $? "smoke, native push descriptors without robustness2, no multiDrawIndirect ($(tail -1 out/t-smoke-push.log))"
     . ./mali_env.sh >/dev/null
     # BC transcoded to ETC2/EAC/ASTC (compared by PSNR), then decoded as the fallback does (exact)
@@ -45,15 +56,15 @@ run_mode() {
   # its binding's shape, from the pipeline's SPIR-V
   if [ -x out/nulldesc_check ]; then
     timeout 60 ./out/nulldesc_check >out/t-nulldesc.log 2>&1 &&
-      { [ "$mode" != mali ] || [ "$(grep -c 'null descriptor stand-in made' out/server.log)" -ge 6 ]; }
-    result $? "nulldesc_check ($(tail -1 out/t-nulldesc.log)$([ "$mode" = mali ] && echo "; $(grep -c 'null descriptor stand-in made' out/server.log) stand-in shapes"))"
+      { [ "$mode" != mali ] || [ "$(grep -c 'null descriptor stand-in made' "$VKB_SERVER_LOG")" -ge 6 ]; }
+    result $? "nulldesc_check ($(tail -1 out/t-nulldesc.log)$([ "$mode" = mali ] && echo "; $(grep -c 'null descriptor stand-in made' "$VKB_SERVER_LOG") stand-in shapes"))"
   fi
   if [ -x out/opaque_check ]; then timeout 60 ./out/opaque_check >out/t-opaque.log 2>&1; result $? "opaque_check ($(tail -1 out/t-opaque.log))"; fi
   # Zink's shared linear images (dma-buf, no modifier): Mali refuses them at that tiling (imitated:
   # dmabuflinear) and Skyrim SE exited on its 1D one; the bridge makes them without the handle type
   if [ -x out/dmabuf_image_check ]; then
     timeout 60 ./out/dmabuf_image_check >out/t-dmabuf-image.log 2>&1 &&
-      { [ "$mode" != mali ] || grep -q "dma-buf image refused at tiling" out/server.log; }
+      { [ "$mode" != mali ] || grep -q "dma-buf image refused at tiling" "$VKB_SERVER_LOG"; }
     result $? "dmabuf_image_check ($(tail -1 out/t-dmabuf-image.log))"
   fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
@@ -118,18 +129,18 @@ run_mode() {
 divisor_variants() {
   echo "== KHR-only divisor drivers"
   local l
-  l=$(wc -l < out/server.log)
+  l=$(wc -l < "$VKB_SERVER_LOG")
   VKB_MISSING=divisorzero,VK_EXT_vertex_attribute_divisor . ./bridge_env.sh >/dev/null
   VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check >out/t-divisor-g925.log 2>&1 &&
     VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check --core14 >>out/t-divisor-g925.log 2>&1 &&
-    tail -n +$((l+1)) out/server.log | grep -q "lacks vertexAttributeInstanceRateZeroDivisor; emulated instead" &&
-    tail -n +$((l+1)) out/server.log | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor"
+    tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "lacks vertexAttributeInstanceRateZeroDivisor; emulated instead" &&
+    tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor"
   result $? "divisor_check, Mali-G925's KHR divisor without the zero divisor: emulated ($(grep -c '^PASS' out/t-divisor-g925.log) passed)"
-  l=$(wc -l < out/server.log)
+  l=$(wc -l < "$VKB_SERVER_LOG")
   VKB_MISSING=VK_EXT_vertex_attribute_divisor . ./bridge_env.sh >/dev/null
   VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check >out/t-divisor-khr.log 2>&1 &&
-    tail -n +$((l+1)) out/server.log | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor" &&
-    ! tail -n +$((l+1)) out/server.log | grep -q "emulation 0x[0-9a-f]* installed"
+    tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor" &&
+    ! tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "emulation 0x[0-9a-f]* installed"
   result $? "divisor_check, complete KHR-only divisor: EXT name aliased, native ($(tail -1 out/t-divisor-khr.log))"
 }
 run_mode plain

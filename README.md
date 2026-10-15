@@ -145,6 +145,9 @@ imitating what Mali lacks. Every release passes its regression suite on both:
 make -C host && host/run_tests.sh
 ```
 
+Runs from different checkouts can go at the same time: each run has its own server, socket and
+log, and stops only its own servers.
+
 ## Environment toggles worth knowing
 
 The server reads these from its environment. Most of the ones read per device can also go in
