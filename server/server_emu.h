@@ -64,6 +64,7 @@ void vkb_emu_gfx_free(void *gfx);
 /* BCn (server_emu_bcn.c) */
 void vkb_emu_bcn_install(vkb_srv_table *dev);
 void vkb_emu_bcn_uninstall(vkb_srv_table *dev);
+void vkb_emu_bcn_quiesce(vkb_srv_table *dev);
 VkFormat vkb_emu_bcn_view_format(vkb_emu_device *e, VkImage image, VkFormat requested);
 void vkb_emu_bcn_buffer_usage(vkb_emu_device *e, VkBufferCreateInfo *ci);
 int vkb_emu_bcn_blocks_readback(vkb_emu_device *e, VkImage img);

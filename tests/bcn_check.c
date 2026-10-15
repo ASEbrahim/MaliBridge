@@ -16,7 +16,11 @@
  * (photo, gradient, sky) and its blocks decoded here (astc_decode), so a GPU without ASTC HDR (RADV)
  * still measures it. `bcn_check hdr` runs only that. Then a 2048x2048 mip chain (BC7, BC1; with
  * BCN_BENCH=1 also BC3, BC4, BC5), uploaded a level at a time: each level's time and PSNR, which
- * show the server's per-level quality choice (VKBRIDGE_BC_TRANSCODE_QUALITY=auto).
+ * show the server's per-level quality choice (VKBRIDGE_BC_TRANSCODE_QUALITY=auto); BCN_NO_LEVELS=1
+ * leaves the chains out. The 4096x4096 uploads run twice: the first may include building its
+ * transcoder (the server does that at the first upload that needs it), the second is warm.
+ * `bcn_check pcache [file]`: what the driver's pipeline cache spares on two of the transcoders
+ * (compute pipelines), in this process and from the data an earlier run left in file.
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -70,7 +74,7 @@ F(vkFreeMemory); F(vkGetPhysicalDeviceProperties); F(vkCreateImageView); F(vkDes
 F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCmdCopyImage2); F(vkCreateShaderModule); F(vkDestroyShaderModule);
 F(vkCreateDescriptorSetLayout); F(vkCreatePipelineLayout); F(vkCreateComputePipelines); F(vkCreateDescriptorPool);
 F(vkAllocateDescriptorSets); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
-F(vkCmdDispatch);
+F(vkCmdDispatch); F(vkCreatePipelineCache); F(vkGetPipelineCacheData); F(vkDestroyPipelineCache); F(vkDestroyPipeline);
 #undef F
 
 static uint32_t find_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -1381,6 +1385,13 @@ static void barrier_all(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkI
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
+static double ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1e3 + (t1.tv_nsec - t0->tv_nsec) / 1e6;
+}
+
 static void submit(VkCommandBuffer cb)
 {
     vkEndCommandBuffer(cb);
@@ -1727,6 +1738,108 @@ static void test_levels(VkFormat f, const char *name)
     vkFreeMemory(dev, im, NULL);
 }
 
+/* ------------------------------------------------------------------ pipeline cache, compute */
+
+/* One build of code into cache: ms, or -1. */
+static double pc_build(const uint32_t *code, size_t size, VkPipelineCache cache)
+{
+    static VkPipelineLayout layout;
+    if (!layout) {
+        VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, b};
+        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkDescriptorSetLayout dsl;
+        if (vkCreateDescriptorSetLayout(dev, &dci, NULL, &dsl)) return -1;
+        VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 1, &pr};
+        if (vkCreatePipelineLayout(dev, &plci, NULL, &layout)) return -1;
+    }
+    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size, code};
+    VkShaderModule sm;
+    if (vkCreateShaderModule(dev, &smci, NULL, &sm)) return -1;
+    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
+                                        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL},
+                                        layout, VK_NULL_HANDLE, 0};
+    VkPipeline p;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpci, NULL, &p);
+    double ms = ms_since(&t0);
+    vkDestroyShaderModule(dev, sm, NULL);
+    if (r) return -1;
+    vkDestroyPipeline(dev, p, NULL);
+    return ms;
+}
+
+static VkPipelineCache pc_make(const void *data, size_t size, VkResult *r)
+{
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, size, data};
+    VkPipelineCache c = VK_NULL_HANDLE;
+    *r = vkCreatePipelineCache(dev, &ci, NULL, &c);
+    return *r ? VK_NULL_HANDLE : c;
+}
+
+/* `bcn_check pcache [file]`: whether the driver's VkPipelineCache spares compiling a large compute
+ * pipeline (the bridge's transcoders) - into an empty cache; again into another empty one (what the
+ * driver keeps in memory by itself); from the first cache's data; and from the data an earlier run
+ * wrote to file (a new process: what the bridge's persistent cache can give). The bridge seeds the
+ * first two empty caches an app makes with its own cache: two are made and dropped first. */
+static void test_pcache(const uint32_t *code, size_t size, const char *name, const char *file, int slot)
+{
+    static int burnt;
+    VkResult r;
+    for (; burnt < 2; burnt++) {
+        VkPipelineCache c = pc_make(NULL, 0, &r);
+        if (c) vkDestroyPipelineCache(dev, c, NULL);
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s.%d", file, slot);
+    size_t fsize = 0;
+    void *fdata = NULL;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && (fdata = malloc((size_t)n)) && fread(fdata, 1, (size_t)n, f) == (size_t)n) fsize = (size_t)n;
+        fclose(f);
+    }
+    /* from an earlier run's file first, before this process has built anything */
+    double from_file = -2;
+    VkResult rf = VK_SUCCESS;
+    if (fsize) {
+        VkPipelineCache c = pc_make(fdata, fsize, &rf);
+        from_file = c ? pc_build(code, size, c) : -1;
+        if (c) vkDestroyPipelineCache(dev, c, NULL);
+    }
+    VkPipelineCache a = pc_make(NULL, 0, &r);
+    double cold = a ? pc_build(code, size, a) : -1;
+    size_t dsize = 0;
+    void *data = NULL;
+    if (a && vkGetPipelineCacheData(dev, a, &dsize, NULL) == VK_SUCCESS && dsize && (data = malloc(dsize)) &&
+        vkGetPipelineCacheData(dev, a, &dsize, data) != VK_SUCCESS)
+        dsize = 0;
+    VkPipelineCache a2 = pc_make(NULL, 0, &r);
+    double again = a2 ? pc_build(code, size, a2) : -1;
+    VkResult rd = VK_SUCCESS;
+    VkPipelineCache b = dsize ? pc_make(data, dsize, &rd) : VK_NULL_HANDLE;
+    double from_data = b ? pc_build(code, size, b) : -1;
+    if (!fsize && dsize && (f = fopen(path, "wb"))) {
+        fwrite(data, 1, dsize, f);
+        fclose(f);
+    }
+    printf("INFO pipeline cache, %s (%zu bytes of SPIR-V): cold %.1f ms into an empty cache (its data: %zu bytes); "
+           "again into another empty one %.1f ms; from the data %.1f ms (create %d)", name, size, cold, dsize, again, from_data, rd);
+    if (fsize) printf("; from %s (%zu bytes, an earlier run) %.1f ms (create %d)\n", path, fsize, from_file, rf);
+    else printf("; %s written for the next run\n", path);
+    if (cold < 0) failures++;
+    if (a) vkDestroyPipelineCache(dev, a, NULL);
+    if (a2) vkDestroyPipelineCache(dev, a2, NULL);
+    if (b) vkDestroyPipelineCache(dev, b, NULL);
+    free(data);
+    free(fdata);
+}
+
 /* ------------------------------------------------------------------ BC6H -> ASTC HDR, the shader itself */
 
 /* The bridge's BC6H transcoder (spv_bc6h_astc from server/bc_spv.h) run directly over bw x bh
@@ -2002,7 +2115,8 @@ static void test_size(VkFormat f, const char *name, uint32_t texel_bytes, VkImag
 
 /* 4096x4096 BC7, 2 layers, in one region: 128 MiB decoded, more than the bridge decodes into one
  * command buffer's scratch before reusing it. BCN_BENCH=1: also BC1, BC3, BC4 and BC5, for the
- * upload times. */
+ * upload times. Uploaded twice: the first may be the first use of its pipeline (the server
+ * builds it while it replays the command buffer, inside the time), the second is warm. */
 static void test_large(VkFormat f, const char *name)
 {
     enum { S = 4096, LAYERS = 2 };
@@ -2021,16 +2135,18 @@ static void test_large(VkFormat f, const char *name)
         random_level(f, &lv[l], S, S);
         memcpy((uint8_t *)upp + per * l, lv[l].blocks, per);
     }
-    VkCommandBuffer cb = begin();
-    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, {0, 0, 0}, {S, S, 1}};
-    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    submit(cb);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("INFO %s 4096x4096x2 upload: %.1f ms (submit to idle)\n", name, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    for (int pass = 0; pass < 2; pass++) {
+        VkCommandBuffer cb = begin();
+        barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, {0, 0, 0}, {S, S, 1}};
+        vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        submit(cb);
+        double ms = ms_since(&t0);
+        printf("INFO %s 4096x4096x2 upload%s: %.1f ms (submit to idle)\n", name, pass ? " again (warm)" : "", ms);
+    }
     int bad = 0;
     for (uint32_t l = 0; l < LAYERS; l++) bad += compare_level(img, f, 0, l, &lv[l], 2.5f / 255.0f, name);
     if (bad) {
@@ -2116,9 +2232,11 @@ static void test_many_cbs(void)
 int main(int argc, char **argv)
 {
     int gpu = 0, hdr_only = 0;
+    const char *pcache_file = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "transcode")) tx = 1;
         else if (!strcmp(argv[i], "hdr")) hdr_only = 1;
+        else if (!strcmp(argv[i], "pcache")) pcache_file = i + 1 < argc ? argv[++i] : "bcn_check-pcache.bin";
         else gpu = atoi(argv[i]);
     }
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
@@ -2161,6 +2279,7 @@ int main(int argc, char **argv)
     G(vkCreateShaderModule); G(vkDestroyShaderModule); G(vkCreateDescriptorSetLayout); G(vkCreatePipelineLayout);
     G(vkCreateComputePipelines); G(vkCreateDescriptorPool); G(vkAllocateDescriptorSets); G(vkUpdateDescriptorSets);
     G(vkCmdBindPipeline); G(vkCmdBindDescriptorSets); G(vkCmdPushConstants); G(vkCmdDispatch);
+    G(vkCreatePipelineCache); G(vkGetPipelineCacheData); G(vkDestroyPipelineCache); G(vkDestroyPipeline);
 #undef G
     vkGetDeviceQueue(dev, 0, 0, &queue);
     if (tx && props.apiVersion >= VK_API_VERSION_1_3) {
@@ -2180,6 +2299,12 @@ int main(int argc, char **argv)
     }
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, 0};
     vkCreateCommandPool(dev, &pci, NULL, &pool);
+    if (pcache_file) { /* `bcn_check pcache [file]`: what the driver's pipeline cache does for compute pipelines */
+        test_pcache(spv_bc7_astc, sizeof(spv_bc7_astc), "BC7 -> ASTC transcoder", pcache_file, 0);
+        test_pcache(spv_bc1_etc2, sizeof(spv_bc1_etc2), "BC1 -> ETC2 transcoder", pcache_file, 1);
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
     if (hdr_only) { /* `bcn_check hdr`: only the BC6H -> ASTC HDR transcoder, run directly (any GPU) */
         test_hdr_shader();
         printf("%s\n", failures ? "FAILED" : "OK");
@@ -2212,9 +2337,12 @@ int main(int argc, char **argv)
             test_format(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat (all 14 modes, decoded)", 0.002f);
         }
         test_hdr_shader();
-        test_levels(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4");
-        test_levels(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB -> ETC2 RGB8");
-        if (getenv("BCN_BENCH")) {
+        /* BCN_NO_LEVELS=1: no mip chains, so (under auto) the 4096x4096 uploads below are the fast
+         * transcoders' first use, as before the chains were added */
+        int levels = !getenv("BCN_NO_LEVELS");
+        if (levels) test_levels(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4");
+        if (levels) test_levels(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB -> ETC2 RGB8");
+        if (levels && getenv("BCN_BENCH")) {
             test_levels(VK_FORMAT_BC3_UNORM_BLOCK, "BC3 -> ASTC 4x4");
             test_levels(VK_FORMAT_BC4_UNORM_BLOCK, "BC4 -> EAC R11");
             test_levels(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 -> EAC RG11");

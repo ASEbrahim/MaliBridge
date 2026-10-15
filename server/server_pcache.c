@@ -665,6 +665,17 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     pthread_mutex_unlock(&pc_lock);
 }
 
+VkResult vkb_pcache_create_compute(vkb_srv_table *t, const VkComputePipelineCreateInfo *ci, VkPipeline *out)
+{
+    vkb_pcache *p = t->pcache;
+    if (!p) return t->real.vkCreateComputePipelines(t->device, VK_NULL_HANDLE, 1, ci, NULL, out);
+    __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
+    pthread_rwlock_rdlock(&p->use);
+    VkResult r = t->real.vkCreateComputePipelines(t->device, p->cache, 1, ci, NULL, out);
+    pthread_rwlock_unlock(&p->use);
+    return r;
+}
+
 /* Before the device is destroyed (by the app, or after its process went): what the app's caches
  * hold goes into ours, a last save, then the caches go. */
 void vkb_pcache_device_destroy(vkb_srv_table *t)
