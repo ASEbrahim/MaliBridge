@@ -103,7 +103,9 @@ for _ in $(seq 100); do grep -q "background probes done" $log && break; sleep 0.
 [ -S "$sock" ] && grep -q "probe(s) continue in the background" $log && grep -q "background probes done" $log &&
   grep -q '"complete": true' $(ls $work/c6/probe-*.json | head -1)
 step $? "start budget exceeded: the rest probed in the background, profile complete"
-# 7
+# 7 (with test switches left on: SPIR-V evidence mode and an env override, flagged at the top)
+mkdir -p $work/c3/dump-spirv
+echo "VKBRIDGE_REPORT_TEST_SWITCH=1" >$work/c3/env
 start $work/c3 $work/s7 VKBRIDGE_PROBE_BUDGET_S=0 VKBRIDGE_PROBE_FAKE=$fake
 export VKBRIDGE_CLIENT_LOG=$work/s7/vkbridge-client.log
 timeout 60 "$out/vkbridge-smoke" >$work/7a.log 2>&1
@@ -116,8 +118,10 @@ python3 -c "import json,sys; r=json.load(open(sys.argv[1])); assert r['issue_cou
   $work/s7/malibridge-report.json 2>$work/7j.log &&
   grep -q "^## Summary: [0-9]* issues" $rep && grep -q "probe divisor\( (GPU 0)\)\?: fail -> vertex attribute divisor emulated" $rep &&
   grep -q "probe compile_aces\( (GPU 0)\)\?: hang -> UE4 LUT pipelines get their stand-in at once" $rep && grep -q "### vkbridge-smoke" $rep &&
-  grep -q "pipelines: [0-9]* built" $rep && { [ $vk = 0 ] || grep -q "frames: \`pid=.*presents=" $rep; }
-step $? "session report: $(grep -m1 -o 'Summary: [0-9]* issues' $rep), $(grep -c '^### ' $rep) processes$([ $vk = 1 ] && echo ", vkcube's frames: $(grep -o 'fps_avg=[0-9.]*' $rep | head -1)")"
+  grep -q "pipelines: [0-9]* built" $rep && { [ $vk = 0 ] || grep -q "frames: \`pid=.*presents=" $rep; } &&
+  [ $(grep -n -m1 "^> \*\*Warning, test switch on: SPIR-V evidence mode" $rep | cut -d: -f1) -lt $(grep -n -m1 "^## Summary" $rep | cut -d: -f1) ] &&
+  grep -q "^> \*\*Warning, test switch on: overrides from .*VKBRIDGE_REPORT_TEST_SWITCH=1" $rep && grep -q "test switch on: SPIR-V evidence mode" $work/s7/malibridge-report.json
+step $? "session report: test switches flagged on top, $(grep -m1 -o 'Summary: [0-9]* issues' $rep), $(grep -c '^### ' $rep) processes$([ $vk = 1 ] && echo ", vkcube's frames: $(grep -o 'fps_avg=[0-9.]*' $rep | head -1)")"
 python3 "$tools/malibridge_report_diff.py" "$prof" "$prof3" >$work/7d.log 2>&1
 grep -q "probe divisor: pass -> fail, emu 0x0 -> 0x2" $work/7d.log && grep -q "probe compile_aces: pass -> hang" $work/7d.log &&
   ! python3 "$tools/malibridge_report_diff.py" "$prof" "$prof3" --regressions >/dev/null 2>&1 &&

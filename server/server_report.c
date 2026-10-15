@@ -724,10 +724,57 @@ static const rp_proc *by_pid(int pid)
     return NULL;
 }
 
+/* Test switches left on, which change what the session does (and costs): SPIR-V evidence mode
+ * (<cache dir>/dump-spirv exists: every driver module saved there - 249 MB once on a tablet that
+ * nobody remembered setting it on) and the <cache dir>/env overrides. Each a line into cb. */
+static double dump_scan_s = -1e9;
+static long long dump_bytes;
+static long dump_files;
+
+static void test_switches(void (*cb)(void *arg, const char *line), void *arg)
+{
+    const char *dir = vkb_pcache_dir();
+    char line[1700], path[700];
+    if (dir) {
+        snprintf(path, sizeof(path), "%s/dump-spirv", dir);
+        if (access(path, F_OK) == 0) {
+            if (now_s() - dump_scan_s > 60) { /* thousands of files: not every 5 s */
+                dump_scan_s = now_s();
+                dump_bytes = 0;
+                dump_files = 0;
+                DIR *d = opendir(path);
+                struct dirent *e;
+                while (d && (e = readdir(d)) && dump_files < 200000) {
+                    struct stat st;
+                    if (e->d_name[0] == '.' || fstatat(dirfd(d), e->d_name, &st, 0) != 0) continue;
+                    dump_bytes += st.st_size;
+                    dump_files++;
+                }
+                if (d) closedir(d);
+            }
+            snprintf(line, sizeof(line),
+                     "test switch on: SPIR-V evidence mode (%s exists: every shader module the driver gets is saved there; %ld files, %lld MB) - delete the directory unless collecting evidence",
+                     path, dump_files, dump_bytes >> 20);
+            cb(arg, line);
+        }
+    }
+    char env[1500];
+    if (*vkb_srv_env_list(env, sizeof(env))) {
+        snprintf(line, sizeof(line), "test switch on: overrides from %s/env in effect: %s", dir ? dir : "<cache dir>", env);
+        cb(arg, line);
+    }
+}
+
+static void md_switch(void *arg, const char *line)
+{
+    fprintf(arg, "> **Warning, %s**\n\n", line);
+}
+
 /* Everything that should be looked at, one line each (the report's head). */
 static int list_issues(FILE *f, int json)
 {
     issues is = {f, 0, json};
+    test_switches(probe_issue, &is);
     vkb_probe_issues(probe_issue, &is);
     char nm[120];
     for (int lv = VKB_LOG_ERROR; lv <= VKB_LOG_WARN; lv++)
@@ -809,6 +856,7 @@ static void write_md(FILE *f, int final)
     fprintf(f, "# MaliBridge session report\n\n");
     fprintf(f, "Session started %s, report written %s (%.0f s in)%s. Machine-readable: `malibridge-report.json`.\n\n", ts0, ts, now_s(),
             final ? ", final" : "; rewritten every 5 s");
+    test_switches(md_switch, f);
     int n = list_issues(NULL, 0);
     fprintf(f, "## Summary: %d issue%s\n\n", n, n == 1 ? "" : "s");
     if (n) list_issues(f, 0);
