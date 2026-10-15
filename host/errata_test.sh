@@ -7,7 +7,8 @@
 #      r49p1 only for a beta build and only in safe mode, on r51p0, off from r52p0;
 #   2  probe-driven ones (VKBRIDGE_ERRATA_PROBE): a failed probe turns its erratum on, a probe that
 #      only records does not;
-#   3  VKBRIDGE_ERRATA=+name,-name forces, an unknown name is warned about;
+#   3  VKBRIDGE_ERRATA=+name,-name forces, an unknown name is warned about; a later device with
+#      the same decisions logs one short line, another mode logs them in full again;
 #   4  the no-op example fix with its imitation beneath it, on a device whose null descriptors are
 #      emulated: the bridge's own image views (the stand-ins; the app makes none) go through both;
 #   5  the protocol hash is unchanged (the layer is server-side only).
@@ -85,6 +86,18 @@ got=$(on_set)
 [ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,clamp_zero,example ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
   echo "$new" | grep -q "no erratum named no_such_erratum" && echo "$new" | grep -q "errata: example ON (VKBRIDGE_ERRATA=+example)"
 step $? "VKBRIDGE_ERRATA=+example,-view_counts: $got; the unknown name warned about"
+# the same decisions again: one short line, not the reasons again; another mode: in full again
+first=$(echo "$new" | grep -o 'errata: device [0-9]*,' | tail -1 | grep -o '[0-9]*')
+device VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts
+got=$(on_set)
+[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,clamp_zero,example ] && ! echo "$new" | grep -qE "errata: [a-z_]* O(N|FF) \(" &&
+  echo "$new" | grep -q "errata: device [0-9]*: same as device $first (safe mode): on $got\$" &&
+  ! echo "$new" | grep -q "clamp_zero gives"
+r=$?; same=$(echo "$new" | grep -o 'errata: device [0-9]*: same as.*' | tail -1)
+device VKBRIDGE_MODE=performance VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts
+[ $r = 0 ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
+  echo "$new" | grep -q "errata: device [0-9]*, .*, performance mode: on $(on_set);" && echo "$new" | grep -q "clamp_zero gives"
+step $? "a later device with the same decisions: \"${same:-no short line}\"; in performance mode in full again (on $(on_set))"
 
 # 4 the example fix and its imitation, beneath the null-descriptor emulation
 printf 'VKBRIDGE_FAKE_MISSING=robustness2\nVKBRIDGE_ERRATA=+example\nVKBRIDGE_ERRATA_IMITATE=example\n' > "$cache/env"

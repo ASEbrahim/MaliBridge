@@ -51,6 +51,11 @@ vkb_errata_dev *vkb_errata_cur(void);
  * last device's. */
 const vkb_dispatch *vkb_errata_next(int imitation);
 
+/* A device's setup line (an install's settings): at info level the first time this server process
+ * logs that text or with a device whose decisions log in full, at debug level after, so a session's
+ * dozens of devices log it once. */
+void vkb_errata_info_once(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 /* server_wait.c: wait_retry (MK-01), waits the driver fails with -3 after a signal */
 void vkb_wait_retry_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e);

@@ -17,7 +17,9 @@
  *   3  the mode: safe (the default) or performance (server_mode.c).
  * Each erratum says per mode which of these turn it on: always, a failed probe, the driver in an
  * affected range, an Arm driver whose version cannot be decoded. One line per erratum that ends up
- * on says why, and one line sums up the device.
+ * on says why, and one line sums up the device - in full once per server process for each (GPU,
+ * driver, mode, decisions and their reasons); a later device with the very same ones logs one line
+ * "errata: device N: same as device M (<mode>): on ..." (the full lines at debug level).
  *
  * Switches (from the environment or <cache dir>/env, read at each vkCreateDevice):
  *   VKBRIDGE_ERRATA=+name,-name,...   forces a fix on or off (a bare name is +name); forcing a fix
@@ -48,6 +50,8 @@
 #include "server_errata.h"
 
 #include <pthread.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -420,6 +424,71 @@ int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driv
     return n;
 }
 
+/* The texts logged in full so far in this server process (a device's decision block, an install's
+ * settings line), each with the device that logged it; past SEEN_MAX everything logs in full. */
+#define SEEN_MAX 256
+static struct {
+    uint64_t hash;
+    char *text;
+    uint32_t dev;
+} seen[SEEN_MAX];
+static int seen_n;
+static pthread_mutex_t seen_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 1 (and *first: the device that logged it) when the text was logged in full before; else 0, and
+ * the text is recorded as logged by dev */
+static int seen_before(const char *text, uint32_t dev, uint32_t *first)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *c = (const unsigned char *)text; *c; c++) h = (h ^ *c) * 1099511628211ull;
+    int r = 0;
+    pthread_mutex_lock(&seen_lock);
+    for (int i = 0; i < seen_n; i++)
+        if (seen[i].hash == h && !strcmp(seen[i].text, text)) {
+            if (first) *first = seen[i].dev;
+            r = 1;
+            break;
+        }
+    if (!r && seen_n < SEEN_MAX && (seen[seen_n].text = strdup(text))) {
+        seen[seen_n].hash = h;
+        seen[seen_n].dev = dev;
+        seen_n++;
+    }
+    pthread_mutex_unlock(&seen_lock);
+    return r;
+}
+
+/* Set while a device whose decision block logs in full installs its fixes: their settings lines
+ * log in full with it */
+static __thread int init_full;
+
+void vkb_errata_info_once(const char *fmt, ...)
+{
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    if (!seen_before(msg, 0, NULL) || init_full)
+        vkb_log(VKB_LOG_INFO, "%s", msg);
+    else if (vkb_log_level() >= VKB_LOG_DEBUG)
+        vkb_log(VKB_LOG_DEBUG, "%s", msg);
+}
+
+/* Appends one line to a decision block */
+static void block_add(char *b, size_t cap, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void block_add(char *b, size_t cap, const char *fmt, ...)
+{
+    size_t n = strlen(b);
+    if (n + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b + n, cap - n, fmt, ap);
+    va_end(ap);
+    n = strlen(b);
+    if (n + 1 < cap) b[n] = '\n', b[n + 1] = 0;
+}
+
 void vkb_errata_device_init(vkb_srv_table *t)
 {
     vkb_errata_dev *e = calloc(1, sizeof(*e));
@@ -445,6 +514,7 @@ void vkb_errata_device_init(vkb_srv_table *t)
                  *d.build ? " \"" : "", d.build, *d.build ? "\"" : "", d.family == FAM_JM ? "job manager" : "CSF");
 
     char on_list[256] = "", off_list[256] = "";
+    char block[VKB_ERRATA_COUNT * 480 + 1024] = "";
     for (int i = 0; i < VKB_ERRATA_COUNT; i++) {
         const erratum *x = &errata[i];
         char why[320];
@@ -452,9 +522,9 @@ void vkb_errata_device_init(vkb_srv_table *t)
         int on = decide_erratum(i, &d, gpu, perf, &w, &targeted, why, sizeof(why), &forced_off);
         if (forced_off) {
             if (i == VKB_ERRATUM_WAIT_RETRY && w.wait_fix_off)
-                VKB_INFO("errata: %s OFF (VKBRIDGE_WAIT_FIX=0; it would be on: %s)", x->name, why);
+                block_add(block, sizeof(block), "errata: %s OFF (VKBRIDGE_WAIT_FIX=0; it would be on: %s)", x->name, why);
             else
-                VKB_INFO("errata: %s OFF (VKBRIDGE_ERRATA=-%s; it would be on: %s)", x->name, x->name, why);
+                block_add(block, sizeof(block), "errata: %s OFF (VKBRIDGE_ERRATA=-%s; it would be on: %s)", x->name, x->name, why);
         }
         char *l = on ? on_list : off_list;
         size_t n = strlen(l);
@@ -464,13 +534,25 @@ void vkb_errata_device_init(vkb_srv_table *t)
             if (targeted) e->targeted |= 1u << i;
             if (w.plus >> i & 1) e->forced |= 1u << i;
             if (x->install)
-                VKB_INFO("errata: %s ON (%s)%s%s", x->name, why, x->mk ? " - " : "", x->mk ? x->mk : "");
+                block_add(block, sizeof(block), "errata: %s ON (%s)%s%s", x->name, why, x->mk ? " - " : "", x->mk ? x->mk : "");
             else if (x->elsewhere)
-                VKB_INFO("errata: %s ON (%s) - %s, fixed in %s", x->name, why, x->mk, x->elsewhere);
+                block_add(block, sizeof(block), "errata: %s ON (%s) - %s, fixed in %s", x->name, why, x->mk, x->elsewhere);
             else
-                VKB_INFO("errata: %s ON (%s) - %s, no fix in this build yet", x->name, why, x->mk);
+                block_add(block, sizeof(block), "errata: %s ON (%s) - %s, no fix in this build yet", x->name, why, x->mk);
         }
     }
+
+    /* Logged in full once per (GPU, driver, mode, decisions with their reasons, imitations) */
+    char key[sizeof(block) + 1400];
+    snprintf(key, sizeof(key), "%s%s|%s|%s|on %s|off %s|imitate 0x%x", block, gpu, drv, mode, on_list, off_list, imitate);
+    uint32_t first = 0;
+    int same = seen_before(key, t->id, &first);
+    int level = same ? VKB_LOG_DEBUG : VKB_LOG_INFO;
+    if (level <= vkb_log_level())
+        for (char *l = block, *nl; *l; l = nl + 1) {
+            if (!(nl = strchr(l, '\n'))) break;
+            vkb_log(level, "%.*s", (int)(nl - l), l);
+        }
 
     /* The imitations first (beneath), then the fixes over them. */
     e->next_imi = t->real;
@@ -482,15 +564,22 @@ void vkb_errata_device_init(vkb_srv_table *t)
         } else if (imitate >> i & 1)
             VKB_WARN("errata: %s has no imitation in this build", errata[i].name);
     e->next_fix = t->real;
+    init_full = !same;
     for (int i = 0; i < VKB_ERRATA_COUNT; i++)
         if ((e->on >> i & 1) && errata[i].install) errata[i].install(t, e);
+    init_full = 0;
     pthread_mutex_lock(&last_next_lock);
     last_next_fix = e->next_fix;
     last_next_imi = e->next_imi;
     pthread_mutex_unlock(&last_next_lock);
     __atomic_store_n(&last_dev, e, __ATOMIC_RELEASE);
-    VKB_INFO("errata: device %u, %s, %s, %s: on %s; off %s", t->id, gpu, drv, mode, *on_list ? on_list : "none",
-             *off_list ? off_list : "none");
+    if (same) {
+        VKB_INFO("errata: device %u: same as device %u (%s): on %s", t->id, first, mode, *on_list ? on_list : "none");
+        VKB_DBG("errata: device %u, %s, %s, %s: on %s; off %s", t->id, gpu, drv, mode, *on_list ? on_list : "none",
+                *off_list ? off_list : "none");
+    } else
+        VKB_INFO("errata: device %u, %s, %s, %s: on %s; off %s", t->id, gpu, drv, mode, *on_list ? on_list : "none",
+                 *off_list ? off_list : "none");
 }
 
 void vkb_errata_device_destroy(vkb_srv_table *t)

@@ -482,7 +482,7 @@ void vkb_errata_views_install(vkb_srv_table *t, vkb_errata_dev *e)
     if (q && *q) {
         long n = strtol(q, NULL, 0);
         v->qcap = n < 0 ? 0 : n > 65536 ? 65536 : (uint32_t)n;
-        VKB_INFO("errata: view_quarantine holds %u views (VKBRIDGE_VIEW_QUARANTINE)", v->qcap);
+        vkb_errata_info_once("errata: view_quarantine holds %u views (VKBRIDGE_VIEW_QUARANTINE)", v->qcap);
     }
     v->img_cap = v->qcap / 4 ? v->qcap / 4 : 1;
     if (v->qcap && !(v->q = calloc(v->qcap, sizeof(*v->q)))) v->qcap = 0;

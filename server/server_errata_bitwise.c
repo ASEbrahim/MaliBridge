@@ -279,7 +279,7 @@ static vkb_errata_bitwise *get_state(vkb_errata_dev *e)
         const char *all = vkb_srv_env("VKBRIDGE_BITWISE_ALL");
         if (all && *all && strcmp(all, "0")) {
             e->bitwise->flags |= VKB_BITWISE_ALL;
-            VKB_INFO("errata: bitwise_scalar rewrites every integer vector bitwise op (VKBRIDGE_BITWISE_ALL)");
+            vkb_errata_info_once("errata: bitwise_scalar rewrites every integer vector bitwise op (VKBRIDGE_BITWISE_ALL)");
         }
     }
     return e->bitwise;

@@ -127,7 +127,8 @@ step $? "safe mode, r54p2, no probe result: off (a flip where it is not needed c
 for t in vkbridge-smoke divisor_check gsfold_check recycle_check nulldesc_check view3d_check; do
   [ -x "$out/$t" ] || continue
   run VKBRIDGE_ERRATA=+viewport_flip -- $t
-  [ $rc = 0 ] && echo "$new" | grep -q "errata: viewport_flip ON (VKBRIDGE_ERRATA=+viewport_flip[;)]"
+  # (a device with the same decisions as an earlier one logs only "same as device N ...: on ...")
+  [ $rc = 0 ] && echo "$new" | grep -qE "errata: viewport_flip ON \(VKBRIDGE_ERRATA=\+viewport_flip[;)]|errata: device [0-9]+: same as device [0-9]+ \([a-z]+ mode\): on ([a-z_]+,)*viewport_flip(,|\$)"
   step $? "$t with +viewport_flip: $res; $(lg '[0-9]* pipeline(s) made ([^)]*), [0-9]* with a flipped stage')"
 done
 run VKBRIDGE_ERRATA=+viewport_flip VKBRIDGE_ERRATA_IMITATE=viewport_flip -- vkbridge-smoke

@@ -240,7 +240,7 @@ void vkb_errata_clampzero_install(vkb_srv_table *t, vkb_errata_dev *e)
     if (all == 1 || (all < 0 && forced)) s->flags |= VKB_CLAMP_ZERO_ALL;
     if (env_flag("VKBRIDGE_CLAMP_ZERO_BFI") == 1) s->flags |= VKB_CLAMP_ZERO_BFI;
     if (!e->probe)
-        VKB_INFO("errata: clamp_zero gives %s an opaque zero (%s)%s",
+        vkb_errata_info_once("errata: clamp_zero gives %s an opaque zero (%s)%s",
                  s->flags & VKB_CLAMP_ZERO_ALL ? "every min/max/clamp with a constant zero limit" : "min/max/clamp of constant-selected values",
                  s->flags & VKB_CLAMP_ZERO_BFI ? "OpBitFieldInsert, VKBRIDGE_CLAMP_ZERO_BFI" : "a Private variable",
                  all == 1 ? " - VKBRIDGE_CLAMP_ZERO_ALL" : all < 0 && forced ? " - forced on, the wide form (VKBRIDGE_CLAMP_ZERO_ALL=0: the narrow one)" : "");
