@@ -72,7 +72,7 @@ A rough guide from our testing, mostly on the Mali-G720. A newer GPU (the G925 r
 | Group | Games | What to expect |
 |---|---|---|
 | Easy | Stardew Valley, Celeste, Hollow Knight, Hollow Knight: Silksong, Inscryption, Doki Doki Literature Club, Portal, Hades, Cuphead, Dead Cells | Smooth on default settings. Good first tests. |
-| Medium | Half-Life 2, Portal 2, ULTRAKILL, ENDER LILIES, Lethal Company, Skyrim Special Edition | Playable, 40-75 fps on the G720. Portal 2 and Half-Life 2 need the compatibility tool set by hand (see above); Skyrim on Medium. |
+| Medium | Half-Life 2, Portal 2, ULTRAKILL, ENDER LILIES, Lethal Company, Skyrim Special Edition | Playable, about 40-75 fps on the G720, with some drops (Portal 2 dips to around 30). Portal 2 and Half-Life 2 need the compatibility tool set by hand (see above); Skyrim on Medium. |
 | Hard | Subnautica, Risk of Rain 2 | Run, about 20-30 fps on the G720. Lower the resolution if needed; 12 GB of RAM or more helps. |
 | Very hard | The Witcher 3 (DX12), Stray, Deep Rock Galactic | Start, but run slowly, and on the Mali-G925 Stray and The Witcher 3 stop early (a known issue). Expect problems. |
 
