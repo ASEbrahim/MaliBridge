@@ -9,6 +9,7 @@
 #include "vkb_client.h"
 #include "gen/vkb_client_gen.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static __thread vkb_cmdbuf *tls_encoding;
@@ -191,10 +192,14 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkBeginCommandBuffer(VkCommandBuffer comma
     vkb_enc_u64(e, cb->obj.remote);
     tls_encoding = cb;
     /* As the generated decoder reads a pointer parameter: present flag, count, elements. Without
-     * the count the server decoded garbage (RADV shrugged; Mali crashed in vkBeginCommandBuffer). */
+     * the count the server decoded garbage (RADV shrugged; Mali crashed in vkBeginCommandBuffer).
+     * VKBRIDGE_TEST_BEGIN_NOCOUNT=1 (host tests only, begin_encoding_test.sh) leaves it out again,
+     * as the bridge copy of 2026-10-10 did, to check that the server refuses such a begin. */
+    static int nocount = -1;
+    if (nocount < 0) nocount = getenv("VKBRIDGE_TEST_BEGIN_NOCOUNT") && atoi(getenv("VKBRIDGE_TEST_BEGIN_NOCOUNT")) == 1;
     vkb_enc_u8(e, pBeginInfo != NULL);
     if (pBeginInfo) {
-        vkb_enc_u32(e, 1);
+        if (!nocount) vkb_enc_u32(e, 1);
         vkb_enc_VkCommandBufferBeginInfo(e, pBeginInfo);
     }
     tls_encoding = NULL;

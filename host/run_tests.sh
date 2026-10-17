@@ -145,6 +145,10 @@ run_mode() {
     # the client's switch through vkbQueryServer; the report's preset per process; a built-in preset
     # only on a GPU it was tested on (a server of its own; once)
     timeout 600 ./presets_test.sh >out/t-presets.log 2>&1; result $? "presets_test ($(tail -1 out/t-presets.log))"
+    # vkBeginCommandBuffer's begin info: primary and secondary (inheritance info) round trips; one
+    # encoded without its count (the 2026-10-10 copy's bug, SIGSEGV at 0x10 in Mali's
+    # vkBeginCommandBuffer) is refused before the driver, its commands dropped (a server of its own; once)
+    timeout 120 ./begin_encoding_test.sh >out/t-begin.log 2>&1; result $? "begin_encoding_test ($(tail -1 out/t-begin.log))"
   fi
   # Negative and positive viewports, static and dynamic, two of them, points, a geometry stage,
   # pipeline libraries: every pixel against the CPU's (facing, gl_FragCoord, dFdy) - MK-02's check
