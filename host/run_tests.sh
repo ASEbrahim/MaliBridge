@@ -173,8 +173,12 @@ run_mode() {
   timeout 60 ./out/view3d_check >out/t-view3d.log 2>&1; result $? "view3d_check ($(tail -1 out/t-view3d.log))"
   timeout 60 ./out/viewchurn_check 500 >out/t-viewchurn.log 2>&1; result $? "viewchurn_check ($(tail -1 out/t-viewchurn.log))"
   # Dynamic state across pipeline binds and vertex strides bound in one call or one per binding
-  # (MK-04 and MK-05, both on in safe mode), through this mode's server
-  timeout 60 ./out/dynstate_check >out/t-dynstate.log 2>&1; result $? "dynstate_check ($(tail -1 out/t-dynstate.log))"
+  # (MK-04 and MK-05, both on in safe mode), through this mode's server; on mali the driver lacks
+  # maintenance5 (imitated beneath every layer: VK_WHOLE_SIZE in vkCmdBindVertexBuffers2's pSizes
+  # binds an empty range, as on the G720 r44p1), and nothing in this mode's run may have sent it
+  timeout 60 ./out/dynstate_check >out/t-dynstate.log 2>&1 &&
+    { [ "$mode" != mali ] || ! grep -q "VK_WHOLE_SIZE vertex buffer size reached" "$VKB_SERVER_LOG"; }
+  result $? "dynstate_check ($(tail -1 out/t-dynstate.log)$([ "$mode" = mali ] && echo "; $(grep -c 'VK_WHOLE_SIZE vertex buffer size reached' "$VKB_SERVER_LOG") VK_WHOLE_SIZE at the driver"))"
   timeout 60 ./out/vbstride_check >out/t-vbstride.log 2>&1; result $? "vbstride_check ($(tail -1 out/t-vbstride.log))"
   # Points and lines with a dynamic cull mode set, triangles culled after them (MK-16, on in safe mode)
   timeout 60 ./out/cullmode_check >out/t-cullmode.log 2>&1; result $? "cullmode_check ($(tail -1 out/t-cullmode.log))"

@@ -13,6 +13,8 @@
  *                   draws blue: blue
  *   stencil op/ref  ALWAYS/REPLACE ref 5 mask 0xff (created NEVER, 0, 0); then "stencil == 5": blue
  *   vertex stride   16 (created 4): the colour's attribute at instance 1 is at offset 16: green
+ *                   (again with pSizes VK_WHOLE_SIZE, a VK_KHR_maintenance5 addition, if exposed: the
+ *                   bridge must not hand it to a driver without maintenance5, which may read zeros)
  *   sample mask     (EDS3, if exposed) mask 0 (created 1): nothing drawn; then static pipeline C
  *                   (sample mask all) after it: blue drawn (3893903: C must not pick up the 0)
  * Host imitation (server): VKBRIDGE_ERRATA_IMITATE=dyn_reemit puts the states back to the
@@ -245,12 +247,18 @@ int main(void)
     vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, NULL);
     VkExtensionProperties *ext = calloc(ne ? ne : 1, sizeof(*ext));
     vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ext);
-    int eds3 = 0;
-    for (uint32_t i = 0; i < ne; i++) eds3 |= !strcmp(ext[i].extensionName, "VK_EXT_extended_dynamic_state3");
+    int eds3 = 0, maint5 = 0;
+    for (uint32_t i = 0; i < ne; i++) {
+        eds3 |= !strcmp(ext[i].extensionName, "VK_EXT_extended_dynamic_state3");
+        maint5 |= !strcmp(ext[i].extensionName, "VK_KHR_maintenance5");
+    }
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT f3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f3};
-    if (eds3) vkGetPhysicalDeviceFeatures2(pd, &f2);
+    VkPhysicalDeviceMaintenance5FeaturesKHR f5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    if (maint5) f5.pNext = f2.pNext, f2.pNext = &f5;
+    if (eds3 || maint5) vkGetPhysicalDeviceFeatures2(pd, &f2);
     int smask = eds3 && f3.extendedDynamicState3SampleMask;
+    maint5 = maint5 && f5.maintenance5;
 
     uint32_t nq = 8;
     VkQueueFamilyProperties qf[8];
@@ -261,8 +269,13 @@ int main(void)
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, qfam, 1, &prio};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT f3en = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     f3en.extendedDynamicState3SampleMask = VK_TRUE;
-    const char *names[] = {"VK_EXT_extended_dynamic_state3"};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, smask ? &f3en : NULL, 0, 1, &qci, 0, NULL, smask ? 1 : 0, names, NULL};
+    VkPhysicalDeviceMaintenance5FeaturesKHR f5en = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, NULL, VK_TRUE};
+    const char *names[2];
+    uint32_t nnames = 0;
+    void *chain = NULL;
+    if (smask) names[nnames++] = "VK_EXT_extended_dynamic_state3", f3en.pNext = chain, chain = &f3en;
+    if (maint5) names[nnames++] = "VK_KHR_maintenance5", f5en.pNext = chain, chain = &f5en;
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, chain, 0, 1, &qci, 0, NULL, nnames, names, NULL};
     VkResult r = vkCreateDevice(pd, &dci, NULL, &dev);
     char msg[160];
     snprintf(msg, sizeof(msg), "VkResult %d%s", r, smask ? ", with the EDS3 sample mask" : ", no EDS3 sample mask");
@@ -423,6 +436,16 @@ int main(void)
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, b);
         draw(cb, 0, 0, 0, 0.5f, 1);
         end_case(cb, "vertex stride 16 across a bind (created 4)", GREEN);
+        if (maint5) {
+            VkDeviceSize whole = VK_WHOLE_SIZE;
+            cb = begin_case();
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, a);
+            vkCmdBindVertexBuffers2(cb, 0, 1, &vbuf, &off, &whole, &stride);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, b);
+            draw(cb, 0, 0, 0, 0.5f, 1);
+            end_case(cb, "vertex stride 16 across a bind, size VK_WHOLE_SIZE (maintenance5; black: read as zeros)", GREEN);
+        } else
+            printf("SKIP vertex stride with size VK_WHOLE_SIZE: no maintenance5\n");
     }
     /* sample mask (EDS3) */
     if (smask) {

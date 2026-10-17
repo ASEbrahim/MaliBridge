@@ -17,6 +17,10 @@
  *     the second picture follows the new indices
  *   - dynamic topology and restart (vkd3d-proton's way): a strip with a restart, then a fan, from
  *     one pipeline (Vulkan 1.3 devices)
+ *   - dynamic vertex stride (created 16, set 8 with vkCmdBindVertexBuffers2 before a second bind;
+ *     the buffer bound first with vkCmdBindVertexBuffers): the edges where the stride 8 puts them.
+ *     The emulation binds its variant and the app's pipeline around the draw, and in safe mode
+ *     each bind has MK-04's dyn_reemit send the stride again (Vulkan 1.3 devices)
  *   - FILL, the control: the inside lit
  *   - the command pool and command buffers made before the first non-solid pipeline exists (as an
  *     app's are): a primary's indexed LINE draw, and the same draw recorded in a secondary command
@@ -63,7 +67,7 @@ I(vkGetImageMemoryRequirements); I(vkBindImageMemory); I(vkCreateImageView); I(v
 I(vkCreateShaderModule); I(vkCreatePipelineLayout); I(vkCreateGraphicsPipelines); I(vkCmdBeginRenderPass); I(vkCmdEndRenderPass);
 I(vkCmdBindPipeline); I(vkCmdBindVertexBuffers); I(vkCmdBindIndexBuffer); I(vkCmdDraw); I(vkCmdDrawIndexed);
 I(vkCmdCopyImageToBuffer); I(vkCmdPipelineBarrier); I(vkDeviceWaitIdle); I(vkFlushMappedMemoryRanges);
-I(vkCmdSetPrimitiveTopology); I(vkCmdSetPrimitiveRestartEnable); I(vkCmdExecuteCommands);
+I(vkCmdSetPrimitiveTopology); I(vkCmdSetPrimitiveRestartEnable); I(vkCmdExecuteCommands); I(vkCmdBindVertexBuffers2);
 #undef I
 
 static void check(int ok, const char *what, const char *detail)
@@ -212,7 +216,8 @@ int main(void)
     if (core13) {
         D(vkCmdSetPrimitiveTopology);
         D(vkCmdSetPrimitiveRestartEnable);
-        core13 = vkCmdSetPrimitiveTopology && vkCmdSetPrimitiveRestartEnable;
+        D(vkCmdBindVertexBuffers2);
+        core13 = vkCmdSetPrimitiveTopology && vkCmdSetPrimitiveRestartEnable && vkCmdBindVertexBuffers2;
     }
 #undef D
     vkGetDeviceQueue(dev, qfam, 0, &queue);
@@ -295,7 +300,7 @@ int main(void)
     VkPipelineColorBlendAttachmentState cba = {0};
     cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &cba, {0}};
-    enum { P_LIST, P_STRIP, P_FAN, P_POINT, P_FILL, P_DYN, NP };
+    enum { P_LIST, P_STRIP, P_FAN, P_POINT, P_FILL, P_DYN, P_STRIDE, NP };
     static const struct { VkPrimitiveTopology topo; VkBool32 restart; VkPolygonMode mode; const char *name; } pdesc[NP] = {
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_LINE, "LINE, triangle list"},
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, 1, VK_POLYGON_MODE_LINE, "LINE, triangle strip with primitive restart"},
@@ -303,12 +308,15 @@ int main(void)
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_POINT, "POINT, triangle list"},
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_FILL, "FILL, triangle list"},
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_LINE, "LINE, dynamic topology and restart"},
+        {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_LINE, "LINE, dynamic vertex stride"},
     };
     VkDynamicState dyns[2] = {VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
     VkPipelineDynamicStateCreateInfo dsci = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyns};
+    VkDynamicState dyn_stride = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+    VkPipelineDynamicStateCreateInfo dsci_stride = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 1, &dyn_stride};
     VkPipeline pipe[NP];
     for (int i = 0; i < NP; i++) {
-        if (i == P_DYN && !core13) {
+        if ((i == P_DYN || i == P_STRIDE) && !core13) {
             pipe[i] = VK_NULL_HANDLE;
             continue;
         }
@@ -319,18 +327,20 @@ int main(void)
         rs.cullMode = VK_CULL_MODE_NONE;
         rs.lineWidth = 1.0f;
         VkGraphicsPipelineCreateInfo gpci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms,
-                                             NULL, &cbs, i == P_DYN ? &dsci : NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
+                                             NULL, &cbs, i == P_DYN ? &dsci : i == P_STRIDE ? &dsci_stride : NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
+        bd.stride = i == P_STRIDE ? 16 : 8; /* the dynamic one is created wrong: the draw sets 8 */
         r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe[i]);
+        bd.stride = 8;
         snprintf(msg, sizeof(msg), "VkResult %d", r);
         char what[96];
         snprintf(what, sizeof(what), "pipeline: %s", pdesc[i].name);
         check(r == VK_SUCCESS, what, msg);
         if (r) goto out;
     }
-    enum { C_LIST, C_IDX16, C_STRIP, C_FAN, C_POINT, C_RESTORE, C_RESUBMIT, C_DYN, C_EARLY, C_SECONDARY, C_FILL, NC };
+    enum { C_LIST, C_IDX16, C_STRIP, C_FAN, C_POINT, C_RESTORE, C_RESUBMIT, C_DYN, C_STRIDE, C_EARLY, C_SECONDARY, C_FILL, NC };
     for (int c = 0; c < NC; c++) {
-        if (c == C_DYN && !core13) {
-            printf("SKIP dynamic topology: a Vulkan 1.1 device\n");
+        if ((c == C_DYN || c == C_STRIDE) && !core13) {
+            printf("SKIP %s: a Vulkan 1.1 device\n", c == C_DYN ? "dynamic topology" : "dynamic vertex stride");
             continue;
         }
         VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
@@ -411,6 +421,17 @@ int main(void)
             vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
             vkCmdDraw(cb, 4, 1, 4, 1); /* instance 1: 32 pixels to the right */
             break;
+        case C_STRIDE: {
+            what = "LINE, vkCmdDraw, dynamic vertex stride 8 set before a second bind (created 16)";
+            VkDeviceSize eight = 8;
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_STRIDE]);
+            vkCmdBindVertexBuffers2(cb, 0, 1, &vbuf, &zero, NULL, &eight);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_FILL]); /* static stride 8 */
+            vkCmdBindVertexBuffers2(cb, 0, 1, &vbuf, &zero, NULL, &eight);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_STRIDE]);
+            vkCmdDraw(cb, 3, 1, 1, 0);
+            break;
+        }
         case C_EARLY:
             what = "LINE, vkCmdDrawIndexed, a command buffer allocated before the pipelines";
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_LIST]);
@@ -440,6 +461,7 @@ int main(void)
         msg[0] = 0;
         switch (c) {
         case C_LIST:
+        case C_STRIDE:
             ok = wire_a(0, msg, sizeof(msg));
             break;
         case C_IDX16:

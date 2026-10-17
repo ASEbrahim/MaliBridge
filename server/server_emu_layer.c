@@ -365,6 +365,56 @@ static VkResult driver_create_image(VkDevice device, const VkImageCreateInfo *ci
     return vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
 }
 
+/* VK_WHOLE_SIZE in vkCmdBindVertexBuffers2's pSizes is a VK_KHR_maintenance5 addition: a driver
+ * without it need not take it. Mali-G720 r44p1 does not: a binding bound so reads zeros (MK-04's
+ * re-sent strides showed it, 2026-10-17). The emulation above resolves the clients' calls; whatever
+ * the bridge itself sends beneath it (the errata fixes, the divisor and polygon emulations) must not
+ * send it either. VKBRIDGE_FAKE_MISSING=maint5 imitates such a driver on the host: at the driver
+ * boundary, beneath every layer, a VK_WHOLE_SIZE size becomes 0 (the binding reads zeros, as on the
+ * G720), and the server log says so. */
+static struct {
+    vkb_srv_table *t;
+    PFN_vkCmdBindVertexBuffers2 next;
+} imi_vb2[16];
+static uint64_t imi_vb2_whole;
+
+static VKAPI_ATTR void VKAPI_CALL imi_CmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *buffers,
+                                                           const VkDeviceSize *offsets, const VkDeviceSize *sizes,
+                                                           const VkDeviceSize *strides)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    PFN_vkCmdBindVertexBuffers2 next = imi_vb2[0].next;
+    for (int i = 0; i < 16 && imi_vb2[i].t; i++)
+        if (imi_vb2[i].t == t) next = imi_vb2[i].next;
+    VkDeviceSize s[32];
+    uint32_t whole = 0;
+    for (uint32_t i = 0; sizes && i < n && i < 32; i++) {
+        s[i] = sizes[i];
+        if (s[i] == VK_WHOLE_SIZE) s[i] = 0, whole++;
+    }
+    if (whole) {
+        uint64_t k = __atomic_add_fetch(&imi_vb2_whole, whole, __ATOMIC_RELAXED);
+        if (k == whole || !(k & (k - 1)))
+            VKB_WARN("VK_WHOLE_SIZE vertex buffer size reached a driver without maintenance5 (imitated: bound with size 0, reads "
+                     "zeros); %llu so far", (unsigned long long)k);
+    }
+    next(cb, first, n, buffers, offsets, whole && n <= 32 ? s : sizes, strides);
+}
+
+void vkb_emu_driver_imitate_init(vkb_srv_table *t)
+{
+    if (!vkb_emu_faked("maint5") || !t->real.vkCmdBindVertexBuffers2 || t->real.vkCmdBindVertexBuffers2 == imi_CmdBindVertexBuffers2)
+        return;
+    for (int i = 0; i < 16; i++)
+        if (!imi_vb2[i].t || imi_vb2[i].t == t) {
+            imi_vb2[i].next = t->real.vkCmdBindVertexBuffers2;
+            __atomic_store_n(&imi_vb2[i].t, t, __ATOMIC_RELEASE);
+            if (t->dt.vkCmdBindVertexBuffers2 == t->real.vkCmdBindVertexBuffers2) t->dt.vkCmdBindVertexBuffers2 = imi_CmdBindVertexBuffers2;
+            t->real.vkCmdBindVertexBuffers2 = imi_CmdBindVertexBuffers2;
+            return;
+        }
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
                                                      const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
