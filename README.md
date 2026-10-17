@@ -104,6 +104,7 @@ Each one turns on only when the GPU lacks the feature.
 - **Clip/cull distance**: built-ins turned into varyings, with clipping done in the fragment shader.
 - **Per-vertex built-ins**: loose built-ins in geometry and tessellation shaders are folded into `gl_PerVertex` blocks. Loose ones crash Mali's compiler.
 - **SPIR-V fixes**: DXVK's spec-constant `OpSelect` guards, which Mali's compiler folds wrongly so textures read black; YCbCr samplers in compute layouts.
+- **Shift barriers**: a no-op `OpBitFieldInsert` after each left shift by a constant (Lee Gao's MaliOptimizationBarrierPass), so the compiler cannot fold the shift into speculative memory accesses that fault the GPU. On for every ARM GPU; `VKBRIDGE_SHL_BARRIER=0` turns it off.
 - **Vertex attribute divisor**: the binding gets a stride of 0 and is rebound for each run of instances, with draws split to match. Also used where the driver has only `VK_KHR_vertex_attribute_divisor` without the zero divisor (the Mali-G925 on Android 16), and `VK_EXT_vertex_attribute_divisor` is offered there: vkd3d-proton refuses a GPU without it ("DirectX 12 required" in The Witcher 3).
 - **Renamed extensions**: where a newer driver has only the KHR name of an extension that games look for under its EXT name (index_type_uint8, line_rasterization, robustness2, global_priority, load_store_op_none, vertex_attribute_divisor), the EXT name is offered and mapped onto the KHR one.
 - **maintenance5 / maintenance6, depth clip enable, load/store op none**: mapped onto what the driver has.
@@ -182,6 +183,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_SKIP_SHADERS=h-<hash>,...` | server | the hang detector skips draws with these shaders |
 | `VKBRIDGE_DUMP_SPIRV=<dir>` | server | saves the shader modules handed to the driver |
 | `VKBRIDGE_SPIRV_FIX=0/1` | server | forces the SPIR-V fixes off or on (default: on for ARM GPUs) |
+| `VKBRIDGE_SHL_BARRIER=0/1` | server | forces the optimization barrier after constant left shifts off or on (default: on for ARM GPUs) |
 | `VKBRIDGE_EMULATE=0` | server | no emulations at all |
 | `VKBRIDGE_EMU_OFF=<hex mask>` | server | turns off chosen emulations for bisecting (bits in `common/vkb_proto.h`) |
 | `VKBRIDGE_EMU_<NAME>=0` | server | turns off one emulation (`BCN`, `PUSH`, `DESCLIMITS`, `ROBUSTNESS2`, `MULTIDRAW`, ...) |
@@ -243,6 +245,10 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   extended, with its tables; its licence is in those files and `third_party/etc2_encode/LICENSE`.
 - Lee Gao (leegao) found the Mali compiler's mishandling of DXVK's spec-constant composites
   (bionic-vulkan-wrapper issue #93). `server/server_spvfix.c` fixes the same pattern.
+- Lee Gao's MaliOptimizationBarrierPass ([SPIRV-Tools fork](https://github.com/leegao/SPIRV-Tools),
+  Apache-2.0; bionic-vulkan-wrapper PR #162): `server/spirv_shlbarrier.c` is a C port of it (a
+  no-op `OpBitFieldInsert` after each left shift by a constant, so Mali's compiler cannot fold the
+  shift into speculative memory accesses); its notice is kept in that file.
 - [compat_layer](https://github.com/leegao/compat_layer) by Lee Gao, MIT: turning on image
   robustness alongside buffer robustness for the robustness2 emulation (`server/server_instance.c`)
   follows its robustness2 emulation, as do zero-filling the null-descriptor stand-in buffer and
