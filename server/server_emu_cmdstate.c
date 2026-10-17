@@ -47,6 +47,9 @@ typedef struct cb_state {
     uint32_t npts, cappts;
     void *gfx;            /* graphics-side state (divisor emulation) */
     void *bcn;            /* the BC decoder's scratch buffers (server_emu_bcn.c) */
+    void *poly;           /* polygon-mode emulation (server_emu_polygon.c) */
+    uint32_t begin_flags; /* VkCommandBufferUsageFlags of the last begin */
+    int secondary;        /* allocated at VK_COMMAND_BUFFER_LEVEL_SECONDARY */
     /* Descriptor sets emulations record with (no push descriptors), alive until the next begin. */
     VkDescriptorPool *scratch;
     uint32_t nscratch, cur_scratch, used_scratch;
@@ -145,6 +148,23 @@ void *vkb_emu_cb_bcn(vkb_emu_device *e, VkCommandBuffer cb, size_t size)
     return c->bcn;
 }
 
+/* The polygon emulation's record of cb, made when `size` is not 0 and there is none. */
+void *vkb_emu_cb_poly(vkb_emu_device *e, VkCommandBuffer cb, size_t size)
+{
+    cb_state *c = get(e, cb);
+    if (!c->poly && size) c->poly = calloc(1, size);
+    return c->poly;
+}
+
+/* What the app made cb with and began it with: its pool (VK_NULL_HANDLE when unseen), its level. */
+VkCommandPool vkb_emu_cb_origin(vkb_emu_device *e, VkCommandBuffer cb, int *secondary, uint32_t *begin_flags)
+{
+    cb_state *c = get(e, cb);
+    *secondary = c->secondary;
+    *begin_flags = c->begin_flags;
+    return c->pool;
+}
+
 static void reset(vkb_emu_device *e, cb_state *c)
 {
     for (uint32_t i = 0; i < c->nscratch && i <= c->cur_scratch; i++)
@@ -158,6 +178,7 @@ static void reset(vkb_emu_device *e, cb_state *c)
     c->npts = 0;
     vkb_emu_gfx_reset(c->gfx);
     vkb_emu_bcn_cb_release(e, c->bcn);
+    vkb_emu_polygon_cb_reset(e, c->cb, c->pool, &c->poly);
 }
 
 static void destroy(vkb_emu_device *e, cb_state *c)
@@ -170,6 +191,7 @@ static void destroy(vkb_emu_device *e, cb_state *c)
     free(c->pts);
     vkb_emu_gfx_free(c->gfx);
     free(c->bcn);
+    vkb_emu_polygon_cb_free(e, c->poly);
     free(c);
 }
 
@@ -221,7 +243,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_BeginCommandBuffer(VkCommandBuffer cb,
                      (unsigned long long)ii->renderPass, ii->subpass, (unsigned long long)ii->framebuffer, len ? ", chain" : "", chain);
         }
     }
-    reset(vkb_emu_cur(), get(vkb_emu_cur(), cb));
+    cb_state *c = get(vkb_emu_cur(), cb);
+    reset(vkb_emu_cur(), c);
+    c->begin_flags = info ? info->flags : 0;
     return vkb_emu_real()->vkBeginCommandBuffer(cb, info);
 }
 
@@ -233,7 +257,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_AllocateCommandBuffers(VkDevice device
         vkb_emu_device *e = vkb_emu_cur();
         for (uint32_t i = 0; i < info->commandBufferCount; i++) {
             forget(e, VK_NULL_HANDLE, cbs[i]); /* a handle the driver reused */
-            get(e, cbs[i])->pool = info->commandPool;
+            cb_state *c = get(e, cbs[i]);
+            c->pool = info->commandPool;
+            c->secondary = info->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
         }
     }
     return r;

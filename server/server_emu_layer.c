@@ -86,7 +86,7 @@ static void track_buffer(vkb_emu_device *e, VkBuffer b, VkDeviceSize size)
     pthread_mutex_unlock(&e->lock);
 }
 
-static VkDeviceSize buffer_size(vkb_emu_device *e, VkBuffer b)
+VkDeviceSize vkb_emu_buffer_size(vkb_emu_device *e, VkBuffer b)
 {
     pthread_mutex_lock(&e->lock);
     vkb_emu_buffer *r = e->buffers[rh((uint64_t)b)];
@@ -174,6 +174,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateBuffer(VkDevice device, const Vk
         if (u) ci->usage = (VkBufferUsageFlags)u->usage;
     }
     vkb_emu_bcn_buffer_usage(e, ci);
+    vkb_emu_polygon_buffer_usage(e, ci);
     int opaque = vkb_opaque_buffer(e, ci);
     VkResult r = vkb_emu_real()->vkCreateBuffer(device, ci, pAllocator, pBuffer);
     if (r != VK_SUCCESS && opaque && vkb_opaque_retry(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO))
@@ -446,8 +447,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateGraphicsPipelines(VkDevice devic
     vkb_emu_device *e = vkb_emu_cur();
     VkShaderModule mods[64];
     uint32_t nmods = 0;
-    size_t dsz = vkb_emu_divisor_info_size();
-    uint8_t *divs = calloc(n ? n : 1, dsz);
+    size_t dsz = vkb_emu_divisor_info_size(), psz = vkb_emu_polygon_info_size();
+    uint8_t *divs = calloc(n ? n : 1, dsz), *polys = calloc(n ? n : 1, psz);
     for (uint32_t i = 0; i < n; i++) {
         VkGraphicsPipelineCreateInfo *ci = (VkGraphicsPipelineCreateInfo *)&infos[i];
         vkb_emu_divisor_pipeline(e, device, ci, (div_info *)(divs + i * dsz));
@@ -455,6 +456,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateGraphicsPipelines(VkDevice devic
         /* Shader rewrites first: they read inline SPIR-V before it becomes a module. */
         vkb_emu_shader_xfb_fold(e, device, ci, mods, &nmods, 64);
         vkb_emu_shader_pipeline(e, device, ci, mods, &nmods, 64);
+        /* Before compat flattens a non-solid polygon mode: what the line/point variant needs. */
+        vkb_emu_polygon_pipeline(e, ci, (poly_info *)(polys + i * psz));
         vkb_emu_compat_pipeline(e, device, ci, mods, &nmods, 64);
         if (e->flags & VKB_EMU_MAINT5) {
             VkPipelineCreateFlags2CreateInfo *f2 = vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO);
@@ -479,10 +482,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateGraphicsPipelines(VkDevice devic
         }
     VkResult r = vkb_emu_real()->vkCreateGraphicsPipelines(device, cache, n, infos, pAllocator, pPipelines);
     /* Before the temporary modules go: a divisor variant is built from the same stages. */
-    for (uint32_t i = 0; i < n; i++)
-        vkb_emu_divisor_created(e, device, cache, &infos[i], r >= 0 ? pPipelines[i] : VK_NULL_HANDLE, (div_info *)(divs + i * dsz));
+    for (uint32_t i = 0; i < n; i++) {
+        VkPipeline p = r >= 0 ? pPipelines[i] : VK_NULL_HANDLE;
+        vkb_emu_divisor_created(e, device, cache, &infos[i], p, (div_info *)(divs + i * dsz));
+        vkb_emu_polygon_created(e, device, cache, &infos[i], p, (poly_info *)(polys + i * psz));
+    }
     for (uint32_t i = 0; i < nmods; i++) vkb_emu_real()->vkDestroyShaderModule(device, mods[i], NULL);
     free(divs);
+    free(polys);
     return r;
 }
 
@@ -668,7 +675,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdBindVertexBuffers2(VkCommandBuffer cb, 
         VkDeviceSize *s = (VkDeviceSize *)sizes;
         for (uint32_t i = 0; i < n; i++) {
             if (s[i] != VK_WHOLE_SIZE || !buffers[i]) continue;
-            VkDeviceSize total = buffer_size(e, buffers[i]);
+            VkDeviceSize total = vkb_emu_buffer_size(e, buffers[i]);
             s[i] = total > offsets[i] ? total - offsets[i] : 0;
         }
     }
@@ -713,6 +720,7 @@ void vkb_emu_install(vkb_srv_table *dev)
     vkb_emu_install_features(dev);
     vkb_emu_depth_clip_install(dev);
     vkb_emu_compat_install(dev);
+    vkb_emu_polygon_install(dev); /* over compat: its split indirect draws come through it */
     vkb_emu_desc_install(dev); /* beneath push descriptors: their layouts and templates come through it */
     vkb_emu_push_install(dev);
     VKB_INFO("device %u: emulation 0x%x installed", dev->id, e->flags);
@@ -723,6 +731,7 @@ void vkb_emu_uninstall(vkb_srv_table *dev)
     vkb_emu_device *e = dev->emu;
     vkb_emu_push_uninstall(dev);
     vkb_emu_desc_uninstall(dev);
+    vkb_emu_polygon_uninstall(dev);
     vkb_emu_compat_uninstall(dev);
     vkb_emu_uninstall_features(dev);
     for (int i = 0; i < VKB_EMU_BUCKETS; i++) {
