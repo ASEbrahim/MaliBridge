@@ -367,6 +367,9 @@ int vkb_emu_bcn_astc_hdr(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t 
 void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32_t emu,
                                 VkDeviceCreateInfo *ci, vkb_arena *a);
 void vkb_emu_device_init(vkb_srv_table *dev, uint32_t emu);
+/* host imitation of a driver without maintenance5 (VKBRIDGE_FAKE_MISSING=maint5), at the driver boundary:
+ * before every driver-near layer */
+void vkb_emu_driver_imitate_init(vkb_srv_table *dev);
 void vkb_emu_device_destroy(vkb_srv_table *dev);
 /* first when a device goes: stops the emulations' threads, which call through the layers */
 void vkb_emu_device_quiesce(vkb_srv_table *dev);

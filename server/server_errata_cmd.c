@@ -395,11 +395,20 @@ static unsigned emit(const vkb_dispatch *n, VkCommandBuffer cb, const dstate *v,
     return calls;
 }
 
+/* One binding again. A size of VK_WHOLE_SIZE (a binding from vkCmdBindVertexBuffers, or a
+ * vkCmdBindVertexBuffers2 without pSizes) goes as pSizes NULL: VK_WHOLE_SIZE in pSizes is a
+ * maintenance5 addition, and these calls reach the driver beneath the emulation that resolves it
+ * (Mali-G720 r44p1 bound such a binding as empty: the stride check read zeros, 2026-10-17). */
+static void bind1(PFN_vkCmdBindVertexBuffers2 fn, VkCommandBuffer cb, uint32_t b, const vbind *v)
+{
+    fn(cb, b, 1, &v->buf, &v->off, v->size == VK_WHOLE_SIZE ? NULL : &v->size, &v->stride);
+}
+
 static unsigned rebind(const vkb_dispatch *n, VkCommandBuffer cb, const vbind *vb, uint32_t which)
 {
     unsigned calls = 0;
     for (uint32_t b = 0; which && n->vkCmdBindVertexBuffers2; b++, which >>= 1)
-        if (which & 1) n->vkCmdBindVertexBuffers2(cb, b, 1, &vb[b].buf, &vb[b].off, &vb[b].size, &vb[b].stride), calls++;
+        if (which & 1) bind1(n->vkCmdBindVertexBuffers2, cb, b, &vb[b]), calls++;
     return calls;
 }
 
@@ -542,7 +551,7 @@ static VKAPI_ATTR void VKAPI_CALL i_CmdBindVertexBuffers2(VkCommandBuffer cb, ui
         if ((k < n || (k >= first && k < first + n)) && (s->d_buf >> k & 1)) {
             vbind v = s->dvb[k];
             if (!(s->d_stride >> k & 1)) v.stride = 0;
-            c->imi_vb.vkCmdBindVertexBuffers2(cb, k, 1, &v.buf, &v.off, &v.size, &v.stride);
+            bind1(c->imi_vb.vkCmdBindVertexBuffers2, cb, k, &v);
         }
     ADD(c->imi_vb_wrong, 1);
 }

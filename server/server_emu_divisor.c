@@ -243,6 +243,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdBindVertexBuffers2(VkCommandBuffer cb, 
                                                            const VkDeviceSize *o, const VkDeviceSize *s, const VkDeviceSize *st)
 {
     vkb_emu_device *e = vkb_emu_cur();
+    vkb_emu_vb_sizes_resolve(e, n, b, o, s); /* this wrapper takes maintenance5's place in the table */
     record_bind(gfx(e, cb), first, n, b, o, s, st);
     vkb_emu_real()->vkCmdBindVertexBuffers2(cb, first, n, b, o, s, st);
 }

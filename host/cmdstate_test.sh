@@ -21,7 +21,15 @@
 #        vkCmdBindVertexBuffers2 chain: split, then the state record, then the imitation);
 #    12  the divisor emulation's own binds (VKBRIDGE_FAKE_MISSING=divisor) through both, imitated:
 #        divisor_check passes; smoke passes;
-#    13  the protocol hash is unchanged (the layer is server-side only).
+#    13  Mali-G720's gaps that meet the fixes (VKBRIDGE_FAKE_MISSING=maint5,divisor,fillmode: a driver
+#        without maintenance5 is imitated beneath every layer - VK_WHOLE_SIZE in
+#        vkCmdBindVertexBuffers2's pSizes binds an empty range, as on the G720 r44p1), r44p1, safe
+#        mode: dynstate_check (its stride case with the buffer bound by vkCmdBindVertexBuffers, which
+#        dyn_reemit sent again with pSizes VK_WHOLE_SIZE, and the case with a client's VK_WHOLE_SIZE,
+#        which the divisor emulation's wrapper let through), vbstride_check, divisor_check and
+#        polygon_check (its dynamic-stride wireframe: the emulation's binds around the draw) pass,
+#        and no VK_WHOLE_SIZE reached the driver;
+#    14  the protocol hash is unchanged (the layer is server-side only).
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -124,6 +132,23 @@ r1=$rc; s1=$res
 run VKBRIDGE_ERRATA_IMITATE=vb_split,dyn_reemit -- vkbridge-smoke
 [ $r1 = 0 ] && [ $rc = 0 ]
 step $? "both imitated and fixed: divisor_check with the divisor emulated ($s1), smoke ($res)"
+
+# FAKE_MISSING is taken once per server process: a server of its own, the env written first
+printf '%s\n' VKBRIDGE_FAKE_MISSING=maint5,divisor,fillmode VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 > "$cache/env"
+start
+w=VKBRIDGE_FAKE_MISSING=maint5,divisor,fillmode; v=VKBRIDGE_FAKE_DRIVER_VERSION=r44p1
+run $w $v -- dynstate_check
+r1=$rc; s1=$res; ws=$(grep -c "^PASS vertex stride 16 across a bind, size VK_WHOLE_SIZE" $work/run.log); nw=$(echo "$new" | grep -c "VK_WHOLE_SIZE vertex buffer size reached"); on=$(echo "$new" | grep -c "errata: dyn_reemit ON (always")
+run $w $v -- vbstride_check
+r2=$rc; nw=$((nw + $(echo "$new" | grep -c "VK_WHOLE_SIZE vertex buffer size reached")))
+run $w $v -- divisor_check
+r3=$rc; nw=$((nw + $(echo "$new" | grep -c "VK_WHOLE_SIZE vertex buffer size reached")))
+run $w $v -- polygon_check
+r4=$rc; s4=$res; nw=$((nw + $(echo "$new" | grep -c "VK_WHOLE_SIZE vertex buffer size reached")))
+pst=$(grep -c "^PASS LINE, vkCmdDraw, dynamic vertex stride" $work/run.log)
+[ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ $r4 = 0 ] && [ "$ws" = 1 ] && [ "$pst" = 1 ] && [ "$nw" = 0 ] &&
+  [ "$on" -ge 1 ] && echo "$new" | grep -q "polygon mode LINE drawn as lines (first"
+step $? "no maintenance5 + divisor + fill mode emulated, r44p1: dynstate_check $s1 (VK_WHOLE_SIZE case $ws), vbstride $r2, divisor $r3, polygon_check $s4 (dynamic stride $pst); $nw VK_WHOLE_SIZE at the driver"
 
 grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
