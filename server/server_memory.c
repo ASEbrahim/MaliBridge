@@ -535,6 +535,10 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
         if (!dt->vkGetMemoryHostPointerPropertiesEXT ||
             dt->vkGetMemoryHostPointerPropertiesEXT(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p, &hp) != VK_SUCCESS ||
             !(hp.memoryTypeBits & (1u << ai->memoryTypeIndex))) {
+            /* Said, so a log shows which types the driver takes host pointers in (Mali: cached
+             * ones only, it seems - a Pixel 9 refused type 0, its uncached coherent type). */
+            VKB_INFO("hostptr: host pointer properties %s, memory types 0x%x (want type %u)",
+                     dt->vkGetMemoryHostPointerPropertiesEXT ? "read" : "not loaded", hp.memoryTypeBits, ai->memoryTypeIndex);
             r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
             break;
         }
@@ -542,6 +546,12 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
                                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p};
         info.pNext = &imp;
         r = dt->vkAllocateMemory(dev, &info, NULL, &m->mem);
+        /* The driver took the pointer's types but not the pages: a memfd is a shared file
+         * mapping, and some drivers import only anonymous private memory (RADV on the host
+         * refuses it so; whether Mali does is open). */
+        if (r != VK_SUCCESS)
+            VKB_INFO("hostptr: import of %llu bytes of the client's memfd (type %u) failed: %d", (unsigned long long)info.allocationSize,
+                     info.memoryTypeIndex, r);
         break;
     }
     case VKB_MEM_DMABUF: {
@@ -590,11 +600,20 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
         VkResult pr = dt->vkGetMemoryFdPropertiesKHR
                           ? dt->vkGetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp)
                           : VK_ERROR_EXTENSION_NOT_PRESENT;
+        /* VKBRIDGE_DMAHEAP_ANY_TYPE=1 (an experiment): imported even into a type the driver's fd
+         * properties leave out, as virglrenderer's Android path does (Cimo's droiddeck-mali imports
+         * dma-heap pages into the Mali-G715's uncached type 0 with no such check, and it ran there).
+         * Out of the spec; the self-test still checks the bytes both ways before a type is used. */
+        static int any_type = -1;
+        if (any_type < 0) any_type = getenv("VKBRIDGE_DMAHEAP_ANY_TYPE") && *getenv("VKBRIDGE_DMAHEAP_ANY_TYPE") == '1';
         if (pr != VK_SUCCESS || !(fp.memoryTypeBits & (1u << ai->memoryTypeIndex))) {
-            VKB_INFO("dmaheap: fd properties %d, memory types 0x%x (want type %u)", pr, fp.memoryTypeBits, ai->memoryTypeIndex);
-            close(fd);
-            r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-            break;
+            VKB_INFO("dmaheap: fd properties %d, memory types 0x%x (want type %u)%s", pr, fp.memoryTypeBits, ai->memoryTypeIndex,
+                     any_type ? "; importing anyway (VKBRIDGE_DMAHEAP_ANY_TYPE)" : "");
+            if (!any_type) {
+                close(fd);
+                r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+                break;
+            }
         }
         /* The import takes its own fd; ours goes to the client. A dedicated-allocation struct
          * with an imported dma-buf crashes some Mali drivers (GameNative mesa PR #8): dropped. */
@@ -1650,7 +1669,9 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     uint32_t candidates[4];
     int nc = 0;
     const char *force = getenv("VKBRIDGE_MEMORY");
-
+    char outcome[400] = ""; /* each strategy's fate, for the summary line */
+    int on = 0;
+#define OUTCOME(...) on += snprintf(outcome + on, on < (int)sizeof(outcome) ? sizeof(outcome) - (size_t)on : 0, __VA_ARGS__)
     /* GameNative's order on Mali: the driver's own export, a dma-heap import, then an AHB. */
     uint32_t order[] = {VKB_MEM_HOSTPTR, VKB_MEM_DMABUF, VKB_MEM_DMAHEAP, VKB_MEM_AHB};
     for (int i = 0; i < 4; i++) {
@@ -1665,8 +1686,26 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
                 strcmp(req[j], "VK_KHR_dedicated_allocation") && strcmp(req[j], "VK_KHR_get_memory_requirements2") &&
                 !has_ext(ex, ne, req[j]))
                 ok = 0;
+        /* A driver that exports no dma-buf (Mali: buffers report dma-buf features 0x4, importable
+         * only) fails dmabuf at its first vkGetMemoryFdKHR: not tried. */
+        if (ok && s == VKB_MEM_DMABUF && idt->vkGetPhysicalDeviceExternalBufferProperties) {
+            VkPhysicalDeviceExternalBufferInfo bi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO, NULL, 0,
+                                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+            VkExternalBufferProperties ep = {VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+            idt->vkGetPhysicalDeviceExternalBufferProperties(pd, &bi, &ep);
+            uint32_t feat = ep.externalMemoryProperties.externalMemoryFeatures;
+            if (!(feat & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+                VKB_INFO("memory sharing: dmabuf unavailable (the driver exports no dma-bufs: features 0x%x)", feat);
+                OUTCOME(" dmabuf: no export (0x%x);", feat);
+                continue;
+            }
+        }
         if (ok) candidates[nc++] = s;
-        else VKB_INFO("memory sharing: %s unavailable (driver lacks its extensions)", vkb_mem_strategy_name(s));
+        else {
+            VKB_INFO("memory sharing: %s unavailable (driver lacks its extensions)", vkb_mem_strategy_name(s));
+            OUTCOME(" %s: no extensions;", vkb_mem_strategy_name(s));
+        }
     }
 
     /* One test device with every candidate's extensions. */
@@ -1723,10 +1762,16 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
             k->info.coherent_types = coherent;
             k->info.import_alignment = st.import_align;
             k->info.cached_types = cached_selftest(&st, s, shareable);
+            OUTCOME(" %s: chosen, types 0x%x shared, 0x%x coherent, 0x%x cached readback;", vkb_mem_strategy_name(s), shareable, coherent,
+                    k->info.cached_types);
             break;
         }
         VKB_INFO("memory sharing: %s failed the self-test", vkb_mem_strategy_name(s));
+        OUTCOME(" %s: failed (types 0x%x shared, none coherent);", vkb_mem_strategy_name(s), shareable);
     }
+    /* One line with every strategy's fate (the per-type lines above say why). */
+    VKB_INFO("memory sharing summary for %s:%s", k->name, outcome);
+#undef OUTCOME
     if (k->info.strategy == VKB_MEM_NONE)
         VKB_ERR("memory sharing: no method works on %s; Linux programs will get no host-visible memory", k->name);
 
