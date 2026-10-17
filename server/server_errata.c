@@ -43,7 +43,8 @@
  *
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
- * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), and example: a no-op on vkCreateImageView that
+ * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16),
+ * dedicated_import (MK-39), and example: a no-op on vkCreateImageView that
  * counts the calls reaching it (and its imitation the calls beneath it), the pattern a fix follows.
  */
 #define _GNU_SOURCE
@@ -96,12 +97,13 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_BITWISE_SCALAR] = {"bitwise_scalar", "MK-03", "bitwise_vec", 1, G_PROBE_FAIL | G_IN_RANGE, G_PROBE_FAIL,
         {{V(18, 0), V(54, 0), FAM_ANY, NULL, NULL}}, vkb_errata_bitwise_install, vkb_errata_bitwise_imitate},
     [VKB_ERRATUM_DYN_REEMIT] = {"dyn_reemit", "MK-04", "dyn_state", 1, G_ALWAYS, G_PROBE_FAIL | G_IN_RANGE,
-        {{V(38, 0), V(44, 1), FAM_ANY, NULL, "depth/stencil/cull/stride"},
+        {{V(0, 0), V(44, 1), FAM_ANY, NULL, "depth/stencil/cull/stride; ANGLE: below r44p1"},
          {V(48, 0), V(54, 0), FAM_ANY, NULL, "EDS3 conservative raster, line mode, sample mask"},
          {V(46, 0), V(51, 0), FAM_JM, NULL, "job manager GPUs"}},
         vkb_errata_dyn_install, vkb_errata_dyn_imitate},
     [VKB_ERRATUM_VB_SPLIT] = {"vb_split", "MK-05", "vb_strides", 0, G_ALWAYS, G_ALWAYS,
-        {{V(42, 0), V(48, 0), FAM_ANY, NULL, NULL}}, vkb_errata_vb_install, vkb_errata_vb_imitate},
+        {{V(0, 0), V(48, 0), FAM_ANY, NULL, "ANGLE: below r48; Arm: r42p0-r47p0"}}, vkb_errata_vb_install,
+        vkb_errata_vb_imitate},
     [VKB_ERRATUM_VIEW_QUARANTINE] = {"view_quarantine", "MK-06", "rendering_churn", 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
         {{V(49, 1), V(49, 3), FAM_ANY, NULL, NULL}, {V(50, 0), V(51, 1), FAM_ANY, NULL, NULL}},
         vkb_errata_views_install, vkb_errata_views_install},
@@ -115,6 +117,20 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
          {V(49, 1), V(49, 2), FAM_ANY, NULL, "a beta build: Arm's fix in r49p1 not confirmed for it", R_BETA | R_SAFE},
          {V(50, 0), V(51, 1), FAM_ANY, NULL, NULL}},
         vkb_errata_clampzero_install, vkb_errata_clampzero_imitate},
+    /* Culling never applies to points and lines, so turning it off for them is exact on any
+     * driver: always on in safe mode; in performance mode below r52 (ANGLE's gate, Arm erratum
+     * 3786517: r41p0-r49p2, r50p0-r51p0). Pipelines with a geometry or tessellation stage are left
+     * alone (their rasterized primitive is the shader's, not the topology's). */
+    [VKB_ERRATUM_CULL_NONTRI] = {"cull_nontri", "MK-16", NULL, 0, G_ALWAYS, G_IN_RANGE,
+        {{V(0, 0), V(52, 0), FAM_ANY, NULL, "ANGLE: below r52; Arm: r41p0-r49p2, r50p0-r51p0"}},
+        vkb_errata_cull_install, vkb_errata_cull_imitate},
+    /* GameNative mesa PR #8 / Lee Gao's "WSI woes on Mali": a VkMemoryDedicatedAllocateInfo on a
+     * dma-buf/AHB import whose image or buffer was not made with that handle type fails or crashes
+     * the allocation; fixed somewhere between r32p1 and r54p1 (the exact version is not known).
+     * The struct is a hint, so dropping it there is safe on any driver. */
+    [VKB_ERRATUM_DEDICATED_IMPORT] = {"dedicated_import", "MK-39", NULL, 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
+        {{V(0, 0), V(54, 1), FAM_ANY, NULL, "fixed between r32p1 and r54p1"}},
+        vkb_errata_dedicated_install, vkb_errata_dedicated_imitate},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
 };
 
@@ -591,6 +607,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_cmd_destroy(t, e);
     vkb_errata_flip_destroy(t, e);
     vkb_errata_clampzero_destroy(t, e);
+    vkb_errata_mem_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -714,6 +731,7 @@ void vkb_errata_probe_end(void *handle)
     vkb_errata_cmd_destroy(&h->t, h->e);
     vkb_errata_flip_destroy(&h->t, h->e);
     vkb_errata_clampzero_destroy(&h->t, h->e);
+    vkb_errata_mem_destroy(&h->t, h->e);
     free(h->e);
     free(h);
 }

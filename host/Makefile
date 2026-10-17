@@ -18,7 +18,7 @@ COMMON_SRC := $(VKB)/common/vkb_wire.c $(VKB)/common/gen/vkb_gen_structs.c
 SERVER_SRC := $(wildcard $(SRV)/*.c) $(VKB)/common/gen/vkb_gen_server.c $(COMMON_SRC)
 CLIENT_SRC := $(wildcard $(VKB)/client/*.c) $(VKB)/common/gen/vkb_gen_client.c $(COMMON_SRC)
 
-TESTS := vkbridge-smoke bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus dynstate_check vbstride_check viewport_check flip_corpus clampzero_check clampzero_corpus begin_check
+TESTS := vkbridge-smoke bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus dynstate_check vbstride_check viewport_check flip_corpus clampzero_check clampzero_corpus begin_check shlbarrier_corpus cullmode_check dedimport_check
 
 all: $(OUT)/vkbridge-server $(OUT)/libvulkan_droidbridge.so $(OUT)/vkbridge_icd.json $(addprefix $(OUT)/,$(TESTS))
 
@@ -54,6 +54,8 @@ $(OUT)/vbstride_check: $(VKB)/tests/divisor_vert.inc $(VKB)/tests/divisor_frag.i
 
 $(OUT)/dynstate_check: $(VKB)/tests/dynstate_vert.inc $(VKB)/tests/dynstate_frag.inc
 
+$(OUT)/cullmode_check: $(VKB)/tests/cullmode_vert.inc $(VKB)/tests/dynstate_frag.inc
+
 $(OUT)/gsfold_check: $(VKB)/tests/gsfold_vert.inc $(VKB)/tests/gsfold_geom.inc $(VKB)/tests/gsfold_frag.inc $(VKB)/tests/gsfold_lut.inc
 
 $(OUT)/bitwise_check: $(VKB)/tests/bitwise_comp.inc
@@ -76,6 +78,11 @@ $(OUT)/bitwise_corpus: $(VKB)/tests/bitwise_corpus.c $(SRV)/spirv_bitwise.c $(SR
 $(OUT)/clampzero_corpus: $(VKB)/tests/clampzero_corpus.c $(SRV)/spirv_clampzero.c $(SRV)/spirv_clampzero.h $(SRV)/spirv_edit.c $(SRV)/spirv_edit.h $(SRV)/spirv_opclass.inc
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(SAN) $(WARN) -o $@ $(VKB)/tests/clampzero_corpus.c $(SRV)/spirv_clampzero.c $(SRV)/spirv_edit.c
+
+# The shl_barrier SPIR-V pass alone, over a corpus (host/shlbarrier_test.sh)
+$(OUT)/shlbarrier_corpus: $(VKB)/tests/shlbarrier_corpus.c $(SRV)/spirv_shlbarrier.c $(SRV)/spirv_shlbarrier.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -o $@ $(VKB)/tests/shlbarrier_corpus.c $(SRV)/spirv_shlbarrier.c
 
 $(OUT)/flicker_check: $(VKB)/tests/flicker_check.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)

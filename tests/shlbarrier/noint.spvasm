@@ -1,0 +1,37 @@
+; shl_barrier: a signed-only module (no 32-bit unsigned type, no zero): the pass declares the
+; zero it needs and a 32-bit unsigned type with its 0 for Offset and Count, and barriers both shifts.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %Buf Block
+               OpMemberDecorate %Buf 0 Offset 0
+               OpMemberDecorate %Buf 1 Offset 4
+               OpMemberDecorate %Buf 2 Offset 8
+               OpMemberDecorate %Buf 3 Offset 12
+               OpMemberDecorate %Buf 4 Offset 16
+               OpMemberDecorate %Buf 5 Offset 20
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %int = OpTypeInt 32 1
+      %ivec3 = OpTypeVector %int 3
+        %Buf = OpTypeStruct %int %int %int %int %int %int
+       %pBuf = OpTypePointer StorageBuffer %Buf
+       %pInt = OpTypePointer StorageBuffer %int
+        %buf = OpVariable %pBuf StorageBuffer
+      %int_5 = OpConstant %int 5
+      %int_6 = OpConstant %int 6
+       %iv3c = OpConstantComposite %ivec3 %int_5 %int_6 %int_5
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %p = OpAccessChain %pInt %buf %int_5
+         %a = OpLoad %int %p
+         %s = OpShiftLeftLogical %int %a %int_5
+         %v = OpCompositeConstruct %ivec3 %s %s %a
+         %t = OpShiftLeftLogical %ivec3 %v %iv3c
+         %x = OpCompositeExtract %int %t 1
+               OpStore %p %x
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,69 @@
+; shl_barrier's own module: left shifts by constants of every kind the pass handles or skips.
+;   barriered: uint << 3 (OpConstant), int << 2 (no int zero declared: the pass makes one),
+;              uvec2 << uvec2(1, 4) (OpConstantComposite), ivec4 << OpConstantNull
+;   left alone: ulong << 5 (64-bit: OpBitFieldInsert is 32-bit only), uint << a loaded value
+               OpCapability Shader
+               OpCapability Int64
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %Buf Block
+               OpMemberDecorate %Buf 0 Offset 0
+               OpMemberDecorate %Buf 1 Offset 4
+               OpMemberDecorate %Buf 2 Offset 8
+               OpMemberDecorate %Buf 3 Offset 16
+               OpMemberDecorate %Buf 4 Offset 32
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %ulong = OpTypeInt 64 0
+      %uvec2 = OpTypeVector %uint 2
+      %ivec4 = OpTypeVector %int 4
+        %Buf = OpTypeStruct %uint %int %uvec2 %ivec4 %ulong
+       %pBuf = OpTypePointer StorageBuffer %Buf
+      %pUint = OpTypePointer StorageBuffer %uint
+       %pInt = OpTypePointer StorageBuffer %int
+      %pUv2 = OpTypePointer StorageBuffer %uvec2
+      %pIv4 = OpTypePointer StorageBuffer %ivec4
+     %pUlong = OpTypePointer StorageBuffer %ulong
+        %buf = OpVariable %pBuf StorageBuffer
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_3 = OpConstant %uint 3
+     %uint_4 = OpConstant %uint 4
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+      %int_2 = OpConstant %int 2
+      %int_3 = OpConstant %int 3
+      %int_4 = OpConstant %int 4
+     %ulong_5 = OpConstant %ulong 5
+     %v2_1_4 = OpConstantComposite %uvec2 %uint_1 %uint_4
+    %iv4null = OpConstantNull %ivec4
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %p0 = OpAccessChain %pUint %buf %int_0
+         %a = OpLoad %uint %p0
+         %s0 = OpShiftLeftLogical %uint %a %uint_3
+         %p1 = OpAccessChain %pInt %buf %int_1
+         %b = OpLoad %int %p1
+         %s1 = OpShiftLeftLogical %int %b %int_2
+               OpStore %p1 %s1
+         %p2 = OpAccessChain %pUv2 %buf %int_2
+         %c = OpLoad %uvec2 %p2
+         %s2 = OpShiftLeftLogical %uvec2 %c %v2_1_4
+               OpStore %p2 %s2
+         %p3 = OpAccessChain %pIv4 %buf %int_3
+         %d = OpLoad %ivec4 %p3
+         %s3 = OpShiftLeftLogical %ivec4 %d %iv4null
+               OpStore %p3 %s3
+         %p4 = OpAccessChain %pUlong %buf %int_4
+         %e = OpLoad %ulong %p4
+         %s4 = OpShiftLeftLogical %ulong %e %ulong_5
+               OpStore %p4 %s4
+         %s5 = OpShiftLeftLogical %uint %s0 %a
+               OpStore %p0 %s5
+               OpReturn
+               OpFunctionEnd

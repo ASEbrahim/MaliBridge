@@ -23,6 +23,7 @@ typedef struct vkb_errata_dev {
     struct vkb_errata_cmd *cmd;     /* server_errata_cmd.c (MK-04, MK-05) */
     struct vkb_errata_flip *flip;       /* server_errata_flip.c (MK-02) */
     struct vkb_errata_clampzero *clampzero; /* server_errata_clampzero.c (MK-32) */
+    struct vkb_errata_mem *mem;     /* server_errata_mem.c (MK-39) */
     int probe; /* the startup probe's: an imitation only, for one probe (vkb_errata_probe_begin);
                   it publishes nothing a server thread without a table would fall back to, and logs
                   no totals */
@@ -76,7 +77,16 @@ void vkb_errata_dyn_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_dyn_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_vb_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_vb_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+/* ... and cull_nontri (MK-16), chained above them (installed after) */
+void vkb_errata_cull_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_cull_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+
+/* server_errata_mem.c: dedicated_import (MK-39), the dedicated-allocation struct taken off imports
+ * whose resource was not made for that handle type; the imitation fails such imports */
+void vkb_errata_dedicated_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_dedicated_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_mem_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 /* A module an erratum rewrote is named by the code it came from (vkb_spv_app_hash): registers
  * the new code's hash -> the app's hash of `in` (itself maybe an erratum's output); 1 when the

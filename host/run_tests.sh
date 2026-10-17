@@ -117,6 +117,9 @@ run_mode() {
     # MK-03 bitwise_scalar: the miscompile imitated fails bitwise_check, the SPIR-V rewrite over it
     # passes; only modules with the pattern change; the corpus through the pass is spirv-val clean
     timeout 600 ./bitwise_test.sh >out/t-bitwise.log 2>&1; result $? "bitwise_test ($(tail -1 out/t-bitwise.log); $(grep -o 'corpus: [0-9]* modules' out/t-bitwise.log))"
+    # shl_barrier: the no-op after constant left shifts, forced on: right values in bitwise_check and
+    # vkbridge-smoke, modules named by the app's code, the corpus through the pass spirv-val clean
+    timeout 600 ./shlbarrier_test.sh >out/t-shlbarrier.log 2>&1; result $? "shlbarrier_test ($(tail -1 out/t-shlbarrier.log))"
     # MK-32 clamp_zero: the zero limit dropped (imitated) fails clampzero_check, the opaque zero over it
     # passes, narrow from the version gate and wide when forced; the corpus through both is spirv-val clean
     timeout 600 ./clampzero_test.sh >out/t-clampzero.log 2>&1; result $? "clampzero_test ($(tail -1 out/t-clampzero.log); $(grep -o 'corpus, narrow: [0-9]* modules' out/t-clampzero.log))"
@@ -128,6 +131,12 @@ run_mode() {
     # split vertex buffer binds, each failing with its bug imitated and the fix off and passing
     # with the fix; the two stride shapes the probe tells apart (a server of its own; once)
     timeout 300 ./cmdstate_test.sh >out/t-cmdstate.log 2>&1; result $? "cmdstate_test ($(tail -1 out/t-cmdstate.log))"
+    # MK-16 cull_nontri (a dynamic cull mode culls points and lines): failing with its bug imitated
+    # and the fix off, passing with the fix; the version gate (a server of its own; once)
+    timeout 300 ./cullmode_test.sh >out/t-cullmode-test.log 2>&1; result $? "cullmode_test ($(tail -1 out/t-cullmode-test.log))"
+    # MK-39 dedicated_import (a dedicated struct on an import into a resource not made for its handle
+    # type): failing with its bug imitated and the fix off, passing with the fix; the version gate
+    timeout 300 ./dedimport_test.sh >out/t-dedimport.log 2>&1; result $? "dedimport_test ($(tail -1 out/t-dedimport.log))"
     # The MK probes: each erratum's bug imitated beneath its probe makes it fail with the bug's
     # pattern and the decision follow (probe-gated errata on in performance mode), none without;
     # the report's errata table; the slow light probes in the background (a server of its own; once)
@@ -163,6 +172,8 @@ run_mode() {
   # (MK-04 and MK-05, both on in safe mode), through this mode's server
   timeout 60 ./out/dynstate_check >out/t-dynstate.log 2>&1; result $? "dynstate_check ($(tail -1 out/t-dynstate.log))"
   timeout 60 ./out/vbstride_check >out/t-vbstride.log 2>&1; result $? "vbstride_check ($(tail -1 out/t-vbstride.log))"
+  # Points and lines with a dynamic cull mode set, triangles culled after them (MK-16, on in safe mode)
+  timeout 60 ./out/cullmode_check >out/t-cullmode.log 2>&1; result $? "cullmode_check ($(tail -1 out/t-cullmode.log))"
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
   timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"

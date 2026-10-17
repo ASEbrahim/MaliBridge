@@ -39,6 +39,19 @@
  *   the end keep their old stride). VKBRIDGE_ERRATA_IMITATE_VB=single: single-binding calls too,
  *   the shape the split does not fix (the probe's option B case).
  *
+ * cull_nontri (MK-16; Arm erratum 3786517, r41p0-r49p2 and r50p0-r51p0; ANGLE stops using dynamic
+ *   cull mode below r52): with the cull mode set by vkCmdSetCullMode, the driver culls points and
+ *   lines too, which the API never does: those draws vanish. The fix keeps, per command buffer, the
+ *   app's dynamic cull mode and the bound graphics pipeline's primitive class (its input-assembly
+ *   topology; the dynamic topology when the pipeline has one) and sends the driver
+ *   VK_CULL_MODE_NONE while points or lines are bound, the app's value otherwise: at
+ *   vkCmdSetCullMode, at a bind and at vkCmdSetPrimitiveTopology, only when the value the driver
+ *   holds changes. A pipeline with a geometry or tessellation stage rasterizes what that stage
+ *   makes, which the topology does not tell: it is left alone. A pipeline with a static cull mode
+ *   ends the dynamic value (the app must set it again), as the API says.
+ *   Imitation (host): beneath the fix, a draw is dropped while the bound pipeline has a dynamic cull
+ *   mode, its topology is points or lines and the cull mode the driver got is not NONE.
+ *
  * The wrappers chain: each install takes t->real as it finds it (its next one down), so the
  * vb_split wrapper of vkCmdBindVertexBuffers2 calls dyn_reemit's, which calls the imitation's.
  * The lifecycle wrappers (command buffers and pipelines) are installed once, by the first of these
@@ -64,6 +77,8 @@ enum {
     S_CULL = 1u << 12, S_SMASK = 1u << 13, S_LINE = 1u << 14, S_CONS = 1u << 15,
     S_STRIDE = 1u << 16, /* a pipeline's dynamic list only; the values are the vertex bindings */
 };
+/* Primitive classes (cull_nontri): what the rasterizer gets, as far as the topology tells */
+enum { CLS_UNKNOWN, CLS_POINTS, CLS_LINES, CLS_TRIS, CLS_PATCHES };
 #define S_DS (S_DTEST | S_DWRITE | S_DCMP | S_STEST | S_SOP_F | S_SOP_B | S_SCM_F | S_SCM_B | S_SWM_F | S_SWM_B | S_SREF_F | S_SREF_B)
 #define S_RS (S_CULL | S_LINE | S_CONS)
 #define S_EDS3 (S_SMASK | S_LINE | S_CONS)
@@ -104,6 +119,12 @@ typedef struct cbs {
     uint32_t d_ever, d_buf, d_stride;
     dstate dv;
     vbind dvb[NVB];
+    /* cull_nontri: the app's dynamic cull mode, the bound pipeline, what the driver holds */
+    struct {
+        uint8_t have, sent_ok, pdyn, tdyn, custom, cls, topo_have;
+        VkCullModeFlags app, sent;
+        VkPrimitiveTopology topo;
+    } cu, dcu; /* the fix's; the imitation's (what reached the driver) */
 } cbs;
 
 typedef struct pinfo {
@@ -113,6 +134,9 @@ typedef struct pinfo {
     dstate v; /* the create info's values */
     uint32_t vi_bind;
     VkDeviceSize vi_stride[NVB];
+    uint8_t cls;      /* CLS_* of its input-assembly topology (CLS_UNKNOWN: not in it) */
+    uint8_t topo_dyn; /* VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY */
+    uint8_t custom;   /* a geometry or tessellation stage: the rasterized class is the shader's */
 } pinfo;
 
 typedef struct vkb_errata_cmd {
@@ -123,6 +147,8 @@ typedef struct vkb_errata_cmd {
     pinfo *pl[PL_BUCKETS];
     int life_on, imi_vb_on, imi_vb_bug, imi_vb_single;
     vkb_dispatch life, imi_vb, imi_dyn, fix_dyn, fix_vb; /* each wrapper set's next one down */
+    vkb_dispatch fix_cull, imi_cull;
+    uint64_t cull_none, cull_sent, cull_custom, imi_cull_dropped;
     uint64_t binds, binds_resent, resent, resent_vb, resent_static, nopipe;
     uint64_t split, split_into;
     uint64_t imi_resets, imi_stale, imi_vb_wrong;
@@ -234,6 +260,19 @@ static const void *chain_find(const void *pnext, VkStructureType type)
     return NULL;
 }
 
+static uint8_t topo_class(VkPrimitiveTopology t)
+{
+    switch (t) {
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return CLS_POINTS;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return CLS_LINES;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: return CLS_TRIS;
+    case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST: return CLS_PATCHES;
+    default: return CLS_UNKNOWN;
+    }
+}
+
 /* A graphics pipeline's record: its dynamic list and the values its create info holds, from the
  * parts it has (graphics pipeline libraries: its own parts, the rest from its libraries). */
 static void pinfo_fill(vkb_errata_cmd *c, const VkGraphicsPipelineCreateInfo *ci, pinfo *pi)
@@ -251,7 +290,17 @@ static void pinfo_fill(vkb_errata_cmd *c, const VkGraphicsPipelineCreateInfo *ci
     else if ((ci->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) || (li && li->libraryCount))
         parts = 0;
     if (parts && ci->pDynamicState)
-        for (uint32_t k = 0; k < ci->pDynamicState->dynamicStateCount; k++) pi->dyn |= dyn_bit(ci->pDynamicState->pDynamicStates[k]);
+        for (uint32_t k = 0; k < ci->pDynamicState->dynamicStateCount; k++) {
+            pi->dyn |= dyn_bit(ci->pDynamicState->pDynamicStates[k]);
+            pi->topo_dyn |= ci->pDynamicState->pDynamicStates[k] == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
+        }
+    if ((parts & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT) && ci->pInputAssemblyState)
+        pi->cls = topo_class(ci->pInputAssemblyState->topology);
+    if (parts & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT)
+        for (uint32_t k = 0; k < ci->stageCount; k++)
+            if (ci->pStages[k].stage & (VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT))
+                pi->custom = 1;
     const VkPipelineDepthStencilStateCreateInfo *ds = ci->pDepthStencilState;
     if ((parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) && ds) {
         pi->has |= H_DS;
@@ -296,6 +345,9 @@ static void pinfo_fill(vkb_errata_cmd *c, const VkGraphicsPipelineCreateInfo *ci
         pinfo lp;
         if (!pinfo_get(c, li->pLibraries[l], &lp)) continue;
         pi->dyn |= lp.dyn;
+        pi->topo_dyn |= lp.topo_dyn;
+        pi->custom |= lp.custom;
+        if (!pi->cls) pi->cls = lp.cls;
         if ((lp.has & H_DS) && !(pi->has & H_DS)) memcpy(&pi->v.dtest, &lp.v.dtest, sizeof(VkBool32) * 3), pi->v.dcmp = lp.v.dcmp,
                                                     memcpy(pi->v.st, lp.v.st, sizeof(pi->v.st));
         if ((lp.has & H_RS) && !(pi->has & H_RS)) pi->v.cull = lp.v.cull, pi->v.line = lp.v.line, pi->v.cons = lp.v.cons;
@@ -675,6 +727,155 @@ static VKAPI_ATTR void VKAPI_CALL f_CmdBindVertexBuffers2Split(VkCommandBuffer c
     ADD(c->split_into, n);
 }
 
+/* ---- cull_nontri (MK-16): the fix's and the imitation's bookkeeping share one shape */
+
+typedef __typeof__(((cbs *)0)->cu) cullst;
+
+/* The class the rasterizer gets now (CLS_UNKNOWN: not known, or a geometry/tessellation stage) */
+static uint8_t cull_cls(const cullst *u)
+{
+    if (u->custom) return CLS_UNKNOWN;
+    return u->tdyn && u->topo_have ? topo_class(u->topo) : u->cls;
+}
+
+static int nontri(const cullst *u)
+{
+    uint8_t k = cull_cls(u);
+    return k == CLS_POINTS || k == CLS_LINES;
+}
+
+/* A graphics bind: the pipeline's class and whether its cull mode and topology are dynamic */
+static void cull_bind(vkb_errata_cmd *c, cullst *u, VkPipeline p)
+{
+    pinfo pi;
+    if (!pinfo_get(c, p, &pi)) memset(&pi, 0, sizeof(pi));
+    u->pdyn = (pi.dyn & S_CULL) != 0;
+    u->tdyn = pi.topo_dyn;
+    u->custom = pi.custom;
+    u->cls = pi.cls;
+    if (!u->pdyn) u->have = 0, u->sent_ok = 0; /* a static cull mode ends the dynamic one */
+    if (!u->tdyn) u->topo_have = 0;
+}
+
+/* The fix: sends what the driver should hold, when it differs from what it holds */
+static void cull_sync(vkb_errata_cmd *c, VkCommandBuffer cb, cullst *u, int from_app)
+{
+    if (!u->have || !u->pdyn) return;
+    VkCullModeFlags want = nontri(u) ? VK_CULL_MODE_NONE : u->app;
+    if (!from_app && u->sent_ok && u->sent == want) return;
+    c->fix_cull.vkCmdSetCullMode(cb, want);
+    if (want != u->app) ADD(c->cull_none, 1);
+    if (!from_app) ADD(c->cull_sent, 1);
+    u->sent = want, u->sent_ok = 1;
+}
+
+static VKAPI_ATTR void VKAPI_CALL cu_CmdSetCullMode(VkCommandBuffer cb, VkCullModeFlags v)
+{
+    vkb_errata_cmd *c = C();
+    cbs *s = cb_find(c, cb, 1);
+    if (!s) {
+        c->fix_cull.vkCmdSetCullMode(cb, v);
+        return;
+    }
+    s->cu.app = v, s->cu.have = 1;
+    if (!s->cu.pdyn) {
+        /* no pipeline with a dynamic cull mode bound: sent as it is, the next bind decides */
+        c->fix_cull.vkCmdSetCullMode(cb, v);
+        s->cu.sent = v, s->cu.sent_ok = 1;
+        return;
+    }
+    cull_sync(c, cb, &s->cu, 1);
+}
+
+static VKAPI_ATTR void VKAPI_CALL cu_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p)
+{
+    vkb_errata_cmd *c = C();
+    c->fix_cull.vkCmdBindPipeline(cb, bp, p);
+    if (bp != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
+    cbs *s = cb_find(c, cb, 1);
+    if (!s) return;
+    int had = s->cu.have;
+    cull_bind(c, &s->cu, p);
+    if (had && s->cu.pdyn && s->cu.custom) ADD(c->cull_custom, 1);
+    cull_sync(c, cb, &s->cu, 0);
+}
+
+static VKAPI_ATTR void VKAPI_CALL cu_CmdSetPrimitiveTopology(VkCommandBuffer cb, VkPrimitiveTopology t)
+{
+    vkb_errata_cmd *c = C();
+    c->fix_cull.vkCmdSetPrimitiveTopology(cb, t);
+    cbs *s = cb_find(c, cb, 1);
+    if (!s) return;
+    s->cu.topo = t, s->cu.topo_have = 1;
+    cull_sync(c, cb, &s->cu, 0);
+}
+
+static VKAPI_ATTR void VKAPI_CALL cu_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *l)
+{
+    vkb_errata_cmd *c = C();
+    c->fix_cull.vkCmdExecuteCommands(cb, n, l);
+    cbs *s = cb_find(c, cb, 0);
+    if (s) memset(&s->cu, 0, sizeof(s->cu)); /* the state is undefined after it */
+}
+
+/* The imitation: the driver's view, and the draws it loses */
+static VKAPI_ATTR void VKAPI_CALL ci_CmdSetCullMode(VkCommandBuffer cb, VkCullModeFlags v)
+{
+    vkb_errata_cmd *c = C();
+    cbs *s = cb_find(c, cb, 1);
+    if (s) s->dcu.app = v, s->dcu.have = 1;
+    c->imi_cull.vkCmdSetCullMode(cb, v);
+}
+
+static VKAPI_ATTR void VKAPI_CALL ci_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p)
+{
+    vkb_errata_cmd *c = C();
+    c->imi_cull.vkCmdBindPipeline(cb, bp, p);
+    cbs *s = bp == VK_PIPELINE_BIND_POINT_GRAPHICS ? cb_find(c, cb, 1) : NULL;
+    if (s) cull_bind(c, &s->dcu, p);
+}
+
+static VKAPI_ATTR void VKAPI_CALL ci_CmdSetPrimitiveTopology(VkCommandBuffer cb, VkPrimitiveTopology t)
+{
+    vkb_errata_cmd *c = C();
+    cbs *s = cb_find(c, cb, 1);
+    if (s) s->dcu.topo = t, s->dcu.topo_have = 1;
+    c->imi_cull.vkCmdSetPrimitiveTopology(cb, t);
+}
+
+/* 1: the imitated driver culls this draw away */
+static int ci_lost(vkb_errata_cmd *c, VkCommandBuffer cb)
+{
+    cbs *s = cb_find(c, cb, 0);
+    if (!s || !s->dcu.have || !s->dcu.pdyn || s->dcu.app == VK_CULL_MODE_NONE || !nontri(&s->dcu)) return 0;
+    ADD(c->imi_cull_dropped, 1);
+    return 1;
+}
+
+static VKAPI_ATTR void VKAPI_CALL ci_CmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi)
+{
+    vkb_errata_cmd *c = C();
+    if (!ci_lost(c, cb)) c->imi_cull.vkCmdDraw(cb, vc, ic, fv, fi);
+}
+
+static VKAPI_ATTR void VKAPI_CALL ci_CmdDrawIndexed(VkCommandBuffer cb, uint32_t n, uint32_t ic, uint32_t fi, int32_t vo, uint32_t fin)
+{
+    vkb_errata_cmd *c = C();
+    if (!ci_lost(c, cb)) c->imi_cull.vkCmdDrawIndexed(cb, n, ic, fi, vo, fin);
+}
+
+static VKAPI_ATTR void VKAPI_CALL ci_CmdDrawIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st)
+{
+    vkb_errata_cmd *c = C();
+    if (!ci_lost(c, cb)) c->imi_cull.vkCmdDrawIndirect(cb, b, o, n, st);
+}
+
+static VKAPI_ATTR void VKAPI_CALL ci_CmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st)
+{
+    vkb_errata_cmd *c = C();
+    if (!ci_lost(c, cb)) c->imi_cull.vkCmdDrawIndexedIndirect(cb, b, o, n, st);
+}
+
 /* ---- installs */
 
 static vkb_errata_cmd *cmd_get(vkb_srv_table *t, vkb_errata_dev *e)
@@ -770,6 +971,33 @@ void vkb_errata_vb_install(vkb_srv_table *t, vkb_errata_dev *e)
     ERRATA_HOOK(t, vkCmdBindVertexBuffers2, f_CmdBindVertexBuffers2Split);
 }
 
+void vkb_errata_cull_install(vkb_srv_table *t, vkb_errata_dev *e)
+{
+    vkb_errata_cmd *c = cmd_get(t, e);
+    if (!c) return;
+    life_install(t, c);
+    c->fix_cull = t->real;
+    ERRATA_HOOK(t, vkCmdSetCullMode, cu_CmdSetCullMode);
+    ERRATA_HOOK(t, vkCmdBindPipeline, cu_CmdBindPipeline);
+    ERRATA_HOOK(t, vkCmdSetPrimitiveTopology, cu_CmdSetPrimitiveTopology);
+    ERRATA_HOOK(t, vkCmdExecuteCommands, cu_CmdExecuteCommands);
+}
+
+void vkb_errata_cull_imitate(vkb_srv_table *t, vkb_errata_dev *e)
+{
+    vkb_errata_cmd *c = cmd_get(t, e);
+    if (!c) return;
+    life_install(t, c);
+    c->imi_cull = t->real;
+    ERRATA_HOOK(t, vkCmdSetCullMode, ci_CmdSetCullMode);
+    ERRATA_HOOK(t, vkCmdBindPipeline, ci_CmdBindPipeline);
+    ERRATA_HOOK(t, vkCmdSetPrimitiveTopology, ci_CmdSetPrimitiveTopology);
+    ERRATA_HOOK(t, vkCmdDraw, ci_CmdDraw);
+    ERRATA_HOOK(t, vkCmdDrawIndexed, ci_CmdDrawIndexed);
+    ERRATA_HOOK(t, vkCmdDrawIndirect, ci_CmdDrawIndirect);
+    ERRATA_HOOK(t, vkCmdDrawIndexedIndirect, ci_CmdDrawIndexedIndirect);
+}
+
 void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e)
 {
     vkb_errata_cmd *c = e->cmd;
@@ -784,6 +1012,11 @@ void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e)
     if (!e->probe && ((e->on | e->imitated) >> VKB_ERRATUM_VB_SPLIT & 1) && (c->split || c->imi_vb_wrong))
         VKB_INFO("errata: vb_split: %llu vkCmdBindVertexBuffers2 call(s) split into %llu; %llu imitated wrong",
                  (unsigned long long)c->split, (unsigned long long)c->split_into, (unsigned long long)c->imi_vb_wrong);
+    if (!e->probe && ((e->on | e->imitated) >> VKB_ERRATUM_CULL_NONTRI & 1) && (c->cull_none || c->cull_sent || c->imi_cull_dropped))
+        VKB_INFO("errata: cull_nontri: %llu cull mode(s) sent as NONE for points/lines, %llu sent at a bind or topology change, "
+                 "%llu bind(s) with a geometry/tessellation stage left alone; imitated: %llu draw(s) culled away",
+                 (unsigned long long)c->cull_none, (unsigned long long)c->cull_sent, (unsigned long long)c->cull_custom,
+                 (unsigned long long)c->imi_cull_dropped);
     for (unsigned h = 0; h < CB_BUCKETS; h++)
         for (cbs *s = c->cb[h], *n; s; s = n) n = s->next, free(s);
     for (unsigned h = 0; h < PL_BUCKETS; h++)
