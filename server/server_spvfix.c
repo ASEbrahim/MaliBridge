@@ -27,7 +27,7 @@
  * into the memory accesses around it and can turn them speculative - GPU faults, a lost device.
  * On for ARM GPUs (as in bionic-vulkan-wrapper, where it is on by default for Arm and Qualcomm);
  * VKBRIDGE_SHL_BARRIER=1/0 forces it (on a host GPU it alone installs these wrappers, without the
- * fixes above). A rewritten module is named by the app's code (vkb_errata_spv_origin), so the hang
+ * fixes above). Its output is named by the code it came from (vkb_errata_spv_origin), so the hang
  * detector's dumps and stuck-pipeline lists keep their names.
  */
 #define _GNU_SOURCE
@@ -185,20 +185,19 @@ static uint32_t *shl_barrier(vkb_spvfix *f, const uint32_t *code, size_t size, s
 }
 
 /* The rewrites of one module's code (per-vertex blocks when pervertex, then shl_barrier): new
- * code (malloc'd, named by the app's code) or NULL when nothing changes. */
+ * code (malloc'd) or NULL when nothing changes. shl_barrier's output is named by the code it came
+ * from (vkb_errata_spv_origin); the per-vertex rewrite's keeps its own name, as before. */
 static uint32_t *rewrite(vkb_spvfix *f, const uint32_t *code, size_t size, int pervertex, size_t *out_size)
 {
     size_t s1 = 0, s2 = 0;
     uint32_t *c1 = f->fixes && pervertex ? wrap_pervertex(code, size, &s1) : NULL;
     uint32_t *c2 = shl_barrier(f, c1 ? c1 : code, c1 ? s1 : size, &s2);
     if (c2) {
+        vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
         free(c1);
         c1 = c2, s1 = s2;
     }
-    if (c1) {
-        vkb_errata_spv_origin(c1, s1, code, size);
-        *out_size = s1;
-    }
+    if (c1) *out_size = s1;
     return c1;
 }
 
