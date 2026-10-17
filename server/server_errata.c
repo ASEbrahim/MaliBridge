@@ -558,9 +558,17 @@ void vkb_errata_device_init(vkb_srv_table *t)
         }
     }
 
-    /* Logged in full once per (GPU, driver, mode, decisions with their reasons, imitations) */
+    /* Logged in full once per (GPU, driver, mode, decisions with their reasons, imitations). The
+     * driver is the version decoded, not where it was read: a device made through a Vulkan 1.0/1.1
+     * instance has no driverInfo and reads driverVersion, the same r44p1 (on the tablet a third
+     * full block came from that alone). An undecoded version keys on its build string. */
+    char drv_key[400];
+    if (d.arm && d.known)
+        snprintf(drv_key, sizeof(drv_key), "arm r%up%u%s %s", d.r, d.p, d.beta ? " beta" : "", d.family == FAM_JM ? "jm" : "csf");
+    else
+        snprintf(drv_key, sizeof(drv_key), "%s", drv);
     char key[sizeof(block) + 1400];
-    snprintf(key, sizeof(key), "%s%s|%s|%s|on %s|off %s|imitate 0x%x", block, gpu, drv, mode, on_list, off_list, imitate);
+    snprintf(key, sizeof(key), "%s%s|%s|%s|on %s|off %s|imitate 0x%x", block, gpu, drv_key, mode, on_list, off_list, imitate);
     uint32_t first = 0;
     int same = seen_before(key, t->id, &first);
     int level = same ? VKB_LOG_DEBUG : VKB_LOG_INFO;

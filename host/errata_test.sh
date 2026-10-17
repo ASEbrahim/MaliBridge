@@ -104,6 +104,11 @@ device VKBRIDGE_MODE=performance VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERR
 [ $r = 0 ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
   echo "$new" | grep -q "errata: device [0-9]*, .*, performance mode: on $(on_set);" && echo "$new" | grep -q "clamp_zero gives"
 step $? "a later device with the same decisions: \"${same:-no short line}\"; in performance mode in full again (on $(on_set))"
+# the same driver read another way (a Vulkan 1.0/1.1 instance has no driverInfo, so driverVersion
+# is read: "r44p1 (driverVersion)" against "r44p1 (driverInfo ...)"): still the short line
+device VKBRIDGE_FAKE_DRIVER_VERSION=v1.r44p1-01eac0 VKBRIDGE_ERRATA=+example,-view_counts
+echo "$new" | grep -q "errata: device [0-9]*: same as device $first (safe mode): on $(on_set)\$" && ! echo "$new" | grep -qE "errata: [a-z_]* O(N|FF) \("
+step $? "the same driver from another version string: \"$(echo "$new" | grep -o 'errata: device [0-9]*[:,] [^:]*' | tail -1)\""
 
 # 4 the example fix and its imitation, beneath the null-descriptor emulation
 printf 'VKBRIDGE_FAKE_MISSING=robustness2\nVKBRIDGE_ERRATA=+example\nVKBRIDGE_ERRATA_IMITATE=example\n' > "$cache/env"
