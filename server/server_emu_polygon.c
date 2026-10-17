@@ -24,6 +24,12 @@
  *    are when the app's command buffer starts: a draw whose index buffer an earlier command of the
  *    same command buffer writes (copy, update, fill) is drawn solid instead (logged once).
  *    Strip restarts are honoured; a fan with restart enabled is drawn solid.
+ *    In a secondary command buffer (DXVK 3 records every render pass into one on a tiler such as
+ *    Mali: dxvk.tilerMode) the dispatches go into a primary of the emulation's own as well, from
+ *    the secondary's pool; vkCmdExecuteCommands hands it to the executing primary, and it is
+ *    submitted before that primary with the primary's own. The indices are read as they are when
+ *    the executing primary starts: an index buffer the primary writes before it executes the
+ *    secondary shows its old edges (logged once; DXVK uploads into its separate init command buffer).
  * The approach - turn the triangles' index stream into their edges and give the line rasterizer
  * that, never a geometry shader (Mali runs those very slowly) - is the one Mesa's panvk and
  * taowen's libhybris compatibility layer (arlinux branch, VK_LAYER_HYBRIS_compat polygon_*.c,
@@ -35,13 +41,13 @@
  * to polygons only). Dynamic topology and restart (vkd3d-proton sets them at record time) are
  * taken from the command buffer at each draw; the variant gets a line- or point-list topology set
  * around its draw. Drawn solid, as before (logged once each): indirect draws, pipelines with
- * dynamic polygon mode, geometry or tessellation stages, pipeline libraries; indexed draws in
- * secondary command buffers.
+ * dynamic polygon mode, geometry or tessellation stages, pipeline libraries.
  *
  * VKBRIDGE_POLYGON_EMU=0 turns it off: the feature is still reported and such pipelines draw solid.
  *
  * Cost: none until the first non-solid pipeline is made - the wrappers below pass straight through
- * on one flag. After it, a lookup per pipeline bind and draw. A non-solid pipeline compiles twice;
+ * on one flag. (The command-state tracker beneath records every command buffer's pool and level
+ * from the start, so command buffers allocated before that pipeline get their index pass too.) After it, a lookup per pipeline bind and draw. A non-solid pipeline compiles twice;
  * its draws bind two pipelines and an index buffer more, and indexed ones add a dispatch of
  * ceil(triangles / 64) workgroups, 24 bytes of scratch per triangle and one full barrier per
  * command buffer that has any. Every index buffer is made with STORAGE_BUFFER usage too (while the
@@ -119,6 +125,7 @@ typedef struct poly_dev {
     PFN_vkCmdSetPrimitiveRestartEnable set_restart;
     PFN_vkCmdSetPolygonModeEXT set_polygon;
     PFN_vkEndCommandBuffer end;
+    PFN_vkCmdExecuteCommands exec;
     PFN_vkQueueSubmit submit;
     PFN_vkQueueSubmit2 submit2;
     /* totals, logged at vkDestroyDevice */
@@ -157,9 +164,16 @@ typedef struct poly_cb {
     /* the command buffer submitted before this one, with the index shader's dispatches */
     VkCommandBuffer pre;
     VkCommandPool pre_pool;
-    int pre_open;
+    int pre_open, secondary;
     chunk *chunks;
     uint32_t nchunks;
+    /* index buffers the dispatches read (a secondary's: checked against its primary's writes) */
+    VkBuffer read[MAX_WRITTEN];
+    uint32_t nread;
+    int read_over;
+    /* a primary: the index command buffers of the secondaries it executes (kept across begins) */
+    VkCommandBuffer *xpre;
+    uint32_t nxpre, capxpre;
 } poly_cb;
 
 static poly_dev *pdev(void)
@@ -195,12 +209,13 @@ static int has_dynamic(const VkGraphicsPipelineCreateInfo *ci, VkDynamicState d)
 static void solid(VkPolygonMode m, const char *why)
 {
     /* One line per reason. */
-    static const char *told[8];
+    static const char *told[24];
     static int n;
-    for (int i = 0; i < __atomic_load_n(&n, __ATOMIC_ACQUIRE); i++)
+    int have = __atomic_load_n(&n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < have && i < 24; i++)
         if (told[i] == why) return;
     int k = __atomic_fetch_add(&n, 1, __ATOMIC_ACQ_REL);
-    if (k < 8) told[k] = why;
+    if (k < 24) told[k] = why;
     VKB_WARN("emulation: polygon mode %s drawn solid (%s; no fillModeNonSolid; logged once)", mode_name(m), why);
 }
 
@@ -501,10 +516,13 @@ void vkb_emu_polygon_cb_reset(vkb_emu_device *e, VkCommandBuffer cb, VkCommandPo
     (void)cb;
     if (c->pre) e->dev->real.vkFreeCommandBuffers(e->dev->device, c->pre_pool ? c->pre_pool : pool, 1, &c->pre);
     chunk *chunks = c->chunks;
-    uint32_t n = c->nchunks;
+    uint32_t n = c->nchunks, capx = c->capxpre;
+    VkCommandBuffer *xpre = c->xpre;
     memset(c, 0, sizeof(*c));
     c->chunks = chunks;
     c->nchunks = n;
+    c->xpre = xpre;
+    c->capxpre = capx;
     for (uint32_t i = 0; i < n; i++) chunks[i].used = 0;
     c->complete = 1;
 }
@@ -518,6 +536,7 @@ void vkb_emu_polygon_cb_free(vkb_emu_device *e, void *poly)
         e->dev->real.vkFreeMemory(e->dev->device, c->chunks[i].mem, NULL);
     }
     free(c->chunks);
+    free(c->xpre);
     free(c);
 }
 
@@ -715,23 +734,36 @@ static int written(const poly_cb *c, VkBuffer b)
     return 0;
 }
 
-/* The command buffer submitted before the app's, recording; VK_NULL_HANDLE if there can be none. */
-static VkCommandBuffer pre_cb(poly_dev *s, poly_cb *c, VkCommandBuffer cb)
+/* The command buffer submitted before the app's (a secondary's: before the primary that executes
+ * it), recording; VK_NULL_HANDLE and *why if there can be none. */
+static VkCommandBuffer pre_cb(poly_dev *s, poly_cb *c, VkCommandBuffer cb, const char **why)
 {
     if (c->pre_open) return c->pre;
-    if (c->pre) return VK_NULL_HANDLE;
+    if (c->pre) {
+        *why = "an indexed draw after its command buffer's index pass was closed (vkEndCommandBuffer not followed by a begin)";
+        return VK_NULL_HANDLE;
+    }
     int secondary = 0;
     uint32_t flags = 0;
     VkCommandPool pool = vkb_emu_cb_origin(s->e, cb, &secondary, &flags);
-    if (!pool || secondary) return VK_NULL_HANDLE;
+    if (!pool) {
+        *why = "a command buffer whose allocation the bridge did not see (no pool for the index pass)";
+        return VK_NULL_HANDLE;
+    }
     const vkb_dispatch *r = &s->e->dev->real;
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     VkCommandBuffer pre = VK_NULL_HANDLE;
-    if (r->vkAllocateCommandBuffers(s->e->dev->device, &ai, &pre) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
+    if (r->vkAllocateCommandBuffers(s->e->dev->device, &ai, &pre) != VK_SUCCESS) {
+        *why = "the index pass's command buffer could not be allocated from the app's pool";
+        return VK_NULL_HANDLE;
+    }
+    /* A secondary can be executed by several primaries of one submission or of pending ones. */
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                   secondary ? VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT : flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
                                    NULL};
     if (r->vkBeginCommandBuffer(pre, &bi) != VK_SUCCESS) {
         r->vkFreeCommandBuffers(s->e->dev->device, pool, 1, &pre);
+        *why = "the index pass's command buffer could not be begun";
         return VK_NULL_HANDLE;
     }
     /* Whatever wrote the indices before (earlier submissions, the app's own barriers name the
@@ -743,6 +775,7 @@ static VkCommandBuffer pre_cb(poly_dev *s, poly_cb *c, VkCommandBuffer cb)
     c->pre = pre;
     c->pre_pool = pool;
     c->pre_open = 1;
+    c->secondary = secondary;
     return pre;
 }
 
@@ -804,7 +837,7 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdDrawIndexed(VkCommandBuffer cb, uint32_t 
         if (range > s->limits.maxStorageBufferRange) why = "an index range too large";
     }
     if (!why && !compute_ready(s)) why = "no index shader";
-    if (!why && !(pre = pre_cb(s, c, cb))) why = "an indexed draw in a secondary command buffer";
+    if (!why) pre = pre_cb(s, c, cb, &why);
     if (!why && !scratch(s, c, out_size, &out, &out_off)) why = "no memory for the edge list";
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (!why && !(set = vkb_emu_cb_scratch_set(s->e, cb, s->dsl))) why = "no descriptor set";
@@ -823,7 +856,14 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdDrawIndexed(VkCommandBuffer cb, uint32_t 
     r->vkCmdBindDescriptorSets(pre, VK_PIPELINE_BIND_POINT_COMPUTE, s->pl, 0, 1, &set, 0, NULL);
     r->vkCmdPushConstants(pre, s->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
     r->vkCmdDispatch(pre, (uint32_t)gx, (uint32_t)gy, 1);
+    int known = c->read_over;
+    for (uint32_t i = 0; i < c->nread && !known; i++) known = c->read[i] == c->ib;
+    if (!known) {
+        if (c->nread < MAX_WRITTEN) c->read[c->nread++] = c->ib;
+        else c->read_over = 1;
+    }
     tell_first(s, c->mode, 1);
+    if (c->secondary) VKB_ONCE(VKB_LOG_INFO, "emulation: polygon mode LINE drawn as lines, indexed, in a secondary command buffer (first draw; logged once)");
     count(s, &s->n_lines_idx);
     use_variant(s, cb, c);
     s->bind_ib(cb, out, out_off, VK_INDEX_TYPE_UINT32);
@@ -926,11 +966,52 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_EndCommandBuffer(VkCommandBuffer cb)
     return s->end(cb);
 }
 
-/* The emulation's command buffer that goes before cb in a submission, or VK_NULL_HANDLE. */
-static VkCommandBuffer pre_of(poly_dev *s, VkCommandBuffer cb)
+/* A primary executes secondaries: their index passes go before it in its submissions. */
+static VKAPI_ATTR void VKAPI_CALL p_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *l)
+{
+    poly_dev *s = pdev();
+    poly_cb *c = live(s) ? cbs(s->e, cb) : NULL;
+    for (uint32_t i = 0; c && i < n; i++) {
+        poly_cb *x = vkb_emu_cb_poly(s->e, l[i], 0);
+        if (!x || !x->pre || x->pre_open) continue;
+        int stale = 0;
+        for (uint32_t k = 0; k < x->nread && !stale; k++) stale = written(c, x->read[k]);
+        if (stale || (x->read_over && (c->nwritten || c->written_over)))
+            VKB_ONCE(VKB_LOG_WARN, "emulation: polygon mode LINE: an index buffer written in a primary before it executes a "
+                                   "secondary that draws from it: those lines follow the indices as they were before (logged once)");
+        uint32_t k = 0;
+        while (k < c->nxpre && c->xpre[k] != x->pre) k++;
+        if (k < c->nxpre) continue;
+        if (c->nxpre == c->capxpre) {
+            uint32_t cap = c->capxpre ? c->capxpre * 2 : 4;
+            VkCommandBuffer *nx = realloc(c->xpre, cap * sizeof(*nx));
+            if (!nx) {
+                VKB_ONCE(VKB_LOG_WARN, "emulation: polygon mode LINE: out of memory listing a secondary's index pass; its lines "
+                                       "read unwritten scratch (logged once)");
+                continue;
+            }
+            c->xpre = nx;
+            c->capxpre = cap;
+        }
+        c->xpre[c->nxpre++] = x->pre;
+    }
+    s->exec(cb, n, l);
+}
+
+/* The emulation's command buffers that go before cb in a submission (the index passes of the
+ * secondaries it executes, then its own); their number, written to out when it is not NULL. */
+static uint32_t pres_of(poly_dev *s, VkCommandBuffer cb, VkCommandBuffer *out)
 {
     poly_cb *c = vkb_emu_cb_poly(s->e, cb, 0);
-    return c && c->pre && !c->pre_open ? c->pre : VK_NULL_HANDLE;
+    if (!c) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < c->nxpre; i++, n++)
+        if (out) out[n] = c->xpre[i];
+    if (c->pre && !c->pre_open) {
+        if (out) out[n] = c->pre;
+        n++;
+    }
+    return n;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL p_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f)
@@ -939,8 +1020,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_QueueSubmit(VkQueue q, uint32_t n, const
     if (!live(s)) return s->submit(q, n, si, f);
     uint32_t extra = 0, total = 0;
     for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = 0; j < si[i].commandBufferCount; j++, total++)
-            if (pre_of(s, si[i].pCommandBuffers[j])) extra++;
+        for (uint32_t j = 0; j < si[i].commandBufferCount; j++, total++) extra += pres_of(s, si[i].pCommandBuffers[j], NULL);
     if (!extra) return s->submit(q, n, si, f);
     VkSubmitInfo *ns = malloc(n * sizeof(*ns));
     VkCommandBuffer *all = malloc((total + extra) * sizeof(*all));
@@ -965,18 +1045,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_QueueSubmit(VkQueue q, uint32_t n, const
                 g->commandBufferCount != si[i].commandBufferCount)
                 continue;
             uint32_t m = k;
-            for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
-                if (pre_of(s, si[i].pCommandBuffers[j])) masks[m++] = g->pCommandBufferDeviceMasks[j];
-                masks[m++] = g->pCommandBufferDeviceMasks[j];
-            }
+            for (uint32_t j = 0; j < si[i].commandBufferCount; j++)
+                for (uint32_t p = pres_of(s, si[i].pCommandBuffers[j], NULL) + 1; p; p--) masks[m++] = g->pCommandBufferDeviceMasks[j];
             g->pCommandBufferDeviceMasks = masks + k;
             g->commandBufferCount = m - k;
         }
         ns[i] = si[i];
         ns[i].pCommandBuffers = all + k;
         for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
-            VkCommandBuffer pre = pre_of(s, si[i].pCommandBuffers[j]);
-            if (pre) all[k++] = pre;
+            k += pres_of(s, si[i].pCommandBuffers[j], all + k);
             all[k++] = si[i].pCommandBuffers[j];
         }
         ns[i].commandBufferCount = (uint32_t)(all + k - ns[i].pCommandBuffers);
@@ -995,7 +1072,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_QueueSubmit2(VkQueue q, uint32_t n, cons
     uint32_t extra = 0, total = 0;
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t j = 0; j < si[i].commandBufferInfoCount; j++, total++)
-            if (pre_of(s, si[i].pCommandBufferInfos[j].commandBuffer)) extra++;
+            extra += pres_of(s, si[i].pCommandBufferInfos[j].commandBuffer, NULL);
     if (!extra) return s->submit2(q, n, si, f);
     VkSubmitInfo2 *ns = malloc(n * sizeof(*ns));
     VkCommandBufferSubmitInfo *all = malloc((total + extra) * sizeof(*all));
@@ -1010,12 +1087,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_QueueSubmit2(VkQueue q, uint32_t n, cons
         ns[i].pCommandBufferInfos = all + k;
         for (uint32_t j = 0; j < si[i].commandBufferInfoCount; j++) {
             const VkCommandBufferSubmitInfo *app = &si[i].pCommandBufferInfos[j];
-            VkCommandBuffer pre = pre_of(s, app->commandBuffer);
-            if (pre) {
+            VkCommandBuffer pre[64];
+            uint32_t np = pres_of(s, app->commandBuffer, NULL);
+            VkCommandBuffer *pl = np <= 64 ? pre : malloc(np * sizeof(*pl));
+            if (!pl) {
+                free(ns);
+                free(all);
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            pres_of(s, app->commandBuffer, pl);
+            for (uint32_t p = 0; p < np; p++) {
                 all[k] = *app;
                 all[k].pNext = NULL;
-                all[k++].commandBuffer = pre;
+                all[k++].commandBuffer = pl[p];
             }
+            if (pl != pre) free(pl);
             all[k++] = *app;
         }
         ns[i].commandBufferInfoCount = (uint32_t)(all + k - ns[i].pCommandBufferInfos);
@@ -1071,6 +1157,7 @@ void vkb_emu_polygon_install(vkb_srv_table *dev)
     TAKE(vkCmdSetPrimitiveRestartEnable, p_CmdSetPrimitiveRestartEnable, set_restart);
     TAKE(vkCmdSetPolygonModeEXT, p_CmdSetPolygonModeEXT, set_polygon);
     TAKE(vkEndCommandBuffer, p_EndCommandBuffer, end);
+    TAKE(vkCmdExecuteCommands, p_CmdExecuteCommands, exec);
     TAKE(vkQueueSubmit, p_QueueSubmit, submit);
     TAKE(vkQueueSubmit2, p_QueueSubmit2, submit2);
 #undef TAKE
@@ -1105,6 +1192,7 @@ void vkb_emu_polygon_uninstall(vkb_srv_table *dev)
     GIVE(vkCmdSetPrimitiveRestartEnable, p_CmdSetPrimitiveRestartEnable, set_restart);
     GIVE(vkCmdSetPolygonModeEXT, p_CmdSetPolygonModeEXT, set_polygon);
     GIVE(vkEndCommandBuffer, p_EndCommandBuffer, end);
+    GIVE(vkCmdExecuteCommands, p_CmdExecuteCommands, exec);
     GIVE(vkQueueSubmit, p_QueueSubmit, submit);
     GIVE(vkQueueSubmit2, p_QueueSubmit2, submit2);
 #undef GIVE

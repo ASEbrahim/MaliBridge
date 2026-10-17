@@ -18,6 +18,10 @@
  *   - dynamic topology and restart (vkd3d-proton's way): a strip with a restart, then a fan, from
  *     one pipeline (Vulkan 1.3 devices)
  *   - FILL, the control: the inside lit
+ *   - the command pool and command buffers made before the first non-solid pipeline exists (as an
+ *     app's are): a primary's indexed LINE draw, and the same draw recorded in a secondary command
+ *     buffer executed inside the primary's render pass (DXVK 3's tiler mode records render passes
+ *     so; Half-Life 2's wireframe drew solid on Mali-G720 until secondaries were handled)
  * Culling is off throughout (the emulation draws every triangle's edges; see the server file).
  */
 #define VK_NO_PROTOTYPES
@@ -59,7 +63,7 @@ I(vkGetImageMemoryRequirements); I(vkBindImageMemory); I(vkCreateImageView); I(v
 I(vkCreateShaderModule); I(vkCreatePipelineLayout); I(vkCreateGraphicsPipelines); I(vkCmdBeginRenderPass); I(vkCmdEndRenderPass);
 I(vkCmdBindPipeline); I(vkCmdBindVertexBuffers); I(vkCmdBindIndexBuffer); I(vkCmdDraw); I(vkCmdDrawIndexed);
 I(vkCmdCopyImageToBuffer); I(vkCmdPipelineBarrier); I(vkDeviceWaitIdle); I(vkFlushMappedMemoryRanges);
-I(vkCmdSetPrimitiveTopology); I(vkCmdSetPrimitiveRestartEnable);
+I(vkCmdSetPrimitiveTopology); I(vkCmdSetPrimitiveRestartEnable); I(vkCmdExecuteCommands);
 #undef I
 
 static void check(int ok, const char *what, const char *detail)
@@ -203,7 +207,7 @@ int main(void)
     D(vkBindImageMemory); D(vkCreateImageView); D(vkCreateRenderPass); D(vkCreateFramebuffer); D(vkCreateShaderModule);
     D(vkCreatePipelineLayout); D(vkCreateGraphicsPipelines); D(vkCmdBeginRenderPass); D(vkCmdEndRenderPass); D(vkCmdBindPipeline);
     D(vkCmdBindVertexBuffers); D(vkCmdBindIndexBuffer); D(vkCmdDraw); D(vkCmdDrawIndexed); D(vkCmdCopyImageToBuffer);
-    D(vkCmdPipelineBarrier); D(vkDeviceWaitIdle); D(vkFlushMappedMemoryRanges);
+    D(vkCmdPipelineBarrier); D(vkDeviceWaitIdle); D(vkFlushMappedMemoryRanges); D(vkCmdExecuteCommands);
     int core13 = props.apiVersion >= VK_API_VERSION_1_3;
     if (core13) {
         D(vkCmdSetPrimitiveTopology);
@@ -265,6 +269,18 @@ int main(void)
     const uint32_t i32[] = {1, 2, 3, 0xffffffffu, 8, 9, 10};
     memcpy(ib32, i32, sizeof(i32));
 
+    /* ---- the pool and two command buffers before any non-solid pipeline exists */
+    VkCommandPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, qfam};
+    VkCommandPool cpool;
+    if (vkCreateCommandPool(dev, &cpci, NULL, &cpool)) { check(0, "setup", "command pool"); goto out; }
+    VkCommandBuffer early, second;
+    VkCommandBufferAllocateInfo eai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    VkCommandBufferAllocateInfo sai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, cpool, VK_COMMAND_BUFFER_LEVEL_SECONDARY, 1};
+    if (vkAllocateCommandBuffers(dev, &eai, &early) || vkAllocateCommandBuffers(dev, &sai, &second)) {
+        check(0, "setup", "early command buffers");
+        goto out;
+    }
+
     /* ---- pipelines: LINE list, LINE strip with restart, LINE fan, POINT list, FILL list */
     VkPipelineShaderStageCreateInfo st[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, shader(spv_vert, sizeof(spv_vert)), "main", NULL},
@@ -311,11 +327,7 @@ int main(void)
         check(r == VK_SUCCESS, what, msg);
         if (r) goto out;
     }
-    VkCommandPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, qfam};
-    VkCommandPool cpool;
-    vkCreateCommandPool(dev, &cpci, NULL, &cpool);
-
-    enum { C_LIST, C_IDX16, C_STRIP, C_FAN, C_POINT, C_RESTORE, C_RESUBMIT, C_DYN, C_FILL, NC };
+    enum { C_LIST, C_IDX16, C_STRIP, C_FAN, C_POINT, C_RESTORE, C_RESUBMIT, C_DYN, C_EARLY, C_SECONDARY, C_FILL, NC };
     for (int c = 0; c < NC; c++) {
         if (c == C_DYN && !core13) {
             printf("SKIP dynamic topology: a Vulkan 1.1 device\n");
@@ -323,15 +335,28 @@ int main(void)
         }
         VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         VkCommandBuffer cb;
-        vkAllocateCommandBuffers(dev, &cbai, &cb);
+        if (c == C_EARLY || c == C_SECONDARY) cb = early;
+        else vkAllocateCommandBuffers(dev, &cbai, &cb);
         VkCommandBufferBeginInfo cbbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
                                          c == C_RESUBMIT ? 0 : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
         vkBeginCommandBuffer(cb, &cbbi);
         VkClearValue clear = {.color = {.float32 = {0, 0, 0, 0}}};
         VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {W, H}}, 1, &clear};
-        vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         VkDeviceSize zero = 0;
-        vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &zero);
+        if (c == C_SECONDARY) {
+            /* The render pass's draws in a secondary (begun before the pipelines existed too). */
+            VkCommandBufferInheritanceInfo inh = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, NULL, rp, 0, fb, VK_FALSE, 0, 0};
+            VkCommandBufferBeginInfo sbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, &inh};
+            vkBeginCommandBuffer(second, &sbi);
+            vkCmdBindVertexBuffers(second, 0, 1, &vbuf, &zero);
+            vkCmdBindPipeline(second, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_LIST]);
+            vkCmdBindIndexBuffer(second, ibuf16, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(second, 3, 2, 3, 1, 0);
+            vkEndCommandBuffer(second);
+        }
+        vkCmdBeginRenderPass(cb, &rbi, c == C_SECONDARY ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS : VK_SUBPASS_CONTENTS_INLINE);
+        if (c != C_SECONDARY) vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &zero);
         const char *what = "";
         switch (c) {
         case C_LIST:
@@ -386,6 +411,16 @@ int main(void)
             vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
             vkCmdDraw(cb, 4, 1, 4, 1); /* instance 1: 32 pixels to the right */
             break;
+        case C_EARLY:
+            what = "LINE, vkCmdDrawIndexed, a command buffer allocated before the pipelines";
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_LIST]);
+            vkCmdBindIndexBuffer(cb, ibuf16, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(cb, 3, 2, 3, 1, 0);
+            break;
+        case C_SECONDARY:
+            what = "LINE, vkCmdDrawIndexed in a secondary command buffer, both allocated before the pipelines";
+            vkCmdExecuteCommands(cb, 1, &second);
+            break;
         case C_FILL:
             what = "FILL, vkCmdDraw (control)";
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_FILL]);
@@ -408,6 +443,8 @@ int main(void)
             ok = wire_a(0, msg, sizeof(msg));
             break;
         case C_IDX16:
+        case C_EARLY:
+        case C_SECONDARY:
             ok = wire_a(0, msg, sizeof(msg)) && wire_a(32, msg, sizeof(msg));
             break;
         case C_STRIP:
