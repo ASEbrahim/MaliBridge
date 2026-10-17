@@ -183,11 +183,14 @@ run_mode() {
   timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"
   # Polygon mode LINE / POINT (wireframe): native on plain; on mali drawn through the line- and
   # point-list variants (the edge list of non-indexed draws, the compute pass's edges of indexed
-  # ones), and the check fails there with the emulation off (VKBRIDGE_POLYGON_EMU=0: solid)
+  # ones, in primaries and in secondaries as DXVK 3 records render passes on a tiler; nothing drawn
+  # solid), and the check fails there with the emulation off (VKBRIDGE_POLYGON_EMU=0: solid)
   timeout 60 ./out/polygon_check >out/t-polygon.log 2>&1 &&
     { [ "$mode" != mali ] || { grep -q "polygon mode LINE drawn as lines (first" "$VKB_SERVER_LOG" &&
       grep -q "polygon mode LINE drawn as lines, indexed" "$VKB_SERVER_LOG" &&
-      grep -q "polygon mode POINT drawn as points" "$VKB_SERVER_LOG"; }; }
+      grep -q "polygon mode LINE drawn as lines, indexed, in a secondary command buffer" "$VKB_SERVER_LOG" &&
+      grep -q "polygon mode POINT drawn as points" "$VKB_SERVER_LOG" &&
+      ! grep -q "polygon mode [A-Z]* drawn solid (" "$VKB_SERVER_LOG"; }; }
   result $? "polygon_check ($(tail -1 out/t-polygon.log))"
   if [ "$mode" = mali ]; then
     VKBRIDGE_POLYGON_EMU=0 . ./mali_env.sh >/dev/null
