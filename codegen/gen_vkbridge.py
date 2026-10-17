@@ -683,6 +683,11 @@ def emit_ptr_dec(w, owner, m, dst, side):
         return
     w('if (vkb_dec_u8(d)) {')
     w('uint32_t n_ = vkb_dec_u32(d);')
+    if kind != 'count':
+        # A pointer to one element: any other count means the sender's encoding does not match
+        # (a hand-written encoder once left the count out; the server read 0 from the padding and
+        # handed Mali's vkBeginCommandBuffer a begin info made of stale bytes, SIGSEGV at 0x10).
+        w('if (n_ != 1) d->err = 1;')
     if is_dhandle(t):
         w(f'{ctype} *a_ = ({ctype} *)vkb_dec_alloc(d, (size_t)n_ * sizeof({ctype}));')
         w(f'for (uint32_t i_ = 0; a_ && i_ < n_; i_++) a_[i_] = ({ctype})(uintptr_t)vkb_dec_u64(d);')

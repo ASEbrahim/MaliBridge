@@ -268,6 +268,14 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         scratch = sub.r;
         if (sub.status != VKB_ST_OK) {
             VKB_ERR("command stream: %s failed (status %u)", vkb_cmd_names[id], sub.status);
+            if (id == VKB_CMD_vkBeginCommandBuffer) {
+                /* The begin never reached the driver (its encoding did not decode): recording into
+                 * a command buffer that was not begun would hand the driver one in the wrong state. */
+                VKB_ERR("command stream: command buffer %p not begun; its %zu bytes of commands are dropped", (void *)cb, len);
+                vkb_enc_free(&scratch);
+                vkb_enc_u32(&c->r, (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY);
+                return;
+            }
         }
         if (id == VKB_CMD_vkBeginCommandBuffer && scratch.len >= 4) memcpy(&begin_r, scratch.buf, 4);
         pos += (n + 7) & ~(size_t)7;
