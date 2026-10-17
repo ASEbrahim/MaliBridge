@@ -32,9 +32,11 @@
  * Differences from a GPU's own polygon mode (logged once where they can happen): back-face culling
  * does not apply to the lines and points (every triangle's edges are drawn: cull mode is a
  * property of triangles, which the variant no longer has), nor does depth bias (Vulkan applies it
- * to polygons only). Drawn solid, as before (logged once each): indirect draws, pipelines with
- * dynamic topology or dynamic polygon mode, geometry or tessellation stages, pipeline libraries;
- * indexed draws in secondary command buffers.
+ * to polygons only). Dynamic topology and restart (vkd3d-proton sets them at record time) are
+ * taken from the command buffer at each draw; the variant gets a line- or point-list topology set
+ * around its draw. Drawn solid, as before (logged once each): indirect draws, pipelines with
+ * dynamic polygon mode, geometry or tessellation stages, pipeline libraries; indexed draws in
+ * secondary command buffers.
  *
  * VKBRIDGE_POLYGON_EMU=0 turns it off: the feature is still reported and such pipelines draw solid.
  *
@@ -58,8 +60,9 @@ enum { TOPO_LIST = 0, TOPO_STRIP = 1, TOPO_FAN = 2 };
 struct poly_info {
     int want;                 /* make the variant */
     VkPolygonMode mode;       /* LINE or POINT */
-    uint32_t topo;            /* TOPO_* */
-    VkBool32 restart;         /* primitiveRestartEnable */
+    uint32_t topo;            /* TOPO_* (static topology) */
+    VkBool32 restart;         /* primitiveRestartEnable (static) */
+    int dyn_topo, dyn_restart; /* set at record time instead (vkCmdSetPrimitiveTopology / RestartEnable) */
 };
 
 typedef struct poly_rec {
@@ -67,6 +70,7 @@ typedef struct poly_rec {
     VkPolygonMode mode;
     uint32_t topo;
     VkBool32 restart;
+    int dyn_topo, dyn_restart;
     struct poly_rec *next;
 } poly_rec;
 
@@ -111,6 +115,9 @@ typedef struct poly_dev {
     PFN_vkCmdCopyBuffer2 copy2;
     PFN_vkCmdUpdateBuffer update;
     PFN_vkCmdFillBuffer fill;
+    PFN_vkCmdSetPrimitiveTopology set_topo;
+    PFN_vkCmdSetPrimitiveRestartEnable set_restart;
+    PFN_vkCmdSetPolygonModeEXT set_polygon;
     PFN_vkEndCommandBuffer end;
     PFN_vkQueueSubmit submit;
     PFN_vkQueueSubmit2 submit2;
@@ -133,6 +140,11 @@ typedef struct poly_cb {
     VkPolygonMode mode;
     uint32_t topo;
     VkBool32 restart;
+    int dyn_topo, dyn_restart;
+    /* the app's dynamic topology and restart (when set since the begin) */
+    int topo_known, restart_known;
+    VkPrimitiveTopology app_topo;
+    VkBool32 app_restart;
     /* the app's index buffer */
     int ib_known, ib_two;
     VkBuffer ib;
@@ -199,10 +211,7 @@ void vkb_emu_polygon_pipeline(vkb_emu_device *e, const VkGraphicsPipelineCreateI
     const VkPipelineRasterizationStateCreateInfo *rs = ci->pRasterizationState;
     if (!rs || rs->rasterizerDiscardEnable) return;
     VkPolygonMode m = rs->polygonMode;
-    if (has_dynamic(ci, VK_DYNAMIC_STATE_POLYGON_MODE_EXT)) {
-        solid(VK_POLYGON_MODE_LINE, "a pipeline with dynamic polygon mode");
-        return;
-    }
+    if (has_dynamic(ci, VK_DYNAMIC_STATE_POLYGON_MODE_EXT)) return; /* p_CmdSetPolygonModeEXT */
     if (m != VK_POLYGON_MODE_LINE && m != VK_POLYGON_MODE_POINT) return;
     if (ci->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) {
         solid(m, "a pipeline library");
@@ -219,10 +228,6 @@ void vkb_emu_polygon_pipeline(vkb_emu_device *e, const VkGraphicsPipelineCreateI
             solid(m, "a geometry, tessellation or mesh stage");
             return;
         }
-    if (has_dynamic(ci, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY)) {
-        solid(m, "a pipeline with dynamic topology");
-        return;
-    }
     const VkPipelineInputAssemblyStateCreateInfo *ia = ci->pInputAssemblyState;
     if (!ia) return;
     switch (ia->topology) {
@@ -236,6 +241,9 @@ void vkb_emu_polygon_pipeline(vkb_emu_device *e, const VkGraphicsPipelineCreateI
     out->want = 1;
     out->mode = m;
     out->restart = ia->primitiveRestartEnable;
+    /* vkd3d-proton sets both at record time (VK_EXT_extended_dynamic_state): the draw decides. */
+    out->dyn_topo = has_dynamic(ci, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
+    out->dyn_restart = has_dynamic(ci, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE);
     if (rs->cullMode != VK_CULL_MODE_NONE)
         VKB_ONCE(VKB_LOG_INFO, "emulation: polygon mode %s with back-face culling: the emulation draws every triangle's edges "
                                "(logged once)", mode_name(m));
@@ -276,6 +284,8 @@ void vkb_emu_polygon_created(vkb_emu_device *e, VkDevice device, VkPipelineCache
     rec->mode = info->mode;
     rec->topo = info->topo;
     rec->restart = info->restart;
+    rec->dyn_topo = info->dyn_topo;
+    rec->dyn_restart = info->dyn_restart;
     pthread_mutex_lock(&s->lock);
     rec->next = s->b[ph(p)];
     s->b[ph(p)] = rec;
@@ -525,6 +535,8 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdBindPipeline(VkCommandBuffer cb, VkPipeli
             c->mode = r.mode;
             c->topo = r.topo;
             c->restart = r.restart;
+            c->dyn_topo = r.dyn_topo;
+            c->dyn_restart = r.dyn_restart;
         } else if (c) {
             c->app = c->variant = VK_NULL_HANDLE;
         }
@@ -558,10 +570,78 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdBindIndexBuffer2(VkCommandBuffer cb, VkBu
     s->bind_ib2(cb, b, off, size, t);
 }
 
-static void restore(poly_dev *s, VkCommandBuffer cb, poly_cb *c)
+static VKAPI_ATTR void VKAPI_CALL p_CmdSetPrimitiveTopology(VkCommandBuffer cb, VkPrimitiveTopology t)
+{
+    poly_dev *s = pdev();
+    poly_cb *c = live(s) ? cbs(s->e, cb) : NULL;
+    if (c) {
+        c->topo_known = 1;
+        c->app_topo = t;
+    }
+    s->set_topo(cb, t);
+}
+
+static VKAPI_ATTR void VKAPI_CALL p_CmdSetPrimitiveRestartEnable(VkCommandBuffer cb, VkBool32 on)
+{
+    poly_dev *s = pdev();
+    poly_cb *c = live(s) ? cbs(s->e, cb) : NULL;
+    if (c) {
+        c->restart_known = 1;
+        c->app_restart = on;
+    }
+    s->set_restart(cb, on);
+}
+
+/* VK_EXT_extended_dynamic_state3 on a driver without fillModeNonSolid: the driver must not see a
+ * non-solid mode; drawn solid (not emulated: the mode can change between any two draws). */
+static VKAPI_ATTR void VKAPI_CALL p_CmdSetPolygonModeEXT(VkCommandBuffer cb, VkPolygonMode m)
+{
+    poly_dev *s = pdev();
+    if (m == VK_POLYGON_MODE_LINE || m == VK_POLYGON_MODE_POINT) {
+        solid(m, "dynamic polygon mode");
+        m = VK_POLYGON_MODE_FILL;
+    }
+    s->set_polygon(cb, m);
+}
+
+static int topo_of(VkPrimitiveTopology t, uint32_t *out)
+{
+    switch (t) {
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: *out = TOPO_LIST; return 1;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: *out = TOPO_STRIP; return 1;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: *out = TOPO_FAN; return 1;
+    default: return 0;
+    }
+}
+
+/* The draw's topology and restart, from the pipeline or the dynamic state. 0: the emulation does not
+ * apply (not triangles: polygon mode means nothing), -1: not known (drawn solid). */
+static int draw_shape(poly_cb *c, uint32_t *topo, VkBool32 *restart)
+{
+    *topo = c->topo;
+    *restart = c->restart;
+    if (c->dyn_restart) *restart = c->restart_known ? c->app_restart : VK_TRUE;
+    if (!c->dyn_topo) return 1;
+    if (!c->topo_known) return -1;
+    return topo_of(c->app_topo, topo);
+}
+
+/* The variant bound for the draw, with the dynamic state it needs. */
+static void use_variant(poly_dev *s, VkCommandBuffer cb, poly_cb *c)
+{
+    s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->variant);
+    if (c->dyn_topo && s->set_topo)
+        s->set_topo(cb, c->mode == VK_POLYGON_MODE_POINT ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+    /* A list with restart on needs primitiveTopologyListRestart; the edges never need it. */
+    if (c->dyn_restart && c->restart_known && c->app_restart && s->set_restart) s->set_restart(cb, VK_FALSE);
+}
+
+static void restore(poly_dev *s, VkCommandBuffer cb, poly_cb *c, int ib)
 {
     s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->app);
-    if (!c->ib_known) return; /* none bound since the begin: ours may stay */
+    if (c->dyn_topo && s->set_topo) s->set_topo(cb, c->app_topo);
+    if (c->dyn_restart && c->restart_known && c->app_restart && s->set_restart) s->set_restart(cb, VK_TRUE);
+    if (!ib || !c->ib_known) return; /* none bound since the begin: ours may stay */
     if (c->ib_two && s->bind_ib2) s->bind_ib2(cb, c->ib, c->ib_off, c->ib_size, c->ib_type);
     else s->bind_ib(cb, c->ib, c->ib_off, c->ib_type);
 }
@@ -584,26 +664,34 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdDraw(VkCommandBuffer cb, uint32_t vc, uin
 {
     poly_dev *s = pdev();
     poly_cb *c = live(s) ? cbs(s->e, cb) : NULL;
-    if (!c || !c->variant) {
+    uint32_t topo = 0;
+    VkBool32 restart = 0;
+    int shape = c && c->variant ? draw_shape(c, &topo, &restart) : 0;
+    if (shape < 0) {
+        solid(c->mode, "dynamic topology set before the first non-solid pipeline");
+        count(s, &s->n_solid);
+    }
+    if (shape <= 0) {
         s->draw(cb, vc, ic, fv, fi);
         return;
     }
+    (void)restart;
     if (c->mode == VK_POLYGON_MODE_POINT) {
         tell_first(s, c->mode, 0);
         count(s, &s->n_points);
-        s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->variant);
+        use_variant(s, cb, c);
         s->draw(cb, vc, ic, fv, fi);
-        s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->app);
+        restore(s, cb, c, 0);
         return;
     }
-    uint32_t tris = tris_of(c->topo, vc);
+    uint32_t tris = tris_of(topo, vc);
     VkBuffer pat = VK_NULL_HANDLE;
     if (!tris || !ic) return; /* nothing to draw, as with the GPU's own polygon mode */
     if (!c->complete && !c->ib_known) {
         solid(c->mode, "a command buffer begun before the first non-solid pipeline");
     } else if (fv > (uint32_t)INT32_MAX) {
         solid(c->mode, "firstVertex past INT32_MAX");
-    } else if (!(pat = pattern_for(s, c->topo, tris))) {
+    } else if (!(pat = pattern_for(s, topo, tris))) {
         solid(c->mode, "no memory for the edge list");
     }
     if (!pat) {
@@ -613,10 +701,10 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdDraw(VkCommandBuffer cb, uint32_t vc, uin
     }
     tell_first(s, c->mode, 0);
     count(s, &s->n_lines);
-    s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->variant);
+    use_variant(s, cb, c);
     s->bind_ib(cb, pat, 0, VK_INDEX_TYPE_UINT32);
     s->draw_idx(cb, tris * 6, ic, 0, (int32_t)fv, fi);
-    restore(s, cb, c);
+    restore(s, cb, c, 1);
 }
 
 static int written(const poly_cb *c, VkBuffer b)
@@ -672,19 +760,26 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdDrawIndexed(VkCommandBuffer cb, uint32_t 
 {
     poly_dev *s = pdev();
     poly_cb *c = live(s) ? cbs(s->e, cb) : NULL;
-    if (!c || !c->variant) {
+    uint32_t topo = 0;
+    VkBool32 restart = 0;
+    int shape = c && c->variant ? draw_shape(c, &topo, &restart) : 0;
+    if (shape < 0) {
+        solid(c->mode, "dynamic topology set before the first non-solid pipeline");
+        count(s, &s->n_solid);
+    }
+    if (shape <= 0) {
         s->draw_idx(cb, xc, ic, fx, vo, fi);
         return;
     }
     if (c->mode == VK_POLYGON_MODE_POINT) {
         tell_first(s, c->mode, 1);
         count(s, &s->n_points);
-        s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->variant);
+        use_variant(s, cb, c);
         s->draw_idx(cb, xc, ic, fx, vo, fi);
-        s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->app);
+        restore(s, cb, c, 0);
         return;
     }
-    uint32_t tris = tris_of(c->topo, xc), isz = c->ib_known ? isize_of(c->ib_type) : 0;
+    uint32_t tris = tris_of(topo, xc), isz = c->ib_known ? isize_of(c->ib_type) : 0;
     if (!tris || !ic) return;
     const char *why = NULL;
     VkDeviceSize first = 0, bind_off = 0, range = 0, out_size = (VkDeviceSize)tris * 24, out_off = 0;
@@ -697,7 +792,7 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdDrawIndexed(VkCommandBuffer cb, uint32_t 
     }
     if (!c->ib_known || !c->ib || !isz) why = "an index buffer bound before the first non-solid pipeline";
     else if (written(c, c->ib)) why = "an index buffer written earlier in the same command buffer";
-    else if (c->topo == TOPO_FAN && c->restart) why = "an indexed fan with primitive restart";
+    else if (topo == TOPO_FAN && restart) why = "an indexed fan with primitive restart";
     else if (out_size > s->limits.maxStorageBufferRange || gy > s->limits.maxComputeWorkGroupCount[1]) why = "a draw too large";
     if (!why) {
         VkDeviceSize al = s->limits.minStorageBufferOffsetAlignment ? s->limits.minStorageBufferOffsetAlignment : 1;
@@ -724,16 +819,16 @@ static VKAPI_ATTR void VKAPI_CALL p_CmdDrawIndexed(VkCommandBuffer cb, uint32_t 
     VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[0], NULL},
                                  {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[1], NULL}};
     r->vkUpdateDescriptorSets(s->e->dev->device, 2, w, 0, NULL);
-    uint32_t pc[6] = {(uint32_t)(first - bind_off), isz, tris, c->topo, c->restart && c->topo == TOPO_STRIP, (uint32_t)(gx * 64)};
+    uint32_t pc[6] = {(uint32_t)(first - bind_off), isz, tris, topo, restart && topo == TOPO_STRIP, (uint32_t)(gx * 64)};
     r->vkCmdBindDescriptorSets(pre, VK_PIPELINE_BIND_POINT_COMPUTE, s->pl, 0, 1, &set, 0, NULL);
     r->vkCmdPushConstants(pre, s->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
     r->vkCmdDispatch(pre, (uint32_t)gx, (uint32_t)gy, 1);
     tell_first(s, c->mode, 1);
     count(s, &s->n_lines_idx);
-    s->bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->variant);
+    use_variant(s, cb, c);
     s->bind_ib(cb, out, out_off, VK_INDEX_TYPE_UINT32);
     s->draw_idx(cb, tris * 6, ic, 0, vo, fi);
-    restore(s, cb, c);
+    restore(s, cb, c, 1);
 }
 
 static void indirect(poly_dev *s, VkCommandBuffer cb)
@@ -854,8 +949,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_QueueSubmit(VkQueue q, uint32_t n, const
         free(all);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
+    /* A device group's per-command-buffer masks follow the command buffers (the pre one gets its
+     * app's). The chain is the server's decoded copy of the request: changed in place. */
+    uint32_t *masks = malloc((total + extra) * sizeof(*masks));
+    if (!masks) {
+        free(ns);
+        free(all);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     uint32_t k = 0;
     for (uint32_t i = 0; i < n; i++) {
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)si[i].pNext; b; b = b->pNext) {
+            VkDeviceGroupSubmitInfo *g = (VkDeviceGroupSubmitInfo *)b;
+            if (b->sType != VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO || !g->pCommandBufferDeviceMasks ||
+                g->commandBufferCount != si[i].commandBufferCount)
+                continue;
+            uint32_t m = k;
+            for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+                if (pre_of(s, si[i].pCommandBuffers[j])) masks[m++] = g->pCommandBufferDeviceMasks[j];
+                masks[m++] = g->pCommandBufferDeviceMasks[j];
+            }
+            g->pCommandBufferDeviceMasks = masks + k;
+            g->commandBufferCount = m - k;
+        }
         ns[i] = si[i];
         ns[i].pCommandBuffers = all + k;
         for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
@@ -868,6 +984,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_QueueSubmit(VkQueue q, uint32_t n, const
     VkResult r = s->submit(q, n, ns, f);
     free(ns);
     free(all);
+    free(masks);
     return r;
 }
 
@@ -950,6 +1067,9 @@ void vkb_emu_polygon_install(vkb_srv_table *dev)
     TAKE(vkCmdCopyBuffer2, p_CmdCopyBuffer2, copy2);
     TAKE(vkCmdUpdateBuffer, p_CmdUpdateBuffer, update);
     TAKE(vkCmdFillBuffer, p_CmdFillBuffer, fill);
+    TAKE(vkCmdSetPrimitiveTopology, p_CmdSetPrimitiveTopology, set_topo);
+    TAKE(vkCmdSetPrimitiveRestartEnable, p_CmdSetPrimitiveRestartEnable, set_restart);
+    TAKE(vkCmdSetPolygonModeEXT, p_CmdSetPolygonModeEXT, set_polygon);
     TAKE(vkEndCommandBuffer, p_EndCommandBuffer, end);
     TAKE(vkQueueSubmit, p_QueueSubmit, submit);
     TAKE(vkQueueSubmit2, p_QueueSubmit2, submit2);
@@ -981,6 +1101,9 @@ void vkb_emu_polygon_uninstall(vkb_srv_table *dev)
     GIVE(vkCmdCopyBuffer2, p_CmdCopyBuffer2, copy2);
     GIVE(vkCmdUpdateBuffer, p_CmdUpdateBuffer, update);
     GIVE(vkCmdFillBuffer, p_CmdFillBuffer, fill);
+    GIVE(vkCmdSetPrimitiveTopology, p_CmdSetPrimitiveTopology, set_topo);
+    GIVE(vkCmdSetPrimitiveRestartEnable, p_CmdSetPrimitiveRestartEnable, set_restart);
+    GIVE(vkCmdSetPolygonModeEXT, p_CmdSetPolygonModeEXT, set_polygon);
     GIVE(vkEndCommandBuffer, p_EndCommandBuffer, end);
     GIVE(vkQueueSubmit, p_QueueSubmit, submit);
     GIVE(vkQueueSubmit2, p_QueueSubmit2, submit2);

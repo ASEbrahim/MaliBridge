@@ -15,6 +15,8 @@
  *     index buffer and pipeline are back (inside lit)
  *   - one recorded command buffer submitted twice, the indices changed on the host in between:
  *     the second picture follows the new indices
+ *   - dynamic topology and restart (vkd3d-proton's way): a strip with a restart, then a fan, from
+ *     one pipeline (Vulkan 1.3 devices)
  *   - FILL, the control: the inside lit
  * Culling is off throughout (the emulation draws every triangle's edges; see the server file).
  */
@@ -57,6 +59,7 @@ I(vkGetImageMemoryRequirements); I(vkBindImageMemory); I(vkCreateImageView); I(v
 I(vkCreateShaderModule); I(vkCreatePipelineLayout); I(vkCreateGraphicsPipelines); I(vkCmdBeginRenderPass); I(vkCmdEndRenderPass);
 I(vkCmdBindPipeline); I(vkCmdBindVertexBuffers); I(vkCmdBindIndexBuffer); I(vkCmdDraw); I(vkCmdDrawIndexed);
 I(vkCmdCopyImageToBuffer); I(vkCmdPipelineBarrier); I(vkDeviceWaitIdle); I(vkFlushMappedMemoryRanges);
+I(vkCmdSetPrimitiveTopology); I(vkCmdSetPrimitiveRestartEnable);
 #undef I
 
 static void check(int ok, const char *what, const char *detail)
@@ -160,7 +163,7 @@ int main(void)
     if (!lib) { printf("FAIL no libvulkan\n"); return 1; }
     gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
     vkCreateInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "polygon_check", 1, "DXVK", 1, VK_API_VERSION_1_1};
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "polygon_check", 1, "DXVK", 1, VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL};
     if (vkCreateInstance(&ici, NULL, &inst)) { printf("FAIL vkCreateInstance\n"); return 1; }
 #define L(name) name = (PFN_##name)gipa(inst, #name)
@@ -201,6 +204,12 @@ int main(void)
     D(vkCreatePipelineLayout); D(vkCreateGraphicsPipelines); D(vkCmdBeginRenderPass); D(vkCmdEndRenderPass); D(vkCmdBindPipeline);
     D(vkCmdBindVertexBuffers); D(vkCmdBindIndexBuffer); D(vkCmdDraw); D(vkCmdDrawIndexed); D(vkCmdCopyImageToBuffer);
     D(vkCmdPipelineBarrier); D(vkDeviceWaitIdle); D(vkFlushMappedMemoryRanges);
+    int core13 = props.apiVersion >= VK_API_VERSION_1_3;
+    if (core13) {
+        D(vkCmdSetPrimitiveTopology);
+        D(vkCmdSetPrimitiveRestartEnable);
+        core13 = vkCmdSetPrimitiveTopology && vkCmdSetPrimitiveRestartEnable;
+    }
 #undef D
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
@@ -270,16 +279,23 @@ int main(void)
     VkPipelineColorBlendAttachmentState cba = {0};
     cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &cba, {0}};
-    enum { P_LIST, P_STRIP, P_FAN, P_POINT, P_FILL, NP };
+    enum { P_LIST, P_STRIP, P_FAN, P_POINT, P_FILL, P_DYN, NP };
     static const struct { VkPrimitiveTopology topo; VkBool32 restart; VkPolygonMode mode; const char *name; } pdesc[NP] = {
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_LINE, "LINE, triangle list"},
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, 1, VK_POLYGON_MODE_LINE, "LINE, triangle strip with primitive restart"},
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, 0, VK_POLYGON_MODE_LINE, "LINE, triangle fan"},
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_POINT, "POINT, triangle list"},
         {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_FILL, "FILL, triangle list"},
+        {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, VK_POLYGON_MODE_LINE, "LINE, dynamic topology and restart"},
     };
+    VkDynamicState dyns[2] = {VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+    VkPipelineDynamicStateCreateInfo dsci = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyns};
     VkPipeline pipe[NP];
     for (int i = 0; i < NP; i++) {
+        if (i == P_DYN && !core13) {
+            pipe[i] = VK_NULL_HANDLE;
+            continue;
+        }
         VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, pdesc[i].topo,
                                                      pdesc[i].restart};
         VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -287,7 +303,7 @@ int main(void)
         rs.cullMode = VK_CULL_MODE_NONE;
         rs.lineWidth = 1.0f;
         VkGraphicsPipelineCreateInfo gpci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms,
-                                             NULL, &cbs, NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
+                                             NULL, &cbs, i == P_DYN ? &dsci : NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
         r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe[i]);
         snprintf(msg, sizeof(msg), "VkResult %d", r);
         char what[96];
@@ -299,8 +315,12 @@ int main(void)
     VkCommandPool cpool;
     vkCreateCommandPool(dev, &cpci, NULL, &cpool);
 
-    enum { C_LIST, C_IDX16, C_STRIP, C_FAN, C_POINT, C_RESTORE, C_RESUBMIT, C_FILL, NC };
+    enum { C_LIST, C_IDX16, C_STRIP, C_FAN, C_POINT, C_RESTORE, C_RESUBMIT, C_DYN, C_FILL, NC };
     for (int c = 0; c < NC; c++) {
+        if (c == C_DYN && !core13) {
+            printf("SKIP dynamic topology: a Vulkan 1.1 device\n");
+            continue;
+        }
         VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         VkCommandBuffer cb;
         vkAllocateCommandBuffers(dev, &cbai, &cb);
@@ -355,6 +375,17 @@ int main(void)
             vkCmdBindIndexBuffer(cb, ibuf32, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cb, 3, 1, 0, 0, 0);
             break;
+        case C_DYN:
+            what = "LINE, dynamic topology: a 32-bit strip with a restart, then a fan";
+            vkCmdSetPrimitiveTopology(cb, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+            vkCmdSetPrimitiveRestartEnable(cb, VK_TRUE);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_DYN]);
+            vkCmdBindIndexBuffer(cb, ibuf32, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cb, 7, 1, 0, 0, 0);
+            vkCmdSetPrimitiveTopology(cb, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN);
+            vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
+            vkCmdDraw(cb, 4, 1, 4, 1); /* instance 1: 32 pixels to the right */
+            break;
         case C_FILL:
             what = "FILL, vkCmdDraw (control)";
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[P_FILL]);
@@ -390,6 +421,20 @@ int main(void)
             if (ok && count_lit(8, 29, 30, 35)) {
                 ok = 0;
                 snprintf(msg, sizeof(msg), "%d pixels lit between the triangles: an edge across the restart", count_lit(8, 29, 30, 35));
+            }
+            break;
+        case C_DYN:
+            ok = wire_a(0, msg, sizeof(msg));
+            if (ok && (!near_lit(16, 36) || !near_lit(4, 48) || !near_lit(16, 48) || lit(10, 42) || count_lit(8, 29, 30, 35))) {
+                ok = 0;
+                snprintf(msg, sizeof(msg), "strip's triangle B: edges %d %d %d, inside %d, %d pixels between", near_lit(16, 36),
+                         near_lit(4, 48), near_lit(16, 48), lit(10, 42), count_lit(8, 29, 30, 35));
+            }
+            if (ok && (!near_lit(48, 4) || !near_lit(60, 16) || !near_lit(48, 28) || !near_lit(36, 16) || !near_lit(48, 16) ||
+                       lit(54, 10) || lit(42, 22))) {
+                ok = 0;
+                snprintf(msg, sizeof(msg), "fan at x+32: sides %d %d %d %d, diagonal %d, inside %d %d", near_lit(48, 4), near_lit(60, 16),
+                         near_lit(48, 28), near_lit(36, 16), near_lit(48, 16), lit(54, 10), lit(42, 22));
             }
             break;
         case C_FAN:
