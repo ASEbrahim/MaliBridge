@@ -66,7 +66,7 @@ p1=$(prof plain)
 [ $ok = 1 ] && grep -q '"probe_version": 2' "$p1" && grep -q '"name": "dyn_state", "status": "pass", .*"cases": "0x[1-9a-f]*", "failed": "0x0"' "$p1"
 step $? "every MK probe passes:$res"
 got=$(on_set)
-[ "$got" = wait_retry,dyn_reemit,vb_split,view_counts ] && echo "$new" | grep -q "errata: dyn_reemit ON (always; safe mode; probe dyn_state passed) - MK-04" &&
+[ "$got" = wait_retry,dyn_reemit,vb_split,view_counts,cull_nontri ] && echo "$new" | grep -q "errata: dyn_reemit ON (always; safe mode; probe dyn_state passed) - MK-04" &&
   echo "$new" | grep -q "errata: wait_retry ON (always; safe mode; probe wait_eintr passed, recorded only)" &&
   echo "$new" | grep -q "errata: vb_split ON (always; safe mode; probe vb_strides passed, recorded only)" &&
   echo "$new" | grep -q "errata: view_counts ON (always; safe mode; probe view3d_layers passed, recorded only)"
@@ -78,7 +78,7 @@ python3 - "$rep.json" <<'PY' 2>$work/1j.log
 import json, sys
 r = json.load(open(sys.argv[1]))
 e = {x["name"]: x for x in r["probe"][0]["errata"]}
-assert len(e) == 8, e.keys()
+assert len(e) == 9, e.keys()
 assert not e["clamp_zero"]["probe"] and not e["clamp_zero"]["safe"]["on"], e["clamp_zero"]
 assert e["dyn_reemit"]["safe"]["on"] and not e["dyn_reemit"]["performance"]["on"], e["dyn_reemit"]
 assert e["viewport_flip"]["probe_status"] == "pass" and not e["viewport_flip"]["safe"]["on"]

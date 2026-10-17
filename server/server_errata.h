@@ -76,6 +76,9 @@ void vkb_errata_dyn_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_dyn_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_vb_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_vb_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+/* ... and cull_nontri (MK-16), chained above them (installed after) */
+void vkb_errata_cull_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_cull_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 /* A module an erratum rewrote is named by the code it came from (vkb_spv_app_hash): registers

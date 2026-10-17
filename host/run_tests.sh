@@ -131,6 +131,9 @@ run_mode() {
     # split vertex buffer binds, each failing with its bug imitated and the fix off and passing
     # with the fix; the two stride shapes the probe tells apart (a server of its own; once)
     timeout 300 ./cmdstate_test.sh >out/t-cmdstate.log 2>&1; result $? "cmdstate_test ($(tail -1 out/t-cmdstate.log))"
+    # MK-16 cull_nontri (a dynamic cull mode culls points and lines): failing with its bug imitated
+    # and the fix off, passing with the fix; the version gate (a server of its own; once)
+    timeout 300 ./cullmode_test.sh >out/t-cullmode-test.log 2>&1; result $? "cullmode_test ($(tail -1 out/t-cullmode-test.log))"
     # The MK probes: each erratum's bug imitated beneath its probe makes it fail with the bug's
     # pattern and the decision follow (probe-gated errata on in performance mode), none without;
     # the report's errata table; the slow light probes in the background (a server of its own; once)
@@ -162,6 +165,8 @@ run_mode() {
   # (MK-04 and MK-05, both on in safe mode), through this mode's server
   timeout 60 ./out/dynstate_check >out/t-dynstate.log 2>&1; result $? "dynstate_check ($(tail -1 out/t-dynstate.log))"
   timeout 60 ./out/vbstride_check >out/t-vbstride.log 2>&1; result $? "vbstride_check ($(tail -1 out/t-vbstride.log))"
+  # Points and lines with a dynamic cull mode set, triangles culled after them (MK-16, on in safe mode)
+  timeout 60 ./out/cullmode_check >out/t-cullmode.log 2>&1; result $? "cullmode_check ($(tail -1 out/t-cullmode.log))"
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
   timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"
