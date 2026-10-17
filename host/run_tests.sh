@@ -134,6 +134,9 @@ run_mode() {
     # MK-16 cull_nontri (a dynamic cull mode culls points and lines): failing with its bug imitated
     # and the fix off, passing with the fix; the version gate (a server of its own; once)
     timeout 300 ./cullmode_test.sh >out/t-cullmode-test.log 2>&1; result $? "cullmode_test ($(tail -1 out/t-cullmode-test.log))"
+    # MK-39 dedicated_import (a dedicated struct on an import into a resource not made for its handle
+    # type): failing with its bug imitated and the fix off, passing with the fix; the version gate
+    timeout 300 ./dedimport_test.sh >out/t-dedimport.log 2>&1; result $? "dedimport_test ($(tail -1 out/t-dedimport.log))"
     # The MK probes: each erratum's bug imitated beneath its probe makes it fail with the bug's
     # pattern and the decision follow (probe-gated errata on in performance mode), none without;
     # the report's errata table; the slow light probes in the background (a server of its own; once)

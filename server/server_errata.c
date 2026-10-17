@@ -43,8 +43,8 @@
  *
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
- * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16), and
- * example: a no-op on vkCreateImageView that
+ * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16),
+ * dedicated_import (MK-39), and example: a no-op on vkCreateImageView that
  * counts the calls reaching it (and its imitation the calls beneath it), the pattern a fix follows.
  */
 #define _GNU_SOURCE
@@ -124,6 +124,13 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_CULL_NONTRI] = {"cull_nontri", "MK-16", NULL, 0, G_ALWAYS, G_IN_RANGE,
         {{V(0, 0), V(52, 0), FAM_ANY, NULL, "ANGLE: below r52; Arm: r41p0-r49p2, r50p0-r51p0"}},
         vkb_errata_cull_install, vkb_errata_cull_imitate},
+    /* GameNative mesa PR #8 / Lee Gao's "WSI woes on Mali": a VkMemoryDedicatedAllocateInfo on a
+     * dma-buf/AHB import whose image or buffer was not made with that handle type fails or crashes
+     * the allocation; fixed somewhere between r32p1 and r54p1 (the exact version is not known).
+     * The struct is a hint, so dropping it there is safe on any driver. */
+    [VKB_ERRATUM_DEDICATED_IMPORT] = {"dedicated_import", "MK-39", NULL, 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
+        {{V(0, 0), V(54, 1), FAM_ANY, NULL, "fixed between r32p1 and r54p1"}},
+        vkb_errata_dedicated_install, vkb_errata_dedicated_imitate},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
 };
 
@@ -600,6 +607,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_cmd_destroy(t, e);
     vkb_errata_flip_destroy(t, e);
     vkb_errata_clampzero_destroy(t, e);
+    vkb_errata_mem_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -723,6 +731,7 @@ void vkb_errata_probe_end(void *handle)
     vkb_errata_cmd_destroy(&h->t, h->e);
     vkb_errata_flip_destroy(&h->t, h->e);
     vkb_errata_clampzero_destroy(&h->t, h->e);
+    vkb_errata_mem_destroy(&h->t, h->e);
     free(h->e);
     free(h);
 }

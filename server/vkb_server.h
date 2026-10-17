@@ -199,6 +199,7 @@ enum {
     VKB_ERRATUM_VIEW_COUNTS,     /* MK-07 3D image as 2D array with VK_REMAINING_ARRAY_LAYERS */
     VKB_ERRATUM_CLAMP_ZERO,      /* MK-32 min/max/clamp with a zero limit on a constant-selected value */
     VKB_ERRATUM_CULL_NONTRI,     /* MK-16 vkCmdSetCullMode culls points and lines */
+    VKB_ERRATUM_DEDICATED_IMPORT, /* MK-39 a dedicated-allocation struct on an import fails or crashes */
     VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };

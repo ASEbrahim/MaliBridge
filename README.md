@@ -249,6 +249,9 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   Apache-2.0; bionic-vulkan-wrapper PR #162): `server/spirv_shlbarrier.c` is a C port of it (a
   no-op `OpBitFieldInsert` after each left shift by a constant, so Mali's compiler cannot fold the
   shift into speculative memory accesses); its notice is kept in that file.
+- Lee Gao's write-up "WSI woes on Mali" (winlator-internals) and GameNative's mesa PR #8: older Mali
+  drivers fail an import that carries a dedicated-allocation struct for a resource not made for that
+  handle type; `server/server_errata_mem.c` takes the struct off such imports. No code is copied.
 - [compat_layer](https://github.com/leegao/compat_layer) by Lee Gao, MIT: turning on image
   robustness alongside buffer robustness for the robustness2 emulation (`server/server_instance.c`)
   follows its robustness2 emulation, as do zero-filling the null-descriptor stand-in buffer and
