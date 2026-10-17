@@ -112,6 +112,14 @@ extern int vkb_verbose;
 
 void vkb_log_summary(void);
 
+/* server_conn.c: the command buffer whose stream this thread is replaying (NULL otherwise), how many
+ * of its commands have started, and the names of the last VKB_REPLAY_RING of them (for the crash
+ * line). */
+#define VKB_REPLAY_RING 16
+extern __thread VkCommandBuffer vkb_srv_replay_cb;
+extern __thread uint32_t vkb_srv_replay_n;
+extern __thread const char *vkb_srv_replay_ring[VKB_REPLAY_RING];
+
 /* server_guard.c */
 void vkb_guard_device_init(vkb_srv_table *t);
 void vkb_guard_device_destroy(vkb_srv_table *t);
