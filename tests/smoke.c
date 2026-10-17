@@ -173,7 +173,12 @@ static void test_memory(void)
     const uint32_t n = 1 << 16;
     if (!make_buffer(&b, n * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-        check(0, "host-visible buffer", "cannot create/map");
+        /* The server offers host-visible types only through a memory-sharing method that passed
+         * its self-test: none at all means none did (after The412Banner's "memory sharing" check). */
+        int hv = 0;
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++) hv |= (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        check(0, "host-visible buffer",
+              hv ? "cannot create/map" : "no host-visible memory type: the server found no way to share memory with this driver");
         return;
     }
     uint32_t *p = b.ptr;

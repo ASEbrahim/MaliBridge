@@ -252,6 +252,12 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   `test/non-adreno-all`), GPL-3.0: the zero-filled null-descriptor buffer and the null push
   descriptor writes follow its stand-ins, and the multiDrawIndirect emulation
   (`server/server_emu_compat.c`) follows The412Banner's `draw.c`.
+- The412Banner's testing of an early copy of the bridge on Mali-G615 and Mali-G925 phones
+  (DroidDeck branch `test/non-adreno-all`) found the pipeline cache directory string used after the
+  in-app start freed it (`server/server_pcache.c`), and its crash logs led to the decoders refusing
+  a single-element pointer sent without the count 1 (`codegen/gen_vkbridge.py`). The crash line's
+  library offset and replayed commands (`server/server_main.c`) and the self-test's "no host-visible
+  memory type" message (`tests/smoke.c`) follow its crash detail and "memory sharing" check.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
   (the order of memory-sharing strategies on Mali, the r44 robustness2 profile) informed the
   server. No code from either project is included.

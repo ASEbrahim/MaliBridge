@@ -458,6 +458,7 @@ void vkb_decfix_VkBindMemoryStatus(vkb_dec *d, VkBindMemoryStatus *s)
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pResult = (VkResult *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkResult));
     } else {
         s->pResult = NULL;
@@ -978,6 +979,7 @@ void vkb_decfix_VkCommandBufferBeginInfo(vkb_dec *d, VkCommandBufferBeginInfo *s
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkCommandBufferInheritanceInfo *a_ = (VkCommandBufferInheritanceInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkCommandBufferInheritanceInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkCommandBufferInheritanceInfo(d, &a_[i_]);
         s->pInheritanceInfo = a_;
@@ -1955,6 +1957,7 @@ void vkb_decfix_VkDeviceBufferMemoryRequirements(vkb_dec *d, VkDeviceBufferMemor
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkBufferCreateInfo *a_ = (VkBufferCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkBufferCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkBufferCreateInfo(d, &a_[i_]);
         s->pCreateInfo = a_;
@@ -2013,6 +2016,7 @@ void vkb_decfix_VkDeviceCreateInfo(vkb_dec *d, VkDeviceCreateInfo *s)
     s->ppEnabledExtensionNames = vkb_dec_strarray(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pEnabledFeatures = (const VkPhysicalDeviceFeatures *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkPhysicalDeviceFeatures));
     } else {
         s->pEnabledFeatures = NULL;
@@ -2237,6 +2241,7 @@ void vkb_decfix_VkDeviceImageMemoryRequirements(vkb_dec *d, VkDeviceImageMemoryR
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkImageCreateInfo *a_ = (VkImageCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkImageCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkImageCreateInfo(d, &a_[i_]);
         s->pCreateInfo = a_;
@@ -2283,6 +2288,7 @@ void vkb_decfix_VkDeviceImageSubresourceInfo(vkb_dec *d, VkDeviceImageSubresourc
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkImageCreateInfo *a_ = (VkImageCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkImageCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkImageCreateInfo(d, &a_[i_]);
         s->pCreateInfo = a_;
@@ -2291,6 +2297,7 @@ void vkb_decfix_VkDeviceImageSubresourceInfo(vkb_dec *d, VkDeviceImageSubresourc
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkImageSubresource2 *a_ = (VkImageSubresource2 *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkImageSubresource2));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkImageSubresource2(d, &a_[i_]);
         s->pSubresource = a_;
@@ -2487,6 +2494,7 @@ void vkb_decfix_VkDeviceTensorMemoryRequirementsARM(vkb_dec *d, VkDeviceTensorMe
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkTensorCreateInfoARM *a_ = (VkTensorCreateInfoARM *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkTensorCreateInfoARM));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkTensorCreateInfoARM(d, &a_[i_]);
         s->pCreateInfo = a_;
@@ -3032,6 +3040,7 @@ void vkb_decfix_VkFragmentShadingRateAttachmentInfoKHR(vkb_dec *d, VkFragmentSha
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkAttachmentReference2 *a_ = (VkAttachmentReference2 *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkAttachmentReference2));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkAttachmentReference2(d, &a_[i_]);
         s->pFragmentShadingRateAttachment = a_;
@@ -3255,6 +3264,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineVertexInputStateCreateInfo *a_ = (VkPipelineVertexInputStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineVertexInputStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineVertexInputStateCreateInfo(d, &a_[i_]);
         s->pVertexInputState = a_;
@@ -3263,6 +3273,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineInputAssemblyStateCreateInfo *a_ = (VkPipelineInputAssemblyStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineInputAssemblyStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineInputAssemblyStateCreateInfo(d, &a_[i_]);
         s->pInputAssemblyState = a_;
@@ -3271,6 +3282,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineTessellationStateCreateInfo *a_ = (VkPipelineTessellationStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineTessellationStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineTessellationStateCreateInfo(d, &a_[i_]);
         s->pTessellationState = a_;
@@ -3279,6 +3291,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineViewportStateCreateInfo *a_ = (VkPipelineViewportStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineViewportStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineViewportStateCreateInfo(d, &a_[i_]);
         s->pViewportState = a_;
@@ -3287,6 +3300,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineRasterizationStateCreateInfo *a_ = (VkPipelineRasterizationStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineRasterizationStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineRasterizationStateCreateInfo(d, &a_[i_]);
         s->pRasterizationState = a_;
@@ -3295,6 +3309,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineMultisampleStateCreateInfo *a_ = (VkPipelineMultisampleStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineMultisampleStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineMultisampleStateCreateInfo(d, &a_[i_]);
         s->pMultisampleState = a_;
@@ -3303,6 +3318,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineDepthStencilStateCreateInfo *a_ = (VkPipelineDepthStencilStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineDepthStencilStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineDepthStencilStateCreateInfo(d, &a_[i_]);
         s->pDepthStencilState = a_;
@@ -3311,6 +3327,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineColorBlendStateCreateInfo *a_ = (VkPipelineColorBlendStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineColorBlendStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineColorBlendStateCreateInfo(d, &a_[i_]);
         s->pColorBlendState = a_;
@@ -3319,6 +3336,7 @@ void vkb_decfix_VkGraphicsPipelineCreateInfo(vkb_dec *d, VkGraphicsPipelineCreat
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkPipelineDynamicStateCreateInfo *a_ = (VkPipelineDynamicStateCreateInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkPipelineDynamicStateCreateInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkPipelineDynamicStateCreateInfo(d, &a_[i_]);
         s->pDynamicState = a_;
@@ -4151,6 +4169,7 @@ void vkb_decfix_VkInstanceCreateInfo(vkb_dec *d, VkInstanceCreateInfo *s)
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkApplicationInfo *a_ = (VkApplicationInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkApplicationInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkApplicationInfo(d, &a_[i_]);
         s->pApplicationInfo = a_;
@@ -5730,6 +5749,7 @@ void vkb_decfix_VkPhysicalDeviceExternalTensorInfoARM(vkb_dec *d, VkPhysicalDevi
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkTensorDescriptionARM *a_ = (VkTensorDescriptionARM *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkTensorDescriptionARM));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkTensorDescriptionARM(d, &a_[i_]);
         s->pDescription = a_;
@@ -10375,6 +10395,7 @@ void vkb_decfix_VkPipelineCreationFeedbackCreateInfo(vkb_dec *d, VkPipelineCreat
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pPipelineCreationFeedback = (VkPipelineCreationFeedback *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkPipelineCreationFeedback));
     } else {
         s->pPipelineCreationFeedback = NULL;
@@ -10945,6 +10966,7 @@ void vkb_decfix_VkPipelineShaderStageCreateInfo(vkb_dec *d, VkPipelineShaderStag
     s->pName = vkb_dec_str(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkSpecializationInfo *a_ = (VkSpecializationInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkSpecializationInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkSpecializationInfo(d, &a_[i_]);
         s->pSpecializationInfo = a_;
@@ -11180,6 +11202,7 @@ void vkb_decfix_VkPipelineViewportDepthClampControlCreateInfoEXT(vkb_dec *d, VkP
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pDepthClampRange = (const VkDepthClampRangeEXT *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkDepthClampRangeEXT));
     } else {
         s->pDepthClampRange = NULL;
@@ -11721,6 +11744,7 @@ void vkb_decfix_VkRenderPassCreationFeedbackCreateInfoEXT(vkb_dec *d, VkRenderPa
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pRenderPassFeedback = (VkRenderPassCreationFeedbackInfoEXT *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkRenderPassCreationFeedbackInfoEXT));
     } else {
         s->pRenderPassFeedback = NULL;
@@ -11889,12 +11913,14 @@ void vkb_decfix_VkRenderPassPerformanceCountersByRegionBeginInfoARM(vkb_dec *d, 
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pCounterAddresses = (const VkDeviceAddress *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkDeviceAddress));
     } else {
         s->pCounterAddresses = NULL;
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pCounterIndices = (uint32_t *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(uint32_t));
     } else {
         s->pCounterIndices = NULL;
@@ -12088,6 +12114,7 @@ void vkb_decfix_VkRenderPassSubpassFeedbackCreateInfoEXT(vkb_dec *d, VkRenderPas
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pSubpassFeedback = (VkRenderPassSubpassFeedbackInfoEXT *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkRenderPassSubpassFeedbackInfoEXT));
     } else {
         s->pSubpassFeedback = NULL;
@@ -12341,6 +12368,7 @@ void vkb_decfix_VkRenderingInfo(vkb_dec *d, VkRenderingInfo *s)
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkRenderingAttachmentInfo *a_ = (VkRenderingAttachmentInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkRenderingAttachmentInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkRenderingAttachmentInfo(d, &a_[i_]);
         s->pDepthAttachment = a_;
@@ -12349,6 +12377,7 @@ void vkb_decfix_VkRenderingInfo(vkb_dec *d, VkRenderingInfo *s)
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkRenderingAttachmentInfo *a_ = (VkRenderingAttachmentInfo *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkRenderingAttachmentInfo));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkRenderingAttachmentInfo(d, &a_[i_]);
         s->pStencilAttachment = a_;
@@ -12408,12 +12437,14 @@ void vkb_decfix_VkRenderingInputAttachmentIndexInfo(vkb_dec *d, VkRenderingInput
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pDepthInputAttachmentIndex = (const uint32_t *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(uint32_t));
     } else {
         s->pDepthInputAttachmentIndex = NULL;
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pStencilInputAttachmentIndex = (const uint32_t *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(uint32_t));
     } else {
         s->pStencilInputAttachmentIndex = NULL;
@@ -13368,6 +13399,7 @@ void vkb_decfix_VkSubpassDescription(vkb_dec *d, VkSubpassDescription *s)
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         s->pDepthStencilAttachment = (const VkAttachmentReference *)vkb_dec_raw_view(d, (size_t)n_ * sizeof(VkAttachmentReference));
     } else {
         s->pDepthStencilAttachment = NULL;
@@ -13463,6 +13495,7 @@ void vkb_decfix_VkSubpassDescription2(vkb_dec *d, VkSubpassDescription2 *s)
     }
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkAttachmentReference2 *a_ = (VkAttachmentReference2 *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkAttachmentReference2));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkAttachmentReference2(d, &a_[i_]);
         s->pDepthStencilAttachment = a_;
@@ -13508,6 +13541,7 @@ void vkb_decfix_VkSubpassDescriptionDepthStencilResolve(vkb_dec *d, VkSubpassDes
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkAttachmentReference2 *a_ = (VkAttachmentReference2 *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkAttachmentReference2));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkAttachmentReference2(d, &a_[i_]);
         s->pDepthStencilResolveAttachment = a_;
@@ -13737,6 +13771,7 @@ void vkb_decfix_VkTensorCreateInfoARM(vkb_dec *d, VkTensorCreateInfoARM *s)
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkTensorDescriptionARM *a_ = (VkTensorDescriptionARM *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkTensorDescriptionARM));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkTensorDescriptionARM(d, &a_[i_]);
         s->pDescription = a_;
@@ -13782,6 +13817,7 @@ void vkb_decfix_VkTensorDependencyInfoARM(vkb_dec *d, VkTensorDependencyInfoARM 
     s->pNext = (void *)vkb_dec_chain(d);
     if (vkb_dec_u8(d)) {
         uint32_t n_ = vkb_dec_u32(d);
+        if (n_ != 1) d->err = 1;
         VkTensorMemoryBarrierARM *a_ = (VkTensorMemoryBarrierARM *)vkb_dec_alloc(d, (size_t)n_ * sizeof(VkTensorMemoryBarrierARM));
         for (uint32_t i_ = 0; a_ && i_ < n_; i_++) vkb_dec_VkTensorMemoryBarrierARM(d, &a_[i_]);
         s->pTensorMemoryBarriers = a_;

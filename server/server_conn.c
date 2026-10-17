@@ -25,6 +25,10 @@ static vkb_srv_proc *procs;
 static __thread vkb_srv_table *tls_table;
 static __thread vkb_srv_proc *tls_proc; /* the process this connection thread serves (its preset) */
 __thread const char *vkb_srv_current_cmd;
+/* The command buffer being replayed and its last commands, for the crash line (server_main.c). */
+__thread VkCommandBuffer vkb_srv_replay_cb;
+__thread uint32_t vkb_srv_replay_n;
+__thread const char *vkb_srv_replay_ring[VKB_REPLAY_RING];
 
 vkb_srv_table *vkb_srv_current_table(void) { return tls_table; }
 void vkb_srv_set_current_table(vkb_srv_table *t) { tls_table = t; }
@@ -242,6 +246,8 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
     vkb_enc scratch;
     vkb_enc_init(&scratch);
     uint32_t ncmds = 0;
+    vkb_srv_replay_cb = cb;
+    vkb_srv_replay_n = 0;
     while (s && pos + 8 <= len) {
         uint32_t id, n;
         memcpy(&id, s + pos, 4);
@@ -250,6 +256,7 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         if (id >= VKB_CMD_COUNT || !is_stream_cmd(id) || n > len - pos) {
             VKB_ERR("command stream: bad entry (id %u, %u bytes) after %u commands", id, n, ncmds);
             c->status = VKB_ST_BAD_MESSAGE;
+            vkb_srv_replay_cb = VK_NULL_HANDLE;
             vkb_enc_free(&scratch);
             return;
         }
@@ -263,18 +270,32 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         sub.conn = c->conn;
         sub.in_stream = 1;
         vkb_srv_current_cmd = vkb_cmd_names[id];
+        vkb_srv_replay_ring[ncmds % VKB_REPLAY_RING] = vkb_cmd_names[id];
+        vkb_srv_replay_n = ncmds + 1;
         vkb_srv_handlers[id](&sub);
         vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
         scratch = sub.r;
         if (sub.status != VKB_ST_OK) {
             VKB_ERR("command stream: %s failed (status %u)", vkb_cmd_names[id], sub.status);
+            if (id == VKB_CMD_vkBeginCommandBuffer) {
+                /* The begin never reached the driver (its encoding did not decode): recording into
+                 * a command buffer that was not begun would hand the driver one in the wrong state. */
+                VKB_ERR("command stream: command buffer %p not begun; its %zu bytes of commands are dropped", (void *)cb, len);
+                vkb_srv_replay_cb = VK_NULL_HANDLE;
+                vkb_enc_free(&scratch);
+                vkb_enc_u32(&c->r, (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY);
+                return;
+            }
         }
         if (id == VKB_CMD_vkBeginCommandBuffer && scratch.len >= 4) memcpy(&begin_r, scratch.buf, 4);
         pos += (n + 7) & ~(size_t)7;
         ncmds++;
     }
     vkb_enc_free(&scratch);
+    vkb_srv_current_cmd = "vkEndCommandBuffer (the driver's, after the stream)";
     VkResult r = c->dt->vkEndCommandBuffer(cb);
+    vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
+    vkb_srv_replay_cb = VK_NULL_HANDLE;
     if (begin_r != VK_SUCCESS) r = begin_r;
     if (vkb_verbose) VKB_DBG("command buffer %p: %u commands, %zu bytes -> %d", (void *)cb, ncmds, len, r);
     vkb_enc_u32(&c->r, (uint32_t)r);
