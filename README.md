@@ -176,6 +176,8 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_GPU_PROF=1` / `2` | server | per-pass GPU timestamps (render passes, dispatches, copies). `2` breaks them down by pipeline |
 | `VKBRIDGE_STATS=<s>` | both | every `<s>` seconds, per-command counts of round trips and async requests, and the messages and bytes actually written to the socket. The client also logs the run's totals at exit |
 | `VKBRIDGE_DESC_BATCH=1` | client | async requests batched into one message per flush and `vkUpdateDescriptorSets` packed per descriptor type (75x fewer messages in Subnautica). Off by default since v0.2.1: Risk of Rain 2 showed black flickering with it on; `VKBRIDGE_NO_DESC_BATCH=1` forces it off. With it on, `VKBRIDGE_DESC_BATCH_NOFRAME=1` keeps only the packing and `VKBRIDGE_DESC_BATCH_NOPACK=1` only the batching (to tell which half a problem follows) |
+| `VKBRIDGE_CACHED_READBACK=0` / `1` / `apps` | server | cached readback: GPU results the CPU reads come from CPU-cached pages (the dma-heap's `system` heap, or the strategy's own dma-buf) with the cache maintenance done by `DMA_BUF_IOCTL_SYNC` at each flush and invalidate, where the startup self-test passes it. `1`: for the client's own frame readback (the copy present path); `apps`: also a HOST_CACHED memory type without HOST_COHERENT for apps; `0`: off. Default: `1` in performance mode, off in safe mode. The guest's `VKBRIDGE_CACHED_READBACK=0` turns off the frame readback's use of it |
+| `VKBRIDGE_DMAHEAP_ANY_TYPE=1` | server | experiment: the dma-heap strategy imports its pages even into a memory type the driver's dma-buf fd properties leave out (out of the spec; the self-test still checks each type both ways before it is used) |
 | `VKBRIDGE_MEM_STATS=0` | server | turns off the periodic memory accounting line (on by default) |
 | `VKBRIDGE_TRACE=1` | client | logs every call to stderr (`VKBRIDGE_TRACE_COMM=<name>` limits this to one process) |
 | `VKBRIDGE_DISCARD_SHADERS=h-<hash>,...` | server | pipelines with these shaders draw nothing |
@@ -267,6 +269,10 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   a single-element pointer sent without the count 1 (`codegen/gen_vkbridge.py`). The crash line's
   library offset and replayed commands (`server/server_main.c`) and the self-test's "no host-visible
   memory type" message (`tests/smoke.c`) follow its crash detail and "memory sharing" check.
+- Cached readback (`server/server_memory.c`, `client/wsi.c`) follows David Cimo's Venus work on the
+  Mali-G715 ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali) `docs/mali-venus.md`,
+  GPL-3.0): the frame readback buffer in a cached memory type backed by `/dev/dma_heap/system`,
+  flush and invalidate as a `DMA_BUF_IOCTL_SYNC` start/end pair. No code is copied.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
   (the order of memory-sharing strategies on Mali, the r44 robustness2 profile) informed the
   server. No code from either project is included.

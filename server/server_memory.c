@@ -16,6 +16,18 @@
  *            dma-buf into the driver and hands it to the client - what GameNative's wrapper does on
  *            Mali when the driver will not export one (Android; root-only on desktops).
  * VKBRIDGE_MEMORY=hostptr|dmabuf|dmaheap|ahb forces one.
+ *
+ * Cached readback (the dma-buf strategies): the pages above are uncached for the CPU on Mali, so
+ * the client reads GPU results back at ~400 MB/s. Where the self-test passes it, an allocation the
+ * client asks for as VKB_ALLOC_SHARED_CACHED gets cached pages instead (the dma-heap's "system"
+ * heap; the dma-buf strategies' own dma-buf otherwise), and the server keeps its dma-buf so that
+ * vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges do the CPU cache maintenance with
+ * DMA_BUF_IOCTL_SYNC. Mali here does not snoop the CPU's caches, so the cached pages are offered
+ * only as memory the client flushes and invalidates: the client's own frame readback (the copy
+ * present path), and with VKBRIDGE_CACHED_READBACK=apps a HOST_CACHED type without HOST_COHERENT
+ * for apps. After David Cimo's Venus work on the Mali-G715 (droiddeck-mali, GPL-3.0: WSI's
+ * readback buffer in Mali's cached type, allocated from /dev/dma_heap/system, flush and invalidate
+ * as DMA_BUF_IOCTL_SYNC; the frame memcpy went from 7-10 ms to ~1.3 ms).
  */
 #define _GNU_SOURCE
 #ifdef __ANDROID__
@@ -36,6 +48,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <linux/dma-heap.h>
+#include <linux/dma-buf.h>
 #include <malloc.h>
 #include <unistd.h>
 
@@ -363,6 +376,7 @@ static void mem_release_backing(vkb_srv_mem *m)
     if (m->ahb) p_AHardwareBuffer_release(m->ahb);
 #endif
     if (m->export_fd1) close(m->export_fd1 - 1);
+    if (m->sync_fd1) close(m->sync_fd1 - 1);
     free(m);
 }
 
@@ -411,6 +425,63 @@ static int dmaheap_fd(void)
 
 int vkb_mem_dmaheap_available(void) { return dmaheap_fd() >= 0; }
 
+/* The cached system heap, for cached readback (opened once; -1 when there is none). */
+static int dmaheap_cached_fd(void)
+{
+    static int fd = -2;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (fd == -2) {
+        fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) VKB_INFO("dmaheap: cached readback allocates from /dev/dma_heap/system");
+        else VKB_INFO("dmaheap: /dev/dma_heap/system: %s (no cached readback)", strerror(errno));
+    }
+    int r = fd;
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+/* ------------------------------------------------------------------ cached readback: cache maintenance */
+
+/* What the CPU cache maintenance did, process-wide (the host suite reads it from the log). */
+static struct {
+    uint64_t flushes, invalidates, failures;
+} sync_st;
+
+/*
+ * One DMA_BUF_IOCTL_SYNC bracket on a cached shared dma-buf: START then END with the same
+ * direction, as Cimo's vtest renderer does. Cache maintenance acts on the pages, not on a mapping,
+ * so the server's call covers the client's mapping too. What the kernel does (arm64, a non-snooping
+ * GPU; the system heap syncs each attachment the driver has mapped, and an attachment mapped only
+ * while the GPU uses it is synced on map and unmap):
+ *   write (flush):      START is a no-op, END cleans the CPU's dirty lines to memory;
+ *   read (invalidate):  START invalidates the CPU's lines, END invalidates them again.
+ */
+static int dmabuf_sync(vkb_srv_mem *m, int write)
+{
+    if (!m->sync_fd1) return 0;
+    uint64_t dir = write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ;
+    struct dma_buf_sync sync = {DMA_BUF_SYNC_START | dir};
+    int r;
+    do r = ioctl(m->sync_fd1 - 1, DMA_BUF_IOCTL_SYNC, &sync);
+    while (r < 0 && (errno == EINTR || errno == EAGAIN));
+    if (r == 0) {
+        sync.flags = DMA_BUF_SYNC_END | dir;
+        do r = ioctl(m->sync_fd1 - 1, DMA_BUF_IOCTL_SYNC, &sync);
+        while (r < 0 && (errno == EINTR || errno == EAGAIN));
+    }
+    if (r < 0) {
+        if (__atomic_fetch_add(&sync_st.failures, 1, __ATOMIC_RELAXED) < 8)
+            VKB_WARN("cached readback: DMA_BUF_IOCTL_SYNC (%s) failed: %s", write ? "flush" : "invalidate", strerror(errno));
+        return -1;
+    }
+    uint64_t n = __atomic_add_fetch(write ? &sync_st.flushes : &sync_st.invalidates, 1, __ATOMIC_RELAXED);
+    if (n == 1 || (n & (n - 1)) == 0) /* the 1st, 2nd, 4th, 8th, ... */
+        VKB_INFO("cached readback: %llu %s so far (DMA_BUF_IOCTL_SYNC; %llu bytes this one)", (unsigned long long)n,
+                 write ? "flushes" : "invalidates", (unsigned long long)m->size);
+    return 0;
+}
+
 /* Unlinks every structure of type t from the chain starting at *head. */
 static void chain_drop(const void **head, VkStructureType t)
 {
@@ -432,7 +503,7 @@ PFN_vkGetDeviceProcAddr vkb_mem_gdpa;
  * to send to the client (-1 for hostptr, where the client already has its pages).
  */
 static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, const VkMemoryAllocateInfo *ai,
-                             int client_fd, vkb_srv_mem **out, int *out_fd)
+                             int client_fd, int cached, vkb_srv_mem **out, int *out_fd)
 {
     *out_fd = -1;
     *out = NULL;
@@ -448,7 +519,8 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
     VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
     switch (s) {
     case VKB_MEM_HOSTPTR: {
-        if (client_fd < 0) break;
+        /* No dma-buf to sync through: never cached readback (the self-test does not offer it). */
+        if (client_fd < 0 || cached) break;
         void *p = mmap(NULL, (size_t)ai->allocationSize, PROT_READ | PROT_WRITE, MAP_SHARED, client_fd, 0);
         close(client_fd);
         client_fd = -1;
@@ -463,6 +535,10 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
         if (!dt->vkGetMemoryHostPointerPropertiesEXT ||
             dt->vkGetMemoryHostPointerPropertiesEXT(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p, &hp) != VK_SUCCESS ||
             !(hp.memoryTypeBits & (1u << ai->memoryTypeIndex))) {
+            /* Said, so a log shows which types the driver takes host pointers in (Mali: cached
+             * ones only, it seems - a Pixel 9 refused type 0, its uncached coherent type). */
+            VKB_INFO("hostptr: host pointer properties %s, memory types 0x%x (want type %u)",
+                     dt->vkGetMemoryHostPointerPropertiesEXT ? "read" : "not loaded", hp.memoryTypeBits, ai->memoryTypeIndex);
             r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
             break;
         }
@@ -470,6 +546,12 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
                                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p};
         info.pNext = &imp;
         r = dt->vkAllocateMemory(dev, &info, NULL, &m->mem);
+        /* The driver took the pointer's types but not the pages: a memfd is a shared file
+         * mapping, and some drivers import only anonymous private memory (RADV on the host
+         * refuses it so; whether Mali does is open). */
+        if (r != VK_SUCCESS)
+            VKB_INFO("hostptr: import of %llu bytes of the client's memfd (type %u) failed: %d", (unsigned long long)info.allocationSize,
+                     info.memoryTypeIndex, r);
         break;
     }
     case VKB_MEM_DMABUF: {
@@ -499,11 +581,12 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
             r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
             break;
         }
+        if (cached) m->sync_fd1 = fcntl(fd, F_DUPFD_CLOEXEC, 0) + 1;
         *out_fd = fd;
         break;
     }
     case VKB_MEM_DMAHEAP: {
-        int hfd = dmaheap_fd();
+        int hfd = cached ? dmaheap_cached_fd() : dmaheap_fd();
         if (hfd < 0) break;
         uint64_t len = (ai->allocationSize + 4095) & ~4095ull;
         struct dma_heap_allocation_data hd = {len, 0, O_RDWR | O_CLOEXEC, 0};
@@ -517,11 +600,20 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
         VkResult pr = dt->vkGetMemoryFdPropertiesKHR
                           ? dt->vkGetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp)
                           : VK_ERROR_EXTENSION_NOT_PRESENT;
+        /* VKBRIDGE_DMAHEAP_ANY_TYPE=1 (an experiment): imported even into a type the driver's fd
+         * properties leave out, as virglrenderer's Android path does (Cimo's droiddeck-mali imports
+         * dma-heap pages into the Mali-G715's uncached type 0 with no such check, and it ran there).
+         * Out of the spec; the self-test still checks the bytes both ways before a type is used. */
+        static int any_type = -1;
+        if (any_type < 0) any_type = getenv("VKBRIDGE_DMAHEAP_ANY_TYPE") && *getenv("VKBRIDGE_DMAHEAP_ANY_TYPE") == '1';
         if (pr != VK_SUCCESS || !(fp.memoryTypeBits & (1u << ai->memoryTypeIndex))) {
-            VKB_INFO("dmaheap: fd properties %d, memory types 0x%x (want type %u)", pr, fp.memoryTypeBits, ai->memoryTypeIndex);
-            close(fd);
-            r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-            break;
+            VKB_INFO("dmaheap: fd properties %d, memory types 0x%x (want type %u)%s", pr, fp.memoryTypeBits, ai->memoryTypeIndex,
+                     any_type ? "; importing anyway (VKBRIDGE_DMAHEAP_ANY_TYPE)" : "");
+            if (!any_type) {
+                close(fd);
+                r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+                break;
+            }
         }
         /* The import takes its own fd; ours goes to the client. A dedicated-allocation struct
          * with an imported dma-buf crashes some Mali drivers (GameNative mesa PR #8): dropped. */
@@ -539,6 +631,7 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
             close(fd);
             break;
         }
+        if (cached) m->sync_fd1 = fcntl(fd, F_DUPFD_CLOEXEC, 0) + 1;
         *out_fd = fd;
         break;
     }
@@ -609,6 +702,7 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
             break;
         }
         *out_fd = fcntl(pick, F_DUPFD_CLOEXEC, 0);
+        if (cached && *out_fd >= 0) m->sync_fd1 = fcntl(pick, F_DUPFD_CLOEXEC, 0) + 1;
         break;
     }
 #endif
@@ -616,6 +710,15 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
         break;
     }
     if (client_fd >= 0) close(client_fd);
+    if (r == VK_SUCCESS && cached && !m->sync_fd1) {
+        /* Cached pages with no dma-buf to sync through would be wrong: not made. */
+        VKB_WARN("cached readback: no dma-buf kept for the cache maintenance; allocation refused");
+        dt->vkFreeMemory(dev, m->mem, NULL);
+        m->mem = VK_NULL_HANDLE;
+        if (*out_fd >= 0) close(*out_fd);
+        *out_fd = -1;
+        r = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     if (r != VK_SUCCESS) {
         mem_release_backing(m);
         return r;
@@ -1098,13 +1201,19 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
     vkb_srv_mem *m = NULL;
     int out_fd = -1;
     uint8_t ded = vkb_memstat_dedicated(&ai); /* before the strategies drop the struct from the chain */
-    if (mode == VKB_ALLOC_SHARED) {
+    if (mode == VKB_ALLOC_SHARED || mode == VKB_ALLOC_SHARED_CACHED) {
         uint32_t s = t->pd ? t->pd->info.strategy : VKB_MEM_NONE;
+        /* Cached pages only in a type the self-test passed them in (the client asks only then). */
+        int cached = mode == VKB_ALLOC_SHARED_CACHED && t->pd && ai.memoryTypeIndex < 32 &&
+                     (t->pd->info.cached_types & (1u << ai.memoryTypeIndex));
+        if (mode == VKB_ALLOC_SHARED_CACHED && !cached)
+            VKB_ONCE(VKB_LOG_WARN, "cached readback asked for in memory type %u, which the self-test did not pass; uncached pages instead",
+                     ai.memoryTypeIndex);
         int opaque = vkb_opaque_shared_info(t, &ai); /* server_opaque.c */
-        r = alloc_shared(c->dt, dev, s, &ai, client_fd, &m, &out_fd);
+        r = alloc_shared(c->dt, dev, s, &ai, client_fd, cached, &m, &out_fd);
         if (r == VK_SUCCESS && opaque) vkb_opaque_shared_done(m, out_fd);
         char path[48];
-        snprintf(path, sizeof(path), "shared (%s)", vkb_mem_strategy_name(s));
+        snprintf(path, sizeof(path), "shared (%s%s)", vkb_mem_strategy_name(s), cached ? ", cached" : "");
         log_alloc(t, &ai, ai.memoryTypeIndex, ded, path, r);
     } else {
         if (client_fd >= 0) close(client_fd);
@@ -1236,8 +1345,24 @@ static void flush_or_invalidate(vkb_srv_call *c, int flush)
         vkb_srv_mem *m = vkb_mem_find(t, ranges[i].memory, 0);
         if (m) r = ensure_server_map(t, m);
     }
+    /* Cached readback: the client's writes cleaned to memory before the driver's flush. The
+     * allocation as a whole (a dma-buf sync has no range). Several ranges of one allocation in a
+     * row are synced once. */
+    VkDeviceMemory last = VK_NULL_HANDLE;
+    for (uint32_t i = 0; flush && r == VK_SUCCESS && i < n; i++) {
+        vkb_srv_mem *m = ranges[i].memory != last ? vkb_mem_find(t, ranges[i].memory, 0) : NULL;
+        last = ranges[i].memory;
+        if (m && m->sync_fd1 && dmabuf_sync(m, 1) < 0) r = VK_ERROR_MEMORY_MAP_FAILED;
+    }
     if (r == VK_SUCCESS && n) {
         r = flush ? c->dt->vkFlushMappedMemoryRanges(dev, n, ranges) : c->dt->vkInvalidateMappedMemoryRanges(dev, n, ranges);
+    }
+    /* ... and the client's stale lines dropped after the driver's invalidate. */
+    last = VK_NULL_HANDLE;
+    for (uint32_t i = 0; !flush && r == VK_SUCCESS && i < n; i++) {
+        vkb_srv_mem *m = ranges[i].memory != last ? vkb_mem_find(t, ranges[i].memory, 0) : NULL;
+        last = ranges[i].memory;
+        if (m && m->sync_fd1 && dmabuf_sync(m, 0) < 0) r = VK_ERROR_MEMORY_MAP_FAILED;
     }
     vkb_enc_u32(&c->r, (uint32_t)r);
 }
@@ -1274,8 +1399,9 @@ static int submit_and_wait(selftest *st, VkCommandBuffer cb)
 #define TEST_SIZE (256u * 1024u)
 
 /* One allocation of `type` with strategy `s`, checked from both sides. 1 = shared and coherent
- * (no flush needed), 2 = shared when flushed, 0 = not shared. */
-static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush);
+ * (no flush needed), 2 = shared when flushed, 0 = not shared. cached: cached readback pages, with
+ * the cache maintenance the server does for the client (always flushed). */
+static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush, int cached);
 
 /* Without flushes first: imported pages from an uncached heap are coherent in practice even where
  * the driver's type does not say HOST_COHERENT (Mali-G720: dma-heap imports land in type 1,
@@ -1284,16 +1410,28 @@ static int test_type(selftest *st, uint32_t s, uint32_t type)
 {
     int coherent_flag = (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     if (!coherent_flag && !getenv("VKBRIDGE_SELFTEST_NOFLUSH")) {
-        int r = test_type_mode(st, s, type, 1);
+        int r = test_type_mode(st, s, type, 1, 0);
         if (r) {
             VKB_INFO("  %s, type %u: coherent in practice (no flushes needed)", vkb_mem_strategy_name(s), type);
             return 1;
         }
     }
-    return test_type_mode(st, s, type, 0);
+    return test_type_mode(st, s, type, 0, 0);
 }
 
-static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush)
+/* What flush_or_invalidate does for a client: the dma-buf sync around the driver's call. */
+static void st_flush(selftest *st, vkb_srv_mem *m, const VkMappedMemoryRange *whole, int flush)
+{
+    if (flush) {
+        dmabuf_sync(m, 1);
+        st->dt.vkFlushMappedMemoryRanges(st->dev, 1, whole);
+    } else {
+        st->dt.vkInvalidateMappedMemoryRanges(st->dev, 1, whole);
+        dmabuf_sync(m, 0);
+    }
+}
+
+static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush, int cached)
 {
     const vkb_dispatch *dt = &st->dt;
     int result = 0;
@@ -1325,9 +1463,10 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush)
     int keep_fd = s == VKB_MEM_HOSTPTR ? fcntl(cfd, F_DUPFD_CLOEXEC, 0) : -1;
     vkb_srv_mem *m = NULL;
     int out_fd = -1;
-    VkResult r = alloc_shared(dt, st->dev, s, &ai, cfd, &m, &out_fd);
+    VkResult r = alloc_shared(dt, st->dev, s, &ai, cfd, cached, &m, &out_fd);
+    const char *cn = cached ? " (cached readback)" : "";
     if (r != VK_SUCCESS) {
-        VKB_INFO("  %s, type %u: allocation failed (%d)", vkb_mem_strategy_name(s), type, r);
+        VKB_INFO("  %s, type %u%s: allocation failed (%d)", vkb_mem_strategy_name(s), type, cn, r);
         if (keep_fd >= 0) close(keep_fd);
         dt->vkDestroyBuffer(st->dev, buf, NULL);
         return 0;
@@ -1349,6 +1488,7 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush)
     int coherent = (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     /* VKBRIDGE_SELFTEST_NOFLUSH=1 forces it for every type. */
     if (no_flush || getenv("VKBRIDGE_SELFTEST_NOFLUSH")) coherent = 1;
+    if (cached) coherent = 0; /* always flushed: what the client does with these pages */
     VkMappedMemoryRange whole = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, m->mem, 0, VK_WHOLE_SIZE};
 
     /* 1: the two CPU mappings are the same pages. */
@@ -1362,7 +1502,7 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush)
     }
     /* 2: GPU writes, client reads.  3: client writes, GPU copies, client reads the copy. */
     for (uint32_t i = TEST_SIZE / 8; i < TEST_SIZE / 8 + TEST_SIZE / 32; i++) ((volatile uint32_t *)cmap)[i] = 0x5a000000u ^ (i * 2654435761u);
-    if (!coherent) dt->vkFlushMappedMemoryRanges(st->dev, 1, &whole);
+    if (!coherent) st_flush(st, m, &whole, 1);
     VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, st->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     VkCommandBuffer cb;
     if (dt->vkAllocateCommandBuffers(st->dev, &cai, &cb) != VK_SUCCESS) goto out;
@@ -1382,7 +1522,7 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush)
         VKB_INFO("  %s, type %u: GPU submission failed", vkb_mem_strategy_name(s), type);
         goto out;
     }
-    if (!coherent) dt->vkInvalidateMappedMemoryRanges(st->dev, 1, &whole);
+    if (!coherent) st_flush(st, m, &whole, 0);
     for (uint32_t i = 0; i < TEST_SIZE / 32; i++) {
         if (((volatile uint32_t *)cmap)[i] != 0xA5A5A5A5u) {
             VKB_INFO("  %s, type %u: the client does not see a GPU write (word %u = 0x%08x)", vkb_mem_strategy_name(s), type, i,
@@ -1400,7 +1540,7 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush)
         }
     }
     result = coherent ? 1 : 2;
-    VKB_INFO("  %s, type %u (flags 0x%x): shared OK%s", vkb_mem_strategy_name(s), type, st->mp.memoryTypes[type].propertyFlags,
+    VKB_INFO("  %s, type %u (flags 0x%x)%s: shared OK%s", vkb_mem_strategy_name(s), type, st->mp.memoryTypes[type].propertyFlags, cn,
              coherent ? ", coherent" : ", needs flushes");
 out:
     if (cmap) munmap(cmap, (size_t)m->size);
@@ -1447,6 +1587,60 @@ static void log_external_props(const vkb_dispatch *idt, VkPhysicalDevice pd)
     }
 }
 
+/*
+ * Cached readback, for the strategy chosen: each shareable type the driver calls HOST_CACHED is
+ * tried with cached pages and the client's flushes and invalidates (the server's dma-buf syncs).
+ * Only HOST_CACHED types: the server's own mapping (vkMapMemory, for the driver's flushes) is then
+ * cached too, never a cached and an uncached mapping of one page. A pass says the pages, the import
+ * and the syncs work; it cannot prove that no stale line ever survives (a race), which is why the
+ * pages are offered only per VKBRIDGE_CACHED_READBACK (vkb_mem_cached_gate). The test runs either
+ * way, so the log has the answer. VKBRIDGE_CACHED_READBACK=0 skips it.
+ */
+static uint32_t cached_selftest(selftest *st, uint32_t s, uint32_t shareable)
+{
+    const char *e = getenv("VKBRIDGE_CACHED_READBACK");
+    if (e && *e == '0') return 0;
+    if (s != VKB_MEM_DMABUF && s != VKB_MEM_DMAHEAP && s != VKB_MEM_AHB) {
+        VKB_INFO("cached readback: not with %s (no dma-buf to sync through)", vkb_mem_strategy_name(s));
+        return 0;
+    }
+    uint32_t ok = 0;
+    for (uint32_t t = 0; t < st->mp.memoryTypeCount; t++) {
+        VkMemoryPropertyFlags f = st->mp.memoryTypes[t].propertyFlags;
+        if (!(shareable & (1u << t)) || !(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) continue;
+        if (test_type_mode(st, s, t, 0, 1)) ok |= 1u << t;
+    }
+    VKB_INFO("cached readback: %s, types 0x%x pass with cached pages", vkb_mem_strategy_name(s), ok);
+    return ok;
+}
+
+/* What the client is told (vkbQueryServer): the self-test's types, when VKBRIDGE_CACHED_READBACK
+ * (server environment or <cache dir>/env) and the mode allow them.
+ *   0     off;
+ *   1     the client's own frame readback only (VKB_CACHED_WSI);
+ *   apps  that, and a HOST_CACHED type without HOST_COHERENT for apps (VKB_CACHED_APPS);
+ *   unset: 1 in performance mode, 0 in safe mode. */
+void vkb_mem_cached_gate(vkb_server_pd_info *info, int mode)
+{
+    const char *e = vkb_srv_env("VKBRIDGE_CACHED_READBACK");
+    uint32_t flags;
+    if (e && *e) flags = *e == '0' ? 0 : !strcmp(e, "apps") ? VKB_CACHED_WSI | VKB_CACHED_APPS : VKB_CACHED_WSI;
+    else flags = mode == VKB_MODE_PERFORMANCE ? VKB_CACHED_WSI : 0;
+    if (!flags || !info->cached_types) {
+        info->cached_types = 0;
+        info->cached_flags = 0;
+        return;
+    }
+    info->cached_flags = flags;
+    static uint32_t said = ~0u;
+    if (said != (flags | info->cached_types << 8)) {
+        said = flags | info->cached_types << 8;
+        VKB_INFO("cached readback: offered in types 0x%x to %s (%s)", info->cached_types,
+                 flags & VKB_CACHED_APPS ? "the client's frame readback and apps" : "the client's frame readback",
+                 e && *e ? "VKBRIDGE_CACHED_READBACK" : "performance mode");
+    }
+}
+
 void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd)
 {
     selftest st;
@@ -1475,6 +1669,9 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     uint32_t candidates[4];
     int nc = 0;
     const char *force = getenv("VKBRIDGE_MEMORY");
+    char outcome[400] = ""; /* each strategy's fate, for the summary line */
+    int on = 0;
+#define OUTCOME(...) on += snprintf(outcome + on, on < (int)sizeof(outcome) ? sizeof(outcome) - (size_t)on : 0, __VA_ARGS__)
     /* GameNative's order on Mali: the driver's own export, a dma-heap import, then an AHB. */
     uint32_t order[] = {VKB_MEM_HOSTPTR, VKB_MEM_DMABUF, VKB_MEM_DMAHEAP, VKB_MEM_AHB};
     for (int i = 0; i < 4; i++) {
@@ -1489,8 +1686,26 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
                 strcmp(req[j], "VK_KHR_dedicated_allocation") && strcmp(req[j], "VK_KHR_get_memory_requirements2") &&
                 !has_ext(ex, ne, req[j]))
                 ok = 0;
+        /* A driver that exports no dma-buf (Mali: buffers report dma-buf features 0x4, importable
+         * only) fails dmabuf at its first vkGetMemoryFdKHR: not tried. */
+        if (ok && s == VKB_MEM_DMABUF && idt->vkGetPhysicalDeviceExternalBufferProperties) {
+            VkPhysicalDeviceExternalBufferInfo bi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO, NULL, 0,
+                                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+            VkExternalBufferProperties ep = {VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+            idt->vkGetPhysicalDeviceExternalBufferProperties(pd, &bi, &ep);
+            uint32_t feat = ep.externalMemoryProperties.externalMemoryFeatures;
+            if (!(feat & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+                VKB_INFO("memory sharing: dmabuf unavailable (the driver exports no dma-bufs: features 0x%x)", feat);
+                OUTCOME(" dmabuf: no export (0x%x);", feat);
+                continue;
+            }
+        }
         if (ok) candidates[nc++] = s;
-        else VKB_INFO("memory sharing: %s unavailable (driver lacks its extensions)", vkb_mem_strategy_name(s));
+        else {
+            VKB_INFO("memory sharing: %s unavailable (driver lacks its extensions)", vkb_mem_strategy_name(s));
+            OUTCOME(" %s: no extensions;", vkb_mem_strategy_name(s));
+        }
     }
 
     /* One test device with every candidate's extensions. */
@@ -1546,10 +1761,17 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
             k->info.shareable_types = shareable;
             k->info.coherent_types = coherent;
             k->info.import_alignment = st.import_align;
+            k->info.cached_types = cached_selftest(&st, s, shareable);
+            OUTCOME(" %s: chosen, types 0x%x shared, 0x%x coherent, 0x%x cached readback;", vkb_mem_strategy_name(s), shareable, coherent,
+                    k->info.cached_types);
             break;
         }
         VKB_INFO("memory sharing: %s failed the self-test", vkb_mem_strategy_name(s));
+        OUTCOME(" %s: failed (types 0x%x shared, none coherent);", vkb_mem_strategy_name(s), shareable);
     }
+    /* One line with every strategy's fate (the per-type lines above say why). */
+    VKB_INFO("memory sharing summary for %s:%s", k->name, outcome);
+#undef OUTCOME
     if (k->info.strategy == VKB_MEM_NONE)
         VKB_ERR("memory sharing: no method works on %s; Linux programs will get no host-visible memory", k->name);
 

@@ -251,13 +251,14 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
-    vkb_pds_select_mode();
+    int mode = vkb_pds_select_mode();
     const vkb_pd_knowledge *k = vkb_pd_lookup(c->dt, pd);
     vkb_server_pd_info info;
     memset(&info, 0, sizeof(info));
     if (k) info = k->info;
     else VKB_WARN("query for a physical device the self-test did not see");
     info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: the game's preset file, <cache dir>/env, ... */
+    vkb_mem_cached_gate(&info, mode); /* server_memory.c: cached readback per VKBRIDGE_CACHED_READBACK and the mode */
     vkb_enc_raw(&c->r, &info, sizeof(info));
 }
 
