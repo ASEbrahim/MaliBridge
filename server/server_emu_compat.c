@@ -7,7 +7,9 @@
  *  - dualSrcBlend (VKB_EMU_DUAL_SRC): blend factors on the second source become the first's, and
  *    the fragment shader's second output (Index 1) goes to an unused location. Approximate - a
  *    game blending with two outputs looks different - and logged once when it happens.
- *  - fillModeNonSolid (VKB_EMU_FILL_MODE): wireframe/point fill draws solid. Debug views only.
+ *  - fillModeNonSolid (VKB_EMU_FILL_MODE): the pipeline itself is made solid; server_emu_polygon.c
+ *    gives it a line-list or point-list variant and draws through that (VKBRIDGE_POLYGON_EMU=0:
+ *    solid, as it was).
  *  - multiViewport (VKB_EMU_MULTI_VIEWPORT): only the first viewport and scissor are used. D3D
  *    games set one almost always; logged once when more arrive.
  *  - VK_KHR_maintenance6 (VKB_EMU_MAINT6): vkCmdBindDescriptorSets2 / vkCmdPushConstants2 on their
@@ -82,7 +84,8 @@ void vkb_emu_compat_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipel
     }
     if ((e->flags & VKB_EMU_FILL_MODE) && ci->pRasterizationState && ci->pRasterizationState->polygonMode != VK_POLYGON_MODE_FILL) {
         ((VkPipelineRasterizationStateCreateInfo *)ci->pRasterizationState)->polygonMode = VK_POLYGON_MODE_FILL;
-        once(&told_fill, "wireframe/point fill drawn solid (no fillModeNonSolid)");
+        /* server_emu_polygon.c draws them as lines or points through a variant (and logs that). */
+        if (!e->polygon) once(&told_fill, "wireframe/point fill drawn solid (no fillModeNonSolid)");
     }
     if ((e->flags & VKB_EMU_MULTI_VIEWPORT) && ci->pViewportState) {
         VkPipelineViewportStateCreateInfo *vp = (VkPipelineViewportStateCreateInfo *)ci->pViewportState;

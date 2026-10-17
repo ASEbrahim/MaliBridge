@@ -86,6 +86,25 @@ static void log_device(const vkb_dispatch *dt, VkPhysicalDevice pd, const VkPhys
     VKB_INFO("features: %s=%u %s=%u %s=%u %s=%u %s=%u %s=%u", F(robustBufferAccess), F(fullDrawIndexUint32), F(samplerAnisotropy),
              F(depthBounds), F(largePoints), F(shaderStorageImageExtendedFormats));
 #undef F
+    /* *_SCALED vertex fetch: DXVK's D3D9 vertex declarations use it (UBYTE4 bone indices, SHORT2/4,
+     * UDEC3). Adreno lacks it; Mali reportedly has it (MK-13 says otherwise; the G925 lists it). */
+    static const VkFormat scaled[] = {
+        VK_FORMAT_R8G8B8A8_USCALED, VK_FORMAT_R8G8B8A8_SSCALED, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8_SSCALED,
+        VK_FORMAT_R16G16_USCALED, VK_FORMAT_R16G16_SSCALED, VK_FORMAT_R16G16B16A16_USCALED, VK_FORMAT_R16G16B16A16_SSCALED,
+        VK_FORMAT_A2B10G10R10_USCALED_PACK32, VK_FORMAT_A2B10G10R10_SSCALED_PACK32, VK_FORMAT_R8_USCALED, VK_FORMAT_R16_SSCALED,
+    };
+    char missing[256] = "";
+    int nm = 0, flen = 0;
+    for (size_t i = 0; i < sizeof(scaled) / sizeof(scaled[0]); i++) {
+        VkFormatProperties fp;
+        dt->vkGetPhysicalDeviceFormatProperties(pd, scaled[i], &fp);
+        if (!(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
+            nm++;
+            if (flen < (int)sizeof(missing) - 16) flen += snprintf(missing + flen, sizeof(missing) - (size_t)flen, " %d", scaled[i]);
+        }
+    }
+    VKB_INFO("vertex fetch: %d of %zu *_SCALED formats%s%s", (int)(sizeof(scaled) / sizeof(scaled[0])) - nm,
+             sizeof(scaled) / sizeof(scaled[0]), nm ? ", without:" : "", missing);
     uint32_t n = 0;
     dt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
     VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));

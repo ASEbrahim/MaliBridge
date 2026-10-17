@@ -1,0 +1,52 @@
+#version 450
+// The triangles of an indexed draw as a line list, for polygon mode LINE on a GPU without
+// fillModeNonSolid (server_emu_polygon.c): one invocation per triangle writes its three edges,
+// (a,b) (b,c) (c,a), as six 32-bit indices. Edges shared by two triangles are written twice, as
+// the GPU's own polygon mode draws them. The idea - turn the index stream into the triangles'
+// edges and draw it with the line rasterizer - is the one Mesa's panvk and taowen's libhybris
+// compatibility layer (polygon_indices.comp, Apache-2.0) use; this shader is the bridge's own.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Src { uint w[]; } src;   // the app's indices
+layout(set = 0, binding = 1, std430) writeonly buffer Dst { uint w[]; } dst;  // 6 per triangle
+
+layout(push_constant) uniform P {
+    uint byte_off;  // byte offset of the draw's first index in src
+    uint isize;     // bytes per index: 1, 2 or 4
+    uint tris;      // triangles in the draw
+    uint topo;      // 0 list, 1 strip, 2 fan
+    uint restart;   // strips: a triangle touching the restart value is skipped
+    uint row;       // invocations per dispatch row (y > 0 when one row is not enough)
+} p;
+
+uint idx(uint k)
+{
+    uint b = p.byte_off + k * p.isize;
+    uint word = src.w[b >> 2];
+    if (p.isize == 4u) return word;
+    if (p.isize == 2u) return (word >> ((b & 2u) * 8u)) & 0xffffu;
+    return (word >> ((b & 3u) * 8u)) & 0xffu;
+}
+
+void main()
+{
+    uint t = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * p.row;
+    if (t >= p.tris) return;
+    uint a, b, c;
+    if (p.topo == 0u) {
+        a = idx(3u * t); b = idx(3u * t + 1u); c = idx(3u * t + 2u);
+    } else if (p.topo == 1u) {
+        a = idx(t); b = idx(t + 1u); c = idx(t + 2u);
+    } else {
+        a = idx(0u); b = idx(t + 1u); c = idx(t + 2u);
+    }
+    if (p.restart != 0u) {
+        uint r = p.isize == 4u ? 0xffffffffu : (p.isize == 2u ? 0xffffu : 0xffu);
+        // Zero-length lines: no fragments (a restart splits the strip; the triangles across it are none).
+        if (a == r || b == r || c == r) { a = 0u; b = 0u; c = 0u; }
+    }
+    uint o = 6u * t;
+    dst.w[o] = a; dst.w[o + 1u] = b;
+    dst.w[o + 2u] = b; dst.w[o + 3u] = c;
+    dst.w[o + 4u] = c; dst.w[o + 5u] = a;
+}

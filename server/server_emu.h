@@ -41,6 +41,7 @@ typedef struct vkb_emu_device {
     void *cmdstate;  /* server_emu_cmdstate.c */
     void *divisor;   /* server_emu_divisor.c */
     void *shaders;   /* server_emu_shader.c */
+    void *polygon;   /* server_emu_polygon.c */
 } vkb_emu_device;
 
 /* command buffer state (server_emu_cmdstate.c) */
@@ -50,6 +51,21 @@ void vkb_emu_restore_compute(vkb_emu_device *e, VkCommandBuffer cb);
 void *vkb_emu_cb_gfx(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
 VkDescriptorSet vkb_emu_cb_scratch_set(vkb_emu_device *e, VkCommandBuffer cb, VkDescriptorSetLayout dsl);
 void *vkb_emu_cb_bcn(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
+void *vkb_emu_cb_poly(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
+VkCommandPool vkb_emu_cb_origin(vkb_emu_device *e, VkCommandBuffer cb, int *secondary, uint32_t *begin_flags);
+/* polygon mode LINE / POINT without fillModeNonSolid (server_emu_polygon.c) */
+typedef struct poly_info poly_info;
+size_t vkb_emu_polygon_info_size(void);
+void vkb_emu_polygon_pipeline(vkb_emu_device *e, const VkGraphicsPipelineCreateInfo *ci, poly_info *out);
+void vkb_emu_polygon_created(vkb_emu_device *e, VkDevice device, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo *ci,
+                             VkPipeline p, poly_info *info);
+void vkb_emu_polygon_buffer_usage(vkb_emu_device *e, VkBufferCreateInfo *ci);
+void vkb_emu_polygon_install(vkb_srv_table *dev);
+void vkb_emu_polygon_uninstall(vkb_srv_table *dev);
+/* A command buffer reset or begun again (cb's pool: pool) / forgotten. */
+void vkb_emu_polygon_cb_reset(vkb_emu_device *e, VkCommandBuffer cb, VkCommandPool pool, void **poly);
+void vkb_emu_polygon_cb_free(vkb_emu_device *e, void *poly);
+VkDeviceSize vkb_emu_buffer_size(vkb_emu_device *e, VkBuffer b); /* 0: not tracked */
 /* vertex attribute divisor (server_emu_divisor.c) */
 typedef struct div_info div_info;
 size_t vkb_emu_divisor_info_size(void);

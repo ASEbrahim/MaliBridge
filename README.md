@@ -108,7 +108,8 @@ Each one turns on only when the GPU lacks the feature.
 - **Vertex attribute divisor**: the binding gets a stride of 0 and is rebound for each run of instances, with draws split to match. Also used where the driver has only `VK_KHR_vertex_attribute_divisor` without the zero divisor (the Mali-G925 on Android 16), and `VK_EXT_vertex_attribute_divisor` is offered there: vkd3d-proton refuses a GPU without it ("DirectX 12 required" in The Witcher 3).
 - **Renamed extensions**: where a newer driver has only the KHR name of an extension that games look for under its EXT name (index_type_uint8, line_rasterization, robustness2, global_priority, load_store_op_none, vertex_attribute_divisor), the EXT name is offered and mapped onto the KHR one.
 - **maintenance5 / maintenance6, depth clip enable, load/store op none**: mapped onto what the driver has.
-- **dualSrcBlend, fillModeNonSolid, multiViewport**: reported so that DXVK 3 starts. The rare use is approximated and logged.
+- **Polygon mode LINE / POINT** (`fillModeNonSolid`, wireframe; DXVK 3 will not start without it): a pipeline that asks for it gets a line-list or point-list variant, and its draws go through that. A non-indexed draw uses a fixed list of each triangle's three edges; an indexed one gets its edges written by a compute shader (`server/shaders/polygon/lines.comp`) in a command buffer submitted just before the app's, so the render pass is not split. Strips, fans and strip restarts are handled; no geometry shader is used (Mali runs those slowly). Dynamic topology and restart (vkd3d-proton) are read at each draw. Back-face culling and depth bias do not apply to the emulated lines; indirect draws and pipeline libraries still draw solid (logged). `VKBRIDGE_POLYGON_EMU=0` draws all of it solid. The approach follows Mesa's panvk and taowen's libhybris compatibility layer (Apache-2.0).
+- **dualSrcBlend, multiViewport**: reported so that DXVK 3 starts. The rare use is approximated and logged.
 - **multiDrawIndirect** (Mali-G57 on r32/r38): an indirect draw of n commands is recorded as n single indirect draws.
 - **Storage texel buffer alignment**: any texel offset is accepted (vkd3d-proton 3).
 - **Elastic descriptor pools**: allocation past a pool's size, which desktop drivers allow and Mali refuses.
@@ -273,6 +274,11 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   Mali-G715 ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali) `docs/mali-venus.md`,
   GPL-3.0): the frame readback buffer in a cached memory type backed by `/dev/dma_heap/system`,
   flush and invalidate as a `DMA_BUF_IOCTL_SYNC` start/end pair. No code is copied.
+- [libhybris](https://github.com/taowen/libhybris/tree/arlinux) `arlinux` branch by taowen, Apache-2.0:
+  the polygon-mode emulation (`server/server_emu_polygon.c`, `server/shaders/polygon/lines.comp`)
+  follows the approach of its `VK_LAYER_HYBRIS_compat` layer (`polygon_*.c`, `polygon_indices.comp`):
+  the triangles' index stream rewritten into their edges and drawn as a line list. Mesa's panvk
+  does the same on Mali hardware. No code is copied.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
   (the order of memory-sharing strategies on Mali, the r44 robustness2 profile) informed the
   server. No code from either project is included.

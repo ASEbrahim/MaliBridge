@@ -181,6 +181,21 @@ run_mode() {
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
   timeout 60 ./out/divisor_check >out/t-divisor.log 2>&1; result $? "divisor_check ($(tail -1 out/t-divisor.log))"
+  # Polygon mode LINE / POINT (wireframe): native on plain; on mali drawn through the line- and
+  # point-list variants (the edge list of non-indexed draws, the compute pass's edges of indexed
+  # ones), and the check fails there with the emulation off (VKBRIDGE_POLYGON_EMU=0: solid)
+  timeout 60 ./out/polygon_check >out/t-polygon.log 2>&1 &&
+    { [ "$mode" != mali ] || { grep -q "polygon mode LINE drawn as lines (first" "$VKB_SERVER_LOG" &&
+      grep -q "polygon mode LINE drawn as lines, indexed" "$VKB_SERVER_LOG" &&
+      grep -q "polygon mode POINT drawn as points" "$VKB_SERVER_LOG"; }; }
+  result $? "polygon_check ($(tail -1 out/t-polygon.log))"
+  if [ "$mode" = mali ]; then
+    VKBRIDGE_POLYGON_EMU=0 . ./mali_env.sh >/dev/null
+    timeout 60 ./out/polygon_check >out/t-polygon-off.log 2>&1
+    [ $? = 1 ] && grep -q "^FAIL LINE, vkCmdDraw, triangle list" out/t-polygon-off.log
+    result $? "polygon_check fails with the emulation off ($(grep -c '^FAIL' out/t-polygon-off.log) checks failed)"
+    . ./mali_env.sh >/dev/null
+  fi
   timeout 60 vkcube-wayland --c 120 >out/t-vkcube.log 2>&1; result $? "vkcube-wayland (dma-buf)"
   VKBRIDGE_WSI_SHM=1 timeout 60 vkcube-wayland --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube-wayland (wl_shm)"
   timeout 60 vkcube --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube (X11)"
