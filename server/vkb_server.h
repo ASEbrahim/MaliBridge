@@ -73,6 +73,7 @@ typedef struct vkb_srv_mem {
     void *mapped;            /* server-side vkMapMemory pointer (for flush/invalidate) */
     void *ahb;               /* AHardwareBuffer* (Android) */
     int export_fd1;          /* VKB_EMU_DMABUF_EXPORT: the dma-heap fd + 1 handed out as the export (0: none) */
+    int sync_fd1;            /* cached readback: the shared dma-buf + 1, for DMA_BUF_IOCTL_SYNC (0: not cached) */
     uint8_t stat_cls, stat_ded; /* accounting (server_memory.c): strategy class, dedicated to an image (1) / buffer (2) */
     int stat_pid;
     struct vkb_srv_mem *next;
@@ -324,6 +325,9 @@ void vkb_mem_export_install(vkb_srv_table *t);
 void vkb_mem_instance_install(vkb_srv_table *t); /* VKBRIDGE_FAKE_MISSING=lazymem: Mali's memory types (host tests) */
 void vkb_mem_log_types(vkb_srv_table *t, uint32_t id);
 void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd);
+/* Cached readback as the client is told: the self-test's types gated by VKBRIDGE_CACHED_READBACK
+ * and the mode (VKB_MODE_*); clears cached_types/cached_flags when off. */
+void vkb_mem_cached_gate(vkb_server_pd_info *info, int mode);
 const char *const *vkb_mem_required_extensions(uint32_t strategy, uint32_t *count);
 void vkb_mem_track(vkb_srv_table *dev, vkb_srv_mem *m);
 vkb_srv_mem *vkb_mem_find(vkb_srv_table *dev, VkDeviceMemory mem, int remove);

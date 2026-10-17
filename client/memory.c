@@ -428,23 +428,17 @@ static void close_import_fds(const void *pNext)
     }
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
-                                                       const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMemory)
+/* One allocation in server type ai->memoryTypeIndex; ct is the client type (for the log, and
+ * UINT32_MAX for the client's own hidden readback type). */
+static VkResult alloc_memory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo, VkMemoryAllocateInfo ai, uint32_t ct,
+                             int shared, int cached, VkDeviceMemory *pMemory)
 {
-    (void)pAllocator;
     vkb_device *dev = vkb_dev(device);
     vkb_physdev *pd = dev->pd;
-    uint32_t ct = pAllocateInfo->memoryTypeIndex;
-    if (ct >= pd->client_mem.memoryTypeCount) {
-        VKB_ONCE(VKB_LOG_WARN, "vkAllocateMemory in memory type %u: there are only %u", ct, pd->client_mem.memoryTypeCount);
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    }
-    VkMemoryAllocateInfo ai = *pAllocateInfo;
-    ai.memoryTypeIndex = pd->type_map[ct].server_type;
-    int shared = pd->type_map[ct].shared;
     /* An app-imported dma-buf/opaque fd keeps its own memory; it is not one of our shared pages. */
     for (const VkBaseInStructure *b = ai.pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) shared = 0;
+    if (!shared || pd->info.strategy == VKB_MEM_HOSTPTR) cached = 0;
     uint32_t strategy = pd->info.strategy;
     int memfd = -1;
     void *ptr = NULL;
@@ -464,7 +458,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const Vk
     vkb_enc_u64(&c.e, dev->obj.remote);
     vkb_enc_u8(&c.e, 1);
     vkb_enc_VkMemoryAllocateInfo(&c.e, &ai);
-    vkb_enc_u32(&c.e, shared ? VKB_ALLOC_SHARED : VKB_ALLOC_PLAIN);
+    vkb_enc_u32(&c.e, cached ? VKB_ALLOC_SHARED_CACHED : shared ? VKB_ALLOC_SHARED : VKB_ALLOC_PLAIN);
     vkb_enc_fd(&c.e, memfd);
     int ok = vkb_call_exec(&c);
     if (memfd >= 0) close(memfd);
@@ -481,10 +475,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const Vk
         static int told;
         if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
             VKB_WARN("vkAllocateMemory of %llu bytes in memory type %u (flags 0x%x) = server type %u (flags 0x%x)%s failed: %d",
-                     (unsigned long long)pAllocateInfo->allocationSize, ct, pd->client_mem.memoryTypes[ct].propertyFlags,
+                     (unsigned long long)pAllocateInfo->allocationSize, ct, ct < pd->client_mem.memoryTypeCount ? pd->client_mem.memoryTypes[ct].propertyFlags : 0,
                      ai.memoryTypeIndex,
                      ai.memoryTypeIndex < pd->server_mem.memoryTypeCount ? pd->server_mem.memoryTypes[ai.memoryTypeIndex].propertyFlags : 0,
-                     shared ? ", shared" : "", r);
+                     cached ? ", shared, cached" : shared ? ", shared" : "", r);
         if (ptr) munmap(ptr, (size_t)ai.allocationSize);
         if (fd >= 0) close(fd);
         return r;
@@ -495,6 +489,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const Vk
     vkb_memory *m = calloc(1, sizeof(*m));
     m->client_type = ct;
     m->shared = shared;
+    m->cached = cached;
     m->size = shared && strategy == VKB_MEM_HOSTPTR ? ai.allocationSize : size;
     if (shared && strategy != VKB_MEM_HOSTPTR) {
         if (fd < 0) {
@@ -512,6 +507,44 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const Vk
     vkb_map_put(&dev->memories, (uint64_t)mem, m);
     *pMemory = mem;
     return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+                                                       const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMemory)
+{
+    (void)pAllocator;
+    vkb_physdev *pd = vkb_dev(device)->pd;
+    uint32_t ct = pAllocateInfo->memoryTypeIndex;
+    if (ct >= pd->client_mem.memoryTypeCount) {
+        VKB_ONCE(VKB_LOG_WARN, "vkAllocateMemory in memory type %u: there are only %u", ct, pd->client_mem.memoryTypeCount);
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    VkMemoryAllocateInfo ai = *pAllocateInfo;
+    ai.memoryTypeIndex = pd->type_map[ct].server_type;
+    return alloc_memory(device, pAllocateInfo, ai, ct, pd->type_map[ct].shared, pd->type_map[ct].cached, pMemory);
+}
+
+/* The client's own readback memory (client/wsi.c): `size` bytes for `buffer` in the hidden cached
+ * readback type (pd->readback_type) when the server offers one and the buffer may live there. The
+ * caller invalidates (vkInvalidateMappedMemoryRanges) before each read. VK_ERROR_FEATURE_NOT_PRESENT:
+ * no such type here; allocate as usual. */
+VkResult vkb_memory_alloc_readback(VkDevice device, VkBuffer buffer, VkDeviceSize size, VkDeviceMemory *pMemory)
+{
+    vkb_device *dev = vkb_dev(device);
+    int t = dev->pd->readback_type;
+    if (t < 0 || !buffer_shareable(dev, buffer)) return VK_ERROR_FEATURE_NOT_PRESENT;
+    VkMemoryRequirements req;
+    vkb_wire_vkGetBufferMemoryRequirements(device, buffer, &req); /* the server's types */
+    if (!(req.memoryTypeBits & (1u << t))) return VK_ERROR_FEATURE_NOT_PRESENT;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, size > req.size ? size : req.size, (uint32_t)t};
+    return alloc_memory(device, &ai, ai, UINT32_MAX, 1, 1, pMemory);
+}
+
+/* 1 when memory has CPU-cached pages (reads need an invalidate first). */
+int vkb_memory_is_cached(VkDevice device, VkDeviceMemory memory)
+{
+    vkb_memory *m = vkb_map_get(&vkb_dev(device)->memories, (uint64_t)memory);
+    return m && m->cached;
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks *pAllocator)

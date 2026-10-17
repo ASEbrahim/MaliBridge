@@ -525,6 +525,14 @@ static VkResult create_staging(vkb_swapchain *sc)
     if (r != VK_SUCCESS) return r;
     VkMemoryRequirements req;
     vkb_ep_vkGetBufferMemoryRequirements(device, sc->staging, &req);
+    /* Cached readback where the server offers it: the CPU reads each frame from cached pages
+     * (Venus on the Mali-G715: 7-10 ms per frame from uncached memory, ~1.3 ms cached). */
+    sc->staging_cached = 0;
+    if (vkb_memory_alloc_readback(device, sc->staging, req.size, &sc->staging_mem) == VK_SUCCESS) {
+        sc->staging_cached = 1;
+        VKB_INFO("swapchain: frames read back through cached memory (server type %d)", dev->pd->readback_type);
+        goto bind;
+    }
     uint32_t type = pick_type(dev, req.memoryTypeBits,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     if (type == UINT32_MAX || !(dev->pd->client_mem.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
@@ -536,6 +544,7 @@ static VkResult create_staging(vkb_swapchain *sc)
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, type};
     r = vkb_ep_vkAllocateMemory(device, &ai, NULL, &sc->staging_mem);
     if (r != VK_SUCCESS) return r;
+bind:
     r = vkb_wire_vkBindBufferMemory(device, sc->staging, sc->staging_mem, 0);
     if (r != VK_SUCCESS) return r;
     void *p = NULL;
@@ -604,6 +613,12 @@ VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index
     if (r == VK_TIMEOUT) {
         VKB_ERR("swapchain: a frame took more than 10 s to render");
         return VK_ERROR_DEVICE_LOST;
+    }
+    if (r == VK_SUCCESS && sc->copy_present && sc->staging_cached) {
+        /* The copy is done: the CPU's stale lines of the staging buffer dropped before it is read
+         * (server_memory.c: DMA_BUF_IOCTL_SYNC). */
+        VkMappedMemoryRange whole = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, sc->staging_mem, 0, VK_WHOLE_SIZE};
+        r = vkb_ep_vkInvalidateMappedMemoryRanges(device, 1, &whole);
     }
     return r;
 }

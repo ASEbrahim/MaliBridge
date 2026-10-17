@@ -51,6 +51,7 @@ typedef struct vkb_object {
 typedef struct vkb_mem_type_map {
     uint32_t server_type;
     uint8_t shared;
+    uint8_t cached;          /* shared with CPU-cached pages (cached readback, VKB_CACHED_APPS) */
 } vkb_mem_type_map;
 
 struct vkb_instance;
@@ -63,6 +64,7 @@ typedef struct vkb_physdev {
     VkPhysicalDeviceMemoryProperties server_mem;
     VkPhysicalDeviceMemoryProperties client_mem;   /* what the app sees */
     vkb_mem_type_map type_map[VK_MAX_MEMORY_TYPES];
+    int readback_type;                              /* server type for the client's own cached frame readback; -1: none */
     uint32_t heap_map[VK_MAX_MEMORY_HEAPS];         /* client heap -> server heap */
     VkExtensionProperties *exts;                    /* filtered device extensions */
     uint32_t next;
@@ -135,6 +137,7 @@ typedef struct vkb_memory {
     VkDeviceSize size;
     uint32_t client_type;
     int shared;
+    int cached;              /* CPU-cached pages: reads need vkInvalidateMappedMemoryRanges first */
 } vkb_memory;
 
 static inline vkb_device *vkb_dev(VkDevice d) { return (vkb_device *)d; }
@@ -189,6 +192,8 @@ uint32_t vkb_mem_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow
 
 /* memory.c */
 void vkb_memory_init_device(vkb_device *d);
+VkResult vkb_memory_alloc_readback(VkDevice device, VkBuffer buffer, VkDeviceSize size, VkDeviceMemory *pMemory);
+int vkb_memory_is_cached(VkDevice device, VkDeviceMemory memory);
 void vkb_memory_destroy_device(vkb_device *d);
 
 /* bufview.c */

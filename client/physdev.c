@@ -52,7 +52,7 @@ static void build_memory_model(vkb_physdev *pd)
     struct cand {
         VkMemoryPropertyFlags flags;
         uint32_t heap, server;
-        uint8_t shared;
+        uint8_t shared, cached;
     } cands[VK_MAX_MEMORY_TYPES * 2];
     uint32_t nc = 0;
     if (uma) {
@@ -61,7 +61,7 @@ static void build_memory_model(vkb_physdev *pd)
             VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
             if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
                 !(f & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT))) {
-                cands[nc++] = (struct cand){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s->memoryTypes[t].heapIndex, t, 0};
+                cands[nc++] = (struct cand){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s->memoryTypes[t].heapIndex, t, 0, 0};
                 break;
             }
         }
@@ -70,7 +70,7 @@ static void build_memory_model(vkb_physdev *pd)
         VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
         uint32_t heap = s->memoryTypes[t].heapIndex;
         if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-            cands[nc++] = (struct cand){f, heap, t, 0};
+            cands[nc++] = (struct cand){f, heap, t, 0, 0};
             continue;
         }
         if (!(share & (1u << t))) continue; /* host-visible but not shareable: not offered */
@@ -86,8 +86,33 @@ static void build_memory_model(vkb_physdev *pd)
         /* Two client types with identical flags on one heap are pointless: keep the first. */
         int dup = 0;
         for (uint32_t i = 0; i < nc; i++) dup |= cands[i].flags == cf && cands[i].heap == heap;
-        if (!dup) cands[nc++] = (struct cand){cf, heap, t, 1};
+        if (!dup) cands[nc++] = (struct cand){cf, heap, t, 1, 0};
     }
+    /* Cached readback for apps (VKB_CACHED_APPS, server_memory.c): a HOST_CACHED type without
+     * HOST_COHERENT whose pages the CPU caches; apps flush and invalidate it as the spec says. A
+     * shared type that already has those flags (one that needs flushes) becomes that type. */
+    uint32_t cached = pd->info.strategy != VKB_MEM_NONE ? pd->info.cached_types & share : 0;
+    if (pd->info.cached_flags & VKB_CACHED_APPS) {
+        for (uint32_t t = 0; t < s->memoryTypeCount && nc < VK_MAX_MEMORY_TYPES; t++) {
+            if (!(cached & (1u << t))) continue;
+            VkMemoryPropertyFlags cf = (s->memoryTypes[t].propertyFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) & ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            uint32_t heap = s->memoryTypes[t].heapIndex;
+            int dup = 0;
+            for (uint32_t i = 0; i < nc; i++)
+                if (cands[i].flags == cf && cands[i].heap == heap && cands[i].shared) {
+                    cands[i].server = t;
+                    cands[i].cached = dup = 1;
+                }
+            if (!dup) cands[nc++] = (struct cand){cf, heap, t, 1, 1};
+        }
+    }
+    /* The client's own frame readback (VKB_CACHED_WSI, client/wsi.c): the first such type, not
+     * offered to apps. VKBRIDGE_CACHED_READBACK=0 in the guest turns it off here. */
+    const char *cr = getenv("VKBRIDGE_CACHED_READBACK");
+    pd->readback_type = (pd->info.cached_flags & VKB_CACHED_WSI) && cached && !(cr && *cr == '0') ? __builtin_ctz(cached) : -1;
+    if (pd->readback_type >= 0 || (pd->info.cached_flags & VKB_CACHED_APPS))
+        VKB_INFO("cached readback: server types 0x%x; frame readback in server type %d%s", cached, pd->readback_type,
+                 pd->info.cached_flags & VKB_CACHED_APPS ? "; offered to apps" : "");
     /* Order: fewer property bits first, which satisfies the spec's subset ordering. */
     for (uint32_t i = 1; i < nc; i++) {
         struct cand x = cands[i];
@@ -121,6 +146,7 @@ static void build_memory_model(vkb_physdev *pd)
         c->memoryTypes[i].heapIndex = cands[i].heap;
         pd->type_map[i].server_type = cands[i].server;
         pd->type_map[i].shared = cands[i].shared;
+        pd->type_map[i].cached = cands[i].cached;
     }
     /* Images and GPU-only buffers need a device-local type without host access backed by ordinary
      * memory: without one (a client that took Mali's lazily allocated type for it), every image

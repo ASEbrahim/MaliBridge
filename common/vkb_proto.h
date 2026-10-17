@@ -62,7 +62,9 @@ typedef struct vkb_server_pd_info {
     uint32_t real_api_version;
     uint32_t missing;              /* VKB_EMU_* features the GPU lacks (emulated or not) */
     uint32_t client_knobs;         /* VKB_KNOB_*: the client's switches from the server (per-game presets) */
-    uint32_t reserved[5];
+    uint32_t cached_types;         /* server memory types whose shared pages can be CPU-cached (cached readback); 0: none */
+    uint32_t cached_flags;         /* VKB_CACHED_*: who may use them */
+    uint32_t reserved[3];
 } vkb_server_pd_info;
 
 /* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an
@@ -78,6 +80,14 @@ typedef struct vkb_server_pd_info {
 /* vkAllocateMemory wire extras (after VkMemoryAllocateInfo). */
 #define VKB_ALLOC_PLAIN 0u
 #define VKB_ALLOC_SHARED 1u
+#define VKB_ALLOC_SHARED_CACHED 2u /* shared, with CPU-cached pages: the client flushes and invalidates */
+
+/* vkb_server_pd_info.cached_flags. Cached readback: shared pages from a cached dma-buf (the
+ * dma-heap's "system" heap, not "system-uncached"), CPU cache maintenance by DMA_BUF_IOCTL_SYNC on
+ * vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges (server_memory.c). An older server
+ * sent zeros in these fields: nothing cached. */
+#define VKB_CACHED_WSI 1u  /* the client's own frame readback (the copy present path) */
+#define VKB_CACHED_APPS 2u /* also offered to apps, as a HOST_CACHED type without HOST_COHERENT */
 
 /* Extra structure the client hangs on create infos to tell the server which shared handle
  * types were injected (so the server can remove them if the driver refuses). Not on the wire. */

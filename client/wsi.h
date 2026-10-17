@@ -71,6 +71,7 @@ struct vkb_swapchain {
     VkDeviceMemory staging_mem;
     uint8_t *staging_ptr;
     VkDeviceSize staging_size;
+    int staging_cached;       /* CPU-cached pages (cached readback): invalidated before each read */
     VkCommandPool pool;
     uint32_t pool_family;
     VkCommandBuffer *copy_cbs;
