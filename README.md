@@ -208,6 +208,36 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_SERVER_HIDE_EXTS=<ext>,...` | server | hides these driver extensions from clients |
 | `VKBRIDGE_HIDE_EXTS`, `VKBRIDGE_MAX_API` | client | hide extensions or cap the API version reported to apps |
 | `VKBRIDGE_DEBUG=1`, `VKBRIDGE_LOG_LEVEL=<n>` | client | client log verbosity |
+| `VKBRIDGE_HEAP_MAX_MB=<n>` | both | every device-local memory heap is reported to the app as at most `n` MB, and its `VK_EXT_memory_budget` budget too (usage stays real). On Mali the one heap is about all of RAM, so DXVK's budget and the DXGI video memory games read are oversized; `4096` is the common choice. Only what the app is shown changes. Off by default; `0` turns it off. Per-game preset key |
+| `VKBRIDGE_SPOOF_GPU=nvidia` / `amd` | both | the app is shown a desktop GPU: `nvidia` vendor 0x10de, device 0x1c03, "NVIDIA GeForce GTX 1060 6GB"; `amd` 0x1002, 0x67df, "AMD Radeon RX 480 Graphics". driverID, driverName, driverVersion, deviceType, the UUIDs and all limits stay the real GPU's, and the server keeps its own view (Mali detection, errata, probe). Off by default; `off` / `0` turns it off. Per-game preset key; see the risks below |
+
+On the client side the guest's own environment wins; otherwise the server sends the value (its
+environment, `<cache dir>/env`, or the game's preset) in vkbQueryServer's reply.
+
+**Per-game presets.** `<cache dir>/presets/<appid>.env` (`KEY=VALUE` lines) holds one game's
+settings; `server/presets_builtin.inc` has built-in entries, each applied only on the GPUs it was
+tested on. On any other GPU the server logs the lines to copy into that file instead. The built-in
+entries for Garry's Mod (4000), DARK SOULS: REMASTERED (570940), Poppy Playtime (1721470) and The
+Forest (242760) set `VKBRIDGE_HEAP_MAX_MB=4096` (DS:R and Poppy also
+`VKBRIDGE_BC_TRANSCODE_QUALITY=fast`). They are untested on our tablets, so they apply nowhere yet.
+The values come from GameNative's public Mali crowd configs.
+
+**`VKBRIDGE_SPOOF_GPU` risks.** It is meant for a game that refuses an unknown GPU, or that picks
+its lowest settings from the vendor. It is not a speed-up, so try it per game and only with a reason.
+- DXVK picks its tiler paths and driver workarounds by driverID, which stays `ARM_PROPRIETARY`, so
+  those are unchanged. DXVK's DXGI and D3D9 adapters do key on the vendorID, though. In DXVK 3.1
+  an NVIDIA vendorID on a non-NVIDIA driver is hidden by default (`dxgi.hideNvkGpu` follows
+  `dxgi.hideNvidiaGpu`, on unless `DXVK_ENABLE_NVAPI=1`), and D3D9/DXGI then report an AMD RX 6700
+  XT. Under DXVK, `nvidia` therefore usually shows up as AMD, and `amd` is the one that reaches the
+  game as set. D3D9 already shows Mali's own vendorID (0x13b5) as AMD by default. D3D9's format
+  answers (`isNvidia`/`isAmd`) and DXGI's reported UMD version also follow the vendorID.
+- vkd3d-proton (D3D12) chooses code generation by vendorID. With NVIDIA it emits SSBOs below the
+  driver's alignment, hoists CBVs to push descriptors and remaps 2D views to 2D arrays. With AMD it
+  assumes per-component SSBO bounds checks and tries to load `amdxc64.dll`. None of these hold on
+  Mali, so do not spoof for D3D12 games.
+- Native Vulkan games and engines (UE4's scalability and vendor checks) see exactly the spoofed
+  identity. The driverVersion is still Mali's encoding, which can read as an odd version number
+  under NVIDIA's scheme.
 
 ## Layout
 
@@ -279,6 +309,11 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   follows the approach of its `VK_LAYER_HYBRIS_compat` layer (`polygon_*.c`, `polygon_indices.comp`):
   the triangles' index stream rewritten into their edges and drawn as a line list. Mesa's panvk
   does the same on Mali hardware. No code is copied.
+- GameNative (GPL-3.0): the device-local heap cap (`VKBRIDGE_HEAP_MAX_MB`, its
+  `WRAPPER_VMEM_MAX_SIZE`) and the GPU identity spoof (`VKBRIDGE_SPOOF_GPU`, its default GeForce
+  identity) follow its ideas, and the values in the built-in presets for Garry's Mod, DARK SOULS:
+  REMASTERED, Poppy Playtime and The Forest come from its public Mali crowd configs. No code is
+  copied.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
   (the order of memory-sharing strategies on Mali, the r44 robustness2 profile) informed the
   server. No code from either project is included.

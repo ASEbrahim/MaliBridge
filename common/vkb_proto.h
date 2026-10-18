@@ -65,7 +65,8 @@ typedef struct vkb_server_pd_info {
     uint32_t cached_types;         /* server memory types whose shared pages can be CPU-cached (cached readback); 0: none */
     uint32_t cached_flags;         /* VKB_CACHED_*: who may use them */
     uint32_t image_types;          /* server memory types the self-test's images and plain buffers all allow; 0: unknown (older server) */
-    uint32_t reserved[2];
+    uint32_t heap_max_mb;          /* VKBRIDGE_HEAP_MAX_MB from the server (a per-game preset): device-local heaps reported at most this; 0: nothing said */
+    uint32_t spoof_gpu;            /* VKB_SPOOF_*: VKBRIDGE_SPOOF_GPU from the server; 0: nothing said */
 } vkb_server_pd_info;
 
 /* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an
@@ -77,6 +78,12 @@ typedef struct vkb_server_pd_info {
 #define VKB_KNOB_DESC_BATCH_SHIFT 0   /* VKBRIDGE_DESC_BATCH / VKBRIDGE_NO_DESC_BATCH */
 #define VKB_KNOB_QUERY_MIRROR_SHIFT 2 /* VKBRIDGE_QUERY_MIRROR */
 #define VKB_KNOB_GET(word, shift) (((word) >> (shift)) & 3u)
+
+/* vkb_server_pd_info.spoof_gpu (once reserved: an older server sends 0, an older client ignores
+ * it). The GPU identity the app is shown (client/physdev.c); the server keeps the real one. */
+#define VKB_SPOOF_OFF 1u
+#define VKB_SPOOF_NVIDIA 2u
+#define VKB_SPOOF_AMD 3u
 
 /* vkAllocateMemory wire extras (after VkMemoryAllocateInfo). */
 #define VKB_ALLOC_PLAIN 0u

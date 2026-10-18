@@ -170,6 +170,11 @@ run_mode() {
     # mode; the client's frame readback (vkcube's X11 path) and an app's non-coherent cached type
     # read back right through DMA_BUF_IOCTL_SYNC (dma-buf strategy; a server of its own; once)
     timeout 300 ./cached_test.sh >out/t-cached.log 2>&1; result $? "cached_test ($(tail -1 out/t-cached.log))"
+    # What the app is shown: VKBRIDGE_HEAP_MAX_MB (device-local heaps and their budget capped) and
+    # VKBRIDGE_SPOOF_GPU (vendor, device, name; driverID and the server's own view real), from the
+    # guest, a preset file and a built-in preset; the untested built-in entries not applied (a
+    # server of its own; once)
+    timeout 300 ./heapcap_test.sh >out/t-heapcap.log 2>&1; result $? "heapcap_test ($(tail -1 out/t-heapcap.log))"
   fi
   # Negative and positive viewports, static and dynamic, two of them, points, a geometry stage,
   # pipeline libraries: every pixel against the CPU's (facing, gl_FragCoord, dFdy) - MK-02's check

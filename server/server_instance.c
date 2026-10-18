@@ -277,6 +277,7 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
     if (k) info = k->info;
     else VKB_WARN("query for a physical device the self-test did not see");
     info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: the game's preset file, <cache dir>/env, ... */
+    vkb_preset_client_values(&info);               /* the heap cap and GPU identity the app is shown, the same way */
     vkb_mem_cached_gate(&info, mode); /* server_memory.c: cached readback per VKBRIDGE_CACHED_READBACK and the mode */
     vkb_enc_raw(&c->r, &info, sizeof(info));
 }

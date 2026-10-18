@@ -320,6 +320,7 @@ const char *vkb_preset_text(const vkb_srv_proc *p, char *out, size_t cap); /* "K
 /* "preset for steam<appid>: a built-in preset exists but was not tested on <gpu>; ...", or "" */
 const char *vkb_preset_note(const vkb_srv_proc *p, char *out, size_t cap);
 uint32_t vkb_preset_client_knobs(void);  /* vkb_server_pd_info.client_knobs for this thread's client */
+void vkb_preset_client_values(vkb_server_pd_info *info); /* its .heap_max_mb and .spoof_gpu, the same way */
 
 /* server_instance.c */
 void vkb_selftest_all(void);

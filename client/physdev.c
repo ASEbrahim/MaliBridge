@@ -15,6 +15,84 @@
 
 const char *const *vkb_client_device_exts(uint32_t *n);
 
+/* ------------------------------------------------------------------ what the app is shown */
+
+/*
+ * Two per-game values that change only what the app sees, never what the bridge does with the GPU
+ * (the server keeps the real heaps and the real identity for its Mali detection, errata and
+ * probe). Each comes from the guest's environment, else from the server (vkbQueryServer's
+ * heap_max_mb and spoof_gpu: the game's preset file, <cache dir>/env, the server's environment,
+ * the game's built-in preset); both are off by default.
+ *
+ * VKBRIDGE_HEAP_MAX_MB=<n>: every device-local heap is reported at most n MB, and its
+ * VK_EXT_memory_budget budget at most that too. On a unified-memory GPU the one heap is about all
+ * of RAM, so DXVK sizes its budget, and the "dedicated video memory" games read from DXGI, as if
+ * the game had all of it; 4096 is what most good Mali runs in GameNative's crowd configs use (its
+ * WRAPPER_VMEM_MAX_SIZE; the idea only, this is our own code). 0: off.
+ *
+ * VKBRIDGE_SPOOF_GPU=nvidia|amd: the app is shown a desktop GPU's vendorID, deviceID and
+ * deviceName (GameNative shows a GeForce by default; again the idea only). driverID, driverName,
+ * driverVersion, deviceType, the UUIDs and the limits stay the real GPU's: DXVK picks its tiler
+ * paths and driver workarounds by driverID (ARM_PROPRIETARY), and keeping them is the point. The
+ * risks are in the README (vkd3d-proton picks code generation by vendorID). off/0: off.
+ */
+struct spoof_gpu {
+    uint32_t vendor, device;
+    const char *name;
+};
+static const struct spoof_gpu spoof_gpus[] = {
+    [VKB_SPOOF_NVIDIA] = {0x10de, 0x1c03, "NVIDIA GeForce GTX 1060 6GB"},
+    [VKB_SPOOF_AMD] = {0x1002, 0x67df, "AMD Radeon RX 480 Graphics"},
+};
+
+/* VKB_SPOOF_* or 0 (off); *from: where it came from */
+static uint32_t spoof_choice(const vkb_physdev *pd, const char **from)
+{
+    const char *e = getenv("VKBRIDGE_SPOOF_GPU");
+    *from = "the guest's VKBRIDGE_SPOOF_GPU";
+    if (e && *e) {
+        if (!strcmp(e, "nvidia")) return VKB_SPOOF_NVIDIA;
+        if (!strcmp(e, "amd")) return VKB_SPOOF_AMD;
+        if (strcmp(e, "0") && strcmp(e, "off")) VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_SPOOF_GPU=%s is not nvidia, amd or off; the real GPU is shown", e);
+        return 0;
+    }
+    *from = "the server's VKBRIDGE_SPOOF_GPU (the game's preset or <cache dir>/env)";
+    uint32_t v = pd->info.spoof_gpu;
+    return v == VKB_SPOOF_NVIDIA || v == VKB_SPOOF_AMD ? v : 0;
+}
+
+/* The cap in bytes, or 0 (off); *from: where it came from */
+static VkDeviceSize heap_cap(const vkb_physdev *pd, const char **from)
+{
+    const char *e = getenv("VKBRIDGE_HEAP_MAX_MB");
+    if (e && *e) {
+        *from = "the guest's VKBRIDGE_HEAP_MAX_MB";
+        char *end;
+        unsigned long long mb = strtoull(e, &end, 10);
+        if (*end || *e == '-') {
+            VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_HEAP_MAX_MB=%s is not a number of MB; heaps reported as they are", e);
+            return 0;
+        }
+        return (VkDeviceSize)mb << 20;
+    }
+    *from = "the server's VKBRIDGE_HEAP_MAX_MB (the game's preset or <cache dir>/env)";
+    return (VkDeviceSize)pd->info.heap_max_mb << 20;
+}
+
+static void cap_heaps(vkb_physdev *pd)
+{
+    const char *from;
+    VkDeviceSize cap = heap_cap(pd, &from);
+    if (!cap) return;
+    VkPhysicalDeviceMemoryProperties *c = &pd->client_mem;
+    for (uint32_t h = 0; h < c->memoryHeapCount; h++) {
+        if (!(c->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || c->memoryHeaps[h].size <= cap) continue;
+        VKB_INFO("memory: device-local heap %u reported as %llu MB, not %llu MB (%s)", h, (unsigned long long)(cap >> 20),
+                 (unsigned long long)(c->memoryHeaps[h].size >> 20), from);
+        c->memoryHeaps[h].size = cap;
+    }
+}
+
 /* ------------------------------------------------------------------ memory model */
 
 /*
@@ -178,6 +256,7 @@ static void build_memory_model(vkb_physdev *pd)
     for (uint32_t i = 0; i < nc; i++)
         VKB_DBG("memory type %u: flags 0x%x heap %u -> server type %u%s", i, c->memoryTypes[i].propertyFlags,
                 c->memoryTypes[i].heapIndex, pd->type_map[i].server_type, pd->type_map[i].shared ? " (shared)" : "");
+    cap_heaps(pd);
 }
 
 uint32_t vkb_mem_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow_shared)
@@ -340,7 +419,15 @@ uint32_t vkb_max_api(void)
 static void patch_props(vkb_physdev *pd, VkPhysicalDeviceProperties *p)
 {
     if (p->apiVersion > vkb_max_api()) p->apiVersion = vkb_max_api();
-    (void)pd;
+    const char *from;
+    uint32_t sp = vkb_physdev_ready(pd) ? spoof_choice(pd, &from) : 0;
+    if (!sp) return;
+    const struct spoof_gpu *g = &spoof_gpus[sp];
+    VKB_ONCE(VKB_LOG_INFO, "GPU shown to the app as %s (vendor 0x%04x, device 0x%04x), not %s (vendor 0x%04x, device 0x%04x; %s)", g->name,
+             g->vendor, g->device, pd->props.deviceName, pd->props.vendorID, pd->props.deviceID, from);
+    p->vendorID = g->vendor;
+    p->deviceID = g->device;
+    snprintf(p->deviceName, sizeof(p->deviceName), "%s", g->name);
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties *pProperties)
@@ -426,6 +513,9 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceMemoryProperties2(VkPhysica
         for (uint32_t h = 0; h < pd->client_mem.memoryHeapCount; h++) {
             budget->heapBudget[h] = b[pd->heap_map[h]];
             budget->heapUsage[h] = u[pd->heap_map[h]];
+            /* never more than the heap the app is shown (VKBRIDGE_HEAP_MAX_MB); the usage stays
+             * the real one, so over the cap reads as over budget */
+            if (budget->heapBudget[h] > pd->client_mem.memoryHeaps[h].size) budget->heapBudget[h] = pd->client_mem.memoryHeaps[h].size;
         }
     }
 }

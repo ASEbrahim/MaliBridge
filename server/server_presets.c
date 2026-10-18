@@ -27,7 +27,11 @@
  * leak from one game into the next; a preset line naming one is ignored with a warning, as is a
  * line that is not KEY=VALUE. The client's switches (descriptor batching, the query mirror) go to
  * the client in vkbQueryServer's reply (vkb_server_pd_info.client_knobs, a field that was
- * reserved: no protocol change), where the guest's own environment still beats them.
+ * reserved: no protocol change), where the guest's own environment still beats them. So do the
+ * two values that change only what the app is shown (vkb_preset_client_values): the device-local
+ * heap cap (VKBRIDGE_HEAP_MAX_MB, .heap_max_mb) and the GPU identity (VKBRIDGE_SPOOF_GPU,
+ * .spoof_gpu), both in fields that were reserved too; the server's own view of the GPU (its Mali
+ * detection, errata, the probe) stays the real one.
  *
  * VKBRIDGE_MODE in a preset puts that game's devices in that mode (their emulation masks, errata
  * and compile watchdog are chosen at device creation). The server's mode is one value, so with two
@@ -81,6 +85,8 @@ static const char *const keys[] = {
     "VKBRIDGE_HANG_DETECT", "VKBRIDGE_HANG_AFTER_MS", "VKBRIDGE_SKIP_SHADERS",
     /* the client's (vkb_preset_client_knobs) */
     "VKBRIDGE_DESC_BATCH", "VKBRIDGE_NO_DESC_BATCH", "VKBRIDGE_QUERY_MIRROR",
+    /* what the app is shown (vkb_preset_client_values) */
+    "VKBRIDGE_HEAP_MAX_MB", "VKBRIDGE_SPOOF_GPU",
 };
 
 static int allowed(const char *k)
@@ -366,4 +372,34 @@ uint32_t vkb_preset_client_knobs(void)
     const char *qm = vkb_srv_env("VKBRIDGE_QUERY_MIRROR");
     if (qm && *qm) w |= knob(qm) << VKB_KNOB_QUERY_MIRROR_SHIFT;
     return w;
+}
+
+/* VKBRIDGE_HEAP_MAX_MB=<n> (n MB; 0 or empty: nothing said, the client's default, off) and
+ * VKBRIDGE_SPOOF_GPU=nvidia|amd|off for this thread's client: what the app is shown
+ * (client/physdev.c). A value the server cannot read is said once and not sent. */
+static void bad_value(const char *key, const char *v, const char *want)
+{
+    char msg[300];
+    snprintf(msg, sizeof(msg), "%s=%.80s is not %s; not applied", key, v, want);
+    if (first_time(msg)) VKB_WARN("%s", msg);
+}
+
+void vkb_preset_client_values(vkb_server_pd_info *info)
+{
+    const char *h = vkb_srv_env("VKBRIDGE_HEAP_MAX_MB");
+    info->heap_max_mb = 0;
+    if (h && *h) {
+        char *end;
+        unsigned long long mb = strtoull(h, &end, 10);
+        if (*end || *h == '-') bad_value("VKBRIDGE_HEAP_MAX_MB", h, "a number of MB");
+        else info->heap_max_mb = mb > 0xffffffffull ? 0xffffffffu : (uint32_t)mb;
+    }
+    const char *g = vkb_srv_env("VKBRIDGE_SPOOF_GPU");
+    info->spoof_gpu = 0;
+    if (g && *g) {
+        if (!strcmp(g, "nvidia")) info->spoof_gpu = VKB_SPOOF_NVIDIA;
+        else if (!strcmp(g, "amd")) info->spoof_gpu = VKB_SPOOF_AMD;
+        else if (!strcmp(g, "0") || !strcmp(g, "off")) info->spoof_gpu = VKB_SPOOF_OFF;
+        else bad_value("VKBRIDGE_SPOOF_GPU", g, "nvidia, amd or off");
+    }
 }
