@@ -946,7 +946,7 @@ static int lazy_imitated(VkMemoryPropertyFlags f)
 static int fake_lazy(void)
 {
     static int v = -1;
-    if (v < 0) v = vkb_emu_faked("lazymem");
+    if (v < 0) v = vkb_emu_faked("lazymem") || vkb_emu_faked("xringmem");
     return v;
 }
 
@@ -974,6 +974,100 @@ void vkb_mem_instance_install(vkb_srv_table *t)
     if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
     if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;
     VKB_INFO("imitating Mali's memory types: device-local types without host access are lazily allocated");
+}
+
+/* ------------------------------------------------------------------ the XRing O3's image requirements, imitated */
+
+/*
+ * VKBRIDGE_FAKE_MISSING=...,xringmem (host tests; lazymem comes with it): what Mali-G2-Ultra on the
+ * XRing O3 (driver 56, 22 memory types; issue #1) does to images. All its device-local types
+ * without host access are lazily allocated, and an image's memoryTypeBits do not list every
+ * ordinary device-local type: not the first one, which the client used to back its device-local
+ * type with, and the ones it does list are host-visible types the client either does not offer or
+ * offers as shared, which images cannot use. The client's mask for every image came out empty (the
+ * self-test: "no memory type for the image (types 0x0 allowed)"; gamescope: findMemoryType failed).
+ * Here images' memoryTypeBits keep only the device-local host-visible types after the first one.
+ */
+static int fake_xring(void)
+{
+    static int v = -1;
+    if (v < 0) v = vkb_emu_faked("xringmem");
+    return v;
+}
+
+static uint32_t xring_image_mask(const VkPhysicalDeviceMemoryProperties *mp)
+{
+    uint32_t keep = 0;
+    int first = 1;
+    for (uint32_t i = 0; i < mp->memoryTypeCount && i < 32; i++) {
+        VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || (f & VK_MEMORY_PROPERTY_PROTECTED_BIT))
+            continue;
+        if (first) first = 0;
+        else keep |= 1u << i;
+    }
+    return keep;
+}
+
+static struct {
+    vkb_srv_table *t;
+    uint32_t mask;
+    PFN_vkGetImageMemoryRequirements req;
+    PFN_vkGetImageMemoryRequirements2 req2;
+    PFN_vkGetDeviceImageMemoryRequirements dreq;
+} xring_dev[16];
+
+static int xring_slot(void)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    for (int i = 0; i < 16 && xring_dev[i].t; i++)
+        if (xring_dev[i].t == t) return i;
+    return 0;
+}
+
+static VKAPI_ATTR void VKAPI_CALL xring_GetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements *r)
+{
+    int s = xring_slot();
+    xring_dev[s].req(d, i, r);
+    r->memoryTypeBits &= xring_dev[s].mask;
+}
+
+static VKAPI_ATTR void VKAPI_CALL xring_GetImageMemoryRequirements2(VkDevice d, const VkImageMemoryRequirementsInfo2 *i,
+                                                                    VkMemoryRequirements2 *r)
+{
+    int s = xring_slot();
+    xring_dev[s].req2(d, i, r);
+    r->memoryRequirements.memoryTypeBits &= xring_dev[s].mask;
+}
+
+static VKAPI_ATTR void VKAPI_CALL xring_GetDeviceImageMemoryRequirements(VkDevice d, const VkDeviceImageMemoryRequirements *i,
+                                                                         VkMemoryRequirements2 *r)
+{
+    int s = xring_slot();
+    xring_dev[s].dreq(d, i, r);
+    r->memoryRequirements.memoryTypeBits &= xring_dev[s].mask;
+}
+
+/* At the driver's level (t->real), before the layers above it take their copies of it. */
+void vkb_mem_device_install(vkb_srv_table *t)
+{
+    if (!fake_xring() || !t->real.vkGetImageMemoryRequirements) return;
+    for (int i = 0; i < 16; i++) {
+        if (xring_dev[i].t && xring_dev[i].t != t) continue;
+        VkPhysicalDeviceMemoryProperties mp;
+        t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+        xring_dev[i].mask = xring_image_mask(&mp);
+        xring_dev[i].req = t->real.vkGetImageMemoryRequirements;
+        xring_dev[i].req2 = t->real.vkGetImageMemoryRequirements2;
+        xring_dev[i].dreq = t->real.vkGetDeviceImageMemoryRequirements;
+        __atomic_store_n(&xring_dev[i].t, t, __ATOMIC_RELEASE);
+        t->real.vkGetImageMemoryRequirements = t->dt.vkGetImageMemoryRequirements = xring_GetImageMemoryRequirements;
+        if (xring_dev[i].req2) t->real.vkGetImageMemoryRequirements2 = t->dt.vkGetImageMemoryRequirements2 = xring_GetImageMemoryRequirements2;
+        if (xring_dev[i].dreq)
+            t->real.vkGetDeviceImageMemoryRequirements = t->dt.vkGetDeviceImageMemoryRequirements = xring_GetDeviceImageMemoryRequirements;
+        VKB_INFO("imitating the XRing O3's image requirements: images allow memory types 0x%x only", xring_dev[i].mask);
+        return;
+    }
 }
 
 /* ------------------------------------------------------------------ what allocations did (logs) */

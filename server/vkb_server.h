@@ -333,6 +333,7 @@ extern PFN_vkGetDeviceProcAddr vkb_mem_gdpa;
 int vkb_mem_dmaheap_available(void);
 void vkb_mem_export_install(vkb_srv_table *t);
 void vkb_mem_instance_install(vkb_srv_table *t); /* VKBRIDGE_FAKE_MISSING=lazymem: Mali's memory types (host tests) */
+void vkb_mem_device_install(vkb_srv_table *t);   /* VKBRIDGE_FAKE_MISSING=xringmem: the XRing O3's image requirements (host tests) */
 void vkb_mem_log_types(vkb_srv_table *t, uint32_t id);
 void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd);
 /* Cached readback as the client is told: the self-test's types gated by VKBRIDGE_CACHED_READBACK
