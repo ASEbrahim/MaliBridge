@@ -90,6 +90,24 @@ int vkb_emu_ext_hidden(const char *name)
     return 0;
 }
 
+/*
+ * VKBRIDGE_HIDE_CALIBRATED_TS: VK_EXT_calibrated_timestamps (and its KHR promotion) hidden from a
+ * game. GameNative's wrapper hides the EXT name on every Arm device (GameNative/mesa wrapper-25,
+ * wrapper_physical_device.c), with no reason given in its code or history, and Lee Gao's wrapper
+ * does not; no failure with it is known here, so it is opt-in, per game through a preset
+ * (server_presets.c): "1" hides both names, "ext" the EXT name only (as GameNative does, which
+ * leaves the same entry points under the KHR name). Read on the client's connection thread at each
+ * enumeration, so that game's preset applies.
+ */
+static int calts_hidden(const char *name)
+{
+    if (strcmp(name, "VK_EXT_calibrated_timestamps") && strcmp(name, "VK_KHR_calibrated_timestamps")) return 0;
+    const char *v = vkb_srv_env("VKBRIDGE_HIDE_CALIBRATED_TS");
+    if (!v || !*v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "ext")) return !strcmp(name, "VK_EXT_calibrated_timestamps");
+    return 1;
+}
+
 int vkb_emu_hiding_exts(void)
 {
     return hide_list() != NULL || fake_list() != NULL;
@@ -114,7 +132,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
     uint32_t kept = 0;
     const char *erratum = vkb_errata_hidden_ext(t, pd);
     for (uint32_t i = 0; i < n; i++)
-        if (!vkb_emu_ext_hidden(all[i].extensionName) && !(erratum && !strcmp(all[i].extensionName, erratum))) all[kept++] = all[i];
+        if (!vkb_emu_ext_hidden(all[i].extensionName) && !(erratum && !strcmp(all[i].extensionName, erratum)) &&
+            !calts_hidden(all[i].extensionName))
+            all[kept++] = all[i];
     if (!props) {
         *count = kept;
         free(all);
