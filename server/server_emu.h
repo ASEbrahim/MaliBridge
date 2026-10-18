@@ -133,6 +133,8 @@ void vkb_emu_desc_install(vkb_srv_table *dev);
 void vkb_emu_desc_uninstall(vkb_srv_table *dev);
 /* 1 when VKBRIDGE_FAKE_MISSING names t (host tests imitating Mali). */
 int vkb_emu_faked(const char *t);
+/* VKBRIDGE_FAKE_MISSING=planarext: a multi-planar image with extended usage, refused as on the Mali-G925 */
+int vkb_emu_planar_ext_refused(VkFormat f, VkImageCreateFlags flags);
 void vkb_emu_vb_sizes_resolve(vkb_emu_device *e, uint32_t n, const VkBuffer *buffers, const VkDeviceSize *offsets,
                               const VkDeviceSize *sizes);
 int vkb_emu_ext_hidden(const char *name); /* VKBRIDGE_FAKE_MISSING / VKBRIDGE_SERVER_HIDE_EXTS */

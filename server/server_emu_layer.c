@@ -362,6 +362,7 @@ static VkResult driver_create_image(VkDevice device, const VkImageCreateInfo *ci
             if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
                 (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
                 return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT; /* as Mali r44 answers */
+    if (vkb_emu_planar_ext_refused(ci->format, ci->flags)) return VK_ERROR_FORMAT_NOT_SUPPORTED; /* host imitation */
     return vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
 }
 

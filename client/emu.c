@@ -246,3 +246,74 @@ VkFormat vkb_emu_real_format(vkb_physdev *pd, VkFormat format, VkImageUsageFlags
 void vkb_emu_image_create_info(vkb_device *dev, VkImageCreateInfo *ci) { (void)dev; (void)ci; }
 void vkb_emu_image_created(vkb_device *dev, const VkImageCreateInfo *ci, VkImage image) { (void)dev; (void)ci; (void)image; }
 void vkb_emu_image_destroyed(vkb_device *dev, VkImage image) { (void)dev; (void)image; }
+
+/* ------------------------------------------------------------------ multi-planar extended usage */
+
+/*
+ * The Mali-G925 driver refuses VK_IMAGE_CREATE_EXTENDED_USAGE_BIT on multi-planar (YCbCr) formats:
+ * vkGetPhysicalDeviceImageFormatProperties(2) answers VK_ERROR_FORMAT_NOT_SUPPORTED for an NV12
+ * (G8_B8R8_2PLANE_420) image that is MUTABLE_FORMAT | EXTENDED_USAGE, even when every usage bit
+ * asked for is one the format itself supports, and gives the same image without EXTENDED_USAGE.
+ * The flag only relaxes the rules (usage may include bits only a view format supports), so with
+ * usage the format covers it changes nothing. DXVK sets both flags on every multi-planar D3D11
+ * texture (its plane views are R8 / R8G8), so each NV12 texture failed: "D3D11: Cannot create
+ * texture: Format 103", Media Foundation's H.264 decoder could not allocate its output samples
+ * ("Failed to initialize allocator, hr 0x80070057"), and Risk of Rain Returns waited for its intro
+ * video's first frame for ever (2026-10-19).
+ *
+ * Such a query or image goes to the driver without EXTENDED_USAGE when the usage is all supported
+ * by the format at that tiling (an image whose usage needs a view format's features keeps the flag,
+ * and the driver's answer). VKBRIDGE_PLANAR_EXT_FIX=0 turns it off.
+ */
+static int is_multiplanar(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM: case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16: case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16: case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16: case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16: case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM: case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM: case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM: case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16: case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int vkb_emu_planar_ext_usage(vkb_physdev *pd, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags *flags)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *v = getenv("VKBRIDGE_PLANAR_EXT_FIX");
+        off = v && !strcmp(v, "0");
+    }
+    if (off || !(*flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) || !is_multiplanar(format)) return 0;
+    if (tiling != VK_IMAGE_TILING_OPTIMAL && tiling != VK_IMAGE_TILING_LINEAR) return 0;
+    VkFormatProperties fp;
+    vkb_ep_vkGetPhysicalDeviceFormatProperties((VkPhysicalDevice)pd, format, &fp);
+    VkFormatFeatureFlags have = tiling == VK_IMAGE_TILING_OPTIMAL ? fp.optimalTilingFeatures : fp.linearTilingFeatures;
+    static const struct { VkImageUsageFlags u; VkFormatFeatureFlags f; } need[] = {
+        {VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_FEATURE_TRANSFER_SRC_BIT},
+        {VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_FORMAT_FEATURE_TRANSFER_DST_BIT},
+        {VK_IMAGE_USAGE_SAMPLED_BIT, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT},
+        {VK_IMAGE_USAGE_STORAGE_BIT, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT},
+        {VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT},
+    };
+    VkImageUsageFlags left = usage;
+    for (unsigned i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
+        if (!(usage & need[i].u)) continue;
+        if (!(have & need[i].f)) return 0; /* a view format's feature: the flag is needed */
+        left &= ~need[i].u;
+    }
+    if (left) return 0; /* a usage this check does not know */
+    *flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    return 1;
+}

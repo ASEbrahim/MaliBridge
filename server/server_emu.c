@@ -147,8 +147,61 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
     return w < kept ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+/* VKBRIDGE_FAKE_MISSING=planarext (host tests): the Mali-G925's refusal of
+ * VK_IMAGE_CREATE_EXTENDED_USAGE_BIT on multi-planar (YCbCr) formats, which DXVK sets on every NV12
+ * texture: the format queries answer VK_ERROR_FORMAT_NOT_SUPPORTED, image creation fails
+ * (driver_create_image). The client takes the flag off where the format covers the usage
+ * (client/emu.c, vkb_emu_planar_ext_usage). */
+int vkb_emu_planar_ext_refused(VkFormat f, VkImageCreateFlags flags)
+{
+    static int fake = -1;
+    if (fake < 0) fake = vkb_emu_faked("planarext");
+    if (!fake || !(flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) return 0;
+    return (f >= VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM && f <= VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM) ||
+           (f >= VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 && f <= VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16) ||
+           (f >= VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16 && f <= VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16) ||
+           (f >= VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM && f <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM) ||
+           (f >= VK_FORMAT_G8_B8R8_2PLANE_444_UNORM && f <= VK_FORMAT_G16_B16R16_2PLANE_444_UNORM);
+}
+
+static PFN_vkGetPhysicalDeviceImageFormatProperties planar_next1;
+static PFN_vkGetPhysicalDeviceImageFormatProperties2 planar_next2;
+
+static VKAPI_ATTR VkResult VKAPI_CALL planar_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat format, VkImageType type,
+                                                                                   VkImageTiling tiling, VkImageUsageFlags usage,
+                                                                                   VkImageCreateFlags flags, VkImageFormatProperties *props)
+{
+    if (vkb_emu_planar_ext_refused(format, flags)) {
+        memset(props, 0, sizeof(*props));
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return planar_next1(pd, format, type, tiling, usage, flags, props);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL planar_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd,
+                                                                                    const VkPhysicalDeviceImageFormatInfo2 *info,
+                                                                                    VkImageFormatProperties2 *props)
+{
+    if (vkb_emu_planar_ext_refused(info->format, info->flags)) {
+        memset(&props->imageFormatProperties, 0, sizeof(props->imageFormatProperties));
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return planar_next2(pd, info, props);
+}
+
 void vkb_emu_instance_install(vkb_srv_table *t)
 {
+    if (vkb_emu_faked("planarext")) {
+        if (t->dt.vkGetPhysicalDeviceImageFormatProperties) {
+            planar_next1 = t->dt.vkGetPhysicalDeviceImageFormatProperties;
+            t->dt.vkGetPhysicalDeviceImageFormatProperties = planar_GetPhysicalDeviceImageFormatProperties;
+        }
+        if (t->dt.vkGetPhysicalDeviceImageFormatProperties2) {
+            planar_next2 = t->dt.vkGetPhysicalDeviceImageFormatProperties2;
+            t->dt.vkGetPhysicalDeviceImageFormatProperties2 = planar_GetPhysicalDeviceImageFormatProperties2;
+        }
+        VKB_ONCE(VKB_LOG_INFO, "imitating Mali's refusal of extended usage on multi-planar formats (VKBRIDGE_FAKE_MISSING=planarext)");
+    }
     if (!t->real.vkEnumerateDeviceExtensionProperties) return;
     /* always: the driver errata hide by GPU and driver version (vkb_errata_hidden_ext) */
     t->dt.vkEnumerateDeviceExtensionProperties = hide_EnumerateDeviceExtensionProperties;

@@ -68,6 +68,20 @@ run_mode() {
     result $? "nulldesc_check ($(tail -1 out/t-nulldesc.log)$([ "$mode" = mali ] && echo "; $(grep -c 'null descriptor stand-in made' "$VKB_SERVER_LOG") stand-in shapes"))"
   fi
   if [ -x out/opaque_check ]; then timeout 60 ./out/opaque_check >out/t-opaque.log 2>&1; result $? "opaque_check ($(tail -1 out/t-opaque.log))"; fi
+  # NV12 textures as DXVK makes them (MUTABLE | EXTENDED_USAGE): on mali the refusal is imitated
+  # (planarext) and the client makes them without the flag; VKBRIDGE_PLANAR_EXT_FIX=0 is the negative
+  # control (the refusal reaches the app). 77: the driver has no NV12.
+  if [ -x out/planar_check ]; then
+    if [ "$mode" = mali ]; then
+      timeout 60 ./out/planar_check --imitated >out/t-planar.log 2>&1; result $? "planar_check, refusal imitated ($(tail -1 out/t-planar.log))"
+      VKBRIDGE_PLANAR_EXT_FIX=0 timeout 60 ./out/planar_check --imitated >out/t-planar-nofix.log 2>&1; rc=$?
+      [ $rc = 1 ] && grep -q "^FAIL vkGetPhysicalDeviceImageFormatProperties2, NV12 transfer" out/t-planar-nofix.log
+      result $? "planar_check, VKBRIDGE_PLANAR_EXT_FIX=0 fails as the G925 did ($(tail -1 out/t-planar-nofix.log))"
+    else
+      timeout 60 ./out/planar_check >out/t-planar.log 2>&1; rc=$?; [ $rc = 77 ] && rc=0
+      result $rc "planar_check ($(tail -1 out/t-planar.log))"
+    fi
+  fi
   # Zink's shared linear images (dma-buf, no modifier): Mali refuses them at that tiling (imitated:
   # dmabuflinear) and Skyrim SE exited on its 1D one; the bridge makes them without the handle type
   if [ -x out/dmabuf_image_check ]; then
