@@ -6,10 +6,12 @@
 # VKB_MISSING_ADD=xringmem adds to the list (xringmem: images skip the first ordinary device-local type, as on the XRing O3).
 # Like Mali r44 it refuses dma-buf images at LINEAR/OPTIMAL tiling (dmabuflinear: only DRM-modifier
 # dma-buf images are made; the rest get VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT).
+# Like the Mali-G925 it refuses VK_IMAGE_CREATE_EXTENDED_USAGE_BIT on multi-planar formats (planarext:
+# DXVK's NV12 textures, Media Foundation's video frames).
 # Like Mali it samples ETC2/EAC and ASTC LDR (RADV emulates them when vk_require_etc2/astc are set),
 # so BC textures are transcoded; VKB_BC_TRANSCODE=0 starts it decoding them instead.
 . "$(dirname "${BASH_SOURCE[0]}")/server_start.sh"
-vkb_server_start VKBRIDGE_FAKE_MISSING=${VKB_MISSING:-bc,clip,cull,divisor,maint5,depthclip,push,robustness2,dualsrc,fillmode,multiviewport,maint6,desclimits,opaquefd,lazymem,dmabuflinear}${VKB_MISSING_ADD:+,$VKB_MISSING_ADD} \
+vkb_server_start VKBRIDGE_FAKE_MISSING=${VKB_MISSING:-bc,clip,cull,divisor,maint5,depthclip,push,robustness2,dualsrc,fillmode,multiviewport,maint6,desclimits,opaquefd,lazymem,dmabuflinear,planarext}${VKB_MISSING_ADD:+,$VKB_MISSING_ADD} \
     vk_require_etc2=true vk_require_astc=true VKBRIDGE_BC_TRANSCODE=${VKB_BC_TRANSCODE:-1}
 chmod 666 "$VKBRIDGE_SOCKET"
 export VKBRIDGE_HIDE_EXTS=VK_KHR_maintenance5,VK_KHR_push_descriptor,VK_EXT_robustness2,VK_KHR_robustness2,VK_EXT_vertex_attribute_divisor,VK_KHR_vertex_attribute_divisor,VK_EXT_depth_clip_enable,VK_KHR_maintenance6

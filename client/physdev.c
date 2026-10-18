@@ -601,6 +601,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties(V
                                                                                VkImageFormatProperties *pProps)
 {
     VkFormat real = vkb_emu_real_format(vkb_pd(physicalDevice), format, &usage, &flags);
+    vkb_emu_planar_ext_usage(vkb_pd(physicalDevice), real, tiling, usage, &flags);
     return vkb_wire_vkGetPhysicalDeviceImageFormatProperties(physicalDevice, real, type, tiling, usage, flags, pProps);
 }
 
@@ -611,6 +612,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties2(
     VkPhysicalDeviceImageFormatInfo2 info = *pInfo;
     vkb_physdev *pd = vkb_pd(physicalDevice);
     info.format = vkb_emu_real_format(pd, pInfo->format, &info.usage, &info.flags);
+    vkb_emu_planar_ext_usage(pd, info.format, info.tiling, info.usage, &info.flags);
     VkResult r = vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, &info, pProps);
     if (r != VK_SUCCESS || !(pd->info.emu & VKB_EMU_DMABUF_EXPORT)) return r;
     /* dma-buf export of images is emulated by the server (dma-heap pages): what imports, exports. */

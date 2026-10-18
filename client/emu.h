@@ -17,6 +17,9 @@ int vkb_emu_format_properties(vkb_physdev *pd, VkFormat format, VkFormatProperti
 /* The format the server really uses for an emulated one (usage/flags adjusted); else format. */
 VkFormat vkb_emu_real_format(vkb_physdev *pd, VkFormat format, VkImageUsageFlags *usage, VkImageCreateFlags *flags);
 int vkb_emu_is_emulated_format(vkb_physdev *pd, VkFormat format);
+/* Takes VK_IMAGE_CREATE_EXTENDED_USAGE_BIT out of *flags for a multi-planar format whose own features
+ * cover usage at tiling (the Mali-G925 refuses the flag on such formats); 1 when it did. */
+int vkb_emu_planar_ext_usage(vkb_physdev *pd, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags *flags);
 void vkb_emu_image_create_info(vkb_device *dev, VkImageCreateInfo *ci);
 void vkb_emu_image_created(vkb_device *dev, const VkImageCreateInfo *ci, VkImage image);
 void vkb_emu_image_destroyed(vkb_device *dev, VkImage image);

@@ -330,6 +330,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateImage(VkDevice device, const VkIma
     vkb_device *dev = vkb_dev(device);
     VkImageCreateInfo ci = *pCreateInfo;
     vkb_emu_image_create_info(dev, &ci);
+    if (vkb_emu_planar_ext_usage(dev->pd, ci.format, ci.tiling, ci.usage, &ci.flags)) {
+        static int told;
+        if (!__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED))
+            VKB_INFO("multi-planar image (format %d, usage 0x%x): made without VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, which the "
+                     "driver may refuse on such formats; the format covers the usage (logged once)", ci.format, ci.usage);
+    }
     /* Linear images may be mapped by the app: those get the shared handle type when allowed. */
     if (can_share(dev) && ci.tiling == VK_IMAGE_TILING_LINEAR && !(ci.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) {
         int had = 0;
