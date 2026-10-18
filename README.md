@@ -225,7 +225,7 @@ The values come from GameNative's public Mali crowd configs.
 **`VKBRIDGE_SPOOF_GPU` risks.** It is meant for a game that refuses an unknown GPU, or that picks
 its lowest settings from the vendor. It is not a speed-up, so try it per game and only with a reason.
 - DXVK picks its tiler paths and driver workarounds by driverID, which stays `ARM_PROPRIETARY`, so
-  those are unchanged. DXVK's DXGI and D3D9 adapters do key on the vendorID, though. In DXVK 2.x/3.x
+  those are unchanged. DXVK's DXGI and D3D9 adapters do key on the vendorID, though. In DXVK 3.1
   an NVIDIA vendorID on a non-NVIDIA driver is hidden by default (`dxgi.hideNvkGpu` follows
   `dxgi.hideNvidiaGpu`, on unless `DXVK_ENABLE_NVAPI=1`), and D3D9/DXGI then report an AMD RX 6700
   XT. Under DXVK, `nvidia` therefore usually shows up as AMD, and `amd` is the one that reaches the
