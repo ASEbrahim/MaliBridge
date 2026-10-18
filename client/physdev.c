@@ -56,15 +56,23 @@ static void build_memory_model(vkb_physdev *pd)
     } cands[VK_MAX_MEMORY_TYPES * 2];
     uint32_t nc = 0;
     if (uma) {
-        /* A device-local type with no host access, backed by the first device-local type. */
-        for (uint32_t t = 0; t < s->memoryTypeCount; t++) {
-            VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
-            if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-                !(f & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT))) {
-                cands[nc++] = (struct cand){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s->memoryTypes[t].heapIndex, t, 0, 0};
-                break;
+        /* A device-local type with no host access, backed by the first ordinary device-local type
+         * that images allow (the server's self-test tried some: image_types). Not simply the first
+         * device-local type: Mali-G2-Ultra's images (XRing O3, driver 56, 22 memory types) do not
+         * list that one, and every image's mask came out empty (issue #1). A server too old to say
+         * sends 0: the first device-local type, as before. */
+        for (int pass = pd->info.image_types ? 0 : 1; pass < 2 && !nc; pass++)
+            for (uint32_t t = 0; t < s->memoryTypeCount; t++) {
+                VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
+                if (pass == 0 && !(pd->info.image_types & (1u << t))) continue;
+                if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                    !(f & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT))) {
+                    cands[nc++] = (struct cand){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s->memoryTypes[t].heapIndex, t, 0, 0};
+                    VKB_INFO("memory: device-local type backed by server type %u (flags 0x%x; images allow 0x%x%s)", t, f,
+                             pd->info.image_types, pass ? ", not known: the first device-local type" : "");
+                    break;
+                }
             }
-        }
     }
     for (uint32_t t = 0; t < s->memoryTypeCount && nc < VK_MAX_MEMORY_TYPES; t++) {
         VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
@@ -179,6 +187,16 @@ uint32_t vkb_mem_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow
         if (!(server_bits & (1u << pd->type_map[i].server_type))) continue;
         if (pd->type_map[i].shared && !allow_shared) continue;
         bits |= 1u << i;
+    }
+    if (!bits && server_bits) {
+        /* Nothing left for the resource: say what the driver allowed and what the client maps. */
+        char line[320];
+        int n = 0;
+        for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount && n < (int)sizeof(line) - 24; i++)
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %u:0x%x/s%u%s", i, pd->client_mem.memoryTypes[i].propertyFlags,
+                          pd->type_map[i].server_type, pd->type_map[i].shared ? "S" : "");
+        VKB_ONCE(VKB_LOG_WARN, "memory: a resource allowing server types 0x%x gets no client type (%s; client types%s)", server_bits,
+                 allow_shared ? "shared allowed" : "not shareable", line);
     }
     return bits;
 }

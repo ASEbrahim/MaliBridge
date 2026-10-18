@@ -64,7 +64,8 @@ typedef struct vkb_server_pd_info {
     uint32_t client_knobs;         /* VKB_KNOB_*: the client's switches from the server (per-game presets) */
     uint32_t cached_types;         /* server memory types whose shared pages can be CPU-cached (cached readback); 0: none */
     uint32_t cached_flags;         /* VKB_CACHED_*: who may use them */
-    uint32_t reserved[3];
+    uint32_t image_types;          /* server memory types the self-test's images and plain buffers all allow; 0: unknown (older server) */
+    uint32_t reserved[2];
 } vkb_server_pd_info;
 
 /* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an
