@@ -162,6 +162,9 @@ run_mode() {
     # the client's switch through vkbQueryServer; the report's preset per process; a built-in preset
     # only on a GPU it was tested on (a server of its own; once)
     timeout 600 ./presets_test.sh >out/t-presets.log 2>&1; result $? "presets_test ($(tail -1 out/t-presets.log))"
+    # VKBRIDGE_HIDE_CALIBRATED_TS (opt-in, per game): both names or the EXT name only hidden, from
+    # <cache dir>/env and from one game's preset (a server of its own; once)
+    timeout 300 ./calts_test.sh >out/t-calts.log 2>&1; result $? "calts_test ($(tail -1 out/t-calts.log))"
     # vkBeginCommandBuffer's begin info: primary and secondary (inheritance info) round trips; one
     # encoded without its count (the 2026-10-10 copy's bug, SIGSEGV at 0x10 in Mali's
     # vkBeginCommandBuffer) is refused before the driver, its commands dropped (a server of its own; once)

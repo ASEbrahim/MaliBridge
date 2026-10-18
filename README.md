@@ -206,6 +206,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_NO_FORCED_ROBUSTNESS=1` | server | the robustness2 emulation leaves buffer and image robustness to the app instead of turning them on |
 | `VKBRIDGE_NULLDESC_2D=1` | server | null images all get the one 2D RGBA8 stand-in, whatever shape the shader declares (as before v0.3) |
 | `VKBRIDGE_FAKE_MISSING=bc,push,...` | server | pretends the GPU lacks features (host testing, see `host/mali_env.sh`). Read from `<cache dir>/env` at server start too, so a newer Mali can take an older one's paths |
+| `VKBRIDGE_HIDE_CALIBRATED_TS=1` / `ext` | server | hides `VK_EXT_calibrated_timestamps` and `VK_KHR_calibrated_timestamps` from a game (`ext`: the EXT name only, as GameNative's wrapper does on Arm). Off by default (no failure with them is known); a per-game preset key |
 | `VKBRIDGE_SERVER_HIDE_EXTS=<ext>,...` | server | hides these driver extensions from clients |
 | `VKBRIDGE_HIDE_EXTS`, `VKBRIDGE_MAX_API` | client | hide extensions or cap the API version reported to apps |
 | `VKBRIDGE_DEBUG=1`, `VKBRIDGE_LOG_LEVEL=<n>` | client | client log verbosity |
