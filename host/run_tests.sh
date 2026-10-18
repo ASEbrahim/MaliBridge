@@ -188,6 +188,21 @@ run_mode() {
     { [ "$mode" != mali ] || ! grep -q "VK_WHOLE_SIZE vertex buffer size reached" "$VKB_SERVER_LOG"; }
   result $? "dynstate_check ($(tail -1 out/t-dynstate.log)$([ "$mode" = mali ] && echo "; $(grep -c 'VK_WHOLE_SIZE vertex buffer size reached' "$VKB_SERVER_LOG") VK_WHOLE_SIZE at the driver"))"
   timeout 60 ./out/vbstride_check >out/t-vbstride.log 2>&1; result $? "vbstride_check ($(tail -1 out/t-vbstride.log))"
+  # The dedicated-allocation hint (client/memory.c) over Mali's preference imitated beneath it:
+  # cleared for ordinary buffers and images with VKBRIDGE_DEDICATED_HINT=1, kept with =0 and by
+  # default on a GPU that is not Arm's, kept for large and app-external resources either way; and
+  # over the driver's own answers, requiresDedicatedAllocation the same with the switch on and off
+  if [ -x out/dedhint_check ]; then
+    VKBRIDGE_DEDICATED_HINT=1 VKBRIDGE_TEST_PREFER_DEDICATED=1 timeout 60 ./out/dedhint_check clear >out/t-dedhint-1.log 2>&1 &&
+      VKBRIDGE_DEDICATED_HINT=0 VKBRIDGE_TEST_PREFER_DEDICATED=1 timeout 60 ./out/dedhint_check pass >out/t-dedhint-0.log 2>&1 &&
+      env -u VKBRIDGE_DEDICATED_HINT VKBRIDGE_TEST_PREFER_DEDICATED=1 timeout 60 ./out/dedhint_check pass >out/t-dedhint-def.log 2>&1
+    rc=$?
+    VKBRIDGE_DEDICATED_HINT=1 timeout 60 ./out/dedhint_check >out/t-dedhint-r1.log 2>&1
+    VKBRIDGE_DEDICATED_HINT=0 timeout 60 ./out/dedhint_check >out/t-dedhint-r0.log 2>&1
+    [ $rc = 0 ] && [ -n "$(grep -o 'requires [01]' out/t-dedhint-r1.log)" ] &&
+      [ "$(grep -o 'requires [01]' out/t-dedhint-r1.log)" = "$(grep -o 'requires [01]' out/t-dedhint-r0.log)" ]
+    result $? "dedhint_check (on: $(tail -1 out/t-dedhint-1.log); off: $(tail -1 out/t-dedhint-0.log); default: $(tail -1 out/t-dedhint-def.log); requires unchanged: $(grep -c 'requires 1' out/t-dedhint-r1.log) required)"
+  fi
   # Points and lines with a dynamic cull mode set, triangles culled after them (MK-16, on in safe mode)
   timeout 60 ./out/cullmode_check >out/t-cullmode.log 2>&1; result $? "cullmode_check ($(tail -1 out/t-cullmode.log))"
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at

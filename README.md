@@ -179,6 +179,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_DESC_BATCH=1` | client | async requests batched into one message per flush and `vkUpdateDescriptorSets` packed per descriptor type (75x fewer messages in Subnautica). Off by default since v0.2.1: Risk of Rain 2 showed black flickering with it on; `VKBRIDGE_NO_DESC_BATCH=1` forces it off. With it on, `VKBRIDGE_DESC_BATCH_NOFRAME=1` keeps only the packing and `VKBRIDGE_DESC_BATCH_NOPACK=1` only the batching (to tell which half a problem follows) |
 | `VKBRIDGE_CACHED_READBACK=0` / `1` / `apps` | server | cached readback: GPU results the CPU reads come from CPU-cached pages (the dma-heap's `system` heap, or the strategy's own dma-buf) with the cache maintenance done by `DMA_BUF_IOCTL_SYNC` at each flush and invalidate, where the startup self-test passes it. `1`: for the client's own frame readback (the copy present path); `apps`: also a HOST_CACHED memory type without HOST_COHERENT for apps; `0`: off. Default: `1` in performance mode, off in safe mode. The guest's `VKBRIDGE_CACHED_READBACK=0` turns off the frame readback's use of it |
 | `VKBRIDGE_DMAHEAP_ANY_TYPE=1` | server | experiment: the dma-heap strategy imports its pages even into a memory type the driver's dma-buf fd properties leave out (out of the spec; the self-test still checks each type both ways before it is used) |
+| `VKBRIDGE_DEDICATED_HINT=1` / `0` | client | `1`: `prefersDedicatedAllocation` is cleared in the `VkMemoryDedicatedRequirements` apps get for ordinary buffers and images, so DXVK sub-allocates them from its chunks instead of one allocation per texture (each a VMA, and an allocation the server holds); kept where the driver requires a dedicated allocation, for resources the app made for external memory, and for those of 32 MiB or more. `0`: the driver's answer. Default: `1` on Arm (Mali) GPUs, `0` on others |
 | `VKBRIDGE_MEM_STATS=0` | server | turns off the periodic memory accounting line (on by default) |
 | `VKBRIDGE_TRACE=1` | client | logs every call to stderr (`VKBRIDGE_TRACE_COMM=<name>` limits this to one process) |
 | `VKBRIDGE_DISCARD_SHADERS=h-<hash>,...` | server | pipelines with these shaders draw nothing |
@@ -255,6 +256,10 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
 - Lee Gao's write-up "WSI woes on Mali" (winlator-internals) and GameNative's mesa PR #8: older Mali
   drivers fail an import that carries a dedicated-allocation struct for a resource not made for that
   handle type; `server/server_errata_mem.c` takes the struct off such imports. No code is copied.
+- Julius Pinsker's bionic-vulkan-wrapper PR #228 (merged into Lee Gao's tree, MIT): clearing
+  `prefersDedicatedAllocation` so DXVK sub-allocates on Mali, with its GTA V mapping counts. The
+  dedicated-allocation hint in `client/memory.c` follows the idea, with narrower conditions. No
+  code is copied.
 - [compat_layer](https://github.com/leegao/compat_layer) by Lee Gao, MIT: turning on image
   robustness alongside buffer robustness for the robustness2 emulation (`server/server_instance.c`)
   follows its robustness2 emulation, as do zero-filling the null-descriptor stand-in buffer and

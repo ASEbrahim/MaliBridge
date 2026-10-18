@@ -42,7 +42,35 @@ typedef struct vkb_rq_cache {
     vkb_map buffers;              /* VkBuffer -> rq_entry* (entries live as long as the device) */
     rq_entry *buckets[RQ_HB];
     uint32_t count;
+    /* the dedicated-allocation hint (ded_hint below) */
+    int ded_clear;                /* clear prefersDedicatedAllocation where safe */
+    int ded_imitate;              /* VKBRIDGE_TEST_PREFER_DEDICATED: report it set, as Mali does (host tests) */
+    vkb_map ded_keep;             /* VkBuffer/VkImage the app made for external memory -> (void*)1 */
+    uint64_t ded_cleared;         /* answers changed (one log line at the first) */
 } vkb_rq_cache;
+
+/*
+ * The dedicated-allocation hint. Mali answers prefersDedicatedAllocation = VK_TRUE for most
+ * images, and DXVK follows it: one VkDeviceMemory per texture. On kbase every allocation is a VMA
+ * of its own, and through the bridge each one is also an allocation the one server process holds
+ * for every client (and, when shared, an fd and a mapping on both sides). Julius Pinsker's GTA V
+ * measurements (leegao/bionic-vulkan-wrapper PR #228, MIT): 20,651 of 20,665 vkAllocateMemory calls
+ * were dedicated images and the process's mappings reached 24-35k on the way to vm.max_map_count
+ * (65,530); with the preference cleared DXVK sub-allocates from its chunks and they stayed at
+ * 8-15k. The idea is that PR's; the code here is the bridge's own and narrower:
+ *   - requiresDedicatedAllocation is never touched, nor the preference when it is set;
+ *   - resources the app made for external memory keep the preference (an image or buffer created
+ *     with VkExternalMemory*CreateInfo, an image with DRM format modifier tiling or bound to a
+ *     swapchain): they may be exported or imported, where dedicated memory is what drivers and
+ *     the other side expect. The handle types the bridge adds for its own shared memory do not
+ *     count: the app never asked for those;
+ *   - resources of DED_KEEP_MIN bytes or more keep it (large render targets: few allocations, and
+ *     a sub-allocator gains nothing from them).
+ * The hint is only a hint: memory bound to a sub-allocated range is valid either way.
+ * VKBRIDGE_DEDICATED_HINT=1 clears it, =0 passes the driver's answer through; default: 1 on Arm
+ * (Mali) GPUs, 0 on others (their drivers' preference is not known to cost anything).
+ */
+#define DED_KEEP_MIN ((VkDeviceSize)32 << 20)
 
 void vkb_memory_init_device(vkb_device *d)
 {
@@ -50,8 +78,73 @@ void vkb_memory_init_device(vkb_device *d)
     if (c) {
         pthread_mutex_init(&c->lock, NULL);
         vkb_map_init(&c->buffers);
+        vkb_map_init(&c->ded_keep);
+        const char *e = getenv("VKBRIDGE_DEDICATED_HINT");
+        c->ded_clear = e && *e ? atoi(e) != 0 : d->pd->props.vendorID == 0x13B5;
+        c->ded_imitate = getenv("VKBRIDGE_TEST_PREFER_DEDICATED") && atoi(getenv("VKBRIDGE_TEST_PREFER_DEDICATED")) == 1;
+        VKB_INFO("dedicated allocation hint: %s (VKBRIDGE_DEDICATED_HINT=%s)%s",
+                 c->ded_clear ? "prefersDedicatedAllocation cleared for ordinary buffers and images" : "the driver's answer passed through",
+                 e && *e ? e : c->ded_clear ? "1, the default on Arm" : "0, the default", c->ded_imitate ? "; imitating Mali's preference" : "");
     }
     d->buf_reqs = c;
+}
+
+/* Made for external memory by the app itself (see above): keeps the driver's preference. */
+static int ded_external(const void *pNext)
+{
+    for (const VkBaseInStructure *b = pNext; b; b = b->pNext)
+        switch (b->sType) {
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO:
+            if (((const VkExternalMemoryBufferCreateInfo *)b)->handleTypes) return 1;
+            break;
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO:
+            if (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes) return 1;
+            break;
+        case VK_STRUCTURE_TYPE_IMAGE_SWAPCHAIN_CREATE_INFO_KHR:
+        case VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT:
+        case VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT:
+        case VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID:
+            return 1;
+        default:
+            break;
+        }
+    return 0;
+}
+
+static void ded_track(vkb_device *dev, uint64_t handle, const void *pNext, int drm_tiling)
+{
+    vkb_rq_cache *c = dev->buf_reqs;
+    if (c && c->ded_clear && (drm_tiling || ded_external(pNext))) vkb_map_put(&c->ded_keep, handle, (void *)1);
+}
+
+static void ded_forget(vkb_device *dev, uint64_t handle)
+{
+    if (dev->buf_reqs) vkb_map_remove(&dev->buf_reqs->ded_keep, handle);
+}
+
+/* The answer in pReq's VkMemoryDedicatedRequirements, if any, as the app gets it. keep: the
+ * resource keeps the driver's preference whatever the switch says. */
+static void ded_hint(vkb_device *dev, VkMemoryRequirements2 *pReq, int keep)
+{
+    vkb_rq_cache *c = dev->buf_reqs;
+    if (!c || (!c->ded_clear && !c->ded_imitate)) return;
+    for (VkBaseOutStructure *b = pReq->pNext; b; b = b->pNext) {
+        if (b->sType != VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) continue;
+        VkMemoryDedicatedRequirements *d = (VkMemoryDedicatedRequirements *)b;
+        if (c->ded_imitate) d->prefersDedicatedAllocation = VK_TRUE;
+        if (!c->ded_clear || keep || d->requiresDedicatedAllocation || !d->prefersDedicatedAllocation ||
+            pReq->memoryRequirements.size >= DED_KEEP_MIN)
+            continue;
+        d->prefersDedicatedAllocation = VK_FALSE;
+        if (__atomic_fetch_add(&c->ded_cleared, 1, __ATOMIC_RELAXED) == 0)
+            VKB_INFO("dedicated allocation hint: first preference cleared (%llu bytes)", (unsigned long long)pReq->memoryRequirements.size);
+    }
+}
+
+static int ded_kept(vkb_device *dev, uint64_t handle)
+{
+    vkb_rq_cache *c = dev->buf_reqs;
+    return c && c->ded_clear && vkb_map_get(&c->ded_keep, handle) != NULL;
 }
 
 void vkb_memory_destroy_device(vkb_device *d)
@@ -64,6 +157,7 @@ void vkb_memory_destroy_device(vkb_device *d)
             free(e);
         }
     vkb_map_destroy(&c->buffers);
+    vkb_map_destroy(&c->ded_keep);
     pthread_mutex_destroy(&c->lock);
     free(c);
     d->buf_reqs = NULL;
@@ -213,7 +307,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateBuffer(VkDevice device, const VkBu
 {
     vkb_device *dev = vkb_dev(device);
     VkResult r = create_buffer(device, pCreateInfo, pAllocator, pBuffer);
-    if (r == VK_SUCCESS) rq_buffer_created(dev, pCreateInfo, *pBuffer, can_share(dev) && !vkb_map_get(&dev->unshared, (uint64_t)*pBuffer));
+    if (r == VK_SUCCESS) {
+        rq_buffer_created(dev, pCreateInfo, *pBuffer, can_share(dev) && !vkb_map_get(&dev->unshared, (uint64_t)*pBuffer));
+        ded_track(dev, (uint64_t)*pBuffer, pCreateInfo->pNext, 0);
+    }
     return r;
 }
 
@@ -222,6 +319,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyBuffer(VkDevice device, VkBuffer buff
     if (!buffer) return;
     vkb_bufview_buffer_destroyed(vkb_dev(device), buffer);
     if (vkb_dev(device)->buf_reqs) vkb_map_remove(&vkb_dev(device)->buf_reqs->buffers, (uint64_t)buffer);
+    ded_forget(vkb_dev(device), (uint64_t)buffer);
     vkb_map_remove(&vkb_dev(device)->unshared, (uint64_t)buffer);
     vkb_wire_vkDestroyBuffer(device, buffer, pAllocator);
 }
@@ -246,12 +344,16 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateImage(VkDevice device, const VkIma
             if (r == VK_SUCCESS) {
                 vkb_map_put(&dev->shared_images, (uint64_t)*pImage, (void *)1);
                 vkb_emu_image_created(dev, pCreateInfo, *pImage);
+                ded_track(dev, (uint64_t)*pImage, pCreateInfo->pNext, 0);
                 return r;
             }
         }
     }
     VkResult r = vkb_wire_vkCreateImage(device, &ci, pAllocator, pImage);
-    if (r == VK_SUCCESS) vkb_emu_image_created(dev, pCreateInfo, *pImage);
+    if (r == VK_SUCCESS) {
+        vkb_emu_image_created(dev, pCreateInfo, *pImage);
+        ded_track(dev, (uint64_t)*pImage, pCreateInfo->pNext, pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
+    }
     return r;
 }
 
@@ -260,6 +362,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyImage(VkDevice device, VkImage image,
     if (!image) return;
     vkb_device *dev = vkb_dev(device);
     vkb_map_remove(&dev->shared_images, (uint64_t)image);
+    ded_forget(dev, (uint64_t)image);
     vkb_emu_image_destroyed(dev, image);
     vkb_wire_vkDestroyImage(device, image, pAllocator);
 }
@@ -301,10 +404,13 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetBufferMemoryRequirements2(VkDevice device
         if (b->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS && !ded) ded = (VkMemoryDedicatedRequirements *)b;
         else plain = 0;
     }
-    if (plain && rq_lookup(dev, pInfo->buffer, &pReq->memoryRequirements, ded)) return;
-    vkb_wire_vkGetBufferMemoryRequirements2(device, pInfo, pReq);
-    fix_reqs(dev, &pReq->memoryRequirements, buffer_shareable(dev, pInfo->buffer));
-    if (plain) rq_store(dev, pInfo->buffer, &pReq->memoryRequirements, ded);
+    /* The cache keeps the driver's answer; the hint is applied to what the app gets. */
+    if (!(plain && rq_lookup(dev, pInfo->buffer, &pReq->memoryRequirements, ded))) {
+        vkb_wire_vkGetBufferMemoryRequirements2(device, pInfo, pReq);
+        fix_reqs(dev, &pReq->memoryRequirements, buffer_shareable(dev, pInfo->buffer));
+        if (plain) rq_store(dev, pInfo->buffer, &pReq->memoryRequirements, ded);
+    }
+    ded_hint(dev, pReq, ded_kept(dev, (uint64_t)pInfo->buffer));
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetImageMemoryRequirements(VkDevice device, VkImage image, VkMemoryRequirements *pReq)
@@ -316,8 +422,11 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetImageMemoryRequirements(VkDevice device, 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetImageMemoryRequirements2(VkDevice device, const VkImageMemoryRequirementsInfo2 *pInfo,
                                                                 VkMemoryRequirements2 *pReq)
 {
+    vkb_device *dev = vkb_dev(device);
     vkb_wire_vkGetImageMemoryRequirements2(device, pInfo, pReq);
-    fix_reqs(vkb_dev(device), &pReq->memoryRequirements, image_shareable(vkb_dev(device), pInfo->image));
+    fix_reqs(dev, &pReq->memoryRequirements, image_shareable(dev, pInfo->image));
+    /* A plane of a disjoint image (VkImagePlaneMemoryRequirementsInfo) is treated alike. */
+    ded_hint(dev, pReq, ded_kept(dev, (uint64_t)pInfo->image));
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceBufferMemoryRequirements(VkDevice device, const VkDeviceBufferMemoryRequirements *pInfo,
@@ -327,6 +436,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceBufferMemoryRequirements(VkDevice d
     if (!can_share(dev)) {
         vkb_wire_vkGetDeviceBufferMemoryRequirements(device, pInfo, pReq);
         fix_reqs(dev, &pReq->memoryRequirements, 0);
+        ded_hint(dev, pReq, ded_external(pInfo->pCreateInfo->pNext));
         return;
     }
     VkBufferCreateInfo ci = *pInfo->pCreateInfo;
@@ -340,6 +450,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceBufferMemoryRequirements(VkDevice d
     info.pCreateInfo = &ci;
     vkb_wire_vkGetDeviceBufferMemoryRequirements(device, &info, pReq);
     fix_reqs(dev, &pReq->memoryRequirements, 1);
+    ded_hint(dev, pReq, ded_external(pInfo->pCreateInfo->pNext));
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceImageMemoryRequirements *pInfo,
@@ -352,6 +463,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceImageMemoryRequirements(VkDevice de
     info.pCreateInfo = &ci;
     vkb_wire_vkGetDeviceImageMemoryRequirements(device, &info, pReq);
     fix_reqs(dev, &pReq->memoryRequirements, 0);
+    ded_hint(dev, pReq, ded_external(pInfo->pCreateInfo->pNext) || pInfo->pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
     if (!pReq->memoryRequirements.size || !pReq->memoryRequirements.memoryTypeBits) {
         /* Deep Rock Galactic on D3D12 asked vkd3d for a heap of size 0; a requirement of 0 bytes
          * (the driver's answer for an image it cannot make) would explain it. The first few. */
