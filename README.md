@@ -39,11 +39,11 @@ when they connect.
 
 ## Status
 
-Tested in depth on a Mali-G720 Immortalis (Galaxy Tab S10+, MediaTek Dimensity 9300+, driver
-r44p1) and on a Mali-G925 Immortalis (Galaxy Tab S11 Ultra, Dimensity 9400, Android 16), inside
-the DroidDeck launcher, which runs the server and starts the guest. With the same build the G925
-runs these games about 1.4-2x faster than the G720. See [INSTALL.md](INSTALL.md) to try it.
-Everything here is still work in progress.
+Tested on two tablets, plus reports from players: a Mali-G720 Immortalis (Galaxy Tab S10+,
+MediaTek Dimensity 9300+, driver r44p1) and a Mali-G925 Immortalis (Galaxy Tab S11 Ultra,
+Dimensity 9400, driver r49p1, Android 16), inside the DroidDeck launcher, which runs the server
+and starts the guest. With the same build the G925 runs these games about 1.4-2x faster than the
+G720. See [INSTALL.md](INSTALL.md) to try it. Everything here is still work in progress.
 
 | Game | Mali-G720 (Tab S10+) | Mali-G925 (Tab S11 Ultra) |
 |---|---|---|
@@ -56,25 +56,56 @@ Everything here is still work in progress.
 | Dead Cells | runs well | not tested |
 | ENDER LILIES | runs well, 42-44 fps | not tested |
 | Lethal Company | runs well, 43-45 fps | not tested |
-| Subnautica | runs well, 20-24 fps with Detail set to High | 28-40 fps (while thermally throttled) |
+| Subnautica | runs well, 20-24 fps with Detail set to High | 28-40 fps in play (while thermally throttled), 81 fps on the menu |
 | Inscryption | runs well, 68-83 fps | not tested |
 | Doki Doki Literature Club | runs well, title screen 91-92 fps | not tested |
-| Half-Life 2 | runs well, 59-74 fps in the opening chapter | 95-103 fps |
+| Half-Life 2 | runs well, 59-74 fps in the opening chapter | 94-103 fps in the opening chapter |
 | Portal 2 | runs well, about 45-50 fps in play with drops to around 30 | 115 fps in the menu |
 | Hollow Knight: Silksong | runs very well, a steady 62-66 fps in play | 72-96 fps |
 | The Elder Scrolls V: Skyrim Special Edition | runs well, about 60 fps (its cap) on Medium; smooth in third person, some stutter on first load | not tested |
 | Stardew Valley | runs well, 60 fps (its cap) on the title screen | 57-62 fps |
 | Risk of Rain 2 | runs well at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default | 30-43 fps at 1280x720; 20-28 fps in a crowded boss fight, measured while screen recording |
-| The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) | starts since v0.4 (before, "DirectX 12 required"); the intro plays at 60 fps. In game: known issue, being worked on (see below) |
-| Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) | known issue, being worked on (see below) |
+| Dark Souls Remastered | not tested yet | runs well: 10 minutes of play at a median of 53.7 fps, lowest 43.9, 60 fps (its cap) while the tablet is cool; cutscenes correct |
+| Garry's Mod | not tested yet | runs well on a plain map (median 104 fps); median 82 fps on the Golden City Sandbox map, lowest 34 |
+| The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) | the intro plays at 60 fps; after loading a save the game stalls (known issue, see below) |
+| Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) | runs (DX11, the default), 58 fps on the title screen, with a neutral colour grade (see below); gameplay not measured yet |
 | Deep Rock Galactic | runs, but slowly | not tested |
 
-Known issue on the Mali-G925: its shader compiler never finishes compiling Unreal Engine 4's
-colour-grading shader (Stray), so the game waits for ever; The Witcher 3 stops after its intro in
-what looks like the same way. Since v0.4 the bridge interrupts a pipeline compile that runs past
-10 s and builds the pipeline again with a fallback: for that shader, a neutral colour grade in
-place of the game's. This has not yet been confirmed on the device. A real fix, a rewrite of the
-shader that the G925 compiles, is being worked on.
+Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mode, without the
+built-in presets described below. The other G925 figures are from v0.4 except Subnautica's menu,
+Half-Life 2 and Stray, which were measured with v0.5.
+
+**Safe mode and performance mode** (see [below](#safe-mode-and-performance-mode)). Median fps,
+one run per game and mode, on USB power at thermal status 0-1. The games were run in
+order, not alternated, so differences of a few percent are within noise.
+
+| Game (scene) | G720 safe | G720 performance | G925 safe | G925 performance |
+|---|---|---|---|---|
+| Half-Life 2 (train ride, `+map d1_trainstation_01`) | 74.1 | 75.9 | 93.7 | 93.7 |
+| Subnautica (menu) | 62.0 | 62.3 | 81.3 | 81.5 |
+| Stray (title) | 17.1 | 15.8 | 58.4 | 58.0 |
+| Stardew Valley (title, 60 fps cap) | 60.0 | 60.0 | 60.0 | 60.0 |
+| Risk of Rain 2 (title) | 35.6 | 35.8 | 56.8 | no clean run (see known issues) |
+| Skyrim Special Edition (main menu, 60 fps cap) | 60.7 | 60.7 | not tested | not tested |
+
+### Known issues
+
+- **The Witcher 3 (DX12) on the Mali-G925** plays its intro at 60 fps, but after loading a save
+  the frame rate drops below 1 fps. The GPU is busy the whole time (about 98%), so this looks like
+  GPU work that never finishes rather than a shader compile. Being investigated. The installed
+  Steam version of the game is DX12-only, so DX11 has not been tried.
+- **Stray on the Mali-G925**: the G925's shader compiler never finishes Unreal Engine 4's
+  colour-grading shader. The compile watchdog (added in v0.4, confirmed on the device in v0.5)
+  interrupts it after 10 s on the first launch and uses a neutral colour grade in its place, so
+  the game runs with plain colours instead of its own grading. Later launches use the stand-in at
+  once. A rewrite of the shader that the G925 compiles is being worked on.
+- **Stray with `-dx12`** (vkd3d-proton) closes about 60 s after starting on the G925, with an
+  access violation inside the game and no bridge errors. The default (DX11) is not affected.
+- **Risk of Rain 2**: one performance-mode launch on the G925 showed no frames for about 2 minutes
+  on its title load, then went on. It did not happen again in a rerun; the cause is not known.
+- **The Steam window on the Mali-G925** can be slow: Steam's web view process crashes at start and
+  falls back to drawing on the CPU. Having it draw through ANGLE on Vulkan
+  (`BL_VKBRIDGE_CEF_ANGLE=vulkan` in DroidDeck) is being verified and is not on by default.
 
 Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples compressed, at the
 size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11,
@@ -115,10 +146,76 @@ Each one turns on only when the GPU lacks the feature.
 - **Elastic descriptor pools**: allocation past a pool's size, which desktop drivers allow and Mali refuses.
 - **OPAQUE_FD external memory and image dma-buf export**: backed by dma-buf / dma-heap pages.
 - **Pipeline compile crash guard**: a driver crash inside shader or pipeline compilation fails that call instead of the whole session.
-- **Compile watchdog**: a pipeline compile still running in the driver after 10 s is interrupted, and the pipeline is built again with a fallback: Unreal Engine 4's colour-grading shader gets a neutral stand-in (`server/shaders/ue4_lut_standin.frag`, no grading), any other fragment shader a constant colour as the last resort. What worked is remembered in `<cache dir>/stuck-pipelines`, so later runs do not wait again; the stuck SPIR-V is saved to `<cache dir>/stuck-spirv/`.
-- **Semaphore waits the driver fails**: the Mali-G925 driver sometimes answers `vkWaitSemaphores` with `VK_ERROR_INITIALIZATION_FAILED`. The wait is checked again and succeeds when the semaphores are signalled, instead of ending the game.
+- **Compile watchdog**: a pipeline compile still running in the driver after 10 s (20 s in performance mode) is interrupted, and the pipeline is built again with a fallback: Unreal Engine 4's colour-grading shader gets a neutral stand-in (`server/shaders/ue4_lut_standin.frag`, no grading), any other fragment shader a constant colour as the last resort. What worked is remembered in `<cache dir>/stuck-pipelines`, so later runs do not wait again; the stuck SPIR-V is saved to `<cache dir>/stuck-spirv/`.
+- **Waits the driver fails**: the Mali-G925 driver sometimes answers `vkWaitSemaphores` with `VK_ERROR_INITIALIZATION_FAILED`. The wait is checked again and succeeds when the semaphores are signalled, instead of ending the game (`wait_retry`, below; fences, idle waits and query waits too since v0.5).
+- **Memory type for images**: the client's device-local type is backed by a driver type that images actually allow. A Mali-G2-Ultra (XRing O3, 22 memory types) lists only some of its device-local types for images, and every image failed there (not yet tested on that device).
+- **Dedicated allocations**: Mali asks for a dedicated allocation for most images, and DXVK follows it, one allocation per texture. The client clears that preference for ordinary resources (`VKBRIDGE_DEDICATED_HINT`), so DXVK sub-allocates.
 - **Persistent pipeline cache**: Mali recompiles everything in each new process unless it gets a cache, and DXVK passes none. The cache is kept per Steam game (by app id), and Steam's "Processing Vulkan shaders" step now fills the cache the game loads, so letting it finish shortens the first run's stutter. Processes that save the same cache at once merge their pipelines, and a game that is killed keeps what it compiled.
 - **Shader quirk lists**: listed shaders are drawn with rasterization discarded or replaced by a constant colour, for draws the GPU cannot run.
+
+## Safe mode and performance mode
+
+Safe mode is the default. With it on, anything the bridge has not confirmed on this GPU and driver
+gets the workaround; performance mode uses the driver's own path wherever the start-up checks
+passed. In DroidDeck the switch is **Safe mode** under the Mali bridge button; elsewhere
+`VKBRIDGE_MODE=safe` or `performance` (first found: `<cache dir>/env`, the server's environment,
+the app's `<cache dir>/mode`, then safe). It is read again at each device, so a change needs no
+new probe and no restart, and the log and the session report say which mode was used and why.
+
+| | Safe (default) | Performance |
+|---|---|---|
+| Emulations gated by a start-up check | kept unless the check passed (a check still running in the background, or one that could not run, keeps the emulation) | dropped unless the check failed, crashed or hung |
+| Driver bug fixes (next section) | on for an unknown driver version, and for some fixes always | by the driver version and the check result |
+| Compile watchdog interrupt | 10 s | 20 s |
+| Cached readback | off | on for the frame readback where the self-test passes it |
+
+The same in both: the wait retry, BC transcode quality (`auto`), forced robust buffer access, and
+descriptor batching off. On our two tablets the start-up checks are complete, so the modes differ
+little (the table under Status); safe mode is meant for GPUs we have not tested.
+
+## Driver bug fixes
+
+A layer just above the driver turns on fixes for known Mali driver bugs. Each is decided per device
+from the driver version (`r49p1` from driverInfo, or decoded from driverVersion), the bug's known
+range, the start-up check where there is one, and the mode; the log gives one line per fix with the
+reason. `VKBRIDGE_ERRATA=+name,-name` forces a fix on or off (also from `<cache dir>/env` and in
+per-game presets).
+
+| Fix | Bug | Affected (known ranges) |
+|---|---|---|
+| `wait_retry` | a wait (`vkWaitSemaphores`, fences, idle, queries) fails with `VK_ERROR_INITIALIZATION_FAILED` after a signal; retried for the app's whole timeout | all; seen on the G925 |
+| `viewport_flip` | a negative viewport height (the y-flip DXVK and vkd3d-proton use) is ignored; the bridge sends positive heights and flips in the shader | reported on a Mali-G715 r54p2; checked at start; untested on an affected driver |
+| `bitwise_scalar` | integer vector bitwise ops on a swizzle are miscompiled; such ops are split per lane | r18p0-r53p0; both tablets fail the check |
+| `dyn_reemit` | dynamic state lost or mis-applied across pipeline binds; the state is sent again after each bind | below r44p1, and r48p0-r53p0 for three EDS3 states; always on in safe mode |
+| `vb_split` | `vkCmdBindVertexBuffers2` applies strides by array index; split into one call per binding | below r48; the split is always on (it is cheap) |
+| `view_quarantine` | `vkCmdBeginRendering` reuses stale state for a recycled image view handle; destroyed views are held back for a while | r49p1-r49p2, r50p0-r51p0 (the G925) |
+| `view_counts` | a 2D-array view of a 3D image with `VK_REMAINING_ARRAY_LAYERS` (the G720 driver crashed); counts made explicit | r19p0-r54p0; always on |
+| `cull_nontri` | dynamic cull mode culls points and lines (Arm erratum 3786517) | below r52 |
+| `clamp_zero` | a clamp with a zero limit on a value picked from constants becomes a min or max (Arm erratum 3779215, Godot) | r38p1-r49p0, r50p0-r51p0 |
+| `dedicated_import` | an import with a dedicated-allocation struct for a resource not made for that handle type fails or crashes | older drivers, below r54p1 |
+
+Each fix has a host test that puts the bug beneath it (`host/errata_test.sh` and the per-fix
+tests). `wait_retry`, `bitwise_scalar`, `dyn_reemit`, `vb_split`, `view_quarantine` and
+`view_counts` were also exercised on a tablet whose driver is in their range. The bug itself showed
+for `bitwise_scalar` and `view_counts` on both tablets and for `wait_retry` on the G925; it did
+not show for `dyn_reemit` and `vb_split` in our tests.
+
+## Start-up checks and the session report
+
+At its first start on a GPU, driver and bridge build, the server runs small workloads on the driver
+for the features that have failed before (memory sharing, dma-buf export, push descriptors, the
+divisor, depth clip, clip distance, null descriptors, the driver bugs above, the UE4 colour-grading
+compile, the BC transcoders) and keeps the results in `<cache dir>/probe-*.json`. A check that
+fails, crashes or hangs turns on its workaround. The part before the server listens took 88-130 ms
+on our tablets and the rest runs in the background (about 1.3-1.5 s, up to 4 s the first time); with the results cached, it
+takes under 2 ms. `VKBRIDGE_PROBE=0` skips it, `force` runs it again.
+
+The server also writes `malibridge-report.md` and `.json` beside its log, which DroidDeck's Share
+logs includes: line 1 states the mode, then a summary of issues (checks that did not pass, warning
+and error classes, slow compiles, long waits, low frame rates, thermal limits), the device, the
+check table, and per game its frame times, compile times and missing features.
+`tools/malibridge_report_diff.py` compares two reports (`--regressions` for a pass/fail answer).
+`VKBRIDGE_REPORT=0` turns the report off.
 
 ## Building
 
@@ -172,6 +269,11 @@ they take effect on the device without restarting the app.
 | Variable | Side | Effect |
 |---|---|---|
 | `VKBRIDGE_SOCKET` | both | socket path |
+| `VKBRIDGE_MODE=safe` / `performance` | both | the mode (see above); default safe |
+| `VKBRIDGE_ERRATA=+name,-name` | server | forces driver bug fixes on or off |
+| `VKBRIDGE_PROBE=0` / `force` | server | skips the start-up checks, or runs them again |
+| `VKBRIDGE_REPORT=0` | server | no session report |
+| `VKBRIDGE_PCACHE_TOTAL_MB=<n>` | server | total size of the persistent pipeline caches (default 512; each file at most 64 MB); the ones used longest ago go first |
 | `VKBRIDGE_HANG_DETECT=1` | server | fence after every submission. A hung draw is reported with its state (bound sets, root constants, render targets, device fault info) |
 | `VKBRIDGE_HANG_AFTER_MS` | server | how long a submission may run before it counts as hung |
 | `VKBRIDGE_GPU_PROF=1` / `2` | server | per-pass GPU timestamps (render passes, dispatches, copies). `2` breaks them down by pipeline |
@@ -200,7 +302,7 @@ they take effect on the device without restarting the app.
 | `VKBRIDGE_LAYER_GS_FOLD=1` | server | folds every layer-only pass-through geometry stage up front |
 | `VKBRIDGE_NO_PCACHE=1` | server | turns off the persistent pipeline cache |
 | `VKBRIDGE_PCACHE_KEY=<name>` | client | which persistent pipeline cache this process gets (default: the Steam app id) |
-| `VKBRIDGE_WAIT_FIX=0` | server | hands failed semaphore and fence waits straight back to the app; `VKBRIDGE_WAIT_RETRY_MS` (default 2000) is how long a failed wait is checked again |
+| `VKBRIDGE_WAIT_FIX=0` | server | hands failed waits straight back to the app (same as `VKBRIDGE_ERRATA=-wait_retry`); `VKBRIDGE_WAIT_RETRY_MS` caps how long a failed wait is retried (default: the app's own timeout) |
 | `VKBRIDGE_NO_XFB_FOLD=1` | server | turns off the stream output fold |
 | `VKBRIDGE_NO_CRASH_GUARD=1` | server | turns off pipeline crash containment |
 | `VKBRIDGE_NO_FORCED_ROBUSTNESS=1` | server | the robustness2 emulation leaves buffer and image robustness to the app instead of turning them on |
@@ -221,8 +323,9 @@ settings; `server/presets_builtin.inc` has built-in entries, each applied only o
 tested on. On any other GPU the server logs the lines to copy into that file instead. The built-in
 entries for Garry's Mod (4000), DARK SOULS: REMASTERED (570940), Poppy Playtime (1721470) and The
 Forest (242760) set `VKBRIDGE_HEAP_MAX_MB=4096` (DS:R and Poppy also
-`VKBRIDGE_BC_TRANSCODE_QUALITY=fast`). They are untested on our tablets, so they apply nowhere yet.
-The values come from GameNative's public Mali crowd configs.
+`VKBRIDGE_BC_TRANSCODE_QUALITY=fast`). They are untested on our tablets, so they apply nowhere yet
+(Dark Souls Remastered and Garry's Mod were played on the G925 without them). The values come
+from GameNative's public Mali crowd configs.
 
 **`VKBRIDGE_SPOOF_GPU` risks.** It is meant for a game that refuses an unknown GPU, or that picks
 its lowest settings from the vendor. It is not a speed-up, so try it per game and only with a reason.
@@ -320,6 +423,10 @@ GPL-3.0-or-later. See [LICENSE](LICENSE). Each source file carries an SPDX heade
   identity) follow its ideas, and the values in the built-in presets for Garry's Mod, DARK SOULS:
   REMASTERED, Poppy Playtime and The Forest come from its public Mali crowd configs. No code is
   copied.
+- wallentx's placed-memory layer for DroidDeck (MIT): the `/proc/self/maps` offset lookup and the
+  1 MiB chunks in the device tool `tests/mali_xproc_probe.c` follow it. No code is copied.
+- The driver bug ranges (`server/server_errata.c`) draw on Arm's published errata, ANGLE's Mali
+  workarounds and bionic-vulkan-wrapper issue #50.
 - Design notes from Winlator's Vortek (running the server inside the app process) and GameNative
   (the order of memory-sharing strategies on Mali, the r44 robustness2 profile) informed the
   server. No code from either project is included.
