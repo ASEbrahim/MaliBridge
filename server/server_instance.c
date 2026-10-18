@@ -499,6 +499,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             dev = VK_NULL_HANDLE;
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
         } else {
+            vkb_mem_device_install(t); /* host: another driver's image requirements, beneath every layer */
             vkb_guard_device_init(t); /* first: every layer's compiles reach the driver through it */
             vkb_nocomp_device_init(t, nocomp);
             vkb_hang_device_init(t);  /* next: sees the driver-level calls of every layer above it */

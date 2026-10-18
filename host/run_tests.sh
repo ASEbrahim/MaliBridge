@@ -36,6 +36,14 @@ run_mode() {
     grep -q "imitating Mali's memory types" "$VKB_SERVER_LOG" && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG" &&
       ! grep -q "no ordinary device-local type" out/t-smoke.log
     result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' "$VKB_SERVER_LOG"))"
+    # The XRing O3's image requirements (xringmem, issue #1): its images do not list the first
+    # ordinary device-local type, so the client's device-local type is backed by one they do list
+    # (the client's mask for every image was empty: "no memory type for the image (types 0x0 allowed)")
+    VKB_MISSING_ADD=xringmem . ./mali_env.sh >/dev/null
+    timeout 120 ./out/vkbridge-smoke >out/t-smoke-xring.log 2>&1 && grep -q "imitating the XRing O3" "$VKB_SERVER_LOG" &&
+      ! grep -q "no memory type for the image" out/t-smoke-xring.log && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG"
+    result $? "smoke, XRing O3's image requirements: images get a memory type ($(tail -1 out/t-smoke-xring.log))"
+    . ./mali_env.sh >/dev/null
     # Other Mali drivers: push descriptors but not robustness2 (nulls in push descriptor writes are
     # replaced too), no multiDrawIndirect (Mali-G57 r32/r38: indirect draws are split)
     VKB_MISSING=robustness2,multidraw . ./mali_env.sh >/dev/null

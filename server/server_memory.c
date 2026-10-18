@@ -946,7 +946,7 @@ static int lazy_imitated(VkMemoryPropertyFlags f)
 static int fake_lazy(void)
 {
     static int v = -1;
-    if (v < 0) v = vkb_emu_faked("lazymem");
+    if (v < 0) v = vkb_emu_faked("lazymem") || vkb_emu_faked("xringmem");
     return v;
 }
 
@@ -974,6 +974,100 @@ void vkb_mem_instance_install(vkb_srv_table *t)
     if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
     if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;
     VKB_INFO("imitating Mali's memory types: device-local types without host access are lazily allocated");
+}
+
+/* ------------------------------------------------------------------ the XRing O3's image requirements, imitated */
+
+/*
+ * VKBRIDGE_FAKE_MISSING=...,xringmem (host tests; lazymem comes with it): what Mali-G2-Ultra on the
+ * XRing O3 (driver 56, 22 memory types; issue #1) does to images. All its device-local types
+ * without host access are lazily allocated, and an image's memoryTypeBits do not list every
+ * ordinary device-local type: not the first one, which the client used to back its device-local
+ * type with, and the ones it does list are host-visible types the client either does not offer or
+ * offers as shared, which images cannot use. The client's mask for every image came out empty (the
+ * self-test: "no memory type for the image (types 0x0 allowed)"; gamescope: findMemoryType failed).
+ * Here images' memoryTypeBits keep only the device-local host-visible types after the first one.
+ */
+static int fake_xring(void)
+{
+    static int v = -1;
+    if (v < 0) v = vkb_emu_faked("xringmem");
+    return v;
+}
+
+static uint32_t xring_image_mask(const VkPhysicalDeviceMemoryProperties *mp)
+{
+    uint32_t keep = 0;
+    int first = 1;
+    for (uint32_t i = 0; i < mp->memoryTypeCount && i < 32; i++) {
+        VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || (f & VK_MEMORY_PROPERTY_PROTECTED_BIT))
+            continue;
+        if (first) first = 0;
+        else keep |= 1u << i;
+    }
+    return keep;
+}
+
+static struct {
+    vkb_srv_table *t;
+    uint32_t mask;
+    PFN_vkGetImageMemoryRequirements req;
+    PFN_vkGetImageMemoryRequirements2 req2;
+    PFN_vkGetDeviceImageMemoryRequirements dreq;
+} xring_dev[16];
+
+static int xring_slot(void)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    for (int i = 0; i < 16 && xring_dev[i].t; i++)
+        if (xring_dev[i].t == t) return i;
+    return 0;
+}
+
+static VKAPI_ATTR void VKAPI_CALL xring_GetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements *r)
+{
+    int s = xring_slot();
+    xring_dev[s].req(d, i, r);
+    r->memoryTypeBits &= xring_dev[s].mask;
+}
+
+static VKAPI_ATTR void VKAPI_CALL xring_GetImageMemoryRequirements2(VkDevice d, const VkImageMemoryRequirementsInfo2 *i,
+                                                                    VkMemoryRequirements2 *r)
+{
+    int s = xring_slot();
+    xring_dev[s].req2(d, i, r);
+    r->memoryRequirements.memoryTypeBits &= xring_dev[s].mask;
+}
+
+static VKAPI_ATTR void VKAPI_CALL xring_GetDeviceImageMemoryRequirements(VkDevice d, const VkDeviceImageMemoryRequirements *i,
+                                                                         VkMemoryRequirements2 *r)
+{
+    int s = xring_slot();
+    xring_dev[s].dreq(d, i, r);
+    r->memoryRequirements.memoryTypeBits &= xring_dev[s].mask;
+}
+
+/* At the driver's level (t->real), before the layers above it take their copies of it. */
+void vkb_mem_device_install(vkb_srv_table *t)
+{
+    if (!fake_xring() || !t->real.vkGetImageMemoryRequirements) return;
+    for (int i = 0; i < 16; i++) {
+        if (xring_dev[i].t && xring_dev[i].t != t) continue;
+        VkPhysicalDeviceMemoryProperties mp;
+        t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+        xring_dev[i].mask = xring_image_mask(&mp);
+        xring_dev[i].req = t->real.vkGetImageMemoryRequirements;
+        xring_dev[i].req2 = t->real.vkGetImageMemoryRequirements2;
+        xring_dev[i].dreq = t->real.vkGetDeviceImageMemoryRequirements;
+        __atomic_store_n(&xring_dev[i].t, t, __ATOMIC_RELEASE);
+        t->real.vkGetImageMemoryRequirements = t->dt.vkGetImageMemoryRequirements = xring_GetImageMemoryRequirements;
+        if (xring_dev[i].req2) t->real.vkGetImageMemoryRequirements2 = t->dt.vkGetImageMemoryRequirements2 = xring_GetImageMemoryRequirements2;
+        if (xring_dev[i].dreq)
+            t->real.vkGetDeviceImageMemoryRequirements = t->dt.vkGetDeviceImageMemoryRequirements = xring_GetDeviceImageMemoryRequirements;
+        VKB_INFO("imitating the XRing O3's image requirements: images allow memory types 0x%x only", xring_dev[i].mask);
+        return;
+    }
 }
 
 /* ------------------------------------------------------------------ what allocations did (logs) */
@@ -1641,6 +1735,73 @@ void vkb_mem_cached_gate(vkb_server_pd_info *info, int mode)
     }
 }
 
+/*
+ * The memory types ordinary resources can all live in: the AND of the memoryTypeBits of a few
+ * optimal-tiling images (colour, depth, storage) and a plain buffer. The client backs its
+ * device-local type (where images and GPU-only buffers go) with an ordinary device-local type from
+ * these. Picking just the driver's first such type left every image without a type on a driver
+ * whose images do not list that one (Mali-G2-Ultra, XRing O3, driver 56: issue #1).
+ */
+static int ordinary_dl(VkMemoryPropertyFlags f)
+{
+    return (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT));
+}
+
+static uint32_t probe_image_types(selftest *st)
+{
+    static const struct {
+        VkFormat fmt;
+        VkImageUsageFlags usage;
+    } imgs[] = {
+        {VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT},
+        {VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
+        {VK_FORMAT_D16_UNORM, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
+    };
+    uint32_t mask = fake_xring() ? xring_image_mask(&st->mp) : ~0u;
+    uint32_t images = ~0u, seen = 0;
+    for (size_t i = 0; i < sizeof(imgs) / sizeof(imgs[0]); i++) {
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, imgs[i].fmt, {64, 64, 1}, 1, 1,
+                                VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, imgs[i].usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                                VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImage img;
+        if (st->dt.vkCreateImage(st->dev, &ci, NULL, &img) != VK_SUCCESS) continue;
+        VkMemoryRequirements r;
+        st->dt.vkGetImageMemoryRequirements(st->dev, img, &r);
+        st->dt.vkDestroyImage(st->dev, img, NULL);
+        images &= r.memoryTypeBits & mask;
+        seen++;
+    }
+    if (!seen) return 0;
+    uint32_t buffers = ~0u;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 65536,
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkBuffer b;
+    if (st->dt.vkCreateBuffer(st->dev, &bci, NULL, &b) == VK_SUCCESS) {
+        VkMemoryRequirements r;
+        st->dt.vkGetBufferMemoryRequirements(st->dev, b, &r);
+        st->dt.vkDestroyBuffer(st->dev, b, NULL);
+        buffers = r.memoryTypeBits;
+    }
+    /* Images and buffers in one type if there is one; else what the images allow (buffers are
+     * the less picky). */
+    uint32_t both = images & buffers, any_both = 0, any_img = 0;
+    for (uint32_t t = 0; t < st->mp.memoryTypeCount && t < 32; t++) {
+        VkMemoryPropertyFlags f = st->mp.memoryTypes[t].propertyFlags;
+        if (fake_lazy() && lazy_imitated(f)) f |= VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
+        if (!ordinary_dl(f)) continue;
+        if (both & (1u << t)) any_both = 1;
+        if (images & (1u << t)) any_img = 1;
+    }
+    uint32_t types = any_both ? both : any_img ? images : 0;
+    VKB_INFO("memory: images allow types 0x%x, plain buffers 0x%x: ordinary resources in 0x%x", images, buffers, types);
+    if (!types) VKB_WARN("memory: no ordinary device-local type that images allow (images 0x%x); the client keeps its old choice", images);
+    return types;
+}
+
 void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd)
 {
     selftest st;
@@ -1745,6 +1906,7 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     if (st.import_align < 4096) st.import_align = 4096;
 
     k->info.strategy = VKB_MEM_NONE;
+    k->info.image_types = probe_image_types(&st);
     for (int i = 0; i < nc; i++) {
         uint32_t s = candidates[i];
         uint32_t shareable = 0, coherent = 0;
