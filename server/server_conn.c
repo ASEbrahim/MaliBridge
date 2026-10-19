@@ -141,6 +141,11 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
             if (mine) tables[i] = NULL;
             pthread_mutex_unlock(&tables_lock);
             if (!mine) continue;
+            /* As in vkDestroyDevice, the call's table is the device's: the wrappers its teardown
+             * calls through (the errata's on t->real) find their state by it. Without it they
+             * took the last device made, gone once that one was destroyed: the dedicated_import
+             * record of the null descriptors' buffer locked a NULL mutex (Tab S10+, v0.5.1 rc1). */
+            vkb_srv_set_current_table(t);
             if (t->is_device) {
                 VKB_INFO("process %d exited without destroying device %u; cleaning up", p->pid, t->id);
                 vkb_emu_device_quiesce(t);
@@ -154,6 +159,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 vkb_pools_device_destroy(t);
                 vkb_pcache_device_destroy(t);
                 vkb_emu_device_destroy(t);
+                vkb_errata_device_destroy(t);
                 vkb_hang_device_destroy(t);  /* its watcher thread calls the driver */
                 vkb_guard_device_destroy(t); /* as vkDestroyDevice does: no table left pointing at t */
                 vkb_report_device_destroy(t);
@@ -163,6 +169,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 VKB_INFO("process %d exited without destroying instance %u; cleaning up", p->pid, t->id);
                 t->real.vkDestroyInstance(t->instance, NULL);
             }
+            vkb_srv_set_current_table(NULL);
             pthread_mutex_destroy(&t->lock);
             free(t);
         }

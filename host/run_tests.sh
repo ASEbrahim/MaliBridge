@@ -132,6 +132,21 @@ run_mode() {
     VKBRIDGE_HIDE_EXTS=${VKBRIDGE_HIDE_EXTS:+$VKBRIDGE_HIDE_EXTS,}VK_KHR_calibrated_timestamps,VK_EXT_calibrated_timestamps timeout 60 ./out/procaddr_check >out/t-procaddr-hidden.log 2>&1
     result $? "procaddr_check, calibrated timestamps hidden ($(tail -1 out/t-procaddr-hidden.log))"
   fi
+  # Processes gone without destroying their devices while another keeps importing dma-bufs (Tab
+  # S10+, v0.5.1 rc1: the server crashed in the second steamwebhelper's cleanup, its null
+  # descriptors' buffer destroyed through the dedicated_import erratum without the device's table,
+  # after the last device made had been destroyed); with Mali's errata (r44p1), every other round
+  # after a device made and destroyed as it should
+  if [ -x out/exitclean_check ] && [ "$mode" = mali ]; then
+    from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+    VKB_SERVER_ENV=VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKB_MISSING_ADD=dmabuftypes . ./mali_env.sh >/dev/null
+    timeout 180 ./out/exitclean_check >out/t-exitclean.log 2>&1 && ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "crashed with signal" &&
+      [ "$(tail -n +$from "$VKB_SERVER_LOG" | grep -c 'exited without destroying device')" -ge 12 ] &&
+      tail -n +$from "$VKB_SERVER_LOG" | grep -q "null descriptors emulated" &&
+      tail -n +$from "$VKB_SERVER_LOG" | grep -q "errata: dedicated_import ON"
+    result $? "exitclean_check, processes gone without destroying anything ($(tail -1 out/t-exitclean.log))"
+    . ./mali_env.sh >/dev/null
+  fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
   # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
   if [ -x out/desc_traffic_check ]; then
