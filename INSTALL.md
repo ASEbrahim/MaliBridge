@@ -130,11 +130,11 @@ It lets PC games in DroidDeck use your phone's own Mali GPU driver, so Steam gam
 Mali devices.
 
 **Will it work on my device?**
-It needs an Arm Mali GPU. To check, look up your chip: MediaTek Dimensity, Google Tensor and
-Samsung Exynos chips have Mali GPUs (Immortalis is Mali too); Snapdragon has Adreno, which the
-official DroidDeck already supports. On the two tablets in the table below it works well. On
-other Mali devices it is still a test: it depends on the GPU and its driver, so try it and send
-logs (see "If something goes wrong").
+It needs an Arm Mali GPU (Immortalis is Mali too). Look up your phone's chip in the
+[Does my device work?](README.md#does-my-device-work) table. On the Galaxy Tab S10+ and S11 Ultra
+it works well. On other Mali devices it is still a test: it depends on the GPU and its driver, so
+try it and send logs (see "If something goes wrong"). Snapdragon chips have Adreno GPUs, which the
+official DroidDeck supports; recent Exynos chips (Xclipse) and the Pixel 10 (PowerVR) are not Mali.
 
 **How much storage does it need?**
 Plan on about **8-10 GB before any games**: the Linux runtime (about 5 GB), the Steam client
