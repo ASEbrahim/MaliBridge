@@ -261,11 +261,26 @@ static int read_through(VkBufferView view, uint32_t seed, char *detail, size_t l
         return 0;
     }
     range_sync(&out, 0);
+    uint32_t first = N, wrong = 0;
     for (uint32_t i = 0; i < N; i++)
         if (out.ptr[i] != i * seed + 1) {
-            snprintf(detail, len, "texel %u is 0x%x, want 0x%x", i, out.ptr[i], i * seed + 1);
-            return 0;
+            if (first == N) first = i;
+            wrong++;
         }
+    if (wrong) {
+        /* Rare on the host (texels from 4032 or 4048 on read as 0, twice in some 30 suite runs):
+         * say whether the results arrive late (the same memory is right 50 ms on) or are wrong
+         * (the view or the descriptor), so the next one tells which. */
+        uint32_t got = out.ptr[first];
+        struct timespec ts = {0, 50000000};
+        nanosleep(&ts, NULL);
+        range_sync(&out, 0);
+        uint32_t later = 0;
+        for (uint32_t i = 0; i < N; i++) later += out.ptr[i] != i * seed + 1;
+        snprintf(detail, len, "texel %u is 0x%x, want 0x%x (%u of %u texels wrong; 50 ms later %u)", first, got, first * seed + 1, wrong, N,
+                 later);
+        return 0;
+    }
     snprintf(detail, len, "%u texels read through the view", N);
     return 1;
 }
