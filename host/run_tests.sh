@@ -89,6 +89,20 @@ run_mode() {
       { [ "$mode" != mali ] || grep -q "dma-buf image refused at tiling" "$VKB_SERVER_LOG"; }
     result $? "dmabuf_image_check ($(tail -1 out/t-dmabuf-image.log))"
   fi
+  # gamescope's DMA-BUF import for other GPUs (the fd's memoryTypeBits AND the image's): on mali
+  # with Mali's fd properties (dmabuftypes: a dma-buf takes only the host-visible cached types,
+  # which the client offers as shared) the fd's bits were 0; the server imports in a type it takes
+  if [ -x out/fdprops_check ]; then
+    if [ "$mode" = mali ]; then
+      VKB_MISSING_ADD=dmabuftypes . ./mali_env.sh >/dev/null
+      timeout 60 ./out/fdprops_check >out/t-fdprops.log 2>&1 && grep -q "imitating Mali's dma-buf fd properties" "$VKB_SERVER_LOG" &&
+        grep -q "dma-buf import: type [0-9]* is not one the dma-buf takes .*; imported in type" "$VKB_SERVER_LOG"
+      result $? "fdprops_check, Mali's dma-buf fd properties ($(tail -1 out/t-fdprops.log))"
+      . ./mali_env.sh >/dev/null
+    else
+      timeout 60 ./out/fdprops_check >out/t-fdprops.log 2>&1; result $? "fdprops_check ($(tail -1 out/t-fdprops.log))"
+    fi
+  fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
   # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
   if [ -x out/desc_traffic_check ]; then

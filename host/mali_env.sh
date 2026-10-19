@@ -4,6 +4,7 @@
 # and with Mali's memory types: the only device-local type without host access is lazily allocated
 # (lazymem: ordinary allocations there fail with -2, as a Pixel 9 on an older client showed).
 # VKB_MISSING_ADD=xringmem adds to the list (xringmem: images skip the first ordinary device-local type, as on the XRing O3).
+# VKB_MISSING_ADD=dmabuftypes: a dma-buf's fd properties list only the host-visible cached types, as Mali's do.
 # Like Mali r44 it refuses dma-buf images at LINEAR/OPTIMAL tiling (dmabuflinear: only DRM-modifier
 # dma-buf images are made; the rest get VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT).
 # Like the Mali-G925 it refuses VK_IMAGE_CREATE_EXTENDED_USAGE_BIT on multi-planar formats (planarext:
