@@ -45,44 +45,47 @@ Dimensity 9400, driver r49p1, Android 16), inside the DroidDeck launcher, which 
 and starts the guest. With the same build the G925 runs these games about 1.4-2x faster than the
 G720. See [INSTALL.md](INSTALL.md) to try it. Everything here is still work in progress.
 
+Ratings, from worst to best: barely runs, kinda playable, playable, very playable, excellent. They come from
+playing where we did (the owner's notes) and from the frame rate otherwise.
+
 | Game | Mali-G720 (Tab S10+) | Mali-G925 (Tab S11 Ultra) |
 |---|---|---|
-| Hades | runs well | not tested |
-| Hollow Knight | runs well, 87-124 fps | runs well (player report) |
-| ULTRAKILL | runs well, 55-57 fps | not tested |
-| Celeste | runs well, 57-59 fps | not tested |
-| Portal | runs well, 80 fps | not tested |
-| Cuphead | runs well | not tested |
-| Dead Cells | runs well | not tested |
-| ENDER LILIES | runs well, 42-44 fps | not tested |
-| Lethal Company | runs well, 43-45 fps | not tested |
-| Subnautica | runs well, 20-24 fps with Detail set to High | 28-40 fps in play (while thermally throttled), 81 fps on the menu |
-| Inscryption | runs well, 68-83 fps | not tested |
-| Doki Doki Literature Club | runs well, title screen 91-92 fps | not tested |
-| Half-Life 2 | runs well, 59-74 fps in the opening chapter | 94-103 fps in the opening chapter |
-| Portal 2 | runs well, about 45-50 fps in play with drops to around 30 | 115 fps in the menu |
-| Hollow Knight: Silksong | runs very well, a steady 62-66 fps in play | 72-96 fps |
-| The Elder Scrolls V: Skyrim Special Edition | runs well, about 60 fps (its cap) on Medium; smooth in third person, some stutter on first load | not tested |
-| Stardew Valley | runs well, 60 fps (its cap) on the title screen | 57-62 fps |
-| Risk of Rain 2 | runs well at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default | 30-43 fps at 1280x720; 20-28 fps in a crowded boss fight, measured while screen recording |
-| Dark Souls Remastered | not tested yet | runs well: 10 minutes of play at a median of 53.7 fps, lowest 43.9, 60 fps (its cap) while the tablet is cool; cutscenes correct |
-| Garry's Mod | not tested yet | runs well on a plain map (median 104 fps); median 82 fps on the Golden City Sandbox map, lowest 34 |
-| The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) | the intro plays at 60 fps; after loading a save the game stalls (known issue, see below) |
-| Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) | runs (DX11, the default), 58 fps on the title screen, with a neutral colour grade (see below); gameplay not measured yet |
-| Deep Rock Galactic | runs, but slowly | not tested |
-| Poppy Playtime (Chapter 1) | not tested yet | runs, 28-32 fps in the factory lobby; neutral colour grade (the same UE4 shader as Stray) |
-| R.E.P.O. | not tested yet | runs, about 40 fps in single player |
-| Muck | not tested yet | runs, 45-48 fps on the island |
-| Phoenix Wright: Ace Attorney Trilogy | not tested yet | runs well, about 118 fps (the 120 Hz display rate) |
-| Helltaker | not tested yet | runs well, about 59 fps (owner: "works perfectly") |
-| GRIS | not tested yet | runs well, about 119 fps |
-| A Dance of Fire and Ice | not tested yet | runs well, about 106-113 fps; the owner noticed no input delay with a Bluetooth PS5 controller |
-| Stick Fight: The Game | not tested yet | runs well, 59-60 fps (its cap) |
-| Risk of Rain Returns | runs well with v0.5, 59-60 fps in play including a boss fight (never below 59) | runs well with v0.5, 59-60 fps on the title screen and in play (owner: "running perfectly"); earlier builds froze at the intro video (see below) |
-| Don't Starve Together | not tested yet | 60 fps, but only with `PROTON_USE_WINED3D=1 %command%` as the game's launch option; the default DXVK path closes a few seconds after start (an assert in DXVK's shader translator, not the bridge) |
-| ASTRONEER | not tested yet | renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; neutral colour grade |
-| The Forest | not tested yet | 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
-| Outer Wilds | not tested yet | 35-45 fps on the starting planet, about 75-80 in space, high 20s on Brittle Hollow, about 17 looking at the black hole with the GPU half idle; CPU-bound |
+| Hades | **Excellent** | not tested |
+| Hollow Knight | **Excellent**, 87-124 fps | **Excellent** (player report) |
+| ULTRAKILL | **Very playable**, 55-57 fps | not tested |
+| Celeste | **Excellent**, 57-59 fps | not tested |
+| Portal | **Excellent**, 80 fps | not tested |
+| Cuphead | **Excellent** | not tested |
+| Dead Cells | **Excellent** | not tested |
+| ENDER LILIES | **Playable**, 42-44 fps | not tested |
+| Lethal Company | **Playable**, 43-45 fps | not tested |
+| Subnautica | **Playable**, 20-24 fps with Detail set to High | **Very playable**, 28-40 fps in play (while thermally throttled), 81 fps on the menu |
+| Inscryption | **Excellent**, 68-83 fps | not tested |
+| Doki Doki Literature Club | **Excellent**, title screen 91-92 fps | not tested |
+| Half-Life 2 | **Excellent**, 59-74 fps in the opening chapter | **Excellent**, 94-103 fps in the opening chapter |
+| Portal 2 | **Playable**, about 45-50 fps in play with drops to around 30 | **Not rated yet** (menu only): 115 fps in the menu |
+| Hollow Knight: Silksong | **Excellent**, a steady 62-66 fps in play | **Excellent**, 72-96 fps |
+| The Elder Scrolls V: Skyrim Special Edition | **Excellent**, about 60 fps (its cap) on Medium; smooth in third person, some stutter on first load | not tested |
+| Stardew Valley | **Excellent**, 60 fps (its cap) on the title screen | **Excellent**, 57-62 fps |
+| Risk of Rain 2 | **Kinda playable**, at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default | **Playable**, 30-43 fps at 1280x720; 20-28 fps in a crowded boss fight, measured while screen recording |
+| Dark Souls Remastered | not tested yet | **Very playable**, 10 minutes of play at a median of 53.7 fps, lowest 43.9, 60 fps (its cap) while the tablet is cool; cutscenes correct |
+| Garry's Mod | not tested yet | **Excellent**, on a plain map (median 104 fps); median 82 fps on the Golden City Sandbox map, lowest 34 |
+| The Witcher 3 (DX12) | **Barely runs**, long GPU stalls while loading | **Barely runs**, the intro plays at 60 fps; after loading a save the game stalls (known issue, see below) |
+| Stray | **Barely runs**, 17 fps in the opening scene (limited by the emulated render thread) | **Not rated yet** (title screen only): DX11 (the default), 58 fps on the title screen, with a neutral colour grade (see below); gameplay not measured yet |
+| Deep Rock Galactic | **Kinda playable**, slow | not tested |
+| Poppy Playtime (Chapter 1) | not tested yet | **Kinda playable**, 28-32 fps in the factory lobby; neutral colour grade (the same UE4 shader as Stray) |
+| R.E.P.O. | not tested yet | **Playable**, about 40 fps in single player |
+| Muck | not tested yet | **Playable**, 45-48 fps on the island |
+| Phoenix Wright: Ace Attorney Trilogy | not tested yet | **Excellent**, about 118 fps (the 120 Hz display rate) |
+| Helltaker | not tested yet | **Excellent**, about 59 fps (owner: "works perfectly") |
+| GRIS | not tested yet | **Excellent**, about 119 fps |
+| A Dance of Fire and Ice | not tested yet | **Excellent**, about 106-113 fps; the owner noticed no input delay with a Bluetooth PS5 controller |
+| Stick Fight: The Game | not tested yet | **Excellent**, 59-60 fps (its cap) |
+| Risk of Rain Returns | **Excellent**, 59-60 fps in play including a boss fight (never below 59) | **Excellent**, 59-60 fps on the title screen and in play (owner: "running perfectly"); earlier builds froze at the intro video (see below) |
+| Don't Starve Together | not tested yet | **Excellent**, 60 fps, but only with `PROTON_USE_WINED3D=1 %command%` as the game's launch option; the default DXVK path closes a few seconds after start (an assert in DXVK's shader translator, not the bridge) |
+| ASTRONEER | not tested yet | **Kinda playable**, renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; neutral colour grade |
+| The Forest | not tested yet | **Playable**, 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
+| Outer Wilds | not tested yet | **Playable**, 35-45 fps on the starting planet, about 75-80 in space, high 20s on Brittle Hollow, about 17 looking at the black hole with the GPU half idle; CPU-bound |
 
 Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mode, without the
 built-in presets described below. The other G925 figures are from v0.4 except Subnautica's menu,
