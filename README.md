@@ -17,26 +17,39 @@ source.
 
 ## Does my device work?
 
-You need an Arm Mali GPU. Find your phone's chip in its specs, then look it up here:
+You need an Arm Mali GPU. Find your device below, or look up its chip in the second table.
 
-| Chip | GPU | Example devices | Status |
+**Tested**
+
+| Device | Chip / GPU | Driver | Result |
 |---|---|---|---|
-| Dimensity 9300 / 9300+ | Immortalis-G720 MC12 | Galaxy Tab S10+, Xiaomi 14T Pro, vivo X100 Pro | **Works well** (tested in depth) |
-| Dimensity 9400 / 9400+ | Immortalis-G925 MC12 | Galaxy Tab S11 Ultra, vivo X200, OPPO Find X8 | **Works well** (tested in depth) |
-| Dimensity 8400 / 8500 | Mali-G720 MC7 / MC8 | POCO X7 Pro, POCO X8 Pro | Same GPU family as the S10+, smaller; not tested yet, likely to work |
-| Dimensity 9500 | Mali-G1-Ultra MC12 | OPPO Find X9 Pro | Not tested yet |
-| Xiaomi XRing O3 | Mali-G2-Ultra-NX MC16 | Xiaomi 18 Fold | Being tested with players; v0.5.1 has fixes for it |
-| Google Tensor G3 / G4 | Mali-G715 | Pixel 8, Pixel 9 | Steam starts (player report); games not confirmed yet |
-| Dimensity 9000 / 9200 | Mali-G710 / Immortalis-G715 | OnePlus Ace 2V | Not tested yet |
-| Dimensity 7300, 8100, 8200, Helio G99 and similar | Mali-G615 / G610 / G57 | many mid-range phones | Not tested yet; smaller GPUs, expect light games only |
-| Exynos 1280 / 1380 / 2100 | Mali-G68 / G78 | Galaxy A53, A54, S21 | Not tested yet |
+| Samsung Galaxy Tab S10+ | Dimensity 9300+ / Immortalis-G720 MC12 | r44p1 | **Works well** (tested in depth) |
+| Samsung Galaxy Tab S11 Ultra | Dimensity 9400 / Immortalis-G925 MC12 | r49p1 | **Works well** (tested in depth) |
+| Xiaomi 18 Fold | XRing O3 / Mali-G2-Ultra-NX MC16 | r56p0 | Player reports: partly working; v0.5.1 has fixes for it |
+| Google Pixel 9 | Tensor G4 / Mali-G715 | r54p3 | Player report: Steam starts; games not confirmed yet |
+
+**Help wanted: not tested yet.** Reports from these would help the most:
+
+| Chip | GPU | Example devices |
+|---|---|---|
+| Dimensity 9300 / 9300+ (other devices) | Immortalis-G720 MC12 | Xiaomi 14T Pro, vivo X100 Pro |
+| Dimensity 9400 / 9400+ (other devices) | Immortalis-G925 MC12 | vivo X200, OPPO Find X8 |
+| Dimensity 8400 / 8500 | Mali-G720 MC7 / MC8 | POCO X7 Pro, POCO X8 Pro |
+| Dimensity 9500 | Mali-G1-Ultra MC12 | OPPO Find X9 Pro, REDMI K90 Max |
+| Dimensity 9000 / 9200 | Mali-G710 / Immortalis-G715 | OnePlus Ace 2V |
+| Google Tensor G3 | Mali-G715 | Pixel 8 |
+| Dimensity 7300, 8100, 8200, Helio G99 and similar | Mali-G615 / G610 / G57 | many mid-range phones (smaller GPUs: expect light games only) |
+| Exynos 1280 / 1380 / 2100 | Mali-G68 / G78 | Galaxy A53, A54, S21 |
+
+Devices with the same chip as a tested one will likely behave similarly, but phone makers ship
+different driver versions, so it's still worth a report.
 
 **Not Mali:** Snapdragon chips have Adreno GPUs (use the official DroidDeck). Recent Samsung Exynos
 chips (2200, 2400, 2500) have Xclipse GPUs, and the Pixel 10's Tensor G5 has a PowerVR GPU; MaliBridge
 doesn't support these.
 
-On a device marked "not tested yet", it's still a test: it depends on the GPU and its driver. Logs
-from your device help a lot (see [If something goes wrong](INSTALL.md#if-something-goes-wrong)).
+On a device that isn't in the first table, it's still a test: it depends on the GPU and its driver.
+Logs from your device help a lot (see [If something goes wrong](INSTALL.md#if-something-goes-wrong)).
 
 ## Get started
 
