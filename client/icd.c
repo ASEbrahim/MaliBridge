@@ -43,6 +43,40 @@ int vkb_device_ext_enabled(const vkb_device *d, const char *name)
     return 0;
 }
 
+/* "A|B": any of the extensions that bring a command (the proc table's ext). */
+static int any_listed(const char *list, int (*has)(const void *, const char *), const void *o)
+{
+    char one[VK_MAX_EXTENSION_NAME_SIZE];
+    for (const char *p = list; *p;) {
+        size_t n = strcspn(p, "|");
+        snprintf(one, sizeof(one), "%.*s", (int)n, p);
+        if (has(o, one)) return 1;
+        p += n + (p[n] == '|');
+    }
+    return 0;
+}
+
+static int dev_has(const void *d, const char *name) { return vkb_device_ext_enabled(d, name); }
+
+static int pd_has(const void *o, const char *name)
+{
+    const vkb_physdev *pd = o;
+    for (uint32_t i = 0; i < pd->next; i++)
+        if (!strcmp(pd->exts[i].extensionName, name)) return 1;
+    return 0;
+}
+
+/* Physical-device commands of device extensions (generated entry points): vkGetInstanceProcAddr
+ * gives them for every device, as the loader-ICD interface has it; on a device without one of
+ * `list` (as the app sees it: hidden ones are not there) they say there is nothing instead of
+ * asking the server, whose driver may not have them at all (DroidDeck#165). */
+int vkb_physdev_has_ext(VkPhysicalDevice p, const char *list)
+{
+    vkb_physdev *pd = vkb_pd(p);
+    if (!vkb_physdev_ready(pd)) return 0;
+    return any_listed(list, pd_has, pd);
+}
+
 PFN_vkVoidFunction vkb_lookup_proc(const char *name, int level_max, vkb_device *dev, vkb_instance *inst)
 {
     (void)inst;
@@ -51,7 +85,7 @@ PFN_vkVoidFunction vkb_lookup_proc(const char *name, int level_max, vkb_device *
     if (!p) return NULL;
     if (level_max == VKB_LEVEL_DEVICE) {
         if (p->level != VKB_LEVEL_DEVICE) return NULL;
-        if (dev && p->ext && !vkb_device_ext_enabled(dev, p->ext)) return NULL;
+        if (dev && p->ext && !any_listed(p->ext, dev_has, dev)) return NULL;
         /* Core commands newer than the device's Vulkan version do not exist for it. */
         if (dev && p->core && p->core > dev->api_version) return NULL;
     }

@@ -5504,6 +5504,7 @@ void vkb_sv_vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM(v
     for (uint32_t i_ = 0; pCounterDescriptions && i_ < n_pCounterDescriptions; i_++) vkb_dec_out_template(d, &pCounterDescriptions[i_], sizeof(VkPerformanceCounterDescriptionARM));
     if (pCounterDescriptions && pCounterCount) *pCounterCount = n_pCounterDescriptions;
     if (d->err) { vkb_srv_bad_message(c); return; }
+    if (!vkb_srv_pd_has_ext(c, physicalDevice, "VK_ARM_performance_counters_by_region")) { vkb_srv_unsupported(c, "vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM", "VK_ARM_performance_counters_by_region"); return; }
     if (!c->dt->vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM) { vkb_srv_missing(c, "vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM"); return; }
     VkResult r_ = c->dt->vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM(physicalDevice, queueFamilyIndex, pCounterCount, pCounters, pCounterDescriptions);
     vkb_enc_bytes(e, &r_, sizeof(r_));
@@ -6327,6 +6328,7 @@ void vkb_sv_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(vkb_srv_call *c)
     VkTimeDomainKHR *pTimeDomains = has_pTimeDomains ? (VkTimeDomainKHR *)vkb_dec_alloc_zero(d, (size_t)n_pTimeDomains * sizeof(VkTimeDomainKHR)) : NULL;
     if (pTimeDomains && pTimeDomainCount) *pTimeDomainCount = n_pTimeDomains;
     if (d->err) { vkb_srv_bad_message(c); return; }
+    if (!vkb_srv_pd_has_ext(c, physicalDevice, "VK_EXT_calibrated_timestamps|VK_KHR_calibrated_timestamps")) { vkb_srv_unsupported(c, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR", "VK_EXT_calibrated_timestamps|VK_KHR_calibrated_timestamps"); return; }
     if (!c->dt->vkGetPhysicalDeviceCalibrateableTimeDomainsKHR) { vkb_srv_missing(c, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR"); return; }
     VkResult r_ = c->dt->vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(physicalDevice, pTimeDomainCount, pTimeDomains);
     vkb_enc_bytes(e, &r_, sizeof(r_));
@@ -6356,6 +6358,7 @@ void vkb_sv_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(vkb_srv_call *c)
     for (uint32_t i_ = 0; pProperties && i_ < n_pProperties; i_++) vkb_dec_out_template(d, &pProperties[i_], sizeof(VkCooperativeMatrixPropertiesKHR));
     if (pProperties && pPropertyCount) *pPropertyCount = n_pProperties;
     if (d->err) { vkb_srv_bad_message(c); return; }
+    if (!vkb_srv_pd_has_ext(c, physicalDevice, "VK_KHR_cooperative_matrix")) { vkb_srv_unsupported(c, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR", "VK_KHR_cooperative_matrix"); return; }
     if (!c->dt->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) { vkb_srv_missing(c, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"); return; }
     VkResult r_ = c->dt->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physicalDevice, pPropertyCount, pProperties);
     vkb_enc_bytes(e, &r_, sizeof(r_));
@@ -6475,6 +6478,7 @@ void vkb_sv_vkGetPhysicalDeviceExternalTensorPropertiesARM(vkb_srv_call *c)
     if (has_pExternalTensorProperties) vkb_dec_out_template(d, &pExternalTensorProperties_v, sizeof(VkExternalTensorPropertiesARM));
     VkExternalTensorPropertiesARM *pExternalTensorProperties = has_pExternalTensorProperties ? &pExternalTensorProperties_v : NULL;
     if (d->err) { vkb_srv_bad_message(c); return; }
+    if (!vkb_srv_pd_has_ext(c, physicalDevice, "VK_ARM_tensors")) { vkb_srv_unsupported(c, "vkGetPhysicalDeviceExternalTensorPropertiesARM", "VK_ARM_tensors"); return; }
     if (!c->dt->vkGetPhysicalDeviceExternalTensorPropertiesARM) { vkb_srv_missing(c, "vkGetPhysicalDeviceExternalTensorPropertiesARM"); return; }
     c->dt->vkGetPhysicalDeviceExternalTensorPropertiesARM(physicalDevice, pExternalTensorInfo, pExternalTensorProperties);
     vkb_enc_u8(e, pExternalTensorProperties != NULL);
@@ -6571,6 +6575,7 @@ void vkb_sv_vkGetPhysicalDeviceFragmentShadingRatesKHR(vkb_srv_call *c)
     for (uint32_t i_ = 0; pFragmentShadingRates && i_ < n_pFragmentShadingRates; i_++) vkb_dec_out_template(d, &pFragmentShadingRates[i_], sizeof(VkPhysicalDeviceFragmentShadingRateKHR));
     if (pFragmentShadingRates && pFragmentShadingRateCount) *pFragmentShadingRateCount = n_pFragmentShadingRates;
     if (d->err) { vkb_srv_bad_message(c); return; }
+    if (!vkb_srv_pd_has_ext(c, physicalDevice, "VK_KHR_fragment_shading_rate")) { vkb_srv_unsupported(c, "vkGetPhysicalDeviceFragmentShadingRatesKHR", "VK_KHR_fragment_shading_rate"); return; }
     if (!c->dt->vkGetPhysicalDeviceFragmentShadingRatesKHR) { vkb_srv_missing(c, "vkGetPhysicalDeviceFragmentShadingRatesKHR"); return; }
     VkResult r_ = c->dt->vkGetPhysicalDeviceFragmentShadingRatesKHR(physicalDevice, pFragmentShadingRateCount, pFragmentShadingRates);
     vkb_enc_bytes(e, &r_, sizeof(r_));
@@ -6690,6 +6695,7 @@ void vkb_sv_vkGetPhysicalDeviceMultisamplePropertiesEXT(vkb_srv_call *c)
     if (has_pMultisampleProperties) vkb_dec_out_template(d, &pMultisampleProperties_v, sizeof(VkMultisamplePropertiesEXT));
     VkMultisamplePropertiesEXT *pMultisampleProperties = has_pMultisampleProperties ? &pMultisampleProperties_v : NULL;
     if (d->err) { vkb_srv_bad_message(c); return; }
+    if (!vkb_srv_pd_has_ext(c, physicalDevice, "VK_EXT_sample_locations")) { vkb_srv_unsupported(c, "vkGetPhysicalDeviceMultisamplePropertiesEXT", "VK_EXT_sample_locations"); return; }
     if (!c->dt->vkGetPhysicalDeviceMultisamplePropertiesEXT) { vkb_srv_missing(c, "vkGetPhysicalDeviceMultisamplePropertiesEXT"); return; }
     c->dt->vkGetPhysicalDeviceMultisamplePropertiesEXT(physicalDevice, samples, pMultisampleProperties);
     vkb_enc_u8(e, pMultisampleProperties != NULL);

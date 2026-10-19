@@ -24,6 +24,10 @@ struct vkb_srv_call {
 
 void vkb_srv_bad_message(struct vkb_srv_call *c);
 void vkb_srv_missing(struct vkb_srv_call *c, const char *name);
+/* Physical-device commands of device extensions ("A|B": any of them): the driver is asked only
+ * when the device has one; else the call is refused as missing, logged once (DroidDeck#165). */
+int vkb_srv_pd_has_ext(struct vkb_srv_call *c, VkPhysicalDevice pd, const char *list);
+void vkb_srv_unsupported(struct vkb_srv_call *c, const char *name, const char *list);
 void vkb_srv_close_after_send(struct vkb_srv_call *c, int fd);
 
 #endif

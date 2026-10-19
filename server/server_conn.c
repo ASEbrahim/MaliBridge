@@ -91,6 +91,38 @@ void vkb_srv_missing(vkb_srv_call *c, const char *name)
     c->status = VKB_ST_MISSING;
 }
 
+/* The driver's own list (not what is hidden from apps): the loader's entry point for such a
+ * command calls a NULL driver function on a device without the extension (a native run on RADV:
+ * vkGetPhysicalDeviceExternalTensorPropertiesARM crashed at address 0, and the server with it). */
+int vkb_srv_pd_has_ext(vkb_srv_call *c, VkPhysicalDevice pd, const char *list)
+{
+    vkb_srv_table *t = c->table;
+    if (!t || !t->real.vkEnumerateDeviceExtensionProperties) return 0;
+    uint32_t n = 0;
+    if (t->real.vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL) != VK_SUCCESS) return 0;
+    VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));
+    if (!e) return 0;
+    int found = 0;
+    if (t->real.vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e) >= 0)
+        for (uint32_t i = 0; i < n && !found; i++) {
+            size_t l = strlen(e[i].extensionName);
+            for (const char *p = list; *p && !found;) {
+                size_t k = strcspn(p, "|");
+                found = k == l && !strncmp(p, e[i].extensionName, l);
+                p += k + (p[k] == '|');
+            }
+        }
+    free(e);
+    return found;
+}
+
+void vkb_srv_unsupported(vkb_srv_call *c, const char *name, const char *list)
+{
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8) VKB_INFO("%s: the device has none of %s; not asked of the driver", name, list);
+    c->status = VKB_ST_MISSING;
+}
+
 void vkb_srv_close_after_send(vkb_srv_call *c, int fd)
 {
     if (c->nclose < VKB_MAX_FDS) c->close_after[c->nclose++] = fd;

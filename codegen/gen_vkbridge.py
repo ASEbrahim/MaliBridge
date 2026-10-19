@@ -355,6 +355,28 @@ for e in reg.root.find('extensions'):
         if cn != n:
             cmd_aliases_included[cn] = n
 
+# The extensions that list each command name, and each command under any of its names: a command
+# several extensions bring (VK_EXT_ and VK_KHR_calibrated_timestamps) is there when any of them is.
+name_exts = {}  # command name as listed -> [ext names]
+cmd_exts = {}   # canonical cmd -> [ext names]
+for en, (_, cl) in ext_info.items():
+    for cn in cl:
+        for m, k in ((name_exts, cn), (cmd_exts, reg.canon_cmd(cn))):
+            if en not in m.setdefault(k, []):
+                m[k].append(en)
+
+
+def physdev_guard(c):
+    """'A|B' for a physical-device command of device extensions only: the device must have one"""
+    if cmd_origin.get(c, 'core') == 'core' or c not in cmd_exts:
+        return None
+    if reg.canon(reg.commands[c]['params'][0].type) != 'VkPhysicalDevice':
+        return None
+    if any(ext_info[e][0] != 'device' for e in cmd_exts[c]):
+        return None
+    return '|'.join(cmd_exts[c])
+
+
 # Every alias of an included command, wherever it was defined.
 for a, c in reg.cmd_alias.items():
     cc = reg.canon_cmd(a)
@@ -1296,6 +1318,11 @@ for c in wire_cmds:
             call_args.append(p.name)
     vw('if (d->err) { vkb_srv_bad_message(c); return; }')
     fn = f'c->dt->{c}'
+    g = physdev_guard(c)
+    if g:
+        # The loader gives these for any device, and its trampoline calls a NULL driver entry
+        # where the device lacks the extension (Lee Gao, DroidDeck#165): asked only of one that has it.
+        vw(f'if (!vkb_srv_pd_has_ext(c, {params[0].name}, "{g}")) {{ vkb_srv_unsupported(c, "{c}", "{g}"); return; }}')
     vw(f'if (!{fn}) {{ vkb_srv_missing(c, "{c}"); return; }}')
     if ret != 'void':
         vw(f'{ret} r_ = {fn}({", ".join(call_args)});')
@@ -1333,6 +1360,30 @@ for c in wire_cmds:
     ret = cmd['ret']
     cw(f'static VKAPI_ATTR {ret} VKAPI_CALL vkb_ep_{c}({decl})')
     cw('{')
+    g = physdev_guard(c)
+    if g:
+        # vkGetInstanceProcAddr gives it for every device (the loader-ICD interface); on one
+        # without the extension the call says there is nothing, without asking the server.
+        cw(f'if (!vkb_physdev_has_ext({params[0].name}, "{g}")) {{')
+        counted = False
+        for p in params[1:]:
+            t = reg.canon(p.type)
+            if param_class(c, p) != 'out-ptr' or p.len:
+                continue
+            if t == 'uint32_t':
+                cw(f'if ({p.name}) *{p.name} = 0;')
+                counted = True
+            elif t in reg.structs and stype_of(t):
+                cw(f'if ({p.name}) memset((char *){p.name} + offsetof({t}, pNext) + sizeof(void *), 0, sizeof({t}) - offsetof({t}, pNext) - sizeof(void *));')
+            else:
+                cw(f'if ({p.name}) memset({p.name}, 0, sizeof(*{p.name}));')
+        if ret == 'VkResult':
+            cw(f'return {"VK_SUCCESS" if counted else "VK_ERROR_EXTENSION_NOT_PRESENT"};')
+        elif ret != 'void':
+            cw('return 0;')
+        else:
+            cw('return;')
+        cw('}')
     cw(f'{"return " if ret != "void" else ""}vkb_wire_{c}({args});')
     cw('}')
     cw()
@@ -1364,17 +1415,13 @@ for c in sorted(included_cmds):
 for a, c in sorted(cmd_aliases_included.items()):
     entries.append((a, c, None))
 for name, c, origin in sorted(entries):
-    ext = 'NULL'
-    # aliases come from the extension that introduced them; find by registry lookup
-    o = cmd_origin.get(c, 'core') if name == c else None
-    if name != c:
-        # find the extension listing this alias name
-        for en, (_, cl) in ext_info.items():
-            if name in cl:
-                o = en
-                break
-        else:
-            o = 'core'
+    # The extensions listing this very name (an alias or not), any of them enabling it:
+    # vkGetCalibratedTimestampsKHR is VK_KHR_calibrated_timestamps's, its EXT name the EXT one's.
+    o = cmd_origin.get(c, 'core') if name == c else 'core'
+    if o != 'core' and name in name_exts:
+        o = '|'.join(name_exts[name])
+    elif name != c and name in name_exts:
+        o = '|'.join(name_exts[name])
     ext = 'NULL' if o in (None, 'core') else f'"{o}"'
     core = 0
     if name == c and o == 'core' and c in cmd_version:

@@ -6325,6 +6325,10 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyTensorViewARM(VkDevice device,
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, uint32_t* pCounterCount, VkPerformanceCounterARM* pCounters, VkPerformanceCounterDescriptionARM* pCounterDescriptions)
 {
+    if (!vkb_physdev_has_ext(physicalDevice, "VK_ARM_performance_counters_by_region")) {
+        if (pCounterCount) *pCounterCount = 0;
+        return VK_SUCCESS;
+    }
     return vkb_wire_vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM(physicalDevice, queueFamilyIndex, pCounterCount, pCounters, pCounterDescriptions);
 }
 
@@ -6400,21 +6404,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetMemoryFdKHR(VkDevice device, c
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice physicalDevice, uint32_t* pTimeDomainCount, VkTimeDomainKHR* pTimeDomains)
 {
+    if (!vkb_physdev_has_ext(physicalDevice, "VK_EXT_calibrated_timestamps|VK_KHR_calibrated_timestamps")) {
+        if (pTimeDomainCount) *pTimeDomainCount = 0;
+        return VK_SUCCESS;
+    }
     return vkb_wire_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(physicalDevice, pTimeDomainCount, pTimeDomains);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDevice, uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties)
 {
+    if (!vkb_physdev_has_ext(physicalDevice, "VK_KHR_cooperative_matrix")) {
+        if (pPropertyCount) *pPropertyCount = 0;
+        return VK_SUCCESS;
+    }
     return vkb_wire_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physicalDevice, pPropertyCount, pProperties);
 }
 
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceExternalTensorPropertiesARM(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalTensorInfoARM* pExternalTensorInfo, VkExternalTensorPropertiesARM* pExternalTensorProperties)
 {
+    if (!vkb_physdev_has_ext(physicalDevice, "VK_ARM_tensors")) {
+        if (pExternalTensorProperties) memset((char *)pExternalTensorProperties + offsetof(VkExternalTensorPropertiesARM, pNext) + sizeof(void *), 0, sizeof(VkExternalTensorPropertiesARM) - offsetof(VkExternalTensorPropertiesARM, pNext) - sizeof(void *));
+        return;
+    }
     vkb_wire_vkGetPhysicalDeviceExternalTensorPropertiesARM(physicalDevice, pExternalTensorInfo, pExternalTensorProperties);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFragmentShadingRatesKHR(VkPhysicalDevice physicalDevice, uint32_t* pFragmentShadingRateCount, VkPhysicalDeviceFragmentShadingRateKHR* pFragmentShadingRates)
 {
+    if (!vkb_physdev_has_ext(physicalDevice, "VK_KHR_fragment_shading_rate")) {
+        if (pFragmentShadingRateCount) *pFragmentShadingRateCount = 0;
+        return VK_SUCCESS;
+    }
     return vkb_wire_vkGetPhysicalDeviceFragmentShadingRatesKHR(physicalDevice, pFragmentShadingRateCount, pFragmentShadingRates);
 }
 
@@ -6494,7 +6514,7 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkTrimCommandPool(VkDevice device, VkCo
 }
 
 const vkb_proc_desc vkb_client_procs[] = {
-    {"vkAcquireNextImage2KHR", (PFN_vkVoidFunction)vkb_ep_vkAcquireNextImage2KHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain", 0},
+    {"vkAcquireNextImage2KHR", (PFN_vkVoidFunction)vkb_ep_vkAcquireNextImage2KHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain|VK_KHR_device_group", 0},
     {"vkAcquireNextImageKHR", (PFN_vkVoidFunction)vkb_ep_vkAcquireNextImageKHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain", 0},
     {"vkAllocateCommandBuffers", (PFN_vkVoidFunction)vkb_ep_vkAllocateCommandBuffers, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 0, 0)},
     {"vkAllocateDescriptorSets", (PFN_vkVoidFunction)vkb_ep_vkAllocateDescriptorSets, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 0, 0)},
@@ -6597,7 +6617,7 @@ const vkb_proc_desc vkb_client_procs[] = {
     {"vkCmdPushDescriptorSetWithTemplate", (PFN_vkVoidFunction)vkb_ep_vkCmdPushDescriptorSetWithTemplate, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 4, 0)},
     {"vkCmdPushDescriptorSetWithTemplate2", (PFN_vkVoidFunction)vkb_ep_vkCmdPushDescriptorSetWithTemplate2, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 4, 0)},
     {"vkCmdPushDescriptorSetWithTemplate2KHR", (PFN_vkVoidFunction)vkb_ep_vkCmdPushDescriptorSetWithTemplate2, VKB_LEVEL_DEVICE, "VK_KHR_maintenance6", 0},
-    {"vkCmdPushDescriptorSetWithTemplateKHR", (PFN_vkVoidFunction)vkb_ep_vkCmdPushDescriptorSetWithTemplate, VKB_LEVEL_DEVICE, "VK_KHR_push_descriptor", 0},
+    {"vkCmdPushDescriptorSetWithTemplateKHR", (PFN_vkVoidFunction)vkb_ep_vkCmdPushDescriptorSetWithTemplate, VKB_LEVEL_DEVICE, "VK_KHR_push_descriptor|VK_KHR_descriptor_update_template", 0},
     {"vkCmdResetEvent", (PFN_vkVoidFunction)vkb_ep_vkCmdResetEvent, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 0, 0)},
     {"vkCmdResetEvent2", (PFN_vkVoidFunction)vkb_ep_vkCmdResetEvent2, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 3, 0)},
     {"vkCmdResetEvent2KHR", (PFN_vkVoidFunction)vkb_ep_vkCmdResetEvent2, VKB_LEVEL_DEVICE, "VK_KHR_synchronization2", 0},
@@ -6792,15 +6812,15 @@ const vkb_proc_desc vkb_client_procs[] = {
     {"vkGetBufferOpaqueCaptureAddress", (PFN_vkVoidFunction)vkb_ep_vkGetBufferOpaqueCaptureAddress, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 2, 0)},
     {"vkGetBufferOpaqueCaptureAddressKHR", (PFN_vkVoidFunction)vkb_ep_vkGetBufferOpaqueCaptureAddress, VKB_LEVEL_DEVICE, "VK_KHR_buffer_device_address", 0},
     {"vkGetCalibratedTimestampsEXT", (PFN_vkVoidFunction)vkb_ep_vkGetCalibratedTimestampsKHR, VKB_LEVEL_DEVICE, "VK_EXT_calibrated_timestamps", 0},
-    {"vkGetCalibratedTimestampsKHR", (PFN_vkVoidFunction)vkb_ep_vkGetCalibratedTimestampsKHR, VKB_LEVEL_DEVICE, "VK_EXT_calibrated_timestamps", 0},
+    {"vkGetCalibratedTimestampsKHR", (PFN_vkVoidFunction)vkb_ep_vkGetCalibratedTimestampsKHR, VKB_LEVEL_DEVICE, "VK_KHR_calibrated_timestamps", 0},
     {"vkGetDescriptorSetLayoutSupport", (PFN_vkVoidFunction)vkb_ep_vkGetDescriptorSetLayoutSupport, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 1, 0)},
     {"vkGetDescriptorSetLayoutSupportKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDescriptorSetLayoutSupport, VKB_LEVEL_DEVICE, "VK_KHR_maintenance3", 0},
     {"vkGetDeviceBufferMemoryRequirements", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceBufferMemoryRequirements, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 3, 0)},
     {"vkGetDeviceBufferMemoryRequirementsKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceBufferMemoryRequirements, VKB_LEVEL_DEVICE, "VK_KHR_maintenance4", 0},
     {"vkGetDeviceGroupPeerMemoryFeatures", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceGroupPeerMemoryFeatures, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 1, 0)},
     {"vkGetDeviceGroupPeerMemoryFeaturesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceGroupPeerMemoryFeatures, VKB_LEVEL_DEVICE, "VK_KHR_device_group", 0},
-    {"vkGetDeviceGroupPresentCapabilitiesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceGroupPresentCapabilitiesKHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain", 0},
-    {"vkGetDeviceGroupSurfacePresentModesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceGroupSurfacePresentModesKHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain", 0},
+    {"vkGetDeviceGroupPresentCapabilitiesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceGroupPresentCapabilitiesKHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain|VK_KHR_device_group", 0},
+    {"vkGetDeviceGroupSurfacePresentModesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceGroupSurfacePresentModesKHR, VKB_LEVEL_DEVICE, "VK_KHR_swapchain|VK_KHR_device_group", 0},
     {"vkGetDeviceImageMemoryRequirements", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceImageMemoryRequirements, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 3, 0)},
     {"vkGetDeviceImageMemoryRequirementsKHR", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceImageMemoryRequirements, VKB_LEVEL_DEVICE, "VK_KHR_maintenance4", 0},
     {"vkGetDeviceImageSparseMemoryRequirements", (PFN_vkVoidFunction)vkb_ep_vkGetDeviceImageSparseMemoryRequirements, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 3, 0)},
@@ -6832,7 +6852,7 @@ const vkb_proc_desc vkb_client_procs[] = {
     {"vkGetMemoryFdKHR", (PFN_vkVoidFunction)vkb_ep_vkGetMemoryFdKHR, VKB_LEVEL_DEVICE, "VK_KHR_external_memory_fd", 0},
     {"vkGetMemoryFdPropertiesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetMemoryFdPropertiesKHR, VKB_LEVEL_DEVICE, "VK_KHR_external_memory_fd", 0},
     {"vkGetPhysicalDeviceCalibrateableTimeDomainsEXT", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, VKB_LEVEL_PHYSDEV, "VK_EXT_calibrated_timestamps", 0},
-    {"vkGetPhysicalDeviceCalibrateableTimeDomainsKHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, VKB_LEVEL_PHYSDEV, "VK_EXT_calibrated_timestamps", 0},
+    {"vkGetPhysicalDeviceCalibrateableTimeDomainsKHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, VKB_LEVEL_PHYSDEV, "VK_KHR_calibrated_timestamps", 0},
     {"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR, VKB_LEVEL_PHYSDEV, "VK_KHR_cooperative_matrix", 0},
     {"vkGetPhysicalDeviceExternalBufferProperties", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceExternalBufferProperties, VKB_LEVEL_PHYSDEV, NULL, VK_MAKE_API_VERSION(0, 1, 1, 0)},
     {"vkGetPhysicalDeviceExternalBufferPropertiesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceExternalBufferProperties, VKB_LEVEL_PHYSDEV, "VK_KHR_external_memory_capabilities", 0},
@@ -6855,7 +6875,7 @@ const vkb_proc_desc vkb_client_procs[] = {
     {"vkGetPhysicalDeviceMemoryProperties2", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceMemoryProperties2, VKB_LEVEL_PHYSDEV, NULL, VK_MAKE_API_VERSION(0, 1, 1, 0)},
     {"vkGetPhysicalDeviceMemoryProperties2KHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceMemoryProperties2, VKB_LEVEL_PHYSDEV, "VK_KHR_get_physical_device_properties2", 0},
     {"vkGetPhysicalDeviceMultisamplePropertiesEXT", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceMultisamplePropertiesEXT, VKB_LEVEL_PHYSDEV, "VK_EXT_sample_locations", 0},
-    {"vkGetPhysicalDevicePresentRectanglesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDevicePresentRectanglesKHR, VKB_LEVEL_PHYSDEV, "VK_KHR_swapchain", 0},
+    {"vkGetPhysicalDevicePresentRectanglesKHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDevicePresentRectanglesKHR, VKB_LEVEL_PHYSDEV, "VK_KHR_swapchain|VK_KHR_device_group", 0},
     {"vkGetPhysicalDeviceProperties", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceProperties, VKB_LEVEL_PHYSDEV, NULL, VK_MAKE_API_VERSION(0, 1, 0, 0)},
     {"vkGetPhysicalDeviceProperties2", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceProperties2, VKB_LEVEL_PHYSDEV, NULL, VK_MAKE_API_VERSION(0, 1, 1, 0)},
     {"vkGetPhysicalDeviceProperties2KHR", (PFN_vkVoidFunction)vkb_ep_vkGetPhysicalDeviceProperties2, VKB_LEVEL_PHYSDEV, "VK_KHR_get_physical_device_properties2", 0},

@@ -122,6 +122,16 @@ run_mode() {
     fi
   fi
   if [ -x out/memclass_check ]; then timeout 60 ./out/memclass_check >out/t-memclass.log 2>&1; result $? "memclass_check ($(tail -1 out/t-memclass.log))"; fi
+  # Extension commands through the procaddr functions (DroidDeck#165): physical-device ones of
+  # extensions the device lacks are safe to call (the server crashed on VK_ARM_tensors' at address
+  # 0); vkGetDeviceProcAddr follows the enabled extensions (VK_KHR_calibrated_timestamps alone gave
+  # NULL for vkGetCalibratedTimestampsKHR); and with calibrated timestamps hidden from the app
+  if [ -x out/procaddr_check ]; then
+    timeout 60 ./out/procaddr_check >out/t-procaddr.log 2>&1 && ! grep -q "crashed with signal" "$VKB_SERVER_LOG"
+    result $? "procaddr_check ($(tail -1 out/t-procaddr.log))"
+    VKBRIDGE_HIDE_EXTS=${VKBRIDGE_HIDE_EXTS:+$VKBRIDGE_HIDE_EXTS,}VK_KHR_calibrated_timestamps,VK_EXT_calibrated_timestamps timeout 60 ./out/procaddr_check >out/t-procaddr-hidden.log 2>&1
+    result $? "procaddr_check, calibrated timestamps hidden ($(tail -1 out/t-procaddr-hidden.log))"
+  fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
   # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
   if [ -x out/desc_traffic_check ]; then

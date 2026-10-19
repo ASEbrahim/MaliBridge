@@ -142,6 +142,7 @@ typedef struct vkb_memory {
 
 static inline vkb_device *vkb_dev(VkDevice d) { return (vkb_device *)d; }
 static inline vkb_physdev *vkb_pd(VkPhysicalDevice p) { return (vkb_physdev *)p; }
+int vkb_physdev_has_ext(VkPhysicalDevice p, const char *list); /* "A|B": the device (as the app sees it) has one */
 static inline vkb_instance *vkb_inst(VkInstance i) { return (vkb_instance *)i; }
 static inline vkb_cmdbuf *vkb_cb(VkCommandBuffer c) { return (vkb_cmdbuf *)c; }
 

@@ -702,5 +702,9 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceMultisamplePropertiesEXT(Vk
                                                                               VkSampleCountFlagBits samples,
                                                                               VkMultisamplePropertiesEXT *pProps)
 {
+    if (!vkb_physdev_has_ext(physicalDevice, "VK_EXT_sample_locations")) { /* as the generated ones (icd.c) */
+        pProps->maxSampleLocationGridSize = (VkExtent2D){0, 0};
+        return;
+    }
     vkb_wire_vkGetPhysicalDeviceMultisamplePropertiesEXT(physicalDevice, samples, pProps);
 }
