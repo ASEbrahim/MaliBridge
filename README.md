@@ -1,8 +1,43 @@
 # MaliBridge
 
-A Vulkan bridge that runs DX11/DX12 PC games on Mali GPUs.
+**Play Steam and PC games on Android phones and tablets with a Mali GPU**: MediaTek Dimensity,
+Google Tensor, Xiaomi XRing, older Samsung Exynos and other Arm Mali / Immortalis chips.
+MaliBridge runs inside DroidDeck and uses your device's own Mali driver, so no custom GPU driver
+is needed.
 
-## What it is
+**[Download](https://github.com/ASEbrahim/MaliBridge/releases/latest)** ·
+**[Install guide](INSTALL.md)** · **[Does my device work?](#does-my-device-work)** ·
+**[Games that run](#status)** · **[FAQ](INSTALL.md#faq)** ·
+**[Report a problem](https://github.com/ASEbrahim/MaliBridge/issues)**
+
+On a Galaxy Tab S10+ (Mali-G720) and a Galaxy Tab S11 Ultra (Mali-G925), 26 of the 36 games we've
+tested run well, for example Half-Life 2 at about 94 fps, Hollow Knight: Silksong, Stardew Valley,
+Risk of Rain Returns, Dark Souls Remastered and Garry's Mod. It is a free, open-source test build.
+
+## Does my device work?
+
+You need an Arm Mali GPU. Find your phone's chip in its specs, then look it up here:
+
+| Chip | GPU | Example devices | Status |
+|---|---|---|---|
+| Dimensity 9300 / 9300+ | Immortalis-G720 MC12 | Galaxy Tab S10+, Xiaomi 14T Pro, vivo X100 Pro | **Works well** (tested in depth) |
+| Dimensity 9400 / 9400+ | Immortalis-G925 MC12 | Galaxy Tab S11 Ultra, vivo X200, OPPO Find X8 | **Works well** (tested in depth) |
+| Dimensity 8400 / 8500 | Mali-G720 MC7 / MC8 | POCO X7 Pro, POCO X8 Pro | Same GPU family as the S10+, smaller; not tested yet, likely to work |
+| Dimensity 9500 | Mali-G1-Ultra MC12 | OPPO Find X9 Pro | Not tested yet |
+| Xiaomi XRing O3 | Mali-G2-Ultra-NX MC16 | Xiaomi 18 Fold | Being tested with players; v0.5.1 has fixes for it |
+| Google Tensor G3 / G4 | Mali-G715 | Pixel 8, Pixel 9 | Steam starts (player report); games not confirmed yet |
+| Dimensity 9000 / 9200 | Mali-G710 / Immortalis-G715 | OnePlus Ace 2V | Not tested yet |
+| Dimensity 7300, 8100, 8200, Helio G99 and similar | Mali-G615 / G610 / G57 | many mid-range phones | Not tested yet; smaller GPUs, expect light games only |
+| Exynos 1280 / 1380 / 2100 | Mali-G68 / G78 | Galaxy A53, A54, S21 | Not tested yet |
+
+**Not Mali:** Snapdragon chips have Adreno GPUs (use the official DroidDeck). Recent Samsung Exynos
+chips (2200, 2400, 2500) have Xclipse GPUs, and the Pixel 10's Tensor G5 has a PowerVR GPU; MaliBridge
+doesn't support these.
+
+On a device marked "not tested yet", it's still a test: it depends on the GPU and its driver. Logs
+from your device help a lot (see [If something goes wrong](INSTALL.md#if-something-goes-wrong)).
+
+## How it works
 
 PC games on an Android device run in a Linux guest (glibc, aarch64) under x86 emulation, with
 DXVK or vkd3d-proton turning Direct3D into Vulkan. The guest has no GPU driver of its own. The
@@ -48,7 +83,7 @@ Mali" (`com.droiddeck.launcher.mali`), and installs next to the official DroidDe
 is still work in progress.
 
 Ratings, from worst to best: barely runs, kinda playable, playable, very playable, excellent. They come from
-playing where we did (the owner's notes) and from the frame rate otherwise.
+playing the games ourselves where we did, and from the frame rate otherwise.
 
 | Game | Mali-G720 (Tab S10+) | Mali-G925 (Tab S11 Ultra) |
 |---|---|---|
@@ -79,11 +114,11 @@ playing where we did (the owner's notes) and from the frame rate otherwise.
 | R.E.P.O. | not tested yet | **Playable**, about 40 fps in single player |
 | Muck | not tested yet | **Playable**, 45-48 fps on the island |
 | Phoenix Wright: Ace Attorney Trilogy | not tested yet | **Excellent**, about 118 fps (the 120 Hz display rate) |
-| Helltaker | not tested yet | **Excellent**, about 59 fps (owner: "works perfectly") |
+| Helltaker | not tested yet | **Excellent**, about 59 fps, works perfectly |
 | GRIS | not tested yet | **Excellent**, about 119 fps |
-| A Dance of Fire and Ice | not tested yet | **Excellent**, about 106-113 fps; the owner noticed no input delay with a Bluetooth PS5 controller |
+| A Dance of Fire and Ice | not tested yet | **Excellent**, about 106-113 fps; no input delay noticed with a Bluetooth PS5 controller |
 | Stick Fight: The Game | not tested yet | **Excellent**, 59-60 fps (its cap) |
-| Risk of Rain Returns | **Excellent**, 59-60 fps in play including a boss fight (never below 59) | **Excellent**, 59-60 fps on the title screen and in play (owner: "running perfectly"); earlier builds froze at the intro video (see below) |
+| Risk of Rain Returns | **Excellent**, 59-60 fps in play including a boss fight (never below 59) | **Excellent**, 59-60 fps on the title screen and in play; earlier builds froze at the intro video (see below) |
 | Don't Starve Together | not tested yet | **Excellent**, 60 fps, but only with `PROTON_USE_WINED3D=1 %command%` as the game's launch option; the default DXVK path closes a few seconds after start (an assert in DXVK's shader translator, not the bridge) |
 | ASTRONEER | not tested yet | **Kinda playable**, renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; neutral colour grade |
 | The Forest | not tested yet | **Playable**, 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
@@ -93,7 +128,7 @@ Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mo
 built-in presets described below. The other G925 figures are from v0.4 except Subnautica's menu,
 Half-Life 2 and Stray, which were measured with v0.5.
 The games from Poppy Playtime to Outer Wilds were played on the G925 with v0.5 test builds in
-October 2026, some by us and some by the owner (fps read from the launcher's frame counter).
+October 2026, played by hand (fps read from the launcher's frame counter).
 Risk of Rain Returns needed a fix in the client: the G925 driver refuses multi-planar (NV12)
 images created with `MUTABLE_FORMAT | EXTENDED_USAGE`, which DXVK uses for video textures, so
 games that decode intro videos through Media Foundation waited for a frame that never came.
