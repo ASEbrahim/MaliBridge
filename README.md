@@ -78,7 +78,7 @@ G720. See [INSTALL.md](INSTALL.md) to try it. Everything here is still work in p
 | GRIS | not tested yet | runs well, about 119 fps |
 | A Dance of Fire and Ice | not tested yet | runs well, about 106-113 fps; the owner noticed no input delay with a Bluetooth PS5 controller |
 | Stick Fight: The Game | not tested yet | runs well, 59-60 fps (its cap) |
-| Risk of Rain Returns | not tested yet | runs well with v0.5, 59-60 fps on the title screen and in play (owner: "running perfectly"); earlier builds froze at the intro video (see below) |
+| Risk of Rain Returns | runs well with v0.5, 59-60 fps in play including a boss fight (never below 59) | runs well with v0.5, 59-60 fps on the title screen and in play (owner: "running perfectly"); earlier builds froze at the intro video (see below) |
 | Don't Starve Together | not tested yet | 60 fps, but only with `PROTON_USE_WINED3D=1 %command%` as the game's launch option; the default DXVK path closes a few seconds after start (an assert in DXVK's shader translator, not the bridge) |
 | ASTRONEER | not tested yet | renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; neutral colour grade |
 | The Forest | not tested yet | 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
@@ -92,6 +92,7 @@ October 2026, some by us and some by the owner (fps read from the launcher's fra
 Risk of Rain Returns needed a fix in the client: the G925 driver refuses multi-planar (NV12)
 images created with `MUTABLE_FORMAT | EXTENDED_USAGE`, which DXVK uses for video textures, so
 games that decode intro videos through Media Foundation waited for a frame that never came.
+With the fix it also runs at 59-60 fps on the G720.
 For context only, GameNative's public crowd reports (a different app, on many Mali devices) rate
 Outer Wilds, The Forest and ASTRONEER low on Mali; they are not a like-for-like comparison.
 
@@ -126,7 +127,12 @@ order, not alternated, so differences of a few percent are within noise.
 - **The Steam window on the Mali-G925** can be slow: Steam's web view process crashes at start and
   falls back to drawing on the CPU. Drawing it through ANGLE on Vulkan
   (`BL_VKBRIDGE_CEF_ANGLE=vulkan` in DroidDeck) stops the crashes, but compositing is still done
-  on the CPU. A full fix is pending; it is not on by default.
+  on the CPU. A full fix is pending; it is not on by default. On the Mali-G720 the default window
+  is smooth, and this setting makes it slow there.
+- **Just Cause 2** does not start. Steam's copy protection (CEG) runs a helper that fingerprints
+  the Windows folders; inside DroidDeck's sandbox it takes about 5 minutes, and Steam gives up
+  after about 100 s. The game never reaches the GPU, so this is not a bridge issue. The fix
+  belongs in DroidDeck's sandbox (faster file lookups).
 - **Don't Starve Together** needs `PROTON_USE_WINED3D=1 %command%` as its launch option. With the
   default DXVK it closes at start: DXVK's shader model 3 translator hits an assert. This is a DXVK
   bug, not a bridge one.
@@ -160,12 +166,13 @@ Each one turns on only when the GPU lacks the feature.
 - **Stream output fold**: the pass-through geometry shader that DXVK builds for D3D11 stream output is folded into the vertex shader. Mali runs geometry shaders very slowly (Subnautica went from 6 to ~30 fps).
 - **Clip/cull distance**: built-ins turned into varyings, with clipping done in the fragment shader.
 - **Per-vertex built-ins**: loose built-ins in geometry and tessellation shaders are folded into `gl_PerVertex` blocks. Loose ones crash Mali's compiler.
+- **Multi-planar (NV12) video images**: where the format already supports the requested usage, the client leaves out `EXTENDED_USAGE` on `MUTABLE_FORMAT` multi-planar images, which the G925 driver refuses (video textures, Risk of Rain Returns). `VKBRIDGE_PLANAR_EXT_FIX=0` turns it off.
 - **SPIR-V fixes**: DXVK's spec-constant `OpSelect` guards, which Mali's compiler folds wrongly so textures read black; YCbCr samplers in compute layouts.
 - **Shift barriers**: a no-op `OpBitFieldInsert` after each left shift by a constant (Lee Gao's MaliOptimizationBarrierPass), so the compiler cannot fold the shift into speculative memory accesses that fault the GPU. On for every ARM GPU; `VKBRIDGE_SHL_BARRIER=0` turns it off.
 - **Vertex attribute divisor**: the binding gets a stride of 0 and is rebound for each run of instances, with draws split to match. Also used where the driver has only `VK_KHR_vertex_attribute_divisor` without the zero divisor (the Mali-G925 on Android 16), and `VK_EXT_vertex_attribute_divisor` is offered there: vkd3d-proton refuses a GPU without it ("DirectX 12 required" in The Witcher 3).
 - **Renamed extensions**: where a newer driver has only the KHR name of an extension that games look for under its EXT name (index_type_uint8, line_rasterization, robustness2, global_priority, load_store_op_none, vertex_attribute_divisor), the EXT name is offered and mapped onto the KHR one.
 - **maintenance5 / maintenance6, depth clip enable, load/store op none**: mapped onto what the driver has.
-- **Polygon mode LINE / POINT** (`fillModeNonSolid`, wireframe; DXVK 3 will not start without it): a pipeline that asks for it gets a line-list or point-list variant, and its draws go through that. A non-indexed draw uses a fixed list of each triangle's three edges; an indexed one gets its edges written by a compute shader (`server/shaders/polygon/lines.comp`) in a command buffer submitted just before the app's, so the render pass is not split. Strips, fans and strip restarts are handled; no geometry shader is used (Mali runs those slowly). Dynamic topology and restart (vkd3d-proton) are read at each draw. Back-face culling and depth bias do not apply to the emulated lines; indirect draws and pipeline libraries still draw solid (logged). `VKBRIDGE_POLYGON_EMU=0` draws all of it solid. The approach follows Mesa's panvk and taowen's libhybris compatibility layer (Apache-2.0).
+- **Polygon mode LINE / POINT** (`fillModeNonSolid`, wireframe; DXVK 3 will not start without it): a pipeline that asks for it gets a line-list or point-list variant, and its draws go through that. A non-indexed draw uses a fixed list of each triangle's three edges; an indexed one gets its edges written by a compute shader (`server/shaders/polygon/lines.comp`) in a command buffer submitted just before the app's, so the render pass is not split. Strips, fans and strip restarts are handled; no geometry shader is used (Mali runs those slowly). Dynamic topology and restart (vkd3d-proton) are read at each draw. Back-face culling and depth bias do not apply to the emulated lines; indirect draws and pipeline libraries still draw solid (logged). Half-Life 2's `mat_wireframe 1` draws as lines on the G720. `VKBRIDGE_POLYGON_EMU=0` draws all of it solid. The approach follows Mesa's panvk and taowen's libhybris compatibility layer (Apache-2.0).
 - **dualSrcBlend, multiViewport**: reported so that DXVK 3 starts. The rare use is approximated and logged.
 - **multiDrawIndirect** (Mali-G57 on r32/r38): an indirect draw of n commands is recorded as n single indirect draws.
 - **Storage texel buffer alignment**: any texel offset is accepted (vkd3d-proton 3).
