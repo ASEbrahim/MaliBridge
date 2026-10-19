@@ -504,7 +504,25 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetMemoryFdPropertiesKHR(VkDevice device
                                                                  VkMemoryFdPropertiesKHR *pProps)
 {
     VkResult r = vkb_wire_vkGetMemoryFdPropertiesKHR(device, handleType, fd, pProps);
-    if (r == VK_SUCCESS) pProps->memoryTypeBits = vkb_mem_bits_to_client(vkb_dev(device)->pd, pProps->memoryTypeBits, 0);
+    if (r != VK_SUCCESS) return r;
+    vkb_physdev *pd = vkb_dev(device)->pd;
+    uint32_t server_bits = pProps->memoryTypeBits;
+    pProps->memoryTypeBits = vkb_mem_bits_to_client(pd, server_bits, 0);
+    /* Mali puts a dma-buf only in its host-visible cached type, which the client offers only as a
+     * shared type (refused for imports): the bits came out 0, and an app that imports in a type
+     * both the fd and the resource allow (gamescope's DMA-BUF patch for other GPUs: "No compatible
+     * image memory type (image=0x1, fd=0x0)") had none. The device-local types without host
+     * access (where images go) take an importable fd too: the server imports an fd with a
+     * dedicated image or buffer in a type the fd and the resource both allow, and one without in
+     * the type asked, as before (server_memory.c, fit_import_type). */
+    if (server_bits)
+        for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount; i++) {
+            VkMemoryPropertyFlags f = pd->client_mem.memoryTypes[i].propertyFlags;
+            VkMemoryPropertyFlags sf = pd->server_mem.memoryTypes[pd->type_map[i].server_type].propertyFlags;
+            if (!pd->type_map[i].shared && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                !((f | sf) & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT)))
+                pProps->memoryTypeBits |= 1u << i;
+        }
     return r;
 }
 

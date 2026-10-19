@@ -1048,9 +1048,84 @@ static VKAPI_ATTR void VKAPI_CALL xring_GetDeviceImageMemoryRequirements(VkDevic
     r->memoryRequirements.memoryTypeBits &= xring_dev[s].mask;
 }
 
+/* ------------------------------------------------------------------ Mali's dma-buf fd properties, imitated */
+
+/*
+ * VKBRIDGE_FAKE_MISSING=...,dmabuftypes (host tests): Mali's vkGetMemoryFdPropertiesKHR for a
+ * dma-buf lists only its host-visible cached type (G720 r44p1: 0x2, type 1 0xb), which the client
+ * offers only as a shared type, and none of the types images go in. Here a dma-buf's fd properties
+ * are the driver's host-visible cached types, and a dma-buf import in another type is refused with
+ * VK_ERROR_INVALID_EXTERNAL_HANDLE (out of the spec either way; so a test sees the type the
+ * server imported in).
+ */
+static struct {
+    vkb_srv_table *t;
+    uint32_t mask;
+    PFN_vkGetMemoryFdPropertiesKHR props;
+    PFN_vkAllocateMemory alloc;
+} fdt_dev[16];
+
+static int fdt_slot(void)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    for (int i = 0; i < 16 && fdt_dev[i].t; i++)
+        if (fdt_dev[i].t == t) return i;
+    return 0;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fdt_GetMemoryFdPropertiesKHR(VkDevice d, VkExternalMemoryHandleTypeFlagBits h, int fd,
+                                                                    VkMemoryFdPropertiesKHR *p)
+{
+    int s = fdt_slot();
+    VkResult r = fdt_dev[s].props(d, h, fd, p);
+    if (r == VK_SUCCESS && h == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) p->memoryTypeBits = fdt_dev[s].mask;
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fdt_AllocateMemory(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a,
+                                                         VkDeviceMemory *out)
+{
+    int s = fdt_slot();
+    for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR &&
+            ((const VkImportMemoryFdInfoKHR *)b)->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+            (ai->memoryTypeIndex >= 32 || !(fdt_dev[s].mask & (1u << ai->memoryTypeIndex)))) {
+            VKB_INFO("imitated dma-buf fd properties: an import in type %u refused (the dma-buf takes 0x%x)", ai->memoryTypeIndex,
+                     fdt_dev[s].mask);
+            *out = VK_NULL_HANDLE;
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        }
+    return fdt_dev[s].alloc(d, ai, a, out);
+}
+
+static void fdt_install(vkb_srv_table *t)
+{
+    if (!vkb_emu_faked("dmabuftypes") || !t->real.vkGetMemoryFdPropertiesKHR || !t->real.vkAllocateMemory) return;
+    for (int i = 0; i < 16; i++) {
+        if (fdt_dev[i].t && fdt_dev[i].t != t) continue;
+        VkPhysicalDeviceMemoryProperties mp;
+        t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+        uint32_t mask = 0;
+        for (uint32_t k = 0; k < mp.memoryTypeCount && k < 32; k++)
+            if ((mp.memoryTypes[k].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) &&
+                !(mp.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_PROTECTED_BIT))
+                mask |= 1u << k;
+        fdt_dev[i].mask = mask;
+        fdt_dev[i].props = t->real.vkGetMemoryFdPropertiesKHR;
+        fdt_dev[i].alloc = t->real.vkAllocateMemory;
+        __atomic_store_n(&fdt_dev[i].t, t, __ATOMIC_RELEASE);
+        t->real.vkGetMemoryFdPropertiesKHR = t->dt.vkGetMemoryFdPropertiesKHR = fdt_GetMemoryFdPropertiesKHR;
+        t->real.vkAllocateMemory = t->dt.vkAllocateMemory = fdt_AllocateMemory;
+        VKB_INFO("imitating Mali's dma-buf fd properties: a dma-buf takes memory types 0x%x only", mask);
+        return;
+    }
+}
+
 /* At the driver's level (t->real), before the layers above it take their copies of it. */
 void vkb_mem_device_install(vkb_srv_table *t)
 {
+    fdt_install(t);
     if (!fake_xring() || !t->real.vkGetImageMemoryRequirements) return;
     for (int i = 0; i < 16; i++) {
         if (xring_dev[i].t && xring_dev[i].t != t) continue;
@@ -1277,6 +1352,47 @@ static void close_import_fds(const void *pNext)
         if (b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) vkb_close_fd(((const VkImportMemoryFdInfoKHR *)b)->fd);
 }
 
+/*
+ * A dma-buf import with a dedicated image or buffer, in a type the driver's fd properties leave
+ * out, moved to one they list that the resource allows too, never lazily allocated or protected.
+ * Without the struct (the resource unknown), or with no such type, the type stays: Mali took
+ * dma-bufs in its type 0 though its fd properties say type 1 only. The
+ * client offers its device-local type for every importable fd (client/memory.c): on Mali the fd's
+ * own type is host-visible, which the client offers only as shared, so the fd's client bits were
+ * 0 and gamescope's DMA-BUF patch for other GPUs found no type to import in.
+ */
+static void fit_import_type(vkb_srv_table *t, VkMemoryAllocateInfo *ai, int fd)
+{
+    const vkb_dispatch *dt = &t->real;
+    VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    if (!dt->vkGetMemoryFdPropertiesKHR ||
+        dt->vkGetMemoryFdPropertiesKHR(t->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) != VK_SUCCESS ||
+        !fp.memoryTypeBits || ai->memoryTypeIndex >= 32 || (fp.memoryTypeBits & (1u << ai->memoryTypeIndex)))
+        return;
+    const VkMemoryDedicatedAllocateInfo *d = NULL;
+    for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) d = (const VkMemoryDedicatedAllocateInfo *)b;
+    if (!d || (!d->image && !d->buffer)) return;
+    VkMemoryRequirements req;
+    if (d->image)
+        dt->vkGetImageMemoryRequirements(t->device, d->image, &req);
+    else
+        dt->vkGetBufferMemoryRequirements(t->device, d->buffer, &req);
+    uint32_t want = req.memoryTypeBits;
+    VkPhysicalDeviceMemoryProperties mp;
+    dt->vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+    uint32_t ordinary = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if (!(mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT))) ordinary |= 1u << i;
+    uint32_t bits = fp.memoryTypeBits & want & ordinary;
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+        VKB_INFO("dma-buf import: type %u is not one the dma-buf takes (types 0x%x, the %s 0x%x); %s %d", ai->memoryTypeIndex,
+                 fp.memoryTypeBits, d->image ? "image" : "buffer", want,
+                 bits ? "imported in type" : "kept, none fits", bits ? __builtin_ctz(bits) : (int)ai->memoryTypeIndex);
+    if (bits) ai->memoryTypeIndex = (uint32_t)__builtin_ctz(bits);
+}
+
 void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
 {
     VkDevice dev = (VkDevice)(uintptr_t)vkb_dec_u64(&c->d);
@@ -1326,6 +1442,10 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
                 import_fd = ((const VkImportMemoryFdInfoKHR *)b)->fd;
         int emulating = t->pd && (t->pd->info.emu & VKB_EMU_DMABUF_EXPORT) && wants_dmabuf_export(&ai);
         const char *path = import_fd >= 0 ? "dma-buf import" : opaque ? "opaque fd as dma-buf" : "plain";
+        if (import_fd >= 0) {
+            fit_import_type(t, &ai, import_fd);
+            m->type = ai.memoryTypeIndex;
+        }
         uint32_t type = ai.memoryTypeIndex;
         if (fake_lazy() && import_fd < 0 && !opaque) {
             /* Mali refuses ordinary memory in its lazily allocated type (the imitation above). */
