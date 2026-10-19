@@ -67,6 +67,12 @@ typedef struct vkb_server_pd_info {
     uint32_t image_types;          /* server memory types the self-test's images and plain buffers all allow; 0: unknown (older server) */
     uint32_t heap_max_mb;          /* VKBRIDGE_HEAP_MAX_MB from the server (a per-game preset): device-local heaps reported at most this; 0: nothing said */
     uint32_t spoof_gpu;            /* VKB_SPOOF_*: VKBRIDGE_SPOOF_GPU from the server; 0: nothing said */
+    uint32_t dl_types;             /* server types for the client's device-local types without host access, one each (the images'
+                                    * first), when resources disagree on one (XRing O3: images type 6, buffers 0x3); then also
+                                    * every shareable type is offered. 0: one type, from image_types. An older server's reply
+                                    * ends before it (the client reads what is there: vkb_dec_raw_tail); an older client reads
+                                    * the first 64 bytes */
+    uint32_t reserved;
 } vkb_server_pd_info;
 
 /* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an

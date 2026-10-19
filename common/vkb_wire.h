@@ -66,6 +66,7 @@ uint8_t vkb_dec_u8(vkb_dec *d);
 uint32_t vkb_dec_u32(vkb_dec *d);
 uint64_t vkb_dec_u64(vkb_dec *d);
 void vkb_dec_raw_into(vkb_dec *d, void *dst, size_t n);
+void vkb_dec_raw_tail(vkb_dec *d, void *dst, size_t n);
 const void *vkb_dec_raw_view(vkb_dec *d, size_t n);
 void *vkb_dec_alloc(vkb_dec *d, size_t n);       /* zeroed */
 void *vkb_dec_alloc_zero(vkb_dec *d, size_t n);

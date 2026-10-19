@@ -236,6 +236,7 @@ static int server_init(const char *vk_lib, const char *cache_dir)
     vkb_dispatch_load_instance(&vkb_global_dt, vkb_gipa, VK_NULL_HANDLE);
     vkb_pcache_set_dir(cache_dir);
     vkb_srv_env_reload(); /* <cache dir>/env: VKBRIDGE_FAKE_MISSING and the like reach the self-test */
+    vkb_gipa = vkb_mem_imitate_gipa(vkb_gipa); /* host tests: another Mali's memory table (server_memory.c) */
     vkb_mode_refresh();   /* logged with its source; the probe decides for both modes */
     vkb_selftest_all();
     return 1;

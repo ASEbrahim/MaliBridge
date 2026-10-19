@@ -151,7 +151,20 @@ static void build_memory_model(vkb_physdev *pd)
                     break;
                 }
             }
+        /* Resources that do not all allow that one (the server's dl_types; the XRing O3's buffers
+         * allow 0x3 only, its images type 6: every buffer's mask came out without a device-local
+         * type): one more such type for each other backing they need, at most 4 in all. */
+        uint32_t more = nc ? pd->info.dl_types & ~(1u << cands[0].server) : 0;
+        for (uint32_t t = 0; more && t < s->memoryTypeCount && nc < 4; t++) {
+            if (!(more & (1u << t))) continue;
+            cands[nc++] = (struct cand){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s->memoryTypes[t].heapIndex, t, 0, 0};
+            VKB_INFO("memory: device-local type also backed by server type %u (flags 0x%x; resources need types 0x%x)", t,
+                     s->memoryTypes[t].propertyFlags, pd->info.dl_types);
+        }
     }
+    /* With dl_types the server's resources disagree on types: every shareable type is offered,
+     * also one with the flags of another (a buffer may allow the one and not the other). */
+    int keep_dups = uma && pd->info.dl_types;
     for (uint32_t t = 0; t < s->memoryTypeCount && nc < VK_MAX_MEMORY_TYPES; t++) {
         VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
         uint32_t heap = s->memoryTypes[t].heapIndex;
@@ -171,7 +184,7 @@ static void build_memory_model(vkb_physdev *pd)
         (void)host_heap;
         /* Two client types with identical flags on one heap are pointless: keep the first. */
         int dup = 0;
-        for (uint32_t i = 0; i < nc; i++) dup |= cands[i].flags == cf && cands[i].heap == heap;
+        for (uint32_t i = 0; i < nc && !keep_dups; i++) dup |= cands[i].flags == cf && cands[i].heap == heap;
         if (!dup) cands[nc++] = (struct cand){cf, heap, t, 1, 0};
     }
     /* Cached readback for apps (VKB_CACHED_APPS, server_memory.c): a HOST_CACHED type without
@@ -342,7 +355,7 @@ int vkb_physdev_ready(vkb_physdev *pd)
         pthread_mutex_unlock(&pd->lock);
         return 0;
     }
-    vkb_dec_raw_into(&c.d, &pd->info, sizeof(pd->info));
+    vkb_dec_raw_tail(&c.d, &pd->info, sizeof(pd->info)); /* an older server's is shorter (no dl_types) */
     vkb_call_end(&c);
     vkb_client_knobs_set(pd->info.client_knobs);
     vkb_wire_vkGetPhysicalDeviceProperties((VkPhysicalDevice)pd, &pd->props);

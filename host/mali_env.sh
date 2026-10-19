@@ -3,7 +3,8 @@
 # found (no BCn, clip/cull distance, vertex attribute divisor, maintenance5, push descriptors, robustness2, 500,000 descriptors per stage, no opaque fds; Vulkan 1.3),
 # and with Mali's memory types: the only device-local type without host access is lazily allocated
 # (lazymem: ordinary allocations there fail with -2, as a Pixel 9 on an older client showed).
-# VKB_MISSING_ADD=xringmem adds to the list (xringmem: images skip the first ordinary device-local type, as on the XRing O3).
+# VKB_MISSING_ADD=xringmem adds to the list (xringmem: the XRing O3's 22 memory types, images and buffers allowing different ones;
+# g720mem: the G720's and G925's 4 types; server_memory.c).
 # VKB_MISSING_ADD=dmabuftypes: a dma-buf's fd properties list only the host-visible cached types, as Mali's do.
 # Like Mali r44 it refuses dma-buf images at LINEAR/OPTIMAL tiling (dmabuflinear: only DRM-modifier
 # dma-buf images are made; the rest get VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT).

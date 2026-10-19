@@ -36,13 +36,31 @@ run_mode() {
     grep -q "imitating Mali's memory types" "$VKB_SERVER_LOG" && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG" &&
       ! grep -q "no ordinary device-local type" out/t-smoke.log
     result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' "$VKB_SERVER_LOG"))"
-    # The XRing O3's image requirements (xringmem, issue #1): its images do not list the first
-    # ordinary device-local type, so the client's device-local type is backed by one they do list
-    # (the client's mask for every image was empty: "no memory type for the image (types 0x0 allowed)")
+    # The XRing O3's memory table (xringmem, issue #1): 22 types; images allow type 6 but not 0
+    # or 1, buffers 0x3 and by usage more (indirect 6, the others 14). v0.5 had one device-local
+    # type (type 6's) and one shared type (14): images fit, the draws' indirect buffers had no
+    # host-visible type ("no memory type for the buffer (types 0x1 allowed)"), texel buffers none
+    # at all. Now a device-local type for each backing resources need and every shareable type.
     VKB_MISSING_ADD=xringmem . ./mali_env.sh >/dev/null
-    timeout 120 ./out/vkbridge-smoke >out/t-smoke-xring.log 2>&1 && grep -q "imitating the XRing O3" "$VKB_SERVER_LOG" &&
-      ! grep -q "no memory type for the image" out/t-smoke-xring.log && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG"
-    result $? "smoke, XRing O3's image requirements: images get a memory type ($(tail -1 out/t-smoke-xring.log))"
+    timeout 120 ./out/vkbridge-smoke >out/t-smoke-xring.log 2>&1 && grep -q "imitating the XRing O3's memory table" "$VKB_SERVER_LOG" &&
+      grep -q "resources disagree on device-local types" "$VKB_SERVER_LOG" &&
+      ! grep -q "no memory type for the" out/t-smoke-xring.log && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG"
+    result $? "smoke, XRing O3's memory table ($(tail -1 out/t-smoke-xring.log))"
+    timeout 60 ./out/memclass_check >out/t-memclass-xring.log 2>&1 && ! grep -q "gets no client type" out/t-memclass-xring.log
+    result $? "memclass_check, XRing O3's memory table: every image and buffer kind has a type ($(tail -1 out/t-memclass-xring.log))"
+    # ... with Mali's dma-buf fd properties too (gamescope's DMA-BUF import: a type both allow)
+    VKB_MISSING_ADD=xringmem,dmabuftypes . ./mali_env.sh >/dev/null
+    timeout 60 ./out/fdprops_check >out/t-fdprops-xring.log 2>&1 && grep -q "imitating Mali's dma-buf fd properties" "$VKB_SERVER_LOG"
+    result $? "fdprops_check, XRing O3's memory table and Mali's fd properties ($(tail -1 out/t-fdprops-xring.log))"
+    # The G720's and G925's memory table (g720mem): images and buffers agree on type 0, so the
+    # client's types are what v0.5 made of it on those tablets, and nothing disagrees
+    from=$(($(wc -l <"$VKB_SERVER_LOG") + 1)) # this server's lines only (the log goes on across restarts)
+    VKB_MISSING_ADD=g720mem . ./mali_env.sh >/dev/null
+    timeout 60 ./out/memclass_check >out/t-memclass-g720.log 2>&1 &&
+      grep -qx "memory types: 0:0x1 1:0x11 2:0x21/h1 3:0xf" out/t-memclass-g720.log &&
+      tail -n +$from "$VKB_SERVER_LOG" | grep -q "imitating the Mali-G720's memory table" &&
+      ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "resources disagree"
+    result $? "memclass_check, G720/G925 memory table unchanged ($(grep -m1 '^memory types' out/t-memclass-g720.log); $(tail -1 out/t-memclass-g720.log))"
     . ./mali_env.sh >/dev/null
     # Other Mali drivers: push descriptors but not robustness2 (nulls in push descriptor writes are
     # replaced too), no multiDrawIndirect (Mali-G57 r32/r38: indirect draws are split)
@@ -103,6 +121,7 @@ run_mode() {
       timeout 60 ./out/fdprops_check >out/t-fdprops.log 2>&1; result $? "fdprops_check ($(tail -1 out/t-fdprops.log))"
     fi
   fi
+  if [ -x out/memclass_check ]; then timeout 60 ./out/memclass_check >out/t-memclass.log 2>&1; result $? "memclass_check ($(tail -1 out/t-memclass.log))"; fi
   if [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
   # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
   if [ -x out/desc_traffic_check ]; then

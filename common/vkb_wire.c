@@ -349,6 +349,17 @@ void vkb_dec_raw_into(vkb_dec *d, void *dst, size_t n)
     vkb_dec_bytes(d, dst, n);
 }
 
+/* The last item of a message, from a peer whose struct may be shorter (older) or longer (newer):
+ * what is there, the rest zeros. */
+void vkb_dec_raw_tail(vkb_dec *d, void *dst, size_t n)
+{
+    dec_align(d);
+    size_t have = d->err || d->pos > d->len ? 0 : d->len - d->pos;
+    if (have > n) have = n;
+    memset(dst, 0, n);
+    vkb_dec_bytes(d, dst, have);
+}
+
 const void *vkb_dec_raw_view(vkb_dec *d, size_t n)
 {
     dec_align(d);

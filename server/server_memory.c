@@ -946,7 +946,7 @@ static int lazy_imitated(VkMemoryPropertyFlags f)
 static int fake_lazy(void)
 {
     static int v = -1;
-    if (v < 0) v = vkb_emu_faked("lazymem") || vkb_emu_faked("xringmem");
+    if (v < 0) v = vkb_emu_faked("lazymem") || vkb_emu_faked("xringmem") || vkb_emu_faked("g720mem");
     return v;
 }
 
@@ -976,76 +976,434 @@ void vkb_mem_instance_install(vkb_srv_table *t)
     VKB_INFO("imitating Mali's memory types: device-local types without host access are lazily allocated");
 }
 
-/* ------------------------------------------------------------------ the XRing O3's image requirements, imitated */
+/* ------------------------------------------------------------------ another Mali's memory table, imitated */
 
 /*
- * VKBRIDGE_FAKE_MISSING=...,xringmem (host tests; lazymem comes with it): what Mali-G2-Ultra on the
- * XRing O3 (driver 56, 22 memory types; issue #1) does to images. All its device-local types
- * without host access are lazily allocated, and an image's memoryTypeBits do not list every
- * ordinary device-local type: not the first one, which the client used to back its device-local
- * type with, and the ones it does list are host-visible types the client either does not offer or
- * offers as shared, which images cannot use. The client's mask for every image came out empty (the
- * self-test: "no memory type for the image (types 0x0 allowed)"; gamescope: findMemoryType failed).
- * Here images' memoryTypeBits keep only the device-local host-visible types after the first one.
+ * VKBRIDGE_FAKE_MISSING=...,xringmem or g720mem (host tests): the driver's memory types become
+ * another Mali's, beneath everything the server does (vkb_gipa: the self-test, the probes and
+ * the devices all see them). Each imitated type is backed by a desktop type with the same host
+ * access; the resources' memoryTypeBits are what that Mali's are, as far as testers' logs show.
+ *
+ * g720mem: the Mali-G720's and G925's four types (0:0x7 1:0xb 2:0x11 3:0x21/h1). Images and
+ * buffers allow 0x3 (their self-tests: "images allow types 0x3, plain buffers 0x3").
+ *
+ * xringmem: Mali-G2-Ultra on the XRing O3 (driver 56, issue #1), 22 types: 0,3..8 0x7; 1,9..14
+ * 0xb; 2,15..20 0x11 (lazily allocated); 21 0x21 (heap 1). Images do not list types 0 and 1 (here:
+ * 6, 7, 8 and 14; the v0.5 client backed its device-local type with 6, and every image fit). A
+ * buffer allows 0x3; a shareable one (the client makes all buffers so) depends on its usage, a
+ * model that fits the tester's v0.5 logs: indirect buffers 0x43 (the self-test's draws: "no memory
+ * type for the buffer (types 0x1 allowed)"), texel buffers 0x3 ("a resource allowing server types
+ * 0x3 gets no client type (shared allowed; ...)"), the others 0x4000 (its sharing self-test passed
+ * type 14 only, and its other checks passed).
+ *
+ * Both: memory is imported (dma-buf, host pointer) or made exportable only in a HOST_CACHED type
+ * (the G925's self-test: "dmaheap, type 0: allocation failed (-1000072003)", type 1 shared OK),
+ * and fd and host pointer properties list only those.
  */
-static int fake_xring(void)
+typedef struct {
+    VkMemoryPropertyFlags flags;
+    uint32_t heap;
+} imit_type;
+
+static const imit_type imit_g720[] = {{0x7, 0}, {0xb, 0}, {0x11, 0}, {0x21, 1}};
+static const imit_type imit_xring[] = {{0x7, 0},  {0xb, 0},  {0x11, 0}, {0x7, 0},  {0x7, 0},  {0x7, 0},  {0x7, 0},  {0x7, 0},
+                                       {0x7, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0x11, 0},
+                                       {0x11, 0}, {0x11, 0}, {0x11, 0}, {0x11, 0}, {0x11, 0}, {0x21, 1}};
+
+static struct {
+    int on; /* 1 g720mem, 2 xringmem */
+    const imit_type *types;
+    uint32_t count;
+    PFN_vkGetInstanceProcAddr gipa;
+    PFN_vkGetDeviceProcAddr gdpa;
+    PFN_vkGetPhysicalDeviceMemoryProperties props;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 props2;
+    PFN_vkCreateDevice create_device;
+} imit;
+
+typedef struct {
+    VkDevice dev;
+    uint32_t map[VK_MAX_MEMORY_TYPES]; /* imitated type -> the driver's */
+    PFN_vkDestroyDevice destroy;
+    PFN_vkAllocateMemory alloc;
+    PFN_vkCreateBuffer create_buffer;
+    PFN_vkDestroyBuffer destroy_buffer;
+    PFN_vkGetBufferMemoryRequirements buf_req;
+    PFN_vkGetBufferMemoryRequirements2 buf_req2;
+    PFN_vkGetDeviceBufferMemoryRequirements dev_buf_req;
+    PFN_vkGetImageMemoryRequirements img_req;
+    PFN_vkGetImageMemoryRequirements2 img_req2;
+    PFN_vkGetDeviceImageMemoryRequirements dev_img_req;
+    PFN_vkGetMemoryFdPropertiesKHR fd_props;
+    PFN_vkGetMemoryHostPointerPropertiesEXT host_props;
+} imit_dev;
+
+static imit_dev imit_devs[64];
+static pthread_mutex_t imit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Buffers' imitated memoryTypeBits, from their create info (looked up by handle). */
+#define IMIT_BUFS 16384
+#define IMIT_TOMB ((VkBuffer)(uintptr_t)~0ull)
+static struct {
+    VkBuffer b;
+    uint32_t bits;
+} imit_bufs[IMIT_BUFS];
+
+static int imit_on(void)
 {
     static int v = -1;
-    if (v < 0) v = vkb_emu_faked("xringmem");
+    if (v < 0) v = vkb_emu_faked("xringmem") ? 2 : vkb_emu_faked("g720mem") ? 1 : 0;
     return v;
 }
 
-static uint32_t xring_image_mask(const VkPhysicalDeviceMemoryProperties *mp)
+static imit_dev *imit_find(VkDevice d)
 {
-    uint32_t keep = 0;
-    int first = 1;
-    for (uint32_t i = 0; i < mp->memoryTypeCount && i < 32; i++) {
-        VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
-        if (!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || (f & VK_MEMORY_PROPERTY_PROTECTED_BIT))
-            continue;
-        if (first) first = 0;
-        else keep |= 1u << i;
-    }
-    return keep;
+    for (int i = 0; i < 64; i++)
+        if (__atomic_load_n(&imit_devs[i].dev, __ATOMIC_ACQUIRE) == d) return &imit_devs[i];
+    VKB_ERR("memory table imitation: unknown device");
+    abort();
 }
 
-static struct {
-    vkb_srv_table *t;
-    uint32_t mask;
-    PFN_vkGetImageMemoryRequirements req;
-    PFN_vkGetImageMemoryRequirements2 req2;
-    PFN_vkGetDeviceImageMemoryRequirements dreq;
-} xring_dev[16];
-
-static int xring_slot(void)
+static uint32_t imit_cached_types(void)
 {
-    vkb_srv_table *t = vkb_srv_current_table();
-    for (int i = 0; i < 16 && xring_dev[i].t; i++)
-        if (xring_dev[i].t == t) return i;
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < imit.count; i++)
+        if (imit.types[i].flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) m |= 1u << i;
+    return m;
+}
+
+static uint32_t imit_image_bits(void) { return imit.on == 2 ? 0x41c0u : 0x3u; }
+
+static uint32_t imit_buffer_bits(const VkBufferCreateInfo *ci)
+{
+    if (imit.on != 2) return 0x3u;
+    int external = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO && ((const VkExternalMemoryBufferCreateInfo *)b)->handleTypes)
+            external = 1;
+    if (!external) return 0x3u;
+    if (ci->usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) return 0x43u;
+    if (ci->usage & (VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)) return 0x3u;
+    return 0x4000u;
+}
+
+/* The driver's bits -> the imitated types they back, of those `allow` lists. */
+static uint32_t imit_bits(const imit_dev *d, uint32_t real, uint32_t allow)
+{
+    uint32_t bits = 0;
+    for (uint32_t i = 0; i < imit.count; i++)
+        if ((allow & (1u << i)) && (real & (1u << d->map[i]))) bits |= 1u << i;
+    return bits;
+}
+
+static void imit_fill(VkPhysicalDeviceMemoryProperties *mp)
+{
+    /* Both heaps the driver's device-local one. */
+    VkMemoryHeap dl = mp->memoryHeaps[0];
+    for (uint32_t h = 0; h < mp->memoryHeapCount; h++)
+        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            dl = mp->memoryHeaps[h];
+            break;
+        }
+    memset(mp, 0, sizeof(*mp));
+    mp->memoryHeapCount = 2;
+    mp->memoryHeaps[0] = mp->memoryHeaps[1] = dl;
+    mp->memoryTypeCount = imit.count;
+    for (uint32_t i = 0; i < imit.count; i++) {
+        mp->memoryTypes[i].propertyFlags = imit.types[i].flags;
+        mp->memoryTypes[i].heapIndex = imit.types[i].heap;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties *mp)
+{
+    imit.props(pd, mp);
+    imit_fill(mp);
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2 *mp)
+{
+    imit.props2(pd, mp);
+    VkMemoryHeap dl = mp->memoryProperties.memoryHeaps[0];
+    uint32_t dlh = 0;
+    for (uint32_t h = 0; h < mp->memoryProperties.memoryHeapCount; h++)
+        if (mp->memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            dl = mp->memoryProperties.memoryHeaps[h];
+            dlh = h;
+            break;
+        }
+    (void)dl;
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)mp->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT *bp = (VkPhysicalDeviceMemoryBudgetPropertiesEXT *)b;
+            bp->heapBudget[1] = bp->heapBudget[0] = bp->heapBudget[dlh];
+            bp->heapUsage[1] = bp->heapUsage[0] = bp->heapUsage[dlh];
+        }
+    imit_fill(&mp->memoryProperties);
+}
+
+/* The driver's type with the host access an imitated type has. */
+static uint32_t imit_backing(const VkPhysicalDeviceMemoryProperties *mp, VkMemoryPropertyFlags want)
+{
+    const VkMemoryPropertyFlags odd = VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD |
+                                      VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
+    VkMemoryPropertyFlags need = want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                     ? want & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+                                     : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    for (int pass = 0; pass < 2; pass++)
+        for (uint32_t t = 0; t < mp->memoryTypeCount; t++) {
+            VkMemoryPropertyFlags f = mp->memoryTypes[t].propertyFlags;
+            if ((f & odd) || (f & need) != need) continue;
+            if (!(want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+            /* the device-local host-visible kind on the device-local heap first */
+            if (pass == 0 && (want & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(want & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) &&
+                !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                continue;
+            return t;
+        }
     return 0;
 }
 
-static VKAPI_ATTR void VKAPI_CALL xring_GetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements *r)
+static VKAPI_ATTR VkResult VKAPI_CALL imit_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                        VkDevice *out)
 {
-    int s = xring_slot();
-    xring_dev[s].req(d, i, r);
-    r->memoryTypeBits &= xring_dev[s].mask;
+    VkResult r = imit.create_device(pd, ci, a, out);
+    if (r != VK_SUCCESS) return r;
+    VkPhysicalDeviceMemoryProperties mp;
+    imit.props(pd, &mp);
+    pthread_mutex_lock(&imit_lock);
+    imit_dev *d = NULL;
+    for (int i = 0; i < 64 && !d; i++)
+        if (!imit_devs[i].dev || imit_devs[i].dev == *out) d = &imit_devs[i];
+    if (!d) {
+        pthread_mutex_unlock(&imit_lock);
+        VKB_ERR("memory table imitation: too many devices");
+        abort();
+    }
+    memset(d, 0, sizeof(*d));
+    for (uint32_t i = 0; i < imit.count; i++) d->map[i] = imit_backing(&mp, imit.types[i].flags);
+#define IMIT_GET(field, name) d->field = (void *)imit.gdpa(*out, name)
+    IMIT_GET(destroy, "vkDestroyDevice");
+    IMIT_GET(alloc, "vkAllocateMemory");
+    IMIT_GET(create_buffer, "vkCreateBuffer");
+    IMIT_GET(destroy_buffer, "vkDestroyBuffer");
+    IMIT_GET(buf_req, "vkGetBufferMemoryRequirements");
+    IMIT_GET(buf_req2, "vkGetBufferMemoryRequirements2");
+    IMIT_GET(dev_buf_req, "vkGetDeviceBufferMemoryRequirements");
+    IMIT_GET(img_req, "vkGetImageMemoryRequirements");
+    IMIT_GET(img_req2, "vkGetImageMemoryRequirements2");
+    IMIT_GET(dev_img_req, "vkGetDeviceImageMemoryRequirements");
+    IMIT_GET(fd_props, "vkGetMemoryFdPropertiesKHR");
+    IMIT_GET(host_props, "vkGetMemoryHostPointerPropertiesEXT");
+#undef IMIT_GET
+    __atomic_store_n(&d->dev, *out, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&imit_lock);
+    return r;
 }
 
-static VKAPI_ATTR void VKAPI_CALL xring_GetImageMemoryRequirements2(VkDevice d, const VkImageMemoryRequirementsInfo2 *i,
-                                                                    VkMemoryRequirements2 *r)
+static VKAPI_ATTR void VKAPI_CALL imit_DestroyDevice(VkDevice dev, const VkAllocationCallbacks *a)
 {
-    int s = xring_slot();
-    xring_dev[s].req2(d, i, r);
-    r->memoryRequirements.memoryTypeBits &= xring_dev[s].mask;
+    if (!dev) return;
+    imit_dev *d = imit_find(dev);
+    PFN_vkDestroyDevice destroy = d->destroy;
+    __atomic_store_n(&d->dev, VK_NULL_HANDLE, __ATOMIC_RELEASE);
+    destroy(dev, a);
 }
 
-static VKAPI_ATTR void VKAPI_CALL xring_GetDeviceImageMemoryRequirements(VkDevice d, const VkDeviceImageMemoryRequirements *i,
+static VKAPI_ATTR VkResult VKAPI_CALL imit_AllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a,
+                                                          VkDeviceMemory *out)
+{
+    imit_dev *d = imit_find(dev);
+    if (ai->memoryTypeIndex >= imit.count) return d->alloc(dev, ai, a, out); /* the driver's own error */
+    int import = 0;
+    for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+        import |= b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR || b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT ||
+                  b->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    if (import && !(imit_cached_types() & (1u << ai->memoryTypeIndex))) {
+        static int told;
+        if (!__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED))
+            VKB_INFO("imitated memory table: an import or export in type %u refused (HOST_CACHED types only; logged once)",
+                     ai->memoryTypeIndex);
+        *out = VK_NULL_HANDLE;
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    }
+    VkMemoryAllocateInfo c = *ai;
+    c.memoryTypeIndex = d->map[ai->memoryTypeIndex];
+    return d->alloc(dev, &c, a, out);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL imit_CreateBuffer(VkDevice dev, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *out)
+{
+    VkResult r = imit_find(dev)->create_buffer(dev, ci, a, out);
+    if (r != VK_SUCCESS) return r;
+    uint32_t h = (uint32_t)(((uint64_t)*out * 0x9e3779b97f4a7c15ull) >> 50) % IMIT_BUFS;
+    pthread_mutex_lock(&imit_lock);
+    for (uint32_t n = 0; n < IMIT_BUFS; n++, h = (h + 1) % IMIT_BUFS)
+        if (!imit_bufs[h].b || imit_bufs[h].b == IMIT_TOMB) {
+            imit_bufs[h].b = *out;
+            imit_bufs[h].bits = imit_buffer_bits(ci);
+            break;
+        }
+    pthread_mutex_unlock(&imit_lock);
+    return r;
+}
+
+static uint32_t imit_buffer_lookup(VkBuffer b, int forget)
+{
+    uint32_t h = (uint32_t)(((uint64_t)b * 0x9e3779b97f4a7c15ull) >> 50) % IMIT_BUFS, bits = 0x3u;
+    pthread_mutex_lock(&imit_lock);
+    for (uint32_t n = 0; n < IMIT_BUFS; n++, h = (h + 1) % IMIT_BUFS)
+        if (imit_bufs[h].b == b) {
+            bits = imit_bufs[h].bits;
+            if (forget) imit_bufs[h].b = IMIT_TOMB; /* the chain goes on past it */
+            break;
+        } else if (!imit_bufs[h].b) {
+            break;
+        }
+    pthread_mutex_unlock(&imit_lock);
+    return bits;
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_DestroyBuffer(VkDevice dev, VkBuffer b, const VkAllocationCallbacks *a)
+{
+    if (b) imit_buffer_lookup(b, 1);
+    imit_find(dev)->destroy_buffer(dev, b, a);
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetBufferMemoryRequirements(VkDevice dev, VkBuffer b, VkMemoryRequirements *r)
+{
+    imit_dev *d = imit_find(dev);
+    d->buf_req(dev, b, r);
+    r->memoryTypeBits = imit_bits(d, r->memoryTypeBits, imit_buffer_lookup(b, 0));
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetBufferMemoryRequirements2(VkDevice dev, const VkBufferMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r)
+{
+    imit_dev *d = imit_find(dev);
+    d->buf_req2(dev, i, r);
+    r->memoryRequirements.memoryTypeBits = imit_bits(d, r->memoryRequirements.memoryTypeBits, imit_buffer_lookup(i->buffer, 0));
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetDeviceBufferMemoryRequirements(VkDevice dev, const VkDeviceBufferMemoryRequirements *i,
                                                                          VkMemoryRequirements2 *r)
 {
-    int s = xring_slot();
-    xring_dev[s].dreq(d, i, r);
-    r->memoryRequirements.memoryTypeBits &= xring_dev[s].mask;
+    imit_dev *d = imit_find(dev);
+    d->dev_buf_req(dev, i, r);
+    r->memoryRequirements.memoryTypeBits = imit_bits(d, r->memoryRequirements.memoryTypeBits, imit_buffer_bits(i->pCreateInfo));
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetImageMemoryRequirements(VkDevice dev, VkImage img, VkMemoryRequirements *r)
+{
+    imit_dev *d = imit_find(dev);
+    d->img_req(dev, img, r);
+    r->memoryTypeBits = imit_bits(d, r->memoryTypeBits, imit_image_bits());
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetImageMemoryRequirements2(VkDevice dev, const VkImageMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r)
+{
+    imit_dev *d = imit_find(dev);
+    d->img_req2(dev, i, r);
+    r->memoryRequirements.memoryTypeBits = imit_bits(d, r->memoryRequirements.memoryTypeBits, imit_image_bits());
+}
+
+static VKAPI_ATTR void VKAPI_CALL imit_GetDeviceImageMemoryRequirements(VkDevice dev, const VkDeviceImageMemoryRequirements *i,
+                                                                        VkMemoryRequirements2 *r)
+{
+    imit_dev *d = imit_find(dev);
+    d->dev_img_req(dev, i, r);
+    r->memoryRequirements.memoryTypeBits = imit_bits(d, r->memoryRequirements.memoryTypeBits, imit_image_bits());
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL imit_GetMemoryFdPropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits h, int fd,
+                                                                    VkMemoryFdPropertiesKHR *p)
+{
+    imit_dev *d = imit_find(dev);
+    VkResult r = d->fd_props(dev, h, fd, p);
+    if (r == VK_SUCCESS) p->memoryTypeBits = imit_bits(d, p->memoryTypeBits, imit_cached_types());
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL imit_GetMemoryHostPointerPropertiesEXT(VkDevice dev, VkExternalMemoryHandleTypeFlagBits h,
+                                                                             const void *ptr, VkMemoryHostPointerPropertiesEXT *p)
+{
+    imit_dev *d = imit_find(dev);
+    VkResult r = d->host_props(dev, h, ptr, p);
+    if (r == VK_SUCCESS) p->memoryTypeBits = imit_bits(d, p->memoryTypeBits, imit_cached_types());
+    return r;
+}
+
+/* The device-level ones, for both procaddr functions (NULL stays NULL: an extension not there). */
+static PFN_vkVoidFunction imit_device_fn(const char *n)
+{
+    static const struct {
+        const char *name;
+        PFN_vkVoidFunction fn;
+    } fns[] = {
+        {"vkDestroyDevice", (PFN_vkVoidFunction)imit_DestroyDevice},
+        {"vkAllocateMemory", (PFN_vkVoidFunction)imit_AllocateMemory},
+        {"vkCreateBuffer", (PFN_vkVoidFunction)imit_CreateBuffer},
+        {"vkDestroyBuffer", (PFN_vkVoidFunction)imit_DestroyBuffer},
+        {"vkGetBufferMemoryRequirements", (PFN_vkVoidFunction)imit_GetBufferMemoryRequirements},
+        {"vkGetBufferMemoryRequirements2", (PFN_vkVoidFunction)imit_GetBufferMemoryRequirements2},
+        {"vkGetBufferMemoryRequirements2KHR", (PFN_vkVoidFunction)imit_GetBufferMemoryRequirements2},
+        {"vkGetDeviceBufferMemoryRequirements", (PFN_vkVoidFunction)imit_GetDeviceBufferMemoryRequirements},
+        {"vkGetDeviceBufferMemoryRequirementsKHR", (PFN_vkVoidFunction)imit_GetDeviceBufferMemoryRequirements},
+        {"vkGetImageMemoryRequirements", (PFN_vkVoidFunction)imit_GetImageMemoryRequirements},
+        {"vkGetImageMemoryRequirements2", (PFN_vkVoidFunction)imit_GetImageMemoryRequirements2},
+        {"vkGetImageMemoryRequirements2KHR", (PFN_vkVoidFunction)imit_GetImageMemoryRequirements2},
+        {"vkGetDeviceImageMemoryRequirements", (PFN_vkVoidFunction)imit_GetDeviceImageMemoryRequirements},
+        {"vkGetDeviceImageMemoryRequirementsKHR", (PFN_vkVoidFunction)imit_GetDeviceImageMemoryRequirements},
+        {"vkGetMemoryFdPropertiesKHR", (PFN_vkVoidFunction)imit_GetMemoryFdPropertiesKHR},
+        {"vkGetMemoryHostPointerPropertiesEXT", (PFN_vkVoidFunction)imit_GetMemoryHostPointerPropertiesEXT},
+    };
+    for (size_t i = 0; i < sizeof(fns) / sizeof(fns[0]); i++)
+        if (!strcmp(fns[i].name, n)) return fns[i].fn;
+    return NULL;
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL imit_GetDeviceProcAddr(VkDevice dev, const char *n)
+{
+    PFN_vkVoidFunction f = imit.gdpa(dev, n);
+    PFN_vkVoidFunction w = f ? imit_device_fn(n) : NULL;
+    return w ? w : f;
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL imit_GetInstanceProcAddr(VkInstance inst, const char *n)
+{
+    PFN_vkVoidFunction f = imit.gipa(inst, n);
+    if (!f || !inst) return f;
+    if (!strcmp(n, "vkGetDeviceProcAddr")) {
+        imit.gdpa = (PFN_vkGetDeviceProcAddr)f;
+        return (PFN_vkVoidFunction)imit_GetDeviceProcAddr;
+    }
+    if (!strcmp(n, "vkCreateDevice")) {
+        imit.create_device = (PFN_vkCreateDevice)f;
+        imit.gdpa = (PFN_vkGetDeviceProcAddr)imit.gipa(inst, "vkGetDeviceProcAddr");
+        imit.props = (PFN_vkGetPhysicalDeviceMemoryProperties)imit.gipa(inst, "vkGetPhysicalDeviceMemoryProperties");
+        return (PFN_vkVoidFunction)imit_CreateDevice;
+    }
+    if (!strcmp(n, "vkGetPhysicalDeviceMemoryProperties")) {
+        imit.props = (PFN_vkGetPhysicalDeviceMemoryProperties)f;
+        return (PFN_vkVoidFunction)imit_GetPhysicalDeviceMemoryProperties;
+    }
+    if (!strcmp(n, "vkGetPhysicalDeviceMemoryProperties2") || !strcmp(n, "vkGetPhysicalDeviceMemoryProperties2KHR")) {
+        imit.props2 = (PFN_vkGetPhysicalDeviceMemoryProperties2)f;
+        return (PFN_vkVoidFunction)imit_GetPhysicalDeviceMemoryProperties2;
+    }
+    PFN_vkVoidFunction w = imit_device_fn(n);
+    return w ? w : f;
+}
+
+PFN_vkGetInstanceProcAddr vkb_mem_imitate_gipa(PFN_vkGetInstanceProcAddr gipa)
+{
+    if (!imit_on()) return gipa;
+    imit.on = imit_on();
+    imit.types = imit.on == 2 ? imit_xring : imit_g720;
+    imit.count = imit.on == 2 ? sizeof(imit_xring) / sizeof(imit_xring[0]) : sizeof(imit_g720) / sizeof(imit_g720[0]);
+    imit.gipa = gipa;
+    VKB_INFO("imitating %s's memory table: %u types, images allow 0x%x", imit.on == 2 ? "the XRing O3" : "the Mali-G720",
+             imit.count, imit_image_bits());
+    return imit_GetInstanceProcAddr;
 }
 
 /* ------------------------------------------------------------------ Mali's dma-buf fd properties, imitated */
@@ -1126,23 +1484,6 @@ static void fdt_install(vkb_srv_table *t)
 void vkb_mem_device_install(vkb_srv_table *t)
 {
     fdt_install(t);
-    if (!fake_xring() || !t->real.vkGetImageMemoryRequirements) return;
-    for (int i = 0; i < 16; i++) {
-        if (xring_dev[i].t && xring_dev[i].t != t) continue;
-        VkPhysicalDeviceMemoryProperties mp;
-        t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
-        xring_dev[i].mask = xring_image_mask(&mp);
-        xring_dev[i].req = t->real.vkGetImageMemoryRequirements;
-        xring_dev[i].req2 = t->real.vkGetImageMemoryRequirements2;
-        xring_dev[i].dreq = t->real.vkGetDeviceImageMemoryRequirements;
-        __atomic_store_n(&xring_dev[i].t, t, __ATOMIC_RELEASE);
-        t->real.vkGetImageMemoryRequirements = t->dt.vkGetImageMemoryRequirements = xring_GetImageMemoryRequirements;
-        if (xring_dev[i].req2) t->real.vkGetImageMemoryRequirements2 = t->dt.vkGetImageMemoryRequirements2 = xring_GetImageMemoryRequirements2;
-        if (xring_dev[i].dreq)
-            t->real.vkGetDeviceImageMemoryRequirements = t->dt.vkGetDeviceImageMemoryRequirements = xring_GetDeviceImageMemoryRequirements;
-        VKB_INFO("imitating the XRing O3's image requirements: images allow memory types 0x%x only", xring_dev[i].mask);
-        return;
-    }
 }
 
 /* ------------------------------------------------------------------ what allocations did (logs) */
@@ -1596,7 +1937,39 @@ typedef struct {
     uint32_t qf;
     VkPhysicalDeviceMemoryProperties mp;
     VkDeviceSize import_align;
+    uint32_t classes[16]; /* memoryTypeBits of the probed images and unshared buffers (probe_image_types) */
+    int nclasses;
+    int more_usages; /* the sharing test looks for a buffer usage that allows the type (resources disagree) */
 } selftest;
+
+/* Buffer usages the probes try: what apps make (all in one, vertex/index, indirect, uniform,
+ * storage, texel, staging, readback). The XRing O3's buffers allow different types by usage. */
+static const VkBufferUsageFlags probe_usages[] = {
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+};
+#define PROBE_USAGES (sizeof(probe_usages) / sizeof(probe_usages[0]))
+
+/* memoryTypeBits of a buffer of that usage and those external handle types; 0: not made. */
+static uint32_t buffer_bits(selftest *st, VkBufferUsageFlags usage, VkExternalMemoryHandleTypeFlags handles, VkDeviceSize size)
+{
+    VkExternalMemoryBufferCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, handles};
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, handles ? &ext : NULL, 0, size, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkBuffer b;
+    if (st->dt.vkCreateBuffer(st->dev, &bci, NULL, &b) != VK_SUCCESS) return 0;
+    VkMemoryRequirements r;
+    st->dt.vkGetBufferMemoryRequirements(st->dev, b, &r);
+    st->dt.vkDestroyBuffer(st->dev, b, NULL);
+    return r.memoryTypeBits;
+}
 
 static int submit_and_wait(selftest *st, VkCommandBuffer cb)
 {
@@ -1656,13 +2029,22 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush,
                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                               VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     VkBuffer buf = VK_NULL_HANDLE;
-    if (dt->vkCreateBuffer(st->dev, &bci, NULL, &buf) != VK_SUCCESS) return 0;
     VkMemoryRequirements req;
-    dt->vkGetBufferMemoryRequirements(st->dev, buf, &req);
-    if (!(req.memoryTypeBits & (1u << type))) {
+    /* A type this buffer does not allow is tried with another usage that does (and a transfer
+     * one, for the copies below), when the driver's resources disagree (more_usages): on the
+     * XRing O3 the indirect and texel buffers allow types this one does not. */
+    for (size_t u = 0;; u++) {
+        if (dt->vkCreateBuffer(st->dev, &bci, NULL, &buf) != VK_SUCCESS) return 0;
+        dt->vkGetBufferMemoryRequirements(st->dev, buf, &req);
+        if (req.memoryTypeBits & (1u << type)) break;
         dt->vkDestroyBuffer(st->dev, buf, NULL);
-        return 0;
+        if (!st->more_usages || u >= PROBE_USAGES) return 0;
+        bci.usage = probe_usages[u] | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     }
+    if (bci.usage != (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
+        VKB_INFO("  %s, type %u: tested with a buffer of usage 0x%x (the default one does not allow it)", vkb_mem_strategy_name(s), type,
+                 bci.usage);
     VkDeviceSize size = req.size;
     if (s == VKB_MEM_HOSTPTR) size = (size + st->import_align - 1) & ~(st->import_align - 1);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, size, type};
@@ -1878,7 +2260,6 @@ static uint32_t probe_image_types(selftest *st)
         {VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
         {VK_FORMAT_D16_UNORM, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
     };
-    uint32_t mask = fake_xring() ? xring_image_mask(&st->mp) : ~0u;
     uint32_t images = ~0u, seen = 0;
     for (size_t i = 0; i < sizeof(imgs) / sizeof(imgs[0]); i++) {
         VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, imgs[i].fmt, {64, 64, 1}, 1, 1,
@@ -1889,23 +2270,37 @@ static uint32_t probe_image_types(selftest *st)
         VkMemoryRequirements r;
         st->dt.vkGetImageMemoryRequirements(st->dev, img, &r);
         st->dt.vkDestroyImage(st->dev, img, NULL);
-        images &= r.memoryTypeBits & mask;
+        images &= r.memoryTypeBits;
+        st->classes[st->nclasses++] = r.memoryTypeBits;
         seen++;
     }
-    if (!seen) return 0;
-    uint32_t buffers = ~0u;
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 65536,
-                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
-    VkBuffer b;
-    if (st->dt.vkCreateBuffer(st->dev, &bci, NULL, &b) == VK_SUCCESS) {
+    /* Depth-stencil too, for the device-local types (dl_types), not for this mask. */
+    static const VkFormat ds[] = {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    for (size_t i = 0; i < 2; i++) {
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, ds[i], {64, 64, 1}, 1, 1,
+                                VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0,
+                                NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImage img;
+        VkImageFormatProperties ifp;
+        if (st->idt->vkGetPhysicalDeviceImageFormatProperties(st->pd, ds[i], VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0, &ifp) != VK_SUCCESS ||
+            st->dt.vkCreateImage(st->dev, &ci, NULL, &img) != VK_SUCCESS)
+            continue;
         VkMemoryRequirements r;
-        st->dt.vkGetBufferMemoryRequirements(st->dev, b, &r);
-        st->dt.vkDestroyBuffer(st->dev, b, NULL);
-        buffers = r.memoryTypeBits;
+        st->dt.vkGetImageMemoryRequirements(st->dev, img, &r);
+        st->dt.vkDestroyImage(st->dev, img, NULL);
+        st->classes[st->nclasses++] = r.memoryTypeBits;
+        break;
     }
+    /* Unshared buffers of each usage (the first: every usage, the mask's plain buffer). */
+    uint32_t buffers = ~0u;
+    for (size_t u = 0; u < PROBE_USAGES; u++) {
+        uint32_t bits = buffer_bits(st, probe_usages[u], 0, 65536);
+        if (!bits) continue;
+        if (u == 0) buffers = bits;
+        st->classes[st->nclasses++] = bits;
+    }
+    if (!seen) return 0;
     /* Images and buffers in one type if there is one; else what the images allow (buffers are
      * the less picky). */
     uint32_t both = images & buffers, any_both = 0, any_img = 0;
@@ -1920,6 +2315,54 @@ static uint32_t probe_image_types(selftest *st)
     VKB_INFO("memory: images allow types 0x%x, plain buffers 0x%x: ordinary resources in 0x%x", images, buffers, types);
     if (!types) VKB_WARN("memory: no ordinary device-local type that images allow (images 0x%x); the client keeps its old choice", images);
     return types;
+}
+
+static uint32_t ordinary_dl_bits(selftest *st, uint32_t bits)
+{
+    uint32_t m = 0;
+    for (uint32_t t = 0; t < st->mp.memoryTypeCount && t < 32; t++) {
+        VkMemoryPropertyFlags f = st->mp.memoryTypes[t].propertyFlags;
+        if (fake_lazy() && lazy_imitated(f)) f |= VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
+        if ((bits & (1u << t)) && ordinary_dl(f)) m |= 1u << t;
+    }
+    return m;
+}
+
+/*
+ * The client's device-local types without host access (vkb_server_pd_info.dl_types): one is
+ * enough where every image and buffer allows the one the client backs it with (the first ordinary
+ * device-local type images allow, as the client picks it from image_types): then 0, and nothing
+ * changes. On the XRing O3 (issue #1) images allow type 6 and buffers only 0x3: every buffer's
+ * mask came out without a device-local type. Then one more for each probed resource kind that
+ * allows none of those chosen (its first ordinary device-local type), at most 4. `handles`: the
+ * external handle types the client puts on its buffers (they change the masks), 0: none.
+ */
+static uint32_t probe_dl_types(selftest *st, uint32_t image_types, VkExternalMemoryHandleTypeFlags handles, int quiet)
+{
+    uint32_t classes[16 + PROBE_USAGES];
+    int n = 0;
+    for (int i = 0; i < st->nclasses; i++) classes[n++] = st->classes[i];
+    for (size_t u = 0; handles && u < PROBE_USAGES; u++) {
+        uint32_t bits = buffer_bits(st, probe_usages[u], handles, 65536);
+        if (bits) classes[n++] = bits;
+    }
+    uint32_t first = ordinary_dl_bits(st, image_types);
+    if (!first) first = ordinary_dl_bits(st, ~0u);
+    if (!first) return 0;
+    uint32_t chosen = first & -first;
+    char line[256] = "";
+    int ln = 0;
+    for (int i = 0; i < n && __builtin_popcount(chosen) < 4; i++) {
+        uint32_t dl = ordinary_dl_bits(st, classes[i]);
+        if (!dl || (dl & chosen)) continue;
+        chosen |= dl & -dl;
+        ln += snprintf(line + ln, ln < (int)sizeof(line) ? sizeof(line) - (size_t)ln : 0, " 0x%x->%d", classes[i], __builtin_ctz(dl));
+    }
+    if (__builtin_popcount(chosen) < 2) return 0;
+    if (!quiet)
+        VKB_INFO("memory: resources disagree on device-local types: the client gets types 0x%x (images' %d; resource masks%s)", chosen,
+                 __builtin_ctz(first), line);
+    return chosen;
 }
 
 void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd)
@@ -2027,9 +2470,13 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
 
     k->info.strategy = VKB_MEM_NONE;
     k->info.image_types = probe_image_types(&st);
+    k->info.dl_types = probe_dl_types(&st, k->info.image_types, 0, 0);
     for (int i = 0; i < nc; i++) {
         uint32_t s = candidates[i];
         uint32_t shareable = 0, coherent = 0;
+        /* The client's buffers carry this strategy's handle type: their masks with it. */
+        uint32_t dl = probe_dl_types(&st, k->info.image_types, strategy_handle_type(s), 1);
+        st.more_usages = dl != 0;
         for (uint32_t t = 0; t < st.mp.memoryTypeCount; t++) {
             if (!(st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
             if (st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_PROTECTED_BIT) continue;
@@ -2044,6 +2491,7 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
             k->info.coherent_types = coherent;
             k->info.import_alignment = st.import_align;
             k->info.cached_types = cached_selftest(&st, s, shareable);
+            k->info.dl_types = probe_dl_types(&st, k->info.image_types, strategy_handle_type(s), 0);
             OUTCOME(" %s: chosen, types 0x%x shared, 0x%x coherent, 0x%x cached readback;", vkb_mem_strategy_name(s), shareable, coherent,
                     k->info.cached_types);
             break;
