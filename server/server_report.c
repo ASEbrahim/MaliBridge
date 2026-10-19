@@ -814,6 +814,50 @@ typedef struct artefact {
     int fresh;
 } artefact;
 
+/* The Android package the server runs in, for the run-as hint: the process name when it is one
+ * (the JNI server runs in the app process; a ":name" process suffix is dropped), else the package
+ * directory the pipeline cache lives under (/data/user/<n>/<pkg>/... or /data/data/<pkg>/...). */
+static int is_package(const char *s)
+{
+    if (!*s || !strchr(s, '.')) return 0;
+    for (; *s; s++)
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '.' || *s == '_')) return 0;
+    return 1;
+}
+
+static int app_package(char *out, size_t n)
+{
+    char buf[256];
+    int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t r = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (r > 0) {
+            buf[r] = 0;
+            char *colon = strchr(buf, ':');
+            if (colon) *colon = 0;
+            if (is_package(buf) && strlen(buf) < n) {
+                strcpy(out, buf);
+                return 1;
+            }
+        }
+    }
+    const char *dir = vkb_pcache_dir(), *p = NULL;
+    if (!dir) return 0;
+    if (!strncmp(dir, "/data/data/", 11))
+        p = dir + 11;
+    else if (!strncmp(dir, "/data/user/", 11) && (p = strchr(dir + 11, '/')))
+        p++;
+    if (!p) return 0;
+    size_t len = strcspn(p, "/");
+    if (!len || len >= n || len >= sizeof buf) return 0;
+    memcpy(buf, p, len);
+    buf[len] = 0;
+    if (!is_package(buf)) return 0;
+    strcpy(out, buf);
+    return 1;
+}
+
 static int artefacts(artefact *a, int max)
 {
     const char *dir = vkb_pcache_dir();
@@ -995,7 +1039,11 @@ static void write_md(FILE *f, int final)
     fprintf(f, "\n## Artefacts\n\n");
     if (!na) fprintf(f, "None (no saved SPIR-V, stuck pipelines or failed modules).\n");
     for (int i = 0; i < na; i++) fprintf(f, "- `%s` (%lld bytes%s)\n", a[i].path, a[i].size, a[i].fresh ? ", this session" : "");
-    if (na) fprintf(f, "\nPull them with `adb shell run-as com.droiddeck.launcher cat <path>`; `spirv-dis` reads the .spv files.\n");
+    if (na) {
+        char pkg[128];
+        fprintf(f, "\nPull them with `adb shell run-as %s cat <path>`; `spirv-dis` reads the .spv files.\n",
+                app_package(pkg, sizeof pkg) ? pkg : "<app package>");
+    }
 }
 
 static void write_json(FILE *f, int final)
