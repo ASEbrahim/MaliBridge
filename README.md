@@ -70,10 +70,30 @@ G720. See [INSTALL.md](INSTALL.md) to try it. Everything here is still work in p
 | The Witcher 3 (DX12) | runs, but slowly (long GPU stalls while loading) | the intro plays at 60 fps; after loading a save the game stalls (known issue, see below) |
 | Stray | runs, 17 fps in the opening scene (limited by the emulated render thread) | runs (DX11, the default), 58 fps on the title screen, with a neutral colour grade (see below); gameplay not measured yet |
 | Deep Rock Galactic | runs, but slowly | not tested |
+| Poppy Playtime (Chapter 1) | not tested yet | runs, 28-32 fps in the factory lobby; neutral colour grade (the same UE4 shader as Stray) |
+| R.E.P.O. | not tested yet | runs, about 40 fps in single player |
+| Muck | not tested yet | runs, 45-48 fps on the island |
+| Phoenix Wright: Ace Attorney Trilogy | not tested yet | runs well, about 118 fps (the 120 Hz display rate) |
+| Helltaker | not tested yet | runs well, about 59 fps (owner: "works perfectly") |
+| GRIS | not tested yet | runs well, about 119 fps |
+| A Dance of Fire and Ice | not tested yet | runs well, about 106-113 fps; the owner noticed no input delay with a Bluetooth PS5 controller |
+| Stick Fight: The Game | not tested yet | runs well, 59-60 fps (its cap) |
+| Risk of Rain Returns | not tested yet | runs well with v0.5, 59-60 fps on the title screen and in play (owner: "running perfectly"); earlier builds froze at the intro video (see below) |
+| Don't Starve Together | not tested yet | 60 fps, but only with `PROTON_USE_WINED3D=1 %command%` as the game's launch option; the default DXVK path closes a few seconds after start (an assert in DXVK's shader translator, not the bridge) |
+| ASTRONEER | not tested yet | renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; neutral colour grade |
+| The Forest | not tested yet | 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
+| Outer Wilds | not tested yet | 35-45 fps on the starting planet, about 75-80 in space, high 20s on Brittle Hollow, about 17 looking at the black hole with the GPU half idle; CPU-bound |
 
 Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mode, without the
 built-in presets described below. The other G925 figures are from v0.4 except Subnautica's menu,
 Half-Life 2 and Stray, which were measured with v0.5.
+The games from Poppy Playtime to Outer Wilds were played on the G925 with v0.5 test builds in
+October 2026, some by us and some by the owner (fps read from the launcher's frame counter).
+Risk of Rain Returns needed a fix in the client: the G925 driver refuses multi-planar (NV12)
+images created with `MUTABLE_FORMAT | EXTENDED_USAGE`, which DXVK uses for video textures, so
+games that decode intro videos through Media Foundation waited for a frame that never came.
+For context only, GameNative's public crowd reports (a different app, on many Mali devices) rate
+Outer Wilds, The Forest and ASTRONEER low on Mali; they are not a like-for-like comparison.
 
 **Safe mode and performance mode** (see [below](#safe-mode-and-performance-mode)). Median fps,
 one run per game and mode, on USB power at thermal status 0-1. The games were run in
@@ -104,8 +124,14 @@ order, not alternated, so differences of a few percent are within noise.
 - **Risk of Rain 2**: one performance-mode launch on the G925 showed no frames for about 2 minutes
   on its title load, then went on. It did not happen again in a rerun; the cause is not known.
 - **The Steam window on the Mali-G925** can be slow: Steam's web view process crashes at start and
-  falls back to drawing on the CPU. Having it draw through ANGLE on Vulkan
-  (`BL_VKBRIDGE_CEF_ANGLE=vulkan` in DroidDeck) is being verified and is not on by default.
+  falls back to drawing on the CPU. Drawing it through ANGLE on Vulkan
+  (`BL_VKBRIDGE_CEF_ANGLE=vulkan` in DroidDeck) stops the crashes, but compositing is still done
+  on the CPU. A full fix is pending; it is not on by default.
+- **Don't Starve Together** needs `PROTON_USE_WINED3D=1 %command%` as its launch option. With the
+  default DXVK it closes at start: DXVK's shader model 3 translator hits an assert. This is a DXVK
+  bug, not a bridge one.
+- **Outer Wilds, ASTRONEER and The Forest** are limited by the CPU on the G925 (emulated x86), so
+  lowering the resolution or settings helps little.
 
 Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples compressed, at the
 size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11,
