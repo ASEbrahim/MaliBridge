@@ -31,6 +31,12 @@ start() {
       "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$cache" >/dev/null 2>&1 &
   srv=$!
   for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
+  # The device probes this new cache directory starts go on in the background for ~1 s after the
+  # server listens; wait_retry's reason gains "probe wait_eintr passed" when they end, so a device
+  # made before and one made after would differ in their decision blocks (section 3 then saw no
+  # short line, ~10% of runs). One "done" line per GPU whose probes continue in the background.
+  local want; want=$(grep -c "continues after the server listens" "$log" 2>/dev/null)
+  for _ in $(seq 150); do [ "$(grep -c "probe: background probes done" "$log" 2>/dev/null)" -ge "${want:-0}" ] && break; sleep 0.1; done
 }
 trap 'kill $srv 2>/dev/null; rm -f "$sock"; [ -n "$KEEP" ] || rm -rf "$work"' EXIT
 export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES=
