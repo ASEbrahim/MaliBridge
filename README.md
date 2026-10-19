@@ -10,9 +10,10 @@ is needed.
 **[Games that run](#games-that-run)** · **[FAQ](INSTALL.md#faq)** ·
 **[Report a problem](https://github.com/ASEbrahim/MaliBridge/issues)**
 
-On a Galaxy Tab S10+ (Mali-G720) and a Galaxy Tab S11 Ultra (Mali-G925), 26 of the 36 games we've
-tested run well, for example Half-Life 2 at about 94 fps, Hollow Knight: Silksong, Stardew Valley,
-Risk of Rain Returns, Dark Souls Remastered and Garry's Mod. It is a free, open-source test build.
+On a Samsung Galaxy Tab S10+ (Mali-G720) and Galaxy Tab S11 Ultra (Mali-G925), 31 games we've
+tested are playable or better, for example Half-Life 2 at about 94 fps, Hollow Knight: Silksong,
+Stardew Valley, Risk of Rain Returns, Dark Souls Remastered and Garry's Mod. It is free and open
+source.
 
 ## Does my device work?
 
@@ -77,24 +78,24 @@ playing the games ourselves where we did, and from the frame rate otherwise.
 | The Elder Scrolls V: Skyrim Special Edition | **Excellent**, about 60 fps (its cap) on Medium; smooth in third person, some stutter on first load | not tested |
 | Stardew Valley | **Excellent**, 60 fps (its cap) on the title screen | **Excellent**, 57-62 fps |
 | Risk of Rain 2 | **Kinda playable**, at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720); needs descriptor batching off, the v0.2.1 default | **Playable**, 30-43 fps at 1280x720; 20-28 fps in a crowded boss fight, measured while screen recording |
-| Dark Souls Remastered | not tested yet | **Very playable**, 10 minutes of play at a median of 53.7 fps, lowest 43.9, 60 fps (its cap) while the tablet is cool; cutscenes correct |
-| Garry's Mod | not tested yet | **Excellent**, on a plain map (median 104 fps); median 82 fps on the Golden City Sandbox map, lowest 34 |
+| Dark Souls Remastered | **Not rated yet** (menu only): 60 fps (its cap) on the title and main menu | **Very playable**, 10 minutes of play at a median of 53.7 fps, lowest 43.9, 60 fps (its cap) while the tablet is cool; cutscenes correct |
+| Garry's Mod | **Very playable**, 49-54 fps on gm_construct (59 on the menu) | **Excellent**, on a plain map (median 104 fps); median 82 fps on the Golden City Sandbox map, lowest 34 |
 | The Witcher 3 (DX12) | **Barely runs**, long GPU stalls while loading | **Barely runs**, the intro plays at 60 fps; after loading a save the game stalls (known issue, see below) |
 | Stray | **Barely runs**, 17 fps in the opening scene (limited by the emulated render thread) | **Not rated yet** (title screen only): DX11 (the default), 58 fps on the title screen, with a neutral colour grade (see below); gameplay not measured yet |
 | Deep Rock Galactic | **Kinda playable**, slow | not tested |
-| Poppy Playtime (Chapter 1) | not tested yet | **Kinda playable**, 28-32 fps in the factory lobby; neutral colour grade (the same UE4 shader as Stray) |
-| R.E.P.O. | not tested yet | **Playable**, about 40 fps in single player |
-| Muck | not tested yet | **Playable**, 45-48 fps on the island |
-| Phoenix Wright: Ace Attorney Trilogy | not tested yet | **Excellent**, about 118 fps (the 120 Hz display rate) |
-| Helltaker | not tested yet | **Excellent**, about 59 fps, works perfectly |
-| GRIS | not tested yet | **Excellent**, about 119 fps |
-| A Dance of Fire and Ice | not tested yet | **Excellent**, about 106-113 fps; no input delay noticed with a Bluetooth PS5 controller |
-| Stick Fight: The Game | not tested yet | **Excellent**, 59-60 fps (its cap) |
+| Poppy Playtime (Chapter 1) | **Not rated yet** (menu only): 62-64 fps on the Chapter 1 main menu | **Kinda playable**, 28-32 fps in the factory lobby; neutral colour grade (the same UE4 shader as Stray) |
+| R.E.P.O. | **Not rated yet** (menu only): about 42 fps on the main menu after a 50 s warm-up | **Playable**, about 40 fps in single player |
+| Muck | **Not rated yet** (menu only): 43 fps on the main menu over the 3D island | **Playable**, 45-48 fps on the island |
+| Phoenix Wright: Ace Attorney Trilogy | **Not rated yet** (menu only): about 118 fps on the title and menu | **Excellent**, about 118 fps (the 120 Hz display rate) |
+| Helltaker | **Not rated yet** (menu only): 59.8 fps on the title screen | **Excellent**, about 59 fps, works perfectly |
+| GRIS | **Excellent**, about 105 fps after Continue | **Excellent**, about 119 fps |
+| A Dance of Fire and Ice | **Not rated yet** (menu only): 45-52 fps on the title scene | **Excellent**, about 106-113 fps; no input delay noticed with a Bluetooth PS5 controller |
+| Stick Fight: The Game | **Kinda playable**, a flat 30 fps in a local lobby (the G925 reaches its 60 cap) | **Excellent**, 59-60 fps (its cap) |
 | Risk of Rain Returns | **Excellent**, 59-60 fps in play including a boss fight (never below 59) | **Excellent**, 59-60 fps on the title screen and in play; earlier builds froze at the intro video (see below) |
-| Don't Starve Together | not tested yet | **Excellent**, 60 fps, but only with `PROTON_USE_WINED3D=1 %command%` as the game's launch option; the default DXVK path closes a few seconds after start (an assert in DXVK's shader translator, not the bridge) |
-| ASTRONEER | not tested yet | **Kinda playable**, renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; neutral colour grade |
-| The Forest | not tested yet | **Playable**, 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
-| Outer Wilds | not tested yet | **Playable**, 35-45 fps on the starting planet, about 75-80 in space, high 20s on Brittle Hollow, about 17 looking at the black hole with the GPU half idle; CPU-bound |
+| Don't Starve Together | **Not rated yet** (menu only): 60 fps on the main menu (with `PROTON_USE_WINED3D=1`) | **Excellent**, 60 fps, but only with `PROTON_USE_WINED3D=1 %command%` as the game's launch option; the default DXVK path closes a few seconds after start (an assert in DXVK's shader translator, not the bridge) |
+| ASTRONEER | **Not rated yet** (menu only): 27-29 fps on the 3D menu | **Kinda playable**, renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; neutral colour grade |
+| The Forest | **Not rated yet** (menu only): 60 fps on the menu; the first launch stalled once after 20 s, the second was fine | **Playable**, 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
+| Outer Wilds | **Barely runs**, about 10 fps in game (73 on the title): the tablet runs short of memory (12 GB, heavy swapping) | **Playable**, 35-45 fps on the starting planet, about 75-80 in space, high 20s on Brittle Hollow, about 17 looking at the black hole with the GPU half idle; CPU-bound |
 
 Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mode, without the
 built-in presets described below. The other G925 figures are from v0.4 except Subnautica's menu,
