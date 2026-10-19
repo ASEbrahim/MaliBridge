@@ -19,12 +19,12 @@ at the end), so expect rough edges, and please report what you find.
 
 ## Install
 
-1. If the official DroidDeck is installed, uninstall it first. The test APK is signed with a
-   different key, so Android won't install it over the official app. Uninstalling removes that
-   app's data, including the Steam login and installed games.
+1. You can keep the official DroidDeck. The test APK installs next to it as a separate app,
+   **DroidDeck Mali**, with its own Steam login and games. If you have an older MaliBridge test
+   build (before v0.5.1, shown as plain "DroidDeck"), you can uninstall it once the new one works.
 2. Download the DroidDeck-MaliBridge `.apk` from the newest release and open it. Android asks
    you to allow installs from your browser or file manager. Allow it.
-3. Open DroidDeck, go to **Settings**, and tap **Mali bridge: off** so it reads **Mali bridge: on**.
+3. Open **DroidDeck Mali**, go to **Settings**, and tap **Mali bridge: off** so it reads **Mali bridge: on**.
    The button is only shown on Mali devices, and only while no session is running.
    Below it, leave **Safe mode: on** for now (see the next section).
 4. Start a **Steam session**. The first start downloads the Linux runtime and the Steam client,
@@ -142,13 +142,15 @@ Plan on about **8-10 GB before any games**: the Linux runtime (about 5 GB), the 
 own size, plus about 300-400 MB for its Windows files and a shader cache that grows as you play.
 
 **Can I keep the official DroidDeck installed?**
-No. The test APK is signed with a different key, so uninstall the official app first. That
-removes its data, including the Steam login and installed games.
+Yes. Since v0.5.1 the test APK is a separate app, **DroidDeck Mali**, and installs next to the
+official DroidDeck. Each app has its own Steam login, games and settings.
 
 **Android says the app can't be installed over the one I have.**
-Since Oct 19, 2026 the test APK is signed with MaliBridge's own key. If you installed an older
-build (or a DroidDeck build from somewhere else), uninstall it first. That removes its Steam
-login and installed games. Later MaliBridge builds install over each other as normal.
+That is a DroidDeck Mali build signed with a different key (an early test build, or one from
+somewhere else). Uninstall DroidDeck Mali (not the official DroidDeck) and install again. That
+removes DroidDeck Mali's Steam login and games. Test builds before v0.5.1 showed up as plain
+"DroidDeck"; they are not needed any more and can be uninstalled. Later MaliBridge builds
+install over each other as normal.
 
 **Which Proton should I pick?**
 **Proton Experimental ARM64 (Compatible)**, in the game's Properties → Compatibility. Valve's

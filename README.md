@@ -43,7 +43,9 @@ Tested on two tablets, plus reports from players: a Mali-G720 Immortalis (Galaxy
 MediaTek Dimensity 9300+, driver r44p1) and a Mali-G925 Immortalis (Galaxy Tab S11 Ultra,
 Dimensity 9400, driver r49p1, Android 16), inside the DroidDeck launcher, which runs the server
 and starts the guest. With the same build the G925 runs these games about 1.4-2x faster than the
-G720. See [INSTALL.md](INSTALL.md) to try it. Everything here is still work in progress.
+G720. See [INSTALL.md](INSTALL.md) to try it: since v0.5.1 the test APK is its own app, "DroidDeck
+Mali" (`com.droiddeck.launcher.mali`), and installs next to the official DroidDeck. Everything here
+is still work in progress.
 
 Ratings, from worst to best: barely runs, kinda playable, playable, very playable, excellent. They come from
 playing where we did (the owner's notes) and from the frame rate otherwise.
