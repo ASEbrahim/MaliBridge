@@ -46,7 +46,7 @@ game to **Proton Experimental ARM64 (Compatible)**. The steps below have the det
   version, which doesn't start here yet. Set these to Proton Experimental ARM64 (Compatible) by
   hand, as above.
 - **In-game graphics settings.** Most games in the tables run on their default settings. The ones
-  we changed:
+  I changed:
 
   | Game | Setting |
   |---|---|
@@ -74,11 +74,11 @@ Start with something light. These run well:
 | Portal | Excellent, 80 fps | not tested |
 | Inscryption | Excellent, 68-83 fps | not tested |
 
-The [full list](README.md#games-that-run) has every game we've tested.
+The [full list](README.md#games-that-run) has every game I've tested.
 
 ## How demanding each game is
 
-A rough guide from our testing, mostly on the Mali-G720. A newer GPU (the G925 runs these
+A rough guide from my testing, mostly on the Mali-G720. A newer GPU (the G925 runs these
 1.4-2x faster) moves games up a group; a phone with less free memory can move them down.
 
 | Group | Games | What to expect |
@@ -106,8 +106,8 @@ The bridge has two modes, switched with **Safe mode** under the Mali bridge butt
   start-up checks passed on your GPU, and gives a slow shader compile 20 s instead of 10 s before
   the bridge steps in.
 
-On our two tablets the difference was small: 0-2% in most games we measured (the README has the
-numbers). Safe mode matters most on GPUs we have not tested. The switch applies from the next
+On my two tablets the difference was small: 0-2% in most games I measured (the README has the
+numbers). Safe mode matters most on GPUs I haven't tested. The switch applies from the next
 session, and the session logs say which mode was used. If a game misbehaves in performance mode,
 try it in safe mode before reporting it, and say which mode you used.
 
@@ -138,7 +138,9 @@ It lets PC games in DroidDeck use your phone's own Mali GPU driver, so Steam gam
 Mali devices.
 
 **Will it work on my device?**
-It needs an Arm Mali GPU (Immortalis is Mali too). Look up your phone's chip in the
+It needs an Arm Mali GPU (Immortalis is Mali too). Not sure which chip you have? Look under
+Settings → About phone (or About tablet) for the processor, or install an app like CPU-Z, which
+shows the GPU too. Then look up the chip in the
 [Does my device work?](README.md#does-my-device-work) table. On the Galaxy Tab S10+ and S11 Ultra
 it works well. On other Mali devices it is still a test: it depends on the GPU and its driver, so
 try it and send logs (see "If something goes wrong"). Snapdragon chips have Adreno GPUs, which the
@@ -167,7 +169,7 @@ that also have a Linux version (Portal 2, Half-Life 2, ...), set this by hand.
 
 **A game closes right after I press Play. What now?**
 Check the compatibility tool first (the question above). If that is right, stop the session and
-send the logs. The logs tell us whether the game reached the GPU at all.
+send the logs. The logs show whether the game reached the GPU at all.
 
 **Steam stays on "Waiting for Steam's first frame".**
 Stop the session and send the logs. The self-test lines (`== vkbridge:`) usually show what is
@@ -181,7 +183,7 @@ keeps the phone's own driver and works around its known bugs. They are separate 
 No. MaliBridge is built into the DroidDeck test APK from the Releases page.
 
 **Do online games with anti-cheat work?**
-We haven't tested them. Many anti-cheat systems don't run under Proton at all, so expect them
+I haven't tested them. Many anti-cheat systems don't run under Proton at all, so expect them
 not to work.
 
 **Is it free? Is it official?**
@@ -203,4 +205,4 @@ and licensed under GPL-3.0-or-later; any reuse of the code must follow that lice
 | Google Pixel 9 | Mali-G715 (Tensor G4), driver r54p3 | player report: Steam runs and the self-test passes (v0.4); games not confirmed yet |
 
 For other chips, see the [device table](README.md#does-my-device-work). Reports from any Mali GPU
-we haven't tested are very welcome.
+I haven't tested are very welcome.

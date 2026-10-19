@@ -1,0 +1,60 @@
+name: Device report
+description: Tell me how MaliBridge runs (or doesn't) on your device
+labels: ["device report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Please fill in what you can. Every report helps, especially from devices I don't have.
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Brand and model, for example "Galaxy Tab S10+" or "Xiaomi 14T Pro"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Chip / GPU and driver
+      description: If you know them, for example "Dimensity 9300+ / Immortalis-G720, r44p1" (the driver is in the bridge's start-up lines in the logs). Leave blank if you're not sure.
+  - type: input
+    id: android
+    attributes:
+      label: Android version
+  - type: input
+    id: version
+    attributes:
+      label: MaliBridge version
+      description: For example v0.5.1
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Safe mode (default)
+        - Performance mode
+  - type: input
+    id: selftest
+    attributes:
+      label: Self-test
+      description: "The \"OK: 13 of 13 checks passed\" line from the logs, or which checks failed"
+  - type: textarea
+    id: games
+    attributes:
+      label: Games and results
+      description: Which games you tried and what happened (fps if you saw it, crash, black screen, works fine...)
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else, such as settings you changed, problems, or what you'd like to see
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Please stop the Steam session first, then use Settings → Share logs and attach the zip here.

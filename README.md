@@ -10,14 +10,15 @@ is needed.
 **[Games that run](#games-that-run)** · **[FAQ](INSTALL.md#faq)** ·
 **[Report a problem](https://github.com/ASEbrahim/MaliBridge/issues)**
 
-On a Samsung Galaxy Tab S10+ (Mali-G720) and Galaxy Tab S11 Ultra (Mali-G925), 31 games we've
+On a Samsung Galaxy Tab S10+ (Mali-G720) and Galaxy Tab S11 Ultra (Mali-G925), 31 games I've
 tested are playable or better, for example Half-Life 2 at about 94 fps, Hollow Knight: Silksong,
 Stardew Valley, Risk of Rain Returns, Dark Souls Remastered and Garry's Mod. It is free and open
 source.
 
 ## Does my device work?
 
-You need an Arm Mali GPU. Find your device below, or look up its chip in the second table.
+You need an Arm Mali GPU. Find your device below, or look up its chip in the second table. Not sure
+which chip you have? It's under Settings → About phone (or About tablet), or in an app like CPU-Z.
 
 **Tested**
 
@@ -63,13 +64,13 @@ The [install guide](INSTALL.md) has every step, the settings to check, and which
 <a id="status"></a>
 ## Games that run
 
-These are the games we've played on our two tablets, a Galaxy Tab S10+ (Mali-G720) and a Galaxy
+These are the games I've played on my two tablets, a Galaxy Tab S10+ (Mali-G720) and a Galaxy
 Tab S11 Ultra (Mali-G925), with the settings from the [install guide](INSTALL.md#settings-to-check).
 The S11 Ultra runs the same game about 1.4-2x faster. On other devices, expect results in line with
 how strong the GPU is.
 
 Ratings, from worst to best: barely runs, kinda playable, playable, very playable, excellent. They come from
-playing the games ourselves where we did, and from the frame rate otherwise.
+playing the games myself where I did, and from the frame rate otherwise.
 
 | Game | Mali-G720 (Tab S10+) | Mali-G925 (Tab S11 Ultra) |
 |---|---|---|
@@ -151,11 +152,11 @@ Outer Wilds, The Forest and ASTRONEER low on Mali; they are not a like-for-like 
 
 ## Safe mode and performance mode
 
-**Short version:** leave **Safe mode** on (the default). It's the most compatible setting, and on our
+**Short version:** leave **Safe mode** on (the default). It's the most compatible setting, and on my
 tablets performance mode is only 0-2% faster. Try performance mode once a game works, and if
 something breaks, switch back before reporting it.
 
-How much the mode changes frame rates on our tablets (median fps,
+How much the mode changes frame rates on my tablets (median fps,
 one run per game and mode, on USB power at thermal status 0-1). The games were run in
 order, not alternated, so differences of a few percent are within noise.
 
@@ -183,8 +184,8 @@ new probe and no restart, and the log and the session report say which mode was 
 | Cached readback | off | on for the frame readback where the self-test passes it |
 
 The same in both: the wait retry, BC transcode quality (`auto`), forced robust buffer access, and
-descriptor batching off. On our two tablets the start-up checks are complete, so the modes differ
-little (the table above); safe mode is meant for GPUs we have not tested.
+descriptor batching off. On my two tablets the start-up checks are complete, so the modes differ
+little (the table above); safe mode is meant for GPUs I haven't tested.
 
 ## Getting help
 
@@ -200,7 +201,7 @@ little (the table above); safe mode is meant for GPUs we have not tested.
 - The games limited by the CPU (The Forest, ASTRONEER, Outer Wilds) and faster file access in
   DroidDeck's sandbox, which should also fix Just Cause 2.
 - DirectX 12: The Witcher 3's stall, Stray in DX12, Elden Ring.
-- More devices: reports from Mali GPUs we haven't tested are the fastest way to get there.
+- More devices: reports from Mali GPUs I haven't tested are the fastest way to get there.
 - Packaging the Mali fixes as a standalone Vulkan layer that works without the socket bridge.
 
 ---
