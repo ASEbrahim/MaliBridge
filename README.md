@@ -7,7 +7,7 @@ is needed.
 
 **[Download](https://github.com/ASEbrahim/MaliBridge/releases/latest)** ·
 **[Install guide](INSTALL.md)** · **[Does my device work?](#does-my-device-work)** ·
-**[Games that run](#status)** · **[FAQ](INSTALL.md#faq)** ·
+**[Games that run](#games-that-run)** · **[FAQ](INSTALL.md#faq)** ·
 **[Report a problem](https://github.com/ASEbrahim/MaliBridge/issues)**
 
 On a Galaxy Tab S10+ (Mali-G720) and a Galaxy Tab S11 Ultra (Mali-G925), 26 of the 36 games we've
@@ -37,50 +37,22 @@ doesn't support these.
 On a device marked "not tested yet", it's still a test: it depends on the GPU and its driver. Logs
 from your device help a lot (see [If something goes wrong](INSTALL.md#if-something-goes-wrong)).
 
-## How it works
+## Get started
 
-PC games on an Android device run in a Linux guest (glibc, aarch64) under x86 emulation, with
-DXVK or vkd3d-proton turning Direct3D into Vulkan. The guest has no GPU driver of its own. The
-Mali driver lives on the Android side, and it is missing features that DXVK and vkd3d-proton
-need before they will start: BC textures, push descriptors, robustness2, clip distances and more.
+1. Check your chip in the table above.
+2. Download `DroidDeck-MaliBridge-...-test.apk` from the [latest release](https://github.com/ASEbrahim/MaliBridge/releases/latest) and install it. It shows up as **DroidDeck Mali**.
+3. In DroidDeck Mali's **Settings**, turn on **Mali bridge**, then start a **Steam** session and sign in.
+4. For each game, pick **Proton Experimental ARM64 (Compatible)** in its Properties → Compatibility.
 
-MaliBridge is two programs. The **client** is a Vulkan ICD (`libvulkan_droidbridge.so`) that
-the guest's Vulkan loader picks up like any other driver. It encodes each call and sends it over
-a Unix socket. The **server** runs on Android, either in the app's own process (JNI) or as a
-separate executable. It decodes the calls and runs them on the real Mali driver. Where Mali is
-missing a feature, the server makes up for it (decodes BC textures on the GPU, rewrites SPIR-V,
-emulates push descriptors, and so on), and the client reports the feature as present.
+The [install guide](INSTALL.md) has every step, the settings to check, and which games to try first.
 
-Host-visible memory is shared, not copied: the server exports dma-bufs, dma-heap pages or
-AHardwareBuffers, and the client maps them. Command buffers are recorded on the client and sent
-in one message at `vkEndCommandBuffer`. Most calls do not wait for a reply.
+<a id="status"></a>
+## Games that run
 
-```
- Linux guest (glibc, aarch64)                Android (bionic)
-+---------------------------------+        +-----------------------------------+
-| game (x86, emulated)            |        | vkbridge server                   |
-|   D3D11 / D3D12                 |        |   decode, then run each call      |
-|   DXVK / vkd3d-proton           |        |   Mali emulations (BCn, push      |
-|   Vulkan loader                 |        |   descriptors, SPIR-V fixes, ...) |
-|   libvulkan_droidbridge.so ------ socket --->  libvulkan.so (Mali driver)    |
-|   (client ICD)                  |        |                                   |
-+---------------------------------+        +-----------------------------------+
-            \________ shared memory (dma-buf / dma-heap / AHB) ________/
-```
-
-The wire code for every Vulkan command and structure is generated from the Khronos registry
-(`vk.xml` 1.4.341) by `codegen/gen_vkbridge.py`. The client and server check a protocol hash
-when they connect.
-
-## Status
-
-Tested on two tablets, plus reports from players: a Mali-G720 Immortalis (Galaxy Tab S10+,
-MediaTek Dimensity 9300+, driver r44p1) and a Mali-G925 Immortalis (Galaxy Tab S11 Ultra,
-Dimensity 9400, driver r49p1, Android 16), inside the DroidDeck launcher, which runs the server
-and starts the guest. With the same build the G925 runs these games about 1.4-2x faster than the
-G720. See [INSTALL.md](INSTALL.md) to try it: since v0.5.1 the test APK is its own app, "DroidDeck
-Mali" (`com.droiddeck.launcher.mali`), and installs next to the official DroidDeck. Everything here
-is still work in progress.
+These are the games we've played on our two tablets, a Galaxy Tab S10+ (Mali-G720) and a Galaxy
+Tab S11 Ultra (Mali-G925), with the settings from the [install guide](INSTALL.md#settings-to-check).
+The S11 Ultra runs the same game about 1.4-2x faster. On other devices, expect results in line with
+how strong the GPU is.
 
 Ratings, from worst to best: barely runs, kinda playable, playable, very playable, excellent. They come from
 playing the games ourselves where we did, and from the frame rate otherwise.
@@ -127,29 +99,13 @@ playing the games ourselves where we did, and from the frame rate otherwise.
 Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mode, without the
 built-in presets described below. The other G925 figures are from v0.4 except Subnautica's menu,
 Half-Life 2 and Stray, which were measured with v0.5.
-The games from Poppy Playtime to Outer Wilds were played on the G925 with v0.5 test builds in
-October 2026, played by hand (fps read from the launcher's frame counter).
-Risk of Rain Returns needed a fix in the client: the G925 driver refuses multi-planar (NV12)
-images created with `MUTABLE_FORMAT | EXTENDED_USAGE`, which DXVK uses for video textures, so
-games that decode intro videos through Media Foundation waited for a frame that never came.
-With the fix it also runs at 59-60 fps on the G720.
+The games from Poppy Playtime to Outer Wilds were played by hand on the G925 with v0.5 test builds
+in October 2026 (fps read from the launcher's frame counter).
+Risk of Rain Returns used to freeze at its intro video; v0.5 fixes that on both tablets.
 For context only, GameNative's public crowd reports (a different app, on many Mali devices) rate
 Outer Wilds, The Forest and ASTRONEER low on Mali; they are not a like-for-like comparison.
 
-**Safe mode and performance mode** (see [below](#safe-mode-and-performance-mode)). Median fps,
-one run per game and mode, on USB power at thermal status 0-1. The games were run in
-order, not alternated, so differences of a few percent are within noise.
-
-| Game (scene) | G720 safe | G720 performance | G925 safe | G925 performance |
-|---|---|---|---|---|
-| Half-Life 2 (train ride, `+map d1_trainstation_01`) | 74.1 | 75.9 | 93.7 | 93.7 |
-| Subnautica (menu) | 62.0 | 62.3 | 81.3 | 81.5 |
-| Stray (title) | 17.1 | 15.8 | 58.4 | 58.0 |
-| Stardew Valley (title, 60 fps cap) | 60.0 | 60.0 | 60.0 | 60.0 |
-| Risk of Rain 2 (title) | 35.6 | 35.8 | 56.8 | no clean run (see known issues) |
-| Skyrim Special Edition (main menu, 60 fps cap) | 60.7 | 60.7 | not tested | not tested |
-
-### Known issues
+## Known issues
 
 - **The Witcher 3 (DX12) on the Mali-G925** plays its intro at 60 fps, but after loading a save
   the frame rate drops below 1 fps. The GPU is busy the whole time (about 98%), so this looks like
@@ -179,20 +135,100 @@ order, not alternated, so differences of a few percent are within noise.
 - **Outer Wilds, ASTRONEER and The Forest** are limited by the CPU on the G925 (emulated x86), so
   lowering the resolution or settings helps little.
 
-Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples compressed, at the
-size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11,
-BC6H -> ASTC 4x4 HDR where the GPU has `textureCompressionASTC_HDR`, as the G720 does).
-Without ASTC HDR, BC6H is decoded to RGBA16F (8x its compressed size), and so is any texture the
-transcoder cannot take (storage images, uncompressed views in the format list, sizes or types the
-GPU refuses). ASTC HDR has no negative values: BC6H SFLOAT texels below zero become 0.
-Transcoding is lossy: `bcn_check transcode` measures 31-69 dB PSNR against the BC data depending
-on format and content (measured on the Mali-G720: BC1 31-46 dB, BC2/BC3 46-60 dB, BC7 34-56 dB,
-BC4/BC5 44-67 dB, BC6H -> ASTC HDR 67-69 dB in linear values against each image's largest).
-It also costs upload time: a 4096x4096x2 BC7 texture takes about 310 ms to transcode to ASTC on
-the G720 where decoding it takes about 105 ms, so games that stream many large textures load
-somewhat more slowly. In Subnautica with Detail set to High the transcoded textures take 2.5 GB
-where the BC data is 2.4 GB (decoded they reached 4.75 GB and the game was killed); Stray's BC
-textures take 288 MB from 287 MB compressed.
+## Safe mode and performance mode
+
+**Short version:** leave **Safe mode** on (the default). It's the most compatible setting, and on our
+tablets performance mode is only 0-2% faster. Try performance mode once a game works, and if
+something breaks, switch back before reporting it.
+
+How much the mode changes frame rates on our tablets (median fps,
+one run per game and mode, on USB power at thermal status 0-1). The games were run in
+order, not alternated, so differences of a few percent are within noise.
+
+| Game (scene) | G720 safe | G720 performance | G925 safe | G925 performance |
+|---|---|---|---|---|
+| Half-Life 2 (train ride, `+map d1_trainstation_01`) | 74.1 | 75.9 | 93.7 | 93.7 |
+| Subnautica (menu) | 62.0 | 62.3 | 81.3 | 81.5 |
+| Stray (title) | 17.1 | 15.8 | 58.4 | 58.0 |
+| Stardew Valley (title, 60 fps cap) | 60.0 | 60.0 | 60.0 | 60.0 |
+| Risk of Rain 2 (title) | 35.6 | 35.8 | 56.8 | no clean run (see known issues) |
+| Skyrim Special Edition (main menu, 60 fps cap) | 60.7 | 60.7 | not tested | not tested |
+
+**Details:** with safe mode on, anything the bridge has not confirmed on this GPU and driver gets
+the workaround; performance mode uses the driver's own path wherever the start-up checks
+passed. In DroidDeck the switch is **Safe mode** under the Mali bridge button; elsewhere
+`VKBRIDGE_MODE=safe` or `performance` (first found: `<cache dir>/env`, the server's environment,
+the app's `<cache dir>/mode`, then safe). It is read again at each device, so a change needs no
+new probe and no restart, and the log and the session report say which mode was used and why.
+
+| | Safe (default) | Performance |
+|---|---|---|
+| Emulations gated by a start-up check | kept unless the check passed (a check still running in the background, or one that could not run, keeps the emulation) | dropped unless the check failed, crashed or hung |
+| Driver bug fixes (next section) | on for an unknown driver version, and for some fixes always | by the driver version and the check result |
+| Compile watchdog interrupt | 10 s | 20 s |
+| Cached readback | off | on for the frame readback where the self-test passes it |
+
+The same in both: the wait retry, BC transcode quality (`auto`), forced robust buffer access, and
+descriptor batching off. On our two tablets the start-up checks are complete, so the modes differ
+little (the table above); safe mode is meant for GPUs we have not tested.
+
+## Getting help
+
+- **Something doesn't work?** Stop the session, tap **Share logs** in DroidDeck's Settings, and
+  attach the zip to a [new issue](https://github.com/ASEbrahim/MaliBridge/issues) with your device
+  model and what happened. [Install guide: If something goes wrong](INSTALL.md#if-something-goes-wrong)
+  has the details.
+- **Questions** (storage, which Proton, PanVK, anti-cheat): see the [FAQ](INSTALL.md#faq).
+
+## What's next
+
+- Smoother first visits to new areas (shader compiling in the background).
+- The games limited by the CPU (The Forest, ASTRONEER, Outer Wilds) and faster file access in
+  DroidDeck's sandbox, which should also fix Just Cause 2.
+- DirectX 12: The Witcher 3's stall, Stray in DX12, Elden Ring.
+- More devices: reports from Mali GPUs we haven't tested are the fastest way to get there.
+- Packaging the Mali fixes as a standalone Vulkan layer that works without the socket bridge.
+
+---
+
+# For developers
+
+The rest of this page is about how MaliBridge works, how to build and test it, and its switches.
+
+## How it works
+
+PC games on an Android device run in a Linux guest (glibc, aarch64) under x86 emulation, with
+DXVK or vkd3d-proton turning Direct3D into Vulkan. The guest has no GPU driver of its own. The
+Mali driver lives on the Android side, and it is missing features that DXVK and vkd3d-proton
+need before they will start: BC textures, push descriptors, robustness2, clip distances and more.
+
+MaliBridge is two programs. The **client** is a Vulkan ICD (`libvulkan_droidbridge.so`) that
+the guest's Vulkan loader picks up like any other driver. It encodes each call and sends it over
+a Unix socket. The **server** runs on Android, either in the app's own process (JNI) or as a
+separate executable. It decodes the calls and runs them on the real Mali driver. Where Mali is
+missing a feature, the server makes up for it (decodes BC textures on the GPU, rewrites SPIR-V,
+emulates push descriptors, and so on), and the client reports the feature as present.
+
+Host-visible memory is shared, not copied: the server exports dma-bufs, dma-heap pages or
+AHardwareBuffers, and the client maps them. Command buffers are recorded on the client and sent
+in one message at `vkEndCommandBuffer`. Most calls do not wait for a reply.
+
+```
+ Linux guest (glibc, aarch64)                Android (bionic)
++---------------------------------+        +-----------------------------------+
+| game (x86, emulated)            |        | vkbridge server                   |
+|   D3D11 / D3D12                 |        |   decode, then run each call      |
+|   DXVK / vkd3d-proton           |        |   Mali emulations (BCn, push      |
+|   Vulkan loader                 |        |   descriptors, SPIR-V fixes, ...) |
+|   libvulkan_droidbridge.so ------ socket --->  libvulkan.so (Mali driver)    |
+|   (client ICD)                  |        |                                   |
++---------------------------------+        +-----------------------------------+
+            \________ shared memory (dma-buf / dma-heap / AHB) ________/
+```
+
+The wire code for every Vulkan command and structure is generated from the Khronos registry
+(`vk.xml` 1.4.341) by `codegen/gen_vkbridge.py`. The client and server check a protocol hash
+when they connect.
 
 ## Mali workarounds
 
@@ -226,25 +262,20 @@ Each one turns on only when the GPU lacks the feature.
 - **Persistent pipeline cache**: Mali recompiles everything in each new process unless it gets a cache, and DXVK passes none. The cache is kept per Steam game (by app id), and Steam's "Processing Vulkan shaders" step now fills the cache the game loads, so letting it finish shortens the first run's stutter. Processes that save the same cache at once merge their pipelines, and a game that is killed keeps what it compiled.
 - **Shader quirk lists**: listed shaders are drawn with rasterization discarded or replaced by a constant colour, for draws the GPU cannot run.
 
-## Safe mode and performance mode
-
-Safe mode is the default. With it on, anything the bridge has not confirmed on this GPU and driver
-gets the workaround; performance mode uses the driver's own path wherever the start-up checks
-passed. In DroidDeck the switch is **Safe mode** under the Mali bridge button; elsewhere
-`VKBRIDGE_MODE=safe` or `performance` (first found: `<cache dir>/env`, the server's environment,
-the app's `<cache dir>/mode`, then safe). It is read again at each device, so a change needs no
-new probe and no restart, and the log and the session report say which mode was used and why.
-
-| | Safe (default) | Performance |
-|---|---|---|
-| Emulations gated by a start-up check | kept unless the check passed (a check still running in the background, or one that could not run, keeps the emulation) | dropped unless the check failed, crashed or hung |
-| Driver bug fixes (next section) | on for an unknown driver version, and for some fixes always | by the driver version and the check result |
-| Compile watchdog interrupt | 10 s | 20 s |
-| Cached readback | off | on for the frame readback where the self-test passes it |
-
-The same in both: the wait retry, BC transcode quality (`auto`), forced robust buffer access, and
-descriptor batching off. On our two tablets the start-up checks are complete, so the modes differ
-little (the table under Status); safe mode is meant for GPUs we have not tested.
+Known limit: BC textures are transcoded to ETC2/EAC/ASTC, which Mali samples compressed, at the
+size of the BC data (BC1 -> ETC2 RGB8/RGB8A1, BC2/BC3/BC7 -> ASTC 4x4, BC4/BC5 -> EAC R11/RG11,
+BC6H -> ASTC 4x4 HDR where the GPU has `textureCompressionASTC_HDR`, as the G720 does).
+Without ASTC HDR, BC6H is decoded to RGBA16F (8x its compressed size), and so is any texture the
+transcoder cannot take (storage images, uncompressed views in the format list, sizes or types the
+GPU refuses). ASTC HDR has no negative values: BC6H SFLOAT texels below zero become 0.
+Transcoding is lossy: `bcn_check transcode` measures 31-69 dB PSNR against the BC data depending
+on format and content (measured on the Mali-G720: BC1 31-46 dB, BC2/BC3 46-60 dB, BC7 34-56 dB,
+BC4/BC5 44-67 dB, BC6H -> ASTC HDR 67-69 dB in linear values against each image's largest).
+It also costs upload time: a 4096x4096x2 BC7 texture takes about 310 ms to transcode to ASTC on
+the G720 where decoding it takes about 105 ms, so games that stream many large textures load
+somewhat more slowly. In Subnautica with Detail set to High the transcoded textures take 2.5 GB
+where the BC data is 2.4 GB (decoded they reached 4.75 GB and the game was killed); Stray's BC
+textures take 288 MB from 287 MB compressed.
 
 ## Driver bug fixes
 
@@ -430,11 +461,6 @@ host/          desktop build and regression suite
 scripts/       device builds (Android server, Linux client)
 third_party/   Vulkan-Headers 1.4.341, bcdec, etc2_encode's licence (the encoders derive from it)
 ```
-
-## Roadmap
-
-- Package the Mali emulations as a standalone Vulkan layer that works without the socket bridge.
-- Test on more devices and driver versions (other Mali generations, newer drivers).
 
 ## License
 
