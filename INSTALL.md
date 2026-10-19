@@ -9,7 +9,7 @@ On a Galaxy Tab S10+ or S11 Ultra it works well. On other Mali devices it's stil
 rough edges and please report what you find. Not sure about your device? Check the
 [Does my device work?](README.md#does-my-device-work) table.
 
-**Quick version:** install, turn on **Mali bridge** in Settings, start a Steam session, and set each
+**Quick version:** install, start a Steam session (the Mali bridge is on by default), and set each
 game to **Proton Experimental ARM64 (Compatible)**. The steps below have the details.
 
 ## What you need
@@ -29,7 +29,7 @@ game to **Proton Experimental ARM64 (Compatible)**. The steps below have the det
    build (before v0.5.1, shown as plain "DroidDeck"), you can uninstall it once the new one works.
 2. Download the `DroidDeck-MaliBridge-...-test.apk` file from the newest release and open it. Android asks
    you to allow installs from your browser or file manager. Allow it.
-3. Open **DroidDeck Mali**, go to **Settings**, and tap **Mali bridge: off** so it reads **Mali bridge: on**.
+3. Open **DroidDeck Mali** and check **Settings**: **Mali bridge** should read **on** (it is on by default in DroidDeck Mali; tap it if it says off).
    The button is only shown on Mali devices, and only while no session is running.
    Below it, leave **Safe mode: on** for now (see [Safe mode and performance mode](#safe-mode-and-performance-mode)).
 4. Start a **Steam session**. The first start downloads the Linux runtime and the Steam client,

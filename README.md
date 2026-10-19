@@ -41,7 +41,7 @@ from your device help a lot (see [If something goes wrong](INSTALL.md#if-somethi
 
 1. Check your chip in the table above.
 2. Download `DroidDeck-MaliBridge-...-test.apk` from the [latest release](https://github.com/ASEbrahim/MaliBridge/releases/latest) and install it. It shows up as **DroidDeck Mali**.
-3. In DroidDeck Mali's **Settings**, turn on **Mali bridge**, then start a **Steam** session and sign in.
+3. Open DroidDeck Mali (the **Mali bridge** is on by default; check Settings if unsure), start a **Steam** session and sign in.
 4. For each game, pick **Proton Experimental ARM64 (Compatible)** in its Properties → Compatibility.
 
 The [install guide](INSTALL.md) has every step, the settings to check, and which games to try first.
