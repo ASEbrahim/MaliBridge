@@ -26,13 +26,15 @@ which chip you have? It's under Settings → About phone (or About tablet), or i
 |---|---|---|---|
 | Samsung Galaxy Tab S10+ | Dimensity 9300+ / Immortalis-G720 MC12 | r44p1 | **Works well** (tested in depth) |
 | Samsung Galaxy Tab S11 Ultra | Dimensity 9400 / Immortalis-G925 MC12 | r49p1 | **Works well** (tested in depth) |
-| Xiaomi 18 Fold | XRing O3 / Mali-G2-Ultra-NX MC16 | r56p0 | Player reports: partly working; v0.5.1 has fixes for it |
+| Xiaomi 18 Fold | XRing O3 / Mali-G2-Ultra-NX MC16 | r56p0 | Player reports: works since v0.5.2 (self-test 13/13, Steam, Brotato about 77 fps) |
 | Google Pixel 9 | Tensor G4 / Mali-G715 | r54p3 | Player report: Steam starts; games not confirmed yet |
 | Google Pixel 8 / 8 Pro | Tensor G3 / Mali-G715 | r54 | Player reports: games run (Cuphead, Hades, Balatro, Dishonored) |
 | vivo X200 | Dimensity 9400 / Immortalis-G925 MC12 | | Player report: games run (Euro Truck Simulator 2, CarX Drift Racing Online) |
 | OPPO Find X9 Pro and others | Dimensity 9500 / Mali-G1-Ultra MC12 | r54p1 | Player reports: games run since v0.5.2 (Balatro, Slay the Spire) |
 | OnePlus (Dimensity 9000) | Mali-G710 | r32p1 (Vulkan 1.1) | Player report: Half-Life 2 and RimWorld start with DXVK 1.10.3 picked by hand; the automatic pick is being fixed |
 | POCO X6 Pro | Dimensity 8300-Ultra / Mali-G615 MC6 | | Player report: lighter games run (GTA San Andreas, Burnout Paradise) |
+| realme Neo7 | Dimensity 9300+ / Immortalis-G720 MC12 | r44p1 | Player report: Stardew Valley runs; Balatro runs with its text missing |
+| Dimensity 8350 phone | Mali-G615 | | Player report: Rivals of Aether about 55 fps |
 
 **Help wanted: not tested yet.** Reports from these would help the most:
 
@@ -144,6 +146,13 @@ readings, not my measurements.
 | Prince of Persia: Warrior Within | POCO X6 Pro (G615) | about 30 fps |
 | Burnout Paradise | POCO X6 Pro (G615) | 20-30 fps |
 | Palia | POCO X6 Pro (G615) | 4-10 fps |
+| Brotato | Xiaomi 18 Fold (XRing O3) | about 77 fps |
+| Little Nightmares | Redmi K90 Max (Dimensity 9500) | about 60 fps |
+| Little Nightmares II | Redmi K90 Max (Dimensity 9500) | about 60 fps |
+| The Elder Scrolls V: Skyrim | Pixel 8 Pro (G715) | 17-20 fps on Low, dips when fighting |
+| Stardew Valley | realme Neo7 (G720) | about 59 fps |
+| Balatro | realme Neo7 (G720) | 55-72 fps, but its text is missing |
+| Rivals of Aether | Dimensity 8350 phone (G615) | about 55 fps |
 
 ## Known issues
 
