@@ -153,6 +153,7 @@ readings, not my measurements.
 | Stardew Valley | realme Neo7 (G720) | about 59 fps |
 | Balatro | realme Neo7 (G720) | 55-72 fps, but its text is missing |
 | Rivals of Aether | Dimensity 8350 phone (G615) | about 55 fps |
+| Indiana Jones and the Emperor's Tomb | POCO X8 Pro (G720 MC8) | about 30 fps in play with the Stability FEX preset; the Performance presets stop it with an "invalid camera matrix" error |
 
 ## Known issues
 
