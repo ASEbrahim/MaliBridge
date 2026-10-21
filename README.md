@@ -28,17 +28,20 @@ which chip you have? It's under Settings → About phone (or About tablet), or i
 | Samsung Galaxy Tab S11 Ultra | Dimensity 9400 / Immortalis-G925 MC12 | r49p1 | **Works well** (tested in depth) |
 | Xiaomi 18 Fold | XRing O3 / Mali-G2-Ultra-NX MC16 | r56p0 | Player reports: partly working; v0.5.1 has fixes for it |
 | Google Pixel 9 | Tensor G4 / Mali-G715 | r54p3 | Player report: Steam starts; games not confirmed yet |
+| Google Pixel 8 / 8 Pro | Tensor G3 / Mali-G715 | r54 | Player reports: games run (Cuphead, Hades, Balatro, Dishonored) |
+| vivo X200 | Dimensity 9400 / Immortalis-G925 MC12 | | Player report: games run (Euro Truck Simulator 2, CarX Drift Racing Online) |
+| OPPO Find X9 Pro and others | Dimensity 9500 / Mali-G1-Ultra MC12 | r54p1 | Player reports: games run since v0.5.2 (Balatro, Slay the Spire) |
+| OnePlus (Dimensity 9000) | Mali-G710 | r32p1 (Vulkan 1.1) | Player report: Half-Life 2 and RimWorld start with DXVK 1.10.3 picked by hand; the automatic pick is being fixed |
+| POCO X6 Pro | Dimensity 8300-Ultra / Mali-G615 MC6 | | Player report: lighter games run (GTA San Andreas, Burnout Paradise) |
 
 **Help wanted: not tested yet.** Reports from these would help the most:
 
 | Chip | GPU | Example devices |
 |---|---|---|
 | Dimensity 9300 / 9300+ (other devices) | Immortalis-G720 MC12 | Xiaomi 14T Pro, vivo X100 Pro |
-| Dimensity 9400 / 9400+ (other devices) | Immortalis-G925 MC12 | vivo X200, OPPO Find X8 |
+| Dimensity 9400 / 9400+ (other devices) | Immortalis-G925 MC12 | OPPO Find X8 |
 | Dimensity 8400 / 8500 | Mali-G720 MC7 / MC8 | POCO X7 Pro, POCO X8 Pro |
-| Dimensity 9500 | Mali-G1-Ultra MC12 | OPPO Find X9 Pro, REDMI K90 Max |
 | Dimensity 9000 / 9200 | Mali-G710 / Immortalis-G715 | OnePlus Ace 2V |
-| Google Tensor G3 | Mali-G715 | Pixel 8 |
 | Dimensity 7300, 8100, 8200, Helio G99 and similar | Mali-G615 / G610 / G57 | many mid-range phones (smaller GPUs: expect light games only) |
 | Exynos 1280 / 1380 / 2100 | Mali-G68 / G78 | Galaxy A53, A54, S21 |
 
@@ -119,6 +122,28 @@ in October 2026 (fps read from the launcher's frame counter).
 Risk of Rain Returns used to freeze at its intro video; v0.5 fixes that on both tablets.
 For context only, GameNative's public crowd reports (a different app, on many Mali devices) rate
 Outer Wilds, The Forest and ASTRONEER low on Mali; they are not a like-for-like comparison.
+
+**Player reports.** Games other players got running on their devices with v0.5.2. The fps are their own
+readings, not my measurements.
+
+| Game | Device (GPU) | Result |
+|---|---|---|
+| Cuphead | Pixel 8 (G715) | 60-100 fps |
+| Hades | Pixel 8 (G715) | 30-60 fps |
+| Dishonored | Pixel 8 Pro (G715) | 30 fps on the menu, 15-25 in the prologue, drops when moving |
+| Balatro | Dimensity 9500 phone (G1-Ultra) | about 55 fps |
+| Slay the Spire | Dimensity 9500 phone (G1-Ultra) | 60-70 fps |
+| Lobotomy Corporation | Dimensity 9500 phone (G1-Ultra) | about 30 fps; green pixels in some backgrounds |
+| Library of Ruina | Dimensity 9500 phone (G1-Ultra) | 15-35 fps; green pixels in some backgrounds |
+| Reshaping Creatures | Dimensity 9500 (G1-Ultra) | starts; 5-9 fps |
+| Euro Truck Simulator 2 | vivo X200 (G925) | about 20 fps in play (Medium, 1600x720), smooth menus |
+| CarX Drift Racing Online | vivo X200 (G925) | 9-20 fps in play on the lowest settings, with stutter |
+| Half-Life 2 | OnePlus, Dimensity 9000 (G710) | starts with DXVK 1.10.3 picked by hand |
+| RimWorld | OnePlus, Dimensity 9000 (G710) | menu and world generation work; crashes during character creation |
+| GTA San Andreas | POCO X6 Pro (G615) | about 30 fps |
+| Prince of Persia: Warrior Within | POCO X6 Pro (G615) | about 30 fps |
+| Burnout Paradise | POCO X6 Pro (G615) | 20-30 fps |
+| Palia | POCO X6 Pro (G615) | 4-10 fps |
 
 ## Known issues
 
