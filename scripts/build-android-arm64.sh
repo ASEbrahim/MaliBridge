@@ -30,7 +30,7 @@ cmake -B build-android-arm64 \
     -DCMAKE_WARN_DEPRECATED=OFF \
     $INSTALL_FLAG
 
-cmake --build build-android-arm64
+cmake --build build-android-arm64 -j 8
 
 if [ ! -z "${INSTALL_DIR}" ]; then
     cmake --install build-android-arm64

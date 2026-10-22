@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "server_emu.h"
+#include "vkb_emu_formats.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -157,11 +158,7 @@ int vkb_emu_planar_ext_refused(VkFormat f, VkImageCreateFlags flags)
     static int fake = -1;
     if (fake < 0) fake = vkb_emu_faked("planarext");
     if (!fake || !(flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) return 0;
-    return (f >= VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM && f <= VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM) ||
-           (f >= VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 && f <= VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16) ||
-           (f >= VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16 && f <= VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16) ||
-           (f >= VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM && f <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM) ||
-           (f >= VK_FORMAT_G8_B8R8_2PLANE_444_UNORM && f <= VK_FORMAT_G16_B16R16_2PLANE_444_UNORM);
+    return vkb_is_multiplanar(f);
 }
 
 static PFN_vkGetPhysicalDeviceImageFormatProperties planar_next1;

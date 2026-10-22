@@ -20,6 +20,7 @@
 
 #include "vkb_wire.h"
 #include "vkb_proto.h"
+#include "vkb_caps.h"
 #include "vkb_log.h"
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
@@ -60,6 +61,7 @@ typedef struct vkb_physdev {
     vkb_object obj;
     struct vkb_instance *instance;
     vkb_server_pd_info info;
+    vkb_pd_caps caps;
     VkPhysicalDeviceProperties props;
     VkPhysicalDeviceMemoryProperties server_mem;
     VkPhysicalDeviceMemoryProperties client_mem;   /* what the app sees */
