@@ -1,0 +1,63 @@
+name: Test MaliBridge
+run-name: ${{ github.actor }} is testing MaliBridge
+
+on:
+    push:
+    pull_request:
+    workflow_dispatch:
+
+jobs:
+    test:
+        name: Test ${{ matrix.target }}
+        runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: linux-x86-64
+                      cmake-flags: >-
+                          -DCMAKE_SYSTEM_NAME=Linux
+                          -DCMAKE_BUILD_TYPE=Release
+                          -DBUILD_VARIANT=linux-x86-64
+
+                    - target: linux-aarch64
+                      cmake-flags: >-
+                          -DCMAKE_SYSTEM_NAME=Linux
+                          -DCMAKE_BUILD_TYPE=Release
+                          -DCMAKE_SYSTEM_PROCESSOR=aarch64
+                          -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc
+                          -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+                          -DBUILD_VARIANT=linux-aarch64
+
+        steps:
+            - name: Install System Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends \
+                    glslang-tools \
+                    glslc \
+                    xxd \
+                    libvulkan-dev \
+                    mesa-vulkan-drivers \
+                    python3
+
+            - name: Checkout source code
+              uses: actions/checkout@v6
+              with:
+                  submodules: recursive
+
+            - name: Install AArch64 Cross Compiler
+              if: matrix.target == 'linux-aarch64'
+              run: |
+                  sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+            - name: Configure CMake
+              run: |
+                  cmake -B build ${{ matrix.cmake-flags }}
+
+            - name: Build MaliBridge
+              run: cmake --build build --config Release
+
+            - name: The Cached Server Hook List
+              run: host/hook_list_test.sh
