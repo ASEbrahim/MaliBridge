@@ -12,7 +12,7 @@ cmake -B build-linux-aarch64 \
   -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
   $INSTALL_FLAG
 
-cmake --build build-linux-aarch64
+cmake --build build-linux-aarch64 -j 8
 
 if [ ! -z "${INSTALL_DIR}" ]; then
     cmake --install build-linux-aarch64

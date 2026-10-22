@@ -48,11 +48,16 @@ set(COMMON_GEN_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/common/gen/vkb_gen_structs.c
 )
 
+set(CAPS_SOURCE
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/vkb_caps.c
+)
+
 # Server-side
 file(GLOB SERVER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/server/*.c")
 set(SERVER_ALL_SOURCES
     ${SERVER_SOURCES}
     ${COMMON_GEN_SOURCES}
+    ${CAPS_SOURCE}
     ${CMAKE_CURRENT_SOURCE_DIR}/common/gen/vkb_gen_server.c
 )
 
@@ -94,6 +99,7 @@ file(GLOB CLIENT_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/client/*.c")
 set(CLIENT_ALL_SOURCES
     ${CLIENT_SOURCES}
     ${COMMON_GEN_SOURCES}
+    ${CAPS_SOURCE}
     ${CMAKE_CURRENT_SOURCE_DIR}/common/gen/vkb_gen_client.c
 )
 

@@ -20,7 +20,7 @@ git=$(git -C "$root" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/n
     -I"$root/third_party/Vulkan-Headers-1.4.341/include" -I"$root/common" -I"$root/common/gen" -I"$srv" \
     -Wl,-z,max-page-size=16384 -Wl,--build-id=none -DVKB_GIT="\"$git\"" \
     -o "$out/libvkbridge_server.so" \
-    "$srv"/*.c "$root/common/vkb_wire.c" "$root/common/gen/vkb_gen_structs.c" "$root/common/gen/vkb_gen_server.c" \
+    "$srv"/*.c "$root/common/vkb_wire.c" "$root/common/vkb_caps.c" "$root/common/gen/vkb_gen_structs.c" "$root/common/gen/vkb_gen_server.c" \
     -ldl -llog -lm
 "$(dirname "$cc")/llvm-strip" --strip-unneeded "$out/libvkbridge_server.so"
 # In-process is the default on the device: only there does Android hand the server the same
@@ -29,7 +29,7 @@ git=$(git -C "$root" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/n
     -I"$root/third_party/Vulkan-Headers-1.4.341/include" -I"$root/common" -I"$root/common/gen" -I"$srv" \
     -Wl,-z,max-page-size=16384 -Wl,--build-id=none -Wl,--no-undefined -Wl,-soname,libvkbridge_jni.so -DVKB_GIT="\"$git\"" \
     -o "$out/libvkbridge_jni.so" \
-    "$srv"/*.c "$root/common/vkb_wire.c" "$root/common/gen/vkb_gen_structs.c" "$root/common/gen/vkb_gen_server.c" \
+    "$srv"/*.c "$root/common/vkb_wire.c" "$root/common/vkb_caps.c" "$root/common/gen/vkb_gen_structs.c" "$root/common/gen/vkb_gen_server.c" \
     -ldl -llog -lm
 "$(dirname "$cc")/llvm-strip" --strip-unneeded "$out/libvkbridge_jni.so"
 echo "built $out/libvkbridge_server.so and libvkbridge_jni.so"

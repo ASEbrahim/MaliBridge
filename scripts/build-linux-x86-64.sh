@@ -9,7 +9,7 @@ cmake -B build-linux-x86-64 \
   -DCMAKE_BUILD_TYPE=Release \
   $INSTALL_FLAG
 
-cmake --build build-linux-x86-64
+cmake --build build-linux-x86-64 -j 8
 
 if [ ! -z "${INSTALL_DIR}" ]; then
     cmake --install build-linux-x86-64

@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "server_emu.h"
+#include "vkb_caps.h"
 #include "vkb_ext_alias.h"
 
 #include <pthread.h>
@@ -21,6 +22,11 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     for (uint32_t i = 0; i < n; i++)
         if (!strcmp(e[i].extensionName, name)) return 1;
     return 0;
+}
+
+static int ext_faked(const char *name, void *user)
+{
+    return vkb_emu_faked(name);
 }
 
 const vkb_pd_knowledge *vkb_pd_lookup(const vkb_dispatch *dt, VkPhysicalDevice pd)
@@ -370,29 +376,16 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     uint32_t extra_n = 0;
     char not_passed[600] = "";
     const char *const *extra = vkb_mem_required_extensions(strategy, &extra_n);
-    const char **exts = vkb_dec_alloc(&c->d, (ci->enabledExtensionCount + extra_n + 24) * sizeof(char *));
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
-        const char *e = ci->ppEnabledExtensionNames[i];
-        /* VKBRIDGE_FAKE_MISSING may name extensions the driver is to be taken as lacking (host tests). */
-        if (!has_ext(avail, avail_n, e) || vkb_emu_faked(e)) {
-            /* An EXT name the driver has only as KHR (vkb_ext_alias.h): the KHR one in its place. */
-            const char *k = NULL;
-            for (size_t j = 0; j < VKB_EXT_ALIAS_COUNT && !k; j++)
-                if (!strcmp(vkb_ext_aliases[j].app, e) && has_ext(avail, avail_n, vkb_ext_aliases[j].driver))
-                    k = vkb_ext_aliases[j].driver;
-            if (k) {
-                VKB_INFO("vkCreateDevice: %s enabled as %s", e, k);
-                if (!list_has(exts, n, k)) exts[n++] = k;
-                continue;
-            }
-            VKB_DBG("device extension %s is emulated or client-side; not passed to the driver", e);
-            size_t nl = strlen(not_passed);
-            if (nl + strlen(e) + 2 < sizeof(not_passed)) snprintf(not_passed + nl, sizeof(not_passed) - nl, "%s%s", nl ? " " : "", e);
-            continue;
-        }
-        if (!list_has(exts, n, e)) exts[n++] = e;
-    }
+    uint32_t max_exts = ci->enabledExtensionCount + extra_n + 24;
+    const char **exts = vkb_dec_alloc(&c->d, max_exts * sizeof(char *));
+    /* What the driver actually gets:
+     * 1. only the extensions it has,
+     * 2. the app's EXT names translated to the driver's KHR names if necessary,
+     * 3. the emulated and client-side ones dropped */
+    uint32_t n = vkb_caps_filter_device_extensions(emu, avail, avail_n,
+                                                   ci->ppEnabledExtensionNames, ci->enabledExtensionCount,
+                                                   exts, max_exts, ext_faked, NULL,
+                                                   not_passed, sizeof(not_passed));
     for (uint32_t i = 0; i < extra_n; i++)
         if (has_ext(avail, avail_n, extra[i]) && !list_has(exts, n, extra[i])) exts[n++] = extra[i];
     /* What the client's presentation code uses on every device (dma-buf swapchains, sync fds). */
@@ -417,9 +410,6 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     if ((emu & VKB_EMU_BCN) && vkb_emu_bcn_astc_hdr(&inst->real, pd, inst->api_version) == 2 &&
         !list_has(exts, n, "VK_EXT_texture_compression_astc_hdr"))
         exts[n++] = "VK_EXT_texture_compression_astc_hdr";
-    /* The BC decoder binds its buffer and image with push descriptors. */
-    if ((emu & VKB_EMU_BCN) && has_ext(avail, avail_n, "VK_KHR_push_descriptor") && !list_has(exts, n, "VK_KHR_push_descriptor"))
-        exts[n++] = "VK_KHR_push_descriptor";
     /* The hang detector asks the driver what faulted once the device is lost. */
     if (vkb_hang_wanted() && has_ext(avail, avail_n, "VK_EXT_device_fault") && !list_has(exts, n, "VK_EXT_device_fault")) {
         VkPhysicalDeviceFaultFeaturesEXT *ff = vkb_dec_alloc(&c->d, sizeof(*ff));

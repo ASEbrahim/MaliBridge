@@ -52,10 +52,10 @@ static uint32_t spoof_choice(const vkb_physdev *pd, const char **from)
     const char *e = getenv("VKBRIDGE_SPOOF_GPU");
     *from = "the guest's VKBRIDGE_SPOOF_GPU";
     if (e && *e) {
-        if (!strcmp(e, "nvidia")) return VKB_SPOOF_NVIDIA;
-        if (!strcmp(e, "amd")) return VKB_SPOOF_AMD;
-        if (strcmp(e, "0") && strcmp(e, "off")) VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_SPOOF_GPU=%s is not nvidia, amd or off; the real GPU is shown", e);
-        return 0;
+        int ok = 1;
+        uint32_t v = vkb_caps_spoof_gpu(e, &ok);
+        if (!ok) VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_SPOOF_GPU=%s is not nvidia, amd or off; the real GPU is shown", e);
+        return v;
     }
     *from = "the server's VKBRIDGE_SPOOF_GPU (the game's preset or <cache dir>/env)";
     uint32_t v = pd->info.spoof_gpu;
@@ -68,9 +68,9 @@ static VkDeviceSize heap_cap(const vkb_physdev *pd, const char **from)
     const char *e = getenv("VKBRIDGE_HEAP_MAX_MB");
     if (e && *e) {
         *from = "the guest's VKBRIDGE_HEAP_MAX_MB";
-        char *end;
-        unsigned long long mb = strtoull(e, &end, 10);
-        if (*end || *e == '-') {
+        int ok = 1;
+        uint32_t mb = vkb_caps_heap_max_mb(e, &ok);
+        if (!ok) {
             VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_HEAP_MAX_MB=%s is not a number of MB; heaps reported as they are", e);
             return 0;
         }
@@ -90,8 +90,8 @@ static void cap_heaps(vkb_physdev *pd)
         if (!(c->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || c->memoryHeaps[h].size <= cap) continue;
         VKB_INFO("memory: device-local heap %u reported as %llu MB, not %llu MB (%s)", h, (unsigned long long)(cap >> 20),
                  (unsigned long long)(c->memoryHeaps[h].size >> 20), from);
-        c->memoryHeaps[h].size = cap;
     }
+    vkb_caps_patch_memory_heaps(&pd->caps, c, NULL);
 }
 
 /* ------------------------------------------------------------------ memory model */
@@ -409,6 +409,21 @@ int vkb_physdev_ready(vkb_physdev *pd)
     vkb_call_end(&c);
     vkb_client_knobs_set(pd->info.client_knobs);
     vkb_wire_vkGetPhysicalDeviceProperties((VkPhysicalDevice)pd, &pd->props);
+
+    // Set up the common vkb_caps capability context
+    const char *from;
+    pd->caps.emu = pd->info.emu;
+    pd->caps.missing = pd->info.missing;
+    pd->caps.spoof_gpu = spoof_choice(pd, &from);
+    pd->caps.real_props = pd->props; // pd->props has not been modified yet
+    if (pd->caps.spoof_gpu) {
+        const struct spoof_gpu *g = &spoof_gpus[pd->caps.spoof_gpu];
+        VKB_ONCE(VKB_LOG_INFO, "GPU shown to the app as %s (vendor 0x%04x, device 0x%04x), not %s (vendor 0x%04x, device 0x%04x; %s)", g->name,
+                 g->vendor, g->device, pd->props.deviceName, pd->props.vendorID, pd->props.deviceID, from);
+    }
+    VkDeviceSize hcap = heap_cap(pd, &from);
+    pd->caps.heap_max_mb = hcap ? (uint32_t)(hcap >> 20) : 0;
+
     vkb_wire_vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)pd, &pd->server_mem);
     build_memory_model(pd);
 
@@ -444,6 +459,7 @@ int vkb_physdev_ready(vkb_physdev *pd)
         pd->aliased |= 1u << i;
         VKB_INFO("%s: offered as an alias of %s", vkb_ext_aliases[i].app, vkb_ext_aliases[i].driver);
     }
+    pd->caps.aliased = pd->aliased;
     if (drm_node(NULL, NULL)) {
         VkExtensionProperties *e = &pd->exts[pd->next++];
         snprintf(e->extensionName, sizeof(e->extensionName), "VK_EXT_physical_device_drm");
@@ -482,15 +498,7 @@ uint32_t vkb_max_api(void)
 static void patch_props(vkb_physdev *pd, VkPhysicalDeviceProperties *p)
 {
     if (p->apiVersion > vkb_max_api()) p->apiVersion = vkb_max_api();
-    const char *from;
-    uint32_t sp = vkb_physdev_ready(pd) ? spoof_choice(pd, &from) : 0;
-    if (!sp) return;
-    const struct spoof_gpu *g = &spoof_gpus[sp];
-    VKB_ONCE(VKB_LOG_INFO, "GPU shown to the app as %s (vendor 0x%04x, device 0x%04x), not %s (vendor 0x%04x, device 0x%04x; %s)", g->name,
-             g->vendor, g->device, pd->props.deviceName, pd->props.vendorID, pd->props.deviceID, from);
-    p->vendorID = g->vendor;
-    p->deviceID = g->device;
-    snprintf(p->deviceName, sizeof(p->deviceName), "%s", g->name);
+    vkb_physdev_ready(pd);
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties *pProperties)
