@@ -109,7 +109,7 @@ def generate_header(commands, aliases, out_path):
     dev_proc_list = list(HANDLE_CREATION_COMMANDS)
     inst_proc_list = []
 
-    for name in sorted(HANDLE_CREATION_COMMANDS | MANUAL_COMMANDS):
+    for name in sorted(HANDLE_CREATION_COMMANDS | MANUAL_COMMANDS | set(LAYER_FUNCTIONS)):
         cmd = commands[name]
         ret = cmd["return"]
         param_decls = ", ".join(re.sub(r'\s+', ' ', p["decl"]) for p in cmd["params"])
@@ -154,7 +154,7 @@ def generate_header(commands, aliases, out_path):
         first_arg = cmd["params"][0]["name"]
         is_void = (ret == "void")
 
-        func_code = f"static VKAPI_ATTR {ret} VKAPI_CALL Layer_{name}({param_decls})\n{{\n"
+        func_code = f"VKAPI_ATTR {ret} VKAPI_CALL Layer_{name}({param_decls})\n{{\n"
         for use in sorted(mali_bridge_hooks[name]):
             func_code += f"    // {use}\n"
         func_code += f"    auto ctx = get_scoped_ctx({first_arg});\n"
