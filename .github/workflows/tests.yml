@@ -29,6 +29,7 @@ jobs:
         steps:
             - name: Install System Dependencies
               run: |
+                  [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
                   sudo apt-get update
                   sudo apt-get install -y --no-install-recommends \
                     glslang-tools \
@@ -60,3 +61,7 @@ jobs:
             - name: Quick Checks
               if: matrix.target == 'linux-x86-64'
               run: host/quick_check.sh
+
+            - name: The Bridge's Regression Suite
+              if: matrix.target == 'linux-x86-64'
+              run: host/run_ci_tests.sh
