@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.19)
-project(vkbridge C)
+project(vkbridge C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CheckIncludeFile)
 find_package(Threads REQUIRED)
@@ -159,3 +162,22 @@ install(TARGETS droiddeck-vkbridge-smoke
 install(FILES "${ICD_JSON_PATH}"
     DESTINATION share/vkbridge
 )
+
+find_package(Catch2 3 QUIET)
+set(layer_tests_target "${CMAKE_SYSTEM_PROCESSOR}")
+if(NOT layer_tests_target)
+    set(layer_tests_target "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+endif()
+set(layer_tests_32bit OFF)
+if(CMAKE_C_FLAGS MATCHES "-m32" OR CMAKE_CXX_FLAGS MATCHES "-m32")
+    set(layer_tests_32bit ON) # the host's Catch2 is not 32-bit
+endif()
+if(Catch2_FOUND AND NOT layer_tests_32bit AND
+   layer_tests_target STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
+    enable_testing()
+    add_subdirectory(layer/tests)
+else()
+    message(STATUS "unit tests are not built (Catch2: ${Catch2_FOUND}, "
+                   "target: ${layer_tests_target}, host: ${CMAKE_HOST_SYSTEM_PROCESSOR}, "
+                   "32-bit: ${layer_tests_32bit})")
+endif()

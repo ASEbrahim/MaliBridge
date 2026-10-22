@@ -37,7 +37,8 @@ jobs:
                     xxd \
                     libvulkan-dev \
                     mesa-vulkan-drivers \
-                    python3
+                    python3 \
+                    catch2
 
             - name: Checkout source code
               uses: actions/checkout@v6
@@ -46,10 +47,19 @@ jobs:
 
             - name: Configure CMake
               run: |
-                  cmake -B build ${{ matrix.cmake-flags }}
+                cmake -B build ${{ matrix.cmake-flags }}
 
             - name: Build MaliBridge
               run: cmake --build build --config Release
+
+            - name: The Layer's Unit Tests
+              if: matrix.target == 'linux-x86-64'
+              run: |
+                if [ -x build/layer/tests/layer_tests ]; then
+                  ctest --test-dir build -V --output-on-failure
+                else
+                  echo "Catch2 was not available: the unit tests were not built"
+                fi
 
             - name: The Cached Server Hook List
               run: host/hook_list_test.sh
