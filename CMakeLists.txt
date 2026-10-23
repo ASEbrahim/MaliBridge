@@ -195,7 +195,13 @@ file(GENERATE
         "library_path": "./libVkLayer_malibridge_compat.so",
         "api_version": "1.3.278",
         "implementation_version": "1",
-        "description": "MaliBridge Compatibility & Errata Layer for Arm Mali"
+        "description": "MaliBridge Compatibility & Errata Layer for Arm Mali",
+        "enable_environment": {
+            "ENABLE_MALIBRIDGE_COMPAT": "1"
+        },
+        "disable_environment": {
+            "DISABLE_MALIBRIDGE_COMPAT": "1"
+        }
     }
 }
 ]=]
