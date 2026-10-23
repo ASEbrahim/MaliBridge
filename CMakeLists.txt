@@ -139,7 +139,65 @@ target_include_directories(droiddeck-vkbridge-smoke PRIVATE
 set(ICD_JSON_PATH "${CMAKE_CURRENT_BINARY_DIR}/droidbridge_icd.json")
 file(GENERATE
     OUTPUT "${ICD_JSON_PATH}"
-    CONTENT [=[{"file_format_version": "1.0.0", "ICD": {"library_path": "/usr/local/lib/vkbridge/libvulkan_droidbridge.so", "api_version": "1.4.341"}}
+    CONTENT [=[{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "/usr/local/lib/vkbridge/libvulkan_droidbridge.so",
+        "api_version": "1.4.341"
+    }
+}
+]=]
+)
+
+file(GLOB LAYER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/layer/*.cpp")
+set(LAYER_ALL_SOURCES
+    ${SERVER_SOURCES}
+    ${COMMON_GEN_SOURCES}
+    ${CAPS_SOURCE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/gen/vkb_gen_server.c
+    ${LAYER_SOURCES}
+)
+
+add_library(VkLayer_malibridge_compat SHARED ${LAYER_ALL_SOURCES})
+target_compile_features(VkLayer_malibridge_compat PRIVATE cxx_std_17)
+target_link_libraries(VkLayer_malibridge_compat PRIVATE vkb_server_common)
+target_link_libraries(VkLayer_malibridge_compat PRIVATE Threads::Threads)
+target_include_directories(VkLayer_malibridge_compat PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/layer
+    ${CMAKE_CURRENT_SOURCE_DIR}/server
+    ${CMAKE_CURRENT_SOURCE_DIR}/common
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(VkLayer_malibridge_compat PRIVATE VKB_LAYER)
+set_target_properties(VkLayer_malibridge_compat PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES
+    OUTPUT_NAME "VkLayer_malibridge_compat"
+)
+target_link_options(VkLayer_malibridge_compat PRIVATE
+    -Wl,-z,max-page-size=16384
+    -Wl,--build-id=none
+    # The loader exports vkGetInstanceProcAddr too, so without this, the dynamic linker binds the
+    # layer's own copy to the loader's (the first definition in the global scope wins), and the
+    # loader then takes the layer for itself causing a stackoverflow/deadlock
+    -Wl,-Bsymbolic-functions
+)
+
+set(LAYER_JSON_PATH
+    "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_malibridge_compat.json")
+file(GENERATE
+    OUTPUT "${LAYER_JSON_PATH}"
+    CONTENT [=[{
+    "file_format_version": "1.1.2",
+    "layer": {
+        "name": "VK_LAYER_MALIBRIDGE_compat",
+        "type": "GLOBAL",
+        "library_path": "./libVkLayer_malibridge_compat.so",
+        "api_version": "1.3.278",
+        "implementation_version": "1",
+        "description": "MaliBridge Compatibility & Errata Layer for Arm Mali"
+    }
+}
 ]=]
 )
 
@@ -147,6 +205,9 @@ install(TARGETS vulkan_droidbridge
     LIBRARY DESTINATION lib/vkbridge
 )
 install(TARGETS vkbridge_server
+    RUNTIME DESTINATION lib/vkbridge
+)
+install(TARGETS VkLayer_malibridge_compat
     RUNTIME DESTINATION lib/vkbridge
 )
 
@@ -161,6 +222,9 @@ install(TARGETS droiddeck-vkbridge-smoke
 )
 install(FILES "${ICD_JSON_PATH}"
     DESTINATION share/vkbridge
+)
+install(FILES "${LAYER_JSON_PATH}"
+    DESTINATION etc/vulkan/implicit_layer.d
 )
 
 find_package(Catch2 3 QUIET)
