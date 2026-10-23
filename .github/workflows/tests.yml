@@ -1,0 +1,89 @@
+name: Test MaliBridge
+run-name: ${{ github.actor }} is testing MaliBridge
+
+on:
+    push:
+    pull_request:
+    workflow_dispatch:
+
+jobs:
+    test:
+        name: Test ${{ matrix.target }}
+        runs-on: ubuntu-latest
+
+        env:
+            # Use lvp
+            VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+            VKB_HOST_ICD: /usr/share/vulkan/icd.d/lvp_icd.json
+
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: linux-x86-64
+                      cmake-flags: >-
+                          -DCMAKE_SYSTEM_NAME=Linux
+                          -DCMAKE_BUILD_TYPE=Release
+                          -DBUILD_VARIANT=linux-x86-64
+
+        steps:
+            - name: Install System Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends \
+                    glslang-tools \
+                    glslc \
+                    xxd \
+                    libvulkan-dev \
+                    mesa-vulkan-drivers \
+                    vulkan-tools \
+                    python3 \
+                    catch2
+
+            - name: Checkout source code
+              uses: actions/checkout@v6
+              with:
+                  submodules: recursive
+
+            - name: Configure CMake
+              run: |
+                cmake -B build-linux-x86-64 ${{ matrix.cmake-flags }}
+
+            - name: Build MaliBridge
+              run: cmake --build build-linux-x86-64 --config Release
+
+            - name: The Layer's Unit Tests
+              if: matrix.target == 'linux-x86-64'
+              run: |
+                if [ -x build-linux-x86-64/layer/tests/layer_tests ]; then
+                  ctest --test-dir build-linux-x86-64 -V --output-on-failure
+                else
+                  echo "Catch2 was not available: the unit tests were not built"
+                fi
+
+            - name: Configure the Host Build
+              if: matrix.target == 'linux-x86-64'
+              run: |
+                cmake -S host -B host/build
+
+            - name: The Cached Server Hook List
+              if: matrix.target == 'linux-x86-64'
+              run: cmake --build host/build --target hook-list-test
+
+            - name: Build the Host Programs
+              if: matrix.target == 'linux-x86-64'
+              run: cmake --build host/build --parallel
+
+            - name: Quick Checks
+              if: matrix.target == 'linux-x86-64'
+              run: cmake --build host/build --target quick-check
+
+            - name: The Layer's Checks
+              if: matrix.target == 'linux-x86-64'
+              run: |
+                  cmake --build host/build --target layer-quick-check
+                  cmake --build host/build --target layer-errata-test
+
+            - name: The Bridge's Regression Suite
+              if: matrix.target == 'linux-x86-64'
+              run: cmake --build host/build --target ci-test
