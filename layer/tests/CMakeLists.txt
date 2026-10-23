@@ -3,19 +3,19 @@ cmake_minimum_required(VERSION 3.19)
 
 project(layer_tests C CXX)
 
-find_package(Catch2 3 REQUIRED)
+find_package(Catch2 3 REQUIRED) # apt-get install catch2
 find_package(Threads REQUIRED)
 
 file(GLOB LAYER_TEST_SERVER_SOURCES "${CMAKE_SOURCE_DIR}/server/*.c")
 list(REMOVE_ITEM LAYER_TEST_SERVER_SOURCES "${CMAKE_SOURCE_DIR}/server/server_main.c")
 
+file(GLOB LAYER_SOURCES "${CMAKE_SOURCE_DIR}/layer/*.cpp")
+file(GLOB LAYER_TEST_SOURCES "${CMAKE_SOURCE_DIR}/layer/tests/*.cpp")
+
 add_executable(layer_tests
-    test_capabilities.cpp
-    test_layer_ctx.cpp
-    test_support.cpp
-    ../capabilities.cpp
-    ../layer_ctx.cpp
+    ${LAYER_TEST_SOURCES}
     ${LAYER_TEST_SERVER_SOURCES}
+    ${LAYER_SOURCES}
     ${CMAKE_SOURCE_DIR}/common/vkb_caps.c
     ${CMAKE_SOURCE_DIR}/common/vkb_wire.c
     ${CMAKE_SOURCE_DIR}/common/gen/vkb_gen_structs.c
