@@ -44,7 +44,15 @@ export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILEN
 unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API VKBRIDGE_FAKE_MISSING VKBRIDGE_MODE VKBRIDGE_CACHED_READBACK
 fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
-frames() { timeout 60 vkcube --c 60 >"$work/vkcube.log" 2>&1; }
+# The frame readback is the copy-present path: X11 always copies; Wayland only with
+# VKBRIDGE_WSI_SHM (otherwise it presents dma-bufs zero-copy and never reads a frame back).
+frames() {
+  if [ -n "${DISPLAY:-}" ]; then
+    timeout 60 vkcube --wsi xcb --c 60 >"$work/vkcube.log" 2>&1
+  else
+    VKBRIDGE_WSI_SHM=1 timeout 60 vkcube --wsi wayland --c 60 >"$work/vkcube.log" 2>&1
+  fi
+}
 invalidates() { grep -o 'cached readback: [0-9]* invalidates so far' "$log" | tail -1 | grep -o '[0-9]*' || echo 0; }
 flushes() { grep -o 'cached readback: [0-9]* flushes so far' "$log" | tail -1 | grep -o '[0-9]*' || echo 0; }
 # the self-test's own syncs (one flush and one invalidate per type it passes) are not the client's
