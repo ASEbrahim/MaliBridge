@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Connections: one thread per client thread, requests executed in order, replies sent back.
  * A command buffer's recorded commands arrive in one message at vkEndCommandBuffer and are
@@ -29,6 +30,21 @@ __thread const char *vkb_srv_current_cmd;
 __thread VkCommandBuffer vkb_srv_replay_cb;
 __thread uint32_t vkb_srv_replay_n;
 __thread const char *vkb_srv_replay_ring[VKB_REPLAY_RING];
+__thread char vkb_srv_crash_detail[512];
+
+void vkb_srv_note_pipeline_layout(const VkPipelineLayoutCreateInfo *ci)
+{
+    char *b = vkb_srv_crash_detail;
+    size_t cap = sizeof(vkb_srv_crash_detail);
+    int n = snprintf(b, cap, "pipeline layout: flags 0x%x, pNext %s, %u set layout(s):", ci->flags,
+                     ci->pNext ? "set" : "none", ci->setLayoutCount);
+    for (uint32_t i = 0; i < ci->setLayoutCount && n > 0 && (size_t)n < cap; i++)
+        n += snprintf(b + n, cap - (size_t)n, " %#llx", (unsigned long long)(uintptr_t)ci->pSetLayouts[i]);
+    if (n > 0 && (size_t)n < cap) n += snprintf(b + n, cap - (size_t)n, "; %u push constant range(s):", ci->pushConstantRangeCount);
+    for (uint32_t i = 0; i < ci->pushConstantRangeCount && n > 0 && (size_t)n < cap; i++)
+        n += snprintf(b + n, cap - (size_t)n, " stages 0x%x offset %u size %u", ci->pPushConstantRanges[i].stageFlags,
+                      ci->pPushConstantRanges[i].offset, ci->pPushConstantRanges[i].size);
+}
 
 vkb_srv_table *vkb_srv_current_table(void) { return tls_table; }
 void vkb_srv_set_current_table(vkb_srv_table *t) { tls_table = t; }
@@ -148,6 +164,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
             vkb_srv_set_current_table(t);
             if (t->is_device) {
                 VKB_INFO("process %d exited without destroying device %u; cleaning up", p->pid, t->id);
+                vkb_async_device_destroy(t);
                 vkb_emu_device_quiesce(t);
                 if (t->real.vkDeviceWaitIdle) t->real.vkDeviceWaitIdle(t->device);
                 vkb_bvmap_device_destroy(t);
@@ -160,6 +177,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 vkb_pcache_device_destroy(t);
                 vkb_emu_device_destroy(t);
                 vkb_errata_device_destroy(t);
+                vkb_promote_device_destroy(t); /* its SPIR-V lowering slot, kept by the device handle */
                 vkb_hang_device_destroy(t);  /* its watcher thread calls the driver */
                 vkb_guard_device_destroy(t); /* as vkDestroyDevice does: no table left pointing at t */
                 vkb_report_device_destroy(t);
@@ -551,6 +569,7 @@ static void run_request(vkb_srv_conn *conn, vkb_srv_call *c, uint32_t cmd, uint3
     vkb_srv_set_current_table(c->table);
     if (vkb_verbose) VKB_DBG("-> %s", vkb_cmd_names[cmd]);
     vkb_srv_current_cmd = vkb_cmd_names[cmd];
+    vkb_srv_crash_detail[0] = 0;
     vkb_srv_handlers[cmd](c);
     vkb_srv_current_cmd = NULL;
     vkb_srv_set_current_table(NULL);

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Mali (r44p1, Tab S10+) crashes inside its compiler (cmpbe_v2_compile_multiple_shaders, a null
  * read at 0x40) on any Vulkan pipeline whose geometry or tessellation shader declares the

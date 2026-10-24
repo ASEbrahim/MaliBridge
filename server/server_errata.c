@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Driver errata: known Mali driver bugs, each with a fix that sits just above the driver. The
  * errata layer replaces t->real.* right after server_quirks.c (vkb_sv_vkCreateDevice), so every
@@ -33,6 +34,8 @@
  *                                     VKBRIDGE_PROBE_FAKE=<probe>:fail fails the real probe)
  *   VKBRIDGE_WAIT_FIX=0               v0.4's name for -wait_retry; VKBRIDGE_WAIT_FAKE_ERROR (how the
  *                                     wait imitation fails, server_wait.c) imitates on any build
+ *   VKBRIDGE_NO_FP16=1 / =0           +fp16_hide / -fp16_hide (also a per-game preset key); it wins
+ *                                     over VKBRIDGE_ERRATA for that one erratum
  *
  * The probe sees the imitations too: an erratum's probe runs with that erratum's imitation
  * beneath it when VKBRIDGE_ERRATA_IMITATE names it (vkb_errata_probe_begin), so a host test shows
@@ -44,8 +47,9 @@
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
  * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16),
- * dedicated_import (MK-39), and example: a no-op on vkCreateImageView that
- * counts the calls reaching it (and its imitation the calls beneath it), the pattern a fix follows.
+ * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), and example: a no-op on
+ * vkCreateImageView that counts the calls reaching it (and its imitation the calls beneath it),
+ * the pattern a fix follows.
  */
 #define _GNU_SOURCE
 #include "server_errata.h"
@@ -131,6 +135,28 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_DEDICATED_IMPORT] = {"dedicated_import", "MK-39", NULL, 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
         {{V(0, 0), V(54, 1), FAM_ANY, NULL, "fixed between r32p1 and r54p1"}},
         vkb_errata_dedicated_install, vkb_errata_dedicated_imitate},
+    /* ncnn#7054: wrong fp16 arithmetic on the Pixel 8's Mali-G715 with drivers r54p1 and r54p3,
+     * right with r47p0 and in fp32. DXVK computes in 16 bits whenever shaderFloat16 is offered
+     * (and reports D3D11 min precision with shaderInt16 too). The fix hides 16-bit float
+     * arithmetic and storage from the clients and takes them off device creation
+     * (server_errata_fp16.c), so DXVK and vkd3d-proton take their 32-bit paths. The probe tests a
+     * few patterns, not the one ncnn hit (not known), so safe mode also goes by the G715's r54
+     * drivers; performance mode by the probe alone. */
+    [VKB_ERRATUM_FP16_HIDE] = {"fp16_hide", "MK-20", "fp16_math", 1, G_PROBE_FAIL | G_IN_RANGE, G_PROBE_FAIL,
+        {{V(54, 0), V(55, 0), FAM_ANY, "G715", "ncnn#7054: r54p1, r54p3"}}, vkb_errata_fp16_install, vkb_errata_fp16_imitate},
+    /* Arm erratum 4021056: a separate stencil layout (VkAttachment*StencilLayout) is ignored and
+     * the combined one used for both aspects; a stencil written under a read-only depth layout
+     * can be discarded at the end of the pass. The fix (one combined layout for both) is exact on
+     * any driver. */
+    [VKB_ERRATUM_STENCIL_LAYOUT] = {"stencil_layout", "MK-11", NULL, 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
+        {{V(41, 0), V(54, 1), FAM_ANY, NULL, "Arm 4021056, fixed in r54p1"}},
+        vkb_errata_stencil_install, vkb_errata_stencil_imitate},
+    /* MK-05 where the probe found single-binding calls wrong too (the Galaxy A16's G68 r38p1, every
+     * attribute read with one stride): the split cannot fix it, so the strides are baked into
+     * pipeline variants (server_errata_vbbake.c). The probe gates it; its install also wants the
+     * probe's single-binding shape, which a multi-binding failure alone does not show. */
+    [VKB_ERRATUM_VB_BAKE] = {"vb_bake", "MK-05", "vb_strides", 1, G_PROBE_FAIL, G_PROBE_FAIL, {{0}},
+        vkb_errata_vbbake_install, vkb_errata_vbbake_imitate},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
 };
 
@@ -351,6 +377,7 @@ static uint32_t imitated_set(int warn)
 typedef struct {
     uint32_t plus, minus;
     int wait_fix_off;
+    int no_fp16; /* VKBRIDGE_NO_FP16: 1 (+fp16_hide), -1 (=0: -fp16_hide), 0 unset */
 } switches;
 
 static void read_switches(switches *w)
@@ -361,6 +388,21 @@ static void read_switches(switches *w)
     const char *wfix = vkb_srv_env("VKBRIDGE_WAIT_FIX");
     w->wait_fix_off = wfix && !strcmp(wfix, "0") && !(w->plus >> VKB_ERRATUM_WAIT_RETRY & 1);
     if (w->wait_fix_off) w->minus |= 1u << VKB_ERRATUM_WAIT_RETRY;
+    /* VKBRIDGE_NO_FP16 (a per-game preset key): =1 is +fp16_hide, =0 -fp16_hide */
+    const char *nf = vkb_srv_env("VKBRIDGE_NO_FP16");
+    uint32_t fb = 1u << VKB_ERRATUM_FP16_HIDE;
+    w->no_fp16 = !nf || !*nf ? 0 : strcmp(nf, "0") ? 1 : -1;
+    if (w->no_fp16 > 0) w->plus |= fb, w->minus &= ~fb;
+    if (w->no_fp16 < 0) w->minus |= fb, w->plus &= ~fb;
+}
+
+/* The switch that forced erratum i on (plus) or off, as the log and the report name it */
+static const char *forced_by(const switches *w, int i, int plus, char *out, size_t cap)
+{
+    if (i == VKB_ERRATUM_FP16_HIDE && w->no_fp16) snprintf(out, cap, "VKBRIDGE_NO_FP16=%s", plus ? "1" : "0");
+    else if (!plus && i == VKB_ERRATUM_WAIT_RETRY && w->wait_fix_off) snprintf(out, cap, "VKBRIDGE_WAIT_FIX=0");
+    else snprintf(out, cap, "VKBRIDGE_ERRATA=%c%s", plus ? '+' : '-', errata[i].name);
+    return out;
 }
 
 #define CAT(...) (o += o < cap ? (size_t)snprintf(why + o, cap - o, __VA_ARGS__) : 0)
@@ -392,8 +434,9 @@ static int decide_erratum(int i, const drv_version *d, const char *gpu, int perf
     int on = want;
     *forced_off = 0;
     if (w->plus >> i & 1) {
+        char sw[64];
         if (!want) o = 0, why[0] = 0;
-        CAT("%sVKBRIDGE_ERRATA=+%s", o ? "; " : "", x->name);
+        CAT("%s%s", o ? "; " : "", forced_by(w, i, 1, sw, sizeof(sw)));
         on = 1;
     }
     if (w->minus >> i & 1) {
@@ -432,7 +475,8 @@ int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driv
             if (forced_off) {
                 char was[sizeof(r->why[m])];
                 snprintf(was, sizeof(was), "%s", r->why[m]);
-                snprintf(r->why[m], sizeof(r->why[m]), "VKBRIDGE_ERRATA=-%s; it would be on: %.200s", x->name, was);
+                char sw[64];
+                snprintf(r->why[m], sizeof(r->why[m]), "%s; it would be on: %.200s", forced_by(&w, i, 0, sw, sizeof(sw)), was);
             } else if (!r->on[m] && !r->why[m][0])
                 snprintf(r->why[m], sizeof(r->why[m]), "%s", "not needed here");
         }
@@ -537,10 +581,8 @@ void vkb_errata_device_init(vkb_srv_table *t)
         int targeted, forced_off;
         int on = decide_erratum(i, &d, gpu, perf, &w, &targeted, why, sizeof(why), &forced_off);
         if (forced_off) {
-            if (i == VKB_ERRATUM_WAIT_RETRY && w.wait_fix_off)
-                block_add(block, sizeof(block), "errata: %s OFF (VKBRIDGE_WAIT_FIX=0; it would be on: %s)", x->name, why);
-            else
-                block_add(block, sizeof(block), "errata: %s OFF (VKBRIDGE_ERRATA=-%s; it would be on: %s)", x->name, x->name, why);
+            char sw[64];
+            block_add(block, sizeof(block), "errata: %s OFF (%s; it would be on: %s)", x->name, forced_by(&w, i, 0, sw, sizeof(sw)), why);
         }
         char *l = on ? on_list : off_list;
         size_t n = strlen(l);
@@ -616,6 +658,8 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_flip_destroy(t, e);
     vkb_errata_clampzero_destroy(t, e);
     vkb_errata_mem_destroy(t, e);
+    vkb_errata_ds_destroy(t, e);
+    vkb_errata_vbbake_destroy(e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -661,6 +705,21 @@ const char *vkb_errata_hidden_ext(const vkb_srv_table *t, VkPhysicalDevice pd)
     VKB_ONCE(VKB_LOG_INFO, "errata: vb_split: VK_EXT_vertex_input_dynamic_state hidden from clients (%s, driver r%up%u, below r48) - MK-05",
              gpu, d.r, d.p);
     return "VK_EXT_vertex_input_dynamic_state";
+}
+
+int vkb_errata_fp16_hidden(const vkb_srv_table *t, VkPhysicalDevice pd, char *why, size_t cap)
+{
+    char buf[320];
+    if (!why) why = buf, cap = sizeof(buf);
+    why[0] = 0;
+    if (!t || !t->real.vkGetPhysicalDeviceProperties) return 0;
+    char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    drv_version d;
+    driver_version(t, pd, &d, gpu, sizeof(gpu));
+    switches w;
+    read_switches(&w);
+    int targeted, forced_off;
+    return decide_erratum(VKB_ERRATUM_FP16_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off);
 }
 
 /* example: what a fix looks like. Its wrapper calls the function it replaced (example_next), so it
@@ -740,6 +799,7 @@ void vkb_errata_probe_end(void *handle)
     vkb_errata_flip_destroy(&h->t, h->e);
     vkb_errata_clampzero_destroy(&h->t, h->e);
     vkb_errata_mem_destroy(&h->t, h->e);
+    vkb_errata_ds_destroy(&h->t, h->e);
     free(h->e);
     free(h);
 }

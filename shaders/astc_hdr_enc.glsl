@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * ASTC 4x4 HDR block encoder for the Mali bridge's BC6H transcoding (bc_decode.comp, ENC_ASTC_HDR;
  * VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK). Input: g_hpx[16], the BC6H texels as half floats (row-major).

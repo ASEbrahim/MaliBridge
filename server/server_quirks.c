@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Draws the GPU cannot run, made harmless: a graphics pipeline with a listed shader is created
  * with rasterization discarded (its vertex stage still runs; nothing is drawn). Listed by content

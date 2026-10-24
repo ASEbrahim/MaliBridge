@@ -1,5 +1,6 @@
 #version 450
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * BCn block decoder for the Mali bridge's BC texture emulation. One invocation decodes one 4x4
  * block from the copy's source buffer and writes its texels, packed in the decoded format, to a
@@ -21,7 +22,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, binding = 0) readonly buffer Src { uint w[]; } src;
 layout(std430, binding = 1) writeonly buffer Dst { uint w[]; } dst;
 
-#if defined(ENC_ETC2) || defined(ENC_ASTC) || defined(ENC_EAC) || defined(ENC_ASTC_HDR)
+#if defined(ENC_ETC2) || defined(ENC_ASTC) || defined(ENC_EAC) || defined(ENC_ASTC_HDR) || defined(ENC_ASTCN)
 #define TRANSCODE
 #endif
 
@@ -48,7 +49,12 @@ layout(push_constant) uniform PC {
                         * 4: ETC2 RGB8A1 (punch-through alpha) */
     uint dst_word;     /* where the region's texels start in the scratch buffer, in 32-bit words */
     uint pad;
-    uvec2 extent;      /* texels to decode */
+    uvec2 extent;      /* texels to decode (ENC_ASTCN: the piece's, from the first ASTC block's corner) */
+#if defined(ENC_ASTCN)
+    uvec4 nx;          /* ENC_ASTCN: x: how far the region starts past its first ASTC block's corner (bits 0-3 x,
+                        * 4-7 y) and its first block row bound (bits 8-31); y: the piece's first texel row (from
+                        * that corner); zw: the region's extent in texels */
+#endif
 } pc;
 
 #extension GL_GOOGLE_include_directive : require
@@ -83,6 +89,9 @@ uint g_bc7_parts, g_bc7_part, g_bc7_mask; /* a BC7 block's subsets, partition an
 uvec3 g_hpx[16]; /* BC6H: the block's texels as half floats */
 #include "astc_enc.glsl"
 #include "astc_hdr_enc.glsl"
+#elif defined(ENC_ASTCN)
+#include "astc_enc.glsl"
+#include "astcn_enc.glsl"
 #else
 #include "eac_enc.glsl"
 #endif
@@ -433,6 +442,74 @@ uint seen(uint t, uvec2 blk)
     return min(t >> 2, lim.y - 1u) * 4u + min(t & 3u, lim.x - 1u);
 }
 
+#if defined(ENC_ASTCN)
+/* ENC_ASTCN: one invocation per ASTC_N x ASTC_N block. Its texels come from the BC blocks under it
+ * (2x2 for 8x8, 2 or 3 a side for 6x6), each decoded into g_px; texels past the region's edges (a
+ * small mip's, or a region that does not start or end on an ASTC block's edge) repeat the nearest
+ * inside, so the encoder fits what can be seen. */
+void decode_rgba(uvec4 b)
+{
+#if defined(FMT_BC1)
+    uvec4 tex[16];
+    color_block(b.x, b.y, false, tex);
+    for (uint t = 0u; t < 16u; t++) {
+        uvec4 c = tex[t];
+        if ((pc.flags & 1u) != 0u) c.w = 255u;
+        put(t & 3u, t >> 2, vec4(c) / 255.0);
+    }
+#elif defined(FMT_BC2) || defined(FMT_BC3)
+    uvec4 tex[16];
+    color_block(b.z, b.w, true, tex);
+    uint a[16];
+#if defined(FMT_BC2)
+    for (uint t = 0u; t < 16u; t++) a[t] = bits(b, 4u * t, 4u) * 17u;
+#else
+    smooth_alpha(b.x, b.y, a);
+#endif
+    for (uint t = 0u; t < 16u; t++) put(t & 3u, t >> 2, vec4(tex[t].rgb, a[t]) / 255.0);
+#elif defined(FMT_BC7)
+    bc7(b);
+#endif
+}
+
+void main()
+{
+    const uint N = uint(ASTC_N);
+    uvec2 ab = gl_GlobalInvocationID.xy;
+    uvec2 nab = (pc.extent + N - 1u) / N;
+    if (ab.x >= nab.x || ab.y >= nab.y) return;
+#if defined(FMT_BC1)
+    uint words = 2u;
+#else
+    uint words = 4u;
+#endif
+    uint sx = pc.nx.x & 15u, sy = (pc.nx.x >> 4) & 15u, r0 = pc.nx.x >> 8;
+    /* this block's texels inside the piece, and where they come from in the region */
+    uvec2 lim = min(pc.extent - ab * N, uvec2(N));
+    uint u0 = ab.x * N, v0 = pc.nx.y + ab.y * N;
+    uvec2 smin = uvec2(u0 > sx ? u0 - sx : 0u, v0 > sy ? v0 - sy : 0u);
+    uvec2 smax = min(uvec2(u0 + lim.x - 1u, v0 + lim.y - 1u), uvec2(sx, sy) + pc.nx.zw - 1u);
+    smax = uvec2(smax.x > sx ? smax.x - sx : 0u, smax.y > sy ? smax.y - sy : 0u);
+    smin = min(smin, smax);
+    for (uint by = smin.y / 4u; by <= smax.y / 4u; by++)
+        for (uint bx = smin.x / 4u; bx <= smax.x / 4u; bx++) {
+            uint base = pc.src_word + (gl_GlobalInvocationID.z * pc.layer_blocks + (by - r0) * pc.row_blocks + bx) * words;
+            decode_rgba(uvec4(src.w[base], src.w[base + 1u], words > 2u ? src.w[base + 2u] : 0u, words > 2u ? src.w[base + 3u] : 0u));
+            for (uint j = 0u; j < N; j++)
+                for (uint i = 0u; i < N; i++) {
+                    uint u = u0 + min(i, lim.x - 1u), v = v0 + min(j, lim.y - 1u);
+                    uvec2 s = clamp(uvec2(u > sx ? u - sx : 0u, v > sy ? v - sy : 0u), smin, smax);
+                    if (s.x / 4u == bx && s.y / 4u == by) {
+                        ivec4 c = g_px[(s.y & 3u) * 4u + (s.x & 3u)];
+                        g_bpx[j * N + i] = uint(c.r) | (uint(c.g) << 8) | (uint(c.b) << 16) | (uint(c.a) << 24);
+                    }
+                }
+        }
+    uvec4 enc = astcn_encode();
+    uint o = pc.dst_word + ((gl_GlobalInvocationID.z * nab.y + ab.y) * nab.x + ab.x) * 4u;
+    for (uint k = 0u; k < 4u; k++) dst.w[o + k] = enc[k];
+}
+#else
 void main()
 {
     uvec2 blk = gl_GlobalInvocationID.xy;
@@ -544,3 +621,4 @@ void main()
         for (uint k = 0u; k < ROW_WORDS; k++) dst.w[o + ty * row + k] = outw[ty * ROW_WORDS + k];
 #endif
 }
+#endif

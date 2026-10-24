@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * polygon_check: polygon mode LINE and POINT (wireframe). DXVK 3 needs fillModeNonSolid; on a GPU
  * without it (Mali-G720) the bridge reports it and draws the triangles' edges itself

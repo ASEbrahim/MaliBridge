@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Instances, devices and the startup self-test.
  */
@@ -133,6 +134,31 @@ static void log_device(const vkb_dispatch *dt, VkPhysicalDevice pd, const VkPhys
         }
     }
     VKB_INFO("%u device extensions in total", n);
+    /* D3D11 stream output (DXVK refuses CreateGeometryShaderWithStreamOutput without transformFeedback;
+     * DrawAuto is vkCmdDrawIndirectByteCountEXT, transformFeedbackDraw), and graphics pipeline
+     * libraries (DXVK's GPL path, the fossils Steam downloads), as the driver reports them. */
+    if (dt->vkGetPhysicalDeviceFeatures2 && dt->vkGetPhysicalDeviceProperties2) {
+        int xfb = has_ext(e, n, "VK_EXT_transform_feedback"), gpl = has_ext(e, n, "VK_EXT_graphics_pipeline_library");
+        VkPhysicalDeviceTransformFeedbackFeaturesEXT xf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+        VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        if (xfb) xf.pNext = f2.pNext, f2.pNext = &xf;
+        if (gpl) gf.pNext = f2.pNext, f2.pNext = &gf;
+        VkPhysicalDeviceTransformFeedbackPropertiesEXT xp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, xfb ? &xp : NULL};
+        if (xfb || gpl) dt->vkGetPhysicalDeviceFeatures2(pd, &f2);
+        if (xfb) dt->vkGetPhysicalDeviceProperties2(pd, &p2);
+        if (xfb)
+            VKB_INFO("transform feedback: transformFeedback=%u geometryStreams=%u; %u buffers, %u streams, draw=%u, queries=%u, "
+                     "rasterizationStreamSelect=%u, maxDataSize %u, maxBufferDataStride %u",
+                     xf.transformFeedback, xf.geometryStreams, xp.maxTransformFeedbackBuffers, xp.maxTransformFeedbackStreams,
+                     xp.transformFeedbackDraw, xp.transformFeedbackQueries, xp.transformFeedbackRasterizationStreamSelect,
+                     xp.maxTransformFeedbackBufferDataSize, xp.maxTransformFeedbackBufferDataStride);
+        else
+            VKB_INFO("transform feedback: the driver has no VK_EXT_transform_feedback (D3D11 stream output unavailable)");
+        if (gpl) VKB_INFO("graphics pipeline library: graphicsPipelineLibrary=%u (the client hides it when clip distances are emulated)",
+                          gf.graphicsPipelineLibrary);
+    }
     /* All of them, until the device runs show which ones the server's process sees (it is not an
      * app process, and saw fewer than the capability viewer on the same tablet). */
     len = 0;
@@ -184,6 +210,7 @@ void vkb_selftest_all(void)
         memcpy(k->uuid, id.deviceUUID, VK_UUID_SIZE);
         snprintf(k->name, sizeof(k->name), "%s", p2.properties.deviceName);
         k->info.real_api_version = p2.properties.apiVersion;
+        vkb_promote_decide(&dt, pds[i]);
         vkb_mem_selftest(k, inst, &dt, pds[i]);
         k->info.emu_available = vkb_emu_detect(&dt, pds[i], &k->info.missing);
         k->info.emu = k->info.emu_available;
@@ -196,6 +223,7 @@ void vkb_selftest_all(void)
                  k->info.missing, k->info.emu);
     }
     dt.vkDestroyInstance(inst, NULL);
+    vkb_promote_write_apps_file();
     vkb_probe_start_background();
 }
 
@@ -222,11 +250,15 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         t->instance = inst;
         t->proc = c->conn->proc;
         t->api_version = ci->pApplicationInfo ? ci->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
+        t->zink = ci->pApplicationInfo && ci->pApplicationInfo->pEngineName && !strncmp(ci->pApplicationInfo->pEngineName, "mesa zink", 9);
+        t->promote_ui = ci->pApplicationInfo && ci->pApplicationInfo->pApplicationName &&
+                        !strcmp(ci->pApplicationInfo->pApplicationName, "gamescope");
         vkb_dispatch_load_instance(&t->real, vkb_gipa, inst);
         t->dt = t->real;
         vkb_opaque_instance_install(t);
         vkb_mem_instance_install(t);
         vkb_emu_instance_install(t);
+        vkb_promote_instance_install(t);
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);
@@ -279,6 +311,8 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
     info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: the game's preset file, <cache dir>/env, ... */
     vkb_preset_client_values(&info);               /* the heap cap and GPU identity the app is shown, the same way */
     vkb_mem_cached_gate(&info, mode); /* server_memory.c: cached readback per VKBRIDGE_CACHED_READBACK and the mode */
+    if ((info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)) && !vkb_emu_bgr10_for(c->table, pd))
+        info.emu &= ~(VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX);
     vkb_enc_raw(&c->r, &info, sizeof(info));
 }
 
@@ -311,6 +345,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     const vkb_pd_knowledge *k = vkb_pd_lookup(&inst->real, pd);
     uint32_t strategy = k ? k->info.strategy : VKB_MEM_NONE;
     uint32_t emu = k ? k->info.emu : 0;
+    if ((emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)) && !vkb_emu_bgr10_for(inst, pd)) emu &= ~(VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX);
     {
         /* VKBRIDGE_EMU_OFF=<hex mask of VKB_EMU_* bits>: this device runs without those emulations
          * (the client still reports their features: for bisecting, not for games). */
@@ -332,7 +367,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     uint32_t extra_n = 0;
     char not_passed[600] = "";
     const char *const *extra = vkb_mem_required_extensions(strategy, &extra_n);
-    const char **exts = vkb_dec_alloc(&c->d, (ci->enabledExtensionCount + extra_n + 12) * sizeof(char *));
+    const char **exts = vkb_dec_alloc(&c->d, (ci->enabledExtensionCount + extra_n + 24) * sizeof(char *));
     uint32_t n = 0;
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
         const char *e = ci->ppEnabledExtensionNames[i];
@@ -368,6 +403,13 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     if ((emu & VKB_EMU_LOADSTORE_NONE) && has_ext(avail, avail_n, "VK_EXT_load_store_op_none") &&
         !list_has(exts, n, "VK_EXT_load_store_op_none"))
         exts[n++] = "VK_EXT_load_store_op_none";
+    /* Dynamic rendering emulated with render passes (server_emu_dynrend.c): vkCreateRenderPass2,
+     * and depth/stencil resolves, from the extensions on a driver below Vulkan 1.2. */
+    if (emu & VKB_EMU_DYN_RENDER) {
+        static const char *const dr_exts[] = {"VK_KHR_multiview", "VK_KHR_maintenance2", "VK_KHR_create_renderpass2", "VK_KHR_depth_stencil_resolve"};
+        for (size_t i = 0; i < sizeof(dr_exts) / sizeof(dr_exts[0]); i++)
+            if (has_ext(avail, avail_n, dr_exts[i]) && !list_has(exts, n, dr_exts[i])) exts[n++] = dr_exts[i];
+    }
     /* BC6H transcoded to ASTC HDR, on a device below Vulkan 1.3 (vkb_emu_device_create_info). */
     if ((emu & VKB_EMU_BCN) && vkb_emu_bcn_astc_hdr(&inst->real, pd, inst->api_version) == 2 &&
         !list_has(exts, n, "VK_EXT_texture_compression_astc_hdr"))
@@ -393,7 +435,8 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
      * texel instead of whatever lies past the image. Lee Gao's compat_layer (MIT) does the same for
      * its robustness2 emulation. VKBRIDGE_NO_FORCED_ROBUSTNESS=1 leaves both to the app. */
     const char *no_robust = vkb_srv_env("VKBRIDGE_NO_FORCED_ROBUSTNESS");
-    if ((emu & VKB_EMU_ROBUSTNESS2) && !(no_robust && *no_robust && strcmp(no_robust, "0")) &&
+    int r2_stand_in = (emu & VKB_EMU_ROBUSTNESS2) || vkb_emu_robust2_image_stand_in(inst, pd, emu, ci); /* or robustImageAccess2 asked, lacking */
+    if (r2_stand_in && !(no_robust && *no_robust && strcmp(no_robust, "0")) &&
         inst->real.vkGetPhysicalDeviceFeatures2) {
         VkPhysicalDeviceImageRobustnessFeatures have = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES};
         VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have};
@@ -426,7 +469,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
                 on = 1;
             }
         }
-        if (on) VKB_INFO("vkCreateDevice: robustImageAccess on (robustness2 emulated)");
+        if (on) VKB_INFO("vkCreateDevice: robustImageAccess on (robustness2 %s)", (emu & VKB_EMU_ROBUSTNESS2) ? "emulated" : "robustImageAccess2 reported");
     }
     int nocomp = 0;
     /* Also for the GPU profiler, which asks each attachment image whether it got AFBC. */
@@ -442,6 +485,8 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             nocomp = vkb_nocomp_wanted();
         }
     }
+    /* Vulkan 1.2 / 1.3 on a driver below it: the extensions' structures and names (server_promote.c). */
+    exts = vkb_promote_device_create_info(inst, pd, ci, exts, &n, c->d.arena);
     ci->enabledExtensionCount = n;
     ci->ppEnabledExtensionNames = exts;
     ci->enabledLayerCount = 0;
@@ -458,6 +503,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         if (want) vkb_report_features(want, &have, dropped, sizeof(dropped));
     }
     vkb_emu_device_create_info(inst, pd, emu, ci, c->d.arena);
+    vkb_errata_fp16_device_create_info(inst, pd, ci); /* MK-20: what an app enables anyway */
 
     {
         /* What reaches the driver (tablet run 6: gamescope's scalar-layout shaders were refused). */
@@ -490,8 +536,9 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         t->pd = k;
         t->api_version = inst->api_version;
         t->real = inst->real;
-        PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)vkb_gipa(inst->instance, "vkGetDeviceProcAddr");
+        PFN_vkGetDeviceProcAddr gdpa = vkb_promote_gdpa((PFN_vkGetDeviceProcAddr)vkb_gipa(inst->instance, "vkGetDeviceProcAddr"));
         vkb_dispatch_load_device(&t->real, gdpa, dev);
+        vkb_promote_device_init(t); /* beneath every layer: what reaches the driver is SPIR-V it takes */
         t->dt = t->real;
         id = vkb_table_register(t);
         if (!id) {
@@ -516,6 +563,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_trace_device_init(t);
             vkb_gprof_device_init(t); /* wraps what the client's calls reach, emulations included */
             vkb_bvmap_device_init(t); /* last: client-named buffer views are driver views beneath */
+            vkb_async_device_init(t); /* over every layer that sees pipelines: the client's may be stand-ins */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);
             VKB_INFO("device %u created on %s (pid %d, %u extensions, memory sharing %s)", id, k ? k->name : "?",
@@ -542,6 +590,7 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
         return;
     }
     vkb_table_unregister(t);
+    vkb_async_device_destroy(t);
     vkb_emu_device_quiesce(t);
     vkb_bvmap_device_destroy(t);
     vkb_gprof_device_destroy(t);
@@ -553,6 +602,7 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_pcache_device_destroy(t);
     vkb_emu_device_destroy(t);
     vkb_errata_device_destroy(t);
+    vkb_promote_device_destroy(t);
     vkb_hang_device_destroy(t);
     vkb_guard_device_destroy(t);
     vkb_report_device_destroy(t);

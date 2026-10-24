@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MK-32: min/max/clamp with a constant zero limit on a constant-selected value, given a zero the
  * driver cannot fold (see spirv_clampzero.h). One scan of the words finds the min/max/clamp ops

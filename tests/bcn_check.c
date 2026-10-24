@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * bcn_check: uploads random blocks of every BC format (every BC6H and BC7 mode forced in turn),
  * blits the texture to RGBA32F and compares each texel with bcdec's CPU decode. Then the shapes
@@ -19,6 +20,9 @@
  * show the server's per-level quality choice (VKBRIDGE_BC_TRANSCODE_QUALITY=auto); BCN_NO_LEVELS=1
  * leaves the chains out. The 4096x4096 uploads run twice: the first may include building its
  * transcoder (the server does that at the first upload that needs it), the second is warm.
+ * `bcn_check transcode astc6` / `astc8` (the server started with VKBRIDGE_BC_ASTC_BLOCK=6x6 / 8x8): the
+ * same with BC2 / BC3 / BC7 in ASTC 6x6 / 8x8 blocks, whose PSNR floors are lower; sub-region uploads
+ * and copies are placed on that block's edges.
  * `bcn_check pcache [file]`: what the driver's pipeline cache spares on two of the transcoders
  * (compute pipelines), in this process and from the data an earlier run left in file.
  */
@@ -40,6 +44,8 @@
 #define TEX 64 /* 16x16 blocks */
 
 static int tx; /* the bridge transcodes (argument "transcode"): compare by PSNR */
+static int astc_n = 4; /* ... BC2 / BC3 / BC7 into ASTC 6x6 or 8x8 (argument "astc6" / "astc8": the server runs with
+                        * VKBRIDGE_BC_ASTC_BLOCK=6x6 / 8x8) */
 static int tx_hdr; /* ... BC6H too (to ASTC 4x4 HDR, where the GPU samples it) */
 static double min_psnr;
 
@@ -1323,8 +1329,40 @@ static int transcoded(VkFormat f) { return tx && (!is_bc6h(f) || tx_hdr); }
  * worst measured on the test images (2026-10-13, RADV decoding ETC2/ASTC): BC1 -> ETC2 31.3 (rough),
  * BC7 -> ASTC 33.9 (rough), BC4/BC5 -> EAC 43.8, alpha 40.4. BC6H -> ASTC HDR: linear values against
  * the level's largest, 40 (the target; measured: see test_hdr_shader). */
+static int in_astc_n(VkFormat f)
+{
+    if (astc_n == 4) return 0;
+    return (f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC3_SRGB_BLOCK) || f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
+}
+
+/* The texels a side of the block f is transcoded to (sub-regions are placed on its edges). */
+static int tx_dim(VkFormat f) { return tx && in_astc_n(f) ? astc_n : 4; }
+
+/* ASTC 6x6 / 8x8 floors: a little under the worst measured on the test images (2026-10-18, RADV
+ * decoding ASTC, default quality; fast is 0.5-2 dB lower): 6x6 colour 25.6 (BC7 rough), alpha 33.6;
+ * 8x8 colour 23.5 (BC7 rough), alpha 31.5. Photo-like content measured 39-40 / 36.6-37.1 dB. */
+static double psnr_floor_n(VkFormat f, int alpha)
+{
+    (void)f;
+    if (alpha) return astc_n == 6 ? 30 : 28;
+    return astc_n == 6 ? 23 : 21;
+}
+
+/* A check's name with its target as the run has it ("BC7 -> ASTC 4x4" in an astc8 run: "BC7 -> ASTC 8x8"). */
+static const char *tx_name(VkFormat f, const char *name)
+{
+    static char buf[4][96];
+    static int k;
+    const char *a = strstr(name, " -> ");
+    if (!in_astc_n(f) || !a) return name;
+    char *b = buf[k++ & 3];
+    snprintf(b, sizeof(buf[0]), "%.*s -> ASTC %dx%d%s", (int)(a - name), name, astc_n, astc_n, strstr(a, "sRGB") ? " sRGB" : "");
+    return b;
+}
+
 static double psnr_floor(VkFormat f, int alpha)
 {
+    if (in_astc_n(f)) return psnr_floor_n(f, alpha);
     if (alpha) return 36;
     switch (f) {
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
@@ -1538,7 +1576,10 @@ static void test_shapes(VkFormat f, const char *name, float tol, VkImageCreateFl
             random_level(f, &lv[m][l], w ? w : 1, h ? h : 1);
             total += (VkDeviceSize)(lv[m][l].bw + 2) * lv[m][l].bh * bytes + 256;
         }
-    random_level(f, &sub, 32, 16);
+    /* the sub-region: on the edges of ASTC 6x6 blocks where the format goes there (12-texel steps) */
+    int six = tx_dim(f) == 6;
+    uint32_t sox = six ? 12 : 16, soy = six ? 12 : 8, sw = six ? 24 : 32, sh = six ? 12 : 16;
+    random_level(f, &sub, sw, sh);
     total += (VkDeviceSize)sub.bw * sub.bh * bytes;
     VkDeviceMemory um, im, cm;
     void *upp;
@@ -1577,16 +1618,18 @@ static void test_shapes(VkFormat f, const char *name, float tol, VkImageCreateFl
         off = (off + 255) & ~(VkDeviceSize)255;
     }
     vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, LAYERS, r0);
-    /* a 32x16 sub-region of mip 0 layer 0 at (16, 8) */
+    /* a 32x16 sub-region of mip 0 layer 0 at (16, 8) (24x12 at (12, 12)) */
     memcpy((uint8_t *)upp + off, sub.blocks, (size_t)sub.bw * sub.bh * bytes);
     for (uint32_t by = 0; by < sub.bh; by++)
-        memcpy(lv[0][0].blocks + ((size_t)(by + 2) * lv[0][0].bw + 4) * bytes, sub.blocks + (size_t)by * sub.bw * bytes, (size_t)sub.bw * bytes);
+        memcpy(lv[0][0].blocks + ((size_t)(by + soy / 4) * lv[0][0].bw + sox / 4) * bytes, sub.blocks + (size_t)by * sub.bw * bytes,
+               (size_t)sub.bw * bytes);
     if (vkCmdCopyBufferToImage2) {
-        VkBufferImageCopy2 r2 = {VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2, NULL, off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {16, 8, 0}, {32, 16, 1}};
+        VkBufferImageCopy2 r2 = {VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2, NULL, off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                 {(int32_t)sox, (int32_t)soy, 0}, {sw, sh, 1}};
         VkCopyBufferToImageInfo2 ci2 = {VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2, NULL, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r2};
         vkCmdCopyBufferToImage2(cb, &ci2);
     } else {
-        VkBufferImageCopy r1 = {off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {16, 8, 0}, {32, 16, 1}};
+        VkBufferImageCopy r1 = {off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int32_t)sox, (int32_t)soy, 0}, {sw, sh, 1}};
         vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r1);
     }
     off += (VkDeviceSize)sub.bw * sub.bh * bytes;
@@ -1640,6 +1683,7 @@ static void test_shapes(VkFormat f, const char *name, float tol, VkImageCreateFl
  * (PSNR of the transcoded texels against the BC texels, colour and alpha). */
 static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
 {
+    name = tx_name(f, name);
     for (int k = 0; k < nk; k++) {
         enum { S = 256 };
         level lv = {S, S, S / 4, S / 4, image_blocks(f, kinds[k], S, S, 0, 0)};
@@ -1683,6 +1727,7 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
  * PSNR near 59 dB. */
 static void test_levels(VkFormat f, const char *name)
 {
+    name = tx_name(f, name);
     enum { S = 2048, MIPS = 12 };
     VkDeviceMemory im;
     VkImage img = make_image(f, S, S, MIPS, 1, 0, NULL, 0, &im);
@@ -2052,12 +2097,16 @@ static void test_copy_in(VkFormat f, VkFormat uf, const char *name, float tol)
     } else {
         vkCmdCopyImage(cb, u1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c1);
     }
-    /* blocks (2..4, 1..2) of u1 over the same blocks of mip 1 layer 0 */
-    VkImageCopy cs = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {2, 1, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {8, 4, 0}, {3, 2, 1}};
+    /* blocks (2..4, 1..2) of u1 over the same blocks of mip 1 layer 0 (on ASTC 6x6 / 8x8 block edges
+     * where the format goes there: (3..5, 3..5), (2..3, 2..3)) */
+    int d = tx_dim(f);
+    uint32_t cx = d == 6 ? 3 : 2, cy = d == 4 ? 1 : cx, cw = d == 6 ? 3 : d == 8 ? 2 : 3, ch = d == 6 ? 3 : 2;
+    VkImageCopy cs = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int32_t)cx, (int32_t)cy, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1},
+                      {(int32_t)cx * 4, (int32_t)cy * 4, 0}, {cw, ch, 1}};
     vkCmdCopyImage(cb, u1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cs);
-    for (uint32_t by = 1; by < 3; by++)
-        memcpy(lv[1][0].blocks + ((size_t)by * lv[1][0].bw + 2) * bytes, lv[1][1].blocks + ((size_t)by * lv[1][1].bw + 2) * bytes,
-               (size_t)3 * bytes);
+    for (uint32_t by = cy; by < cy + ch; by++)
+        memcpy(lv[1][0].blocks + ((size_t)by * lv[1][0].bw + cx) * bytes, lv[1][1].blocks + ((size_t)by * lv[1][1].bw + cx) * bytes,
+               (size_t)cw * bytes);
     barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     submit(cb);
     int bad = 0;
@@ -2235,6 +2284,8 @@ int main(int argc, char **argv)
     const char *pcache_file = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "transcode")) tx = 1;
+        else if (!strcmp(argv[i], "astc6")) astc_n = 6;
+        else if (!strcmp(argv[i], "astc8")) astc_n = 8;
         else if (!strcmp(argv[i], "hdr")) hdr_only = 1;
         else if (!strcmp(argv[i], "pcache")) pcache_file = i + 1 < argc ? argv[++i] : "bcn_check-pcache.bin";
         else gpu = atoi(argv[i]);

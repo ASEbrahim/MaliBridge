@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MK-03: integer vector bitwise ops on a swizzle, scalarised (see spirv_bitwise.h). One pass over
  * the words to find the pattern (most modules end there, untouched), a second to write the new

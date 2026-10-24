@@ -1,0 +1,65 @@
+; shm_barrier: as dxvkloop, but the loop runs a number of times from the invocation index: not uniform, so level 2 puts in memory barriers only (one more than level 1: the next iteration's, ordered for the compiler).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %lid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %lid BuiltIn LocalInvocationIndex
+               OpDecorate %Buf Block
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_4 = OpConstant %uint 4
+    %uint_16 = OpConstant %uint 16
+    %uint_63 = OpConstant %uint 63
+    %uint_64 = OpConstant %uint 64
+       %pFn = OpTypePointer Function %uint
+        %arr = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %arr
+       %pBuf = OpTypePointer StorageBuffer %Buf
+        %pSB = OpTypePointer StorageBuffer %uint
+        %buf = OpVariable %pBuf StorageBuffer
+        %pIn = OpTypePointer Input %uint
+        %lid = OpVariable %pIn Input
+       %sarr = OpTypeArray %uint %uint_64
+       %pWGa = OpTypePointer Workgroup %sarr
+        %pWG = OpTypePointer Workgroup %uint
+         %sh = OpVariable %pWGa Workgroup
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %r0 = OpVariable %pFn Function
+          %i = OpLoad %uint %lid
+          %n = OpBitwiseAnd %uint %i %uint_4
+               OpStore %r0 %uint_0
+               OpBranch %hdr
+        %hdr = OpLabel
+               OpLoopMerge %mrg %cont None
+               OpBranch %cond
+       %cond = OpLabel
+          %k = OpLoad %uint %r0
+          %c = OpULessThan %bool %k %n
+               OpBranchConditional %c %body %mrg
+       %body = OpLabel
+          %p = OpAccessChain %pWG %sh %i
+          %x = OpIAdd %uint %i %k
+               OpStore %p %x
+          %j = OpBitwiseXor %uint %i %uint_1
+          %q = OpAccessChain %pWG %sh %j
+          %v = OpLoad %uint %q
+          %o = OpAccessChain %pSB %buf %uint_0 %i
+               OpStore %o %v
+               OpBranch %cont
+       %cont = OpLabel
+         %k2 = OpLoad %uint %r0
+         %k1 = OpIAdd %uint %k2 %uint_1
+               OpStore %r0 %k1
+               OpBranch %hdr
+        %mrg = OpLabel
+               OpReturn
+               OpFunctionEnd

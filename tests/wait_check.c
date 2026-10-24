@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * wait_check: every kind of wait the bridge forwards, each answered as the app should see it. For
  * the server's wait_retry erratum (server_wait.c) and its imitation of the Mali driver failing

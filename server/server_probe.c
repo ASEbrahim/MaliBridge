@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Startup capability probe: what the GPU's driver really does, not what it claims.
  *
@@ -38,10 +39,11 @@
  * outcomes set runtime flags: a layer-only geometry stage drawn wrong (and a vertex shader's Layer
  * right) folds such stages into the vertex shader; a compiler spinning on the UE4 LUT shape gives
  * those pipelines their stand-in at once instead of after a 10 s timeout; a BC transcoder that
- * does not build leaves its formats decoded. VKBRIDGE_PROBE_APPLY=0 records without applying.
+ * does not build (within VKBRIDGE_PROBE_TX_TIMEOUT_S, 20 s: they are slow, not stuck, on some
+ * drivers) leaves its formats decoded. VKBRIDGE_PROBE_APPLY=0 records without applying.
  *
  * The MK probes - viewport_flip, bitwise_vec, dyn_state, vb_strides, view3d_layers, wait_eintr,
- * rendering_churn: one per Mali driver erratum (server_errata.c) a probe can tell, MK-06's only
+ * rendering_churn, fp16_math: one per Mali driver erratum (server_errata.c) a probe can tell, MK-06's only
  * recording - each record their sub-cases (bits, named in the report) and, where they saw the
  * bug's own pattern, a VKB_PROBE_FLAG_MK_* flag. That flag is the "probe failed" the errata
  * decisions read at each vkCreateDevice (errata_source, vkb_errata_set_probe_source); a probe that
@@ -64,7 +66,8 @@
  * (_exit), abort, spin with the watchdog's signal blocked (only a kill ends it), or take 3 s
  * longer (to stop a session inside it), or end in error without running (could not set up: what
  * safe mode does not take as verified); VKBRIDGE_FAKE_MISSING applies as everywhere (a feature taken as missing is
- * already emulated, so its probe is skipped).
+ * already emulated, so its probe is skipped). VKBRIDGE_PROBE_TX_FAKE=<transcoder>:<ms>,... (BC7->ASTC:5000)
+ * makes that BC transcoder's build take ms longer, inside its watchdog.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -90,7 +93,7 @@
 #endif
 
 /* Bump when a probe is added, removed or its pass criterion changes: cached profiles are re-run. */
-#define PROBE_VERSION 2
+#define PROBE_VERSION 3
 #define MAX_RESULTS 48
 #define DETAIL 480
 
@@ -206,6 +209,7 @@ typedef struct pctx {
     uint32_t want_flags;
     uint32_t cases, failed; /* sub-cases run / not passed (MK probes) */
     int layer_vs_passed;
+    int fp16; /* shaderFloat16 on the probe device (fp16_math) */
 } pctx;
 
 static int has_ext(const pctx *c, const char *name)
@@ -480,6 +484,7 @@ static int dev_create(pctx *c)
     v12.timelineSemaphore = got12.timelineSemaphore;
     v12.shaderOutputLayer = got12.shaderOutputLayer;
     v12.shaderOutputViewportIndex = got12.shaderOutputViewportIndex;
+    v12.shaderFloat16 = got12.shaderFloat16;
     VkBool32 dyn_rendering = c->api >= VK_API_VERSION_1_3 ? v13.dynamicRendering : dr.dynamicRendering;
     memset((char *)&v13 + offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess), 0,
            sizeof(v13) - offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess));
@@ -535,6 +540,7 @@ static int dev_create(pctx *c)
     c->eds3_smask = smask && c->d.vkCmdSetSampleMaskEXT;
     c->dynrender = dyn_rendering && c->d.vkCmdBeginRendering && c->d.vkCmdEndRendering;
     c->multi_vp = want.multiViewport && c->api >= VK_API_VERSION_1_2 && got12.shaderOutputViewportIndex;
+    c->fp16 = c->api >= VK_API_VERSION_1_2 && got12.shaderFloat16;
     return 1;
 }
 
@@ -1035,12 +1041,43 @@ typedef struct tx_build {
     int index;
     VkResult r;
     double ms;
+    long fake_ms; /* VKBRIDGE_PROBE_TX_FAKE: that much longer (host tests) */
 } tx_build;
 
 static void tx_one(void *arg)
 {
     tx_build *b = arg;
+    struct timespec ts = {b->fake_ms / 1000, (b->fake_ms % 1000) * 1000000L};
+    while (b->fake_ms > 0 && nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
     b->r = vkb_emu_bcn_build_transcoder(&b->c->d, b->c->dev, b->cache, b->index, &b->ms);
+    if (b->fake_ms > 0) b->ms += (double)b->fake_ms;
+}
+
+/* The limit of one transcoder's build. Not the probes' 4 s: these are the bridge's own shaders,
+ * known to be right, and the question is whether the driver builds them, not how fast. The
+ * Mali-G1-Ultra (r54p1) took 1.5-3.3 s over the others where the G720 takes 0.3-0.4 s, and
+ * BC7->ASTC (the biggest, about twice the BC3 one everywhere) went past 4 s: it was interrupted
+ * as a hang, and with it BC2 and BC3 were decoded too. A build is CPU work only (nothing reaches
+ * the GPU, so nothing to reset), in the background part of the probe; but interrupting it jumps
+ * out of the driver's compiler, which may then hold a lock: that is worth doing only for a build
+ * that is really stuck. VKBRIDGE_PROBE_TX_TIMEOUT_S, at least the probes' own limit. */
+#define PROBE_TX_TIMEOUT_S 20.0
+static double tx_limit_s(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PROBE_TX_TIMEOUT_S");
+    double t = v && *v ? atof(v) : PROBE_TX_TIMEOUT_S;
+    return t > sub_limit_s() ? t : sub_limit_s();
+}
+
+/* VKBRIDGE_PROBE_TX_FAKE=<name>:<ms>,...: that transcoder's build takes ms longer (host tests). */
+static long tx_fake_ms(const char *name)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PROBE_TX_FAKE");
+    size_t n = strlen(name);
+    for (const char *p = v; p && (p = strstr(p, name)); p += n)
+        if ((p == v || p[-1] == ',') && p[n] == ':') return atol(p + n + 1);
+    return 0;
 }
 
 static void p_bc_transcoders(pctx *c)
@@ -1059,25 +1096,39 @@ static void p_bc_transcoders(pctx *c)
      * it, at every probe (a re-probe after a stopped session included) */
     char path[512];
     VkPipelineCache cache = vkb_pcache_own_open(&c->d, &c->props, c->dev, "probe", path, sizeof(path));
-    int n = vkb_emu_bcn_transcoders(), stuck = 0;
+    int n = vkb_emu_bcn_transcoders(), stuck = 0, slow = 0;
+    double limit = tx_limit_s();
     for (int k = 0; k < n; k++) {
         uint32_t flag = 0;
         const char *name = vkb_emu_bcn_transcoder_name(k, &flag);
-        tx_build b = {c, cache, k, VK_ERROR_UNKNOWN, 0};
+        tx_build b = {c, cache, k, VK_ERROR_UNKNOWN, 0, tx_fake_ms(name)};
         int sig = 0;
-        int g = vkb_guard_run("probe: BC transcoder", sub_limit_s(), tx_one, &b, &sig);
+        int g = vkb_guard_run("probe: BC transcoder", limit, tx_one, &b, &sig);
         if (g == VKB_GUARD_DONE && b.r == VK_SUCCESS) {
-            say(c, "%s%s %.0f ms", k ? ", " : "", name, b.ms);
+            int s = b.ms > sub_limit_s() * 1000.0;
+            slow += s;
+            say(c, "%s%s %.0f ms%s", k ? ", " : "", name, b.ms, s ? " (slow)" : "");
             continue;
         }
-        say(c, "%s%s %s", k ? ", " : "", name, g == VKB_GUARD_TIMED_OUT ? "HANG" : g == VKB_GUARD_CRASHED ? "CRASH" : "FAILED");
+        if (g == VKB_GUARD_TIMED_OUT)
+            say(c, "%s%s HANG (still compiling after %.0f s, interrupted; a compile, no GPU work)", k ? ", " : "", name, limit);
+        else
+            say(c, "%s%s %s", k ? ", " : "", name, g == VKB_GUARD_CRASHED ? "CRASH" : "FAILED");
         c->want_flags |= flag;
         outcome(c, g == VKB_GUARD_TIMED_OUT ? PS_HANG : g == VKB_GUARD_CRASHED ? PS_CRASH : PS_FAIL);
         if (g != VKB_GUARD_DONE) { /* the driver may hold a lock now: no more compiles here */
             stuck = 1;
+            /* and those not tried are decoded too (they went on to be used untested before) */
+            for (int j = k + 1; j < n; j++) {
+                uint32_t f = 0;
+                const char *rest = vkb_emu_bcn_transcoder_name(j, &f);
+                say(c, ", %s not tried", rest);
+                c->want_flags |= f;
+            }
             break;
         }
     }
+    if (slow && !stuck) say(c, " (slow: over %.0f s, under the %.0f s limit)", sub_limit_s(), limit);
     /* after a hang or a crash the cache is left as it is (the build may still be in it) */
     if (!stuck) vkb_pcache_own_close(&c->d, c->dev, cache, path);
     if (c->want_flags) say(c, " - formats of a failed transcoder are decoded instead");
@@ -2016,6 +2067,85 @@ static void p_bitwise_vec(pctx *c)
     outcome(c, c->failed ? PS_FAIL : PS_PASS);
 }
 
+/* MK-20 (ncnn#7054: wrong 16-bit float results on the Mali-G715's r54 drivers): one dispatch of
+ * fp16.comp, 16-bit float arithmetic on push-constant inputs, its results converted to 32 bits.
+ * Every input, partial result and result is exact in 16 bits, so a right driver gives exact
+ * values; one 16-bit ulp is allowed (two for relaxed precision). Cases: fma (fused, mul + add,
+ * dot), range (the smallest normal, the top of the range; one product through a denormal, which
+ * may flush to zero), convert (from 32 bits, to and from integers, a vector), relaxed (mediump
+ * 32-bit maths a driver may run in 16 bits), chain (a 16-bit accumulation over a loop, scalar
+ * and vector). Runs only where the driver offers shaderFloat16 (applies): one small pipeline. */
+static float ulp16(float x)
+{
+    float a = x < 0 ? -x : x, u = 1.0f / 16777216.0f; /* 2^-24: a 16-bit denormal's step */
+    while (u * 1024.0f * 2.0f <= a && u < 32.0f) u *= 2.0f;
+    return u;
+}
+
+static void p_fp16_math(pctx *c)
+{
+    void *out = NULL;
+    VkBuffer ob = buf(c, 128, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out);
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayout l = dsl(c, &b, 1, 0, NULL);
+    struct {
+        float a[4], c[4];
+        int32_t n;
+    } pc = {{1.5f, 2.25f, -0.125f, 0.25f}, {1.0f / 16384.0f, 1.0f / 3.0f, 65280.0f, -2.75f}, 16};
+    VkPipelineLayout pl = l ? layout_push(c, VK_SHADER_STAGE_COMPUTE_BIT, sizeof(pc), 1, &l) : VK_NULL_HANDLE;
+    VkResult r = VK_ERROR_UNKNOWN;
+    VkPipeline p = pl ? comp(c, spv_probe_fp16, sizeof(spv_probe_fp16), pl, NULL, &r) : VK_NULL_HANDLE;
+    VkDescriptorSet s = p ? set_alloc(c, l) : VK_NULL_HANDLE;
+    if (!ob || !s) {
+        say(c, "setup failed (%d)", r);
+        outcome(c, PS_ERROR);
+        return;
+    }
+    memset(out, 0, 128);
+    VkDescriptorBufferInfo bi = {ob, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, s, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
+    c->d.vkUpdateDescriptorSets(c->dev, 1, &w, 0, NULL);
+    if (!dispatch(c, p, pl, s, &pc, sizeof(pc))) {
+        outcome(c, PS_ERROR);
+        return;
+    }
+    const float *o = out;
+    /* lane 4 may also be 0 (its denormal flushed) */
+    static const float want[18] = {3.25f, 3.25f, 6.6875f,
+                                   3.0f / 16384.0f, 1.0f / 4096.0f, 16320.0f, 65280.0f,
+                                   0.333251953125f, -2.0f, 2048.0f, -2.75f,
+                                   3.25f, 30.0f,
+                                   30.0f, 180.0f, 270.0f, -15.0f, 30.0f};
+    static const int first[6] = {0, 3, 7, 11, 13, 18};
+    if (o[18] != 12345.0f) {
+        say(c, "the shader did not run (marker %g)", o[18]);
+        outcome(c, PS_ERROR);
+        return;
+    }
+    for (int k = 0; k < 5; k++) {
+        int ok = 1;
+        for (int i = first[k]; i < first[k + 1]; i++) {
+            float d = o[i] - want[i], tol = ulp16(want[i]) * (k == 3 ? 2.0f : 1.0f);
+            int good = (d <= tol && d >= -tol) || (i == 4 && o[i] == 0.0f);
+            ok &= good;
+        }
+        sub(c, k, ok);
+        if (!ok) {
+            say(c, "%scase %d lanes", c->dlen ? "; " : "", k);
+            for (int i = first[k]; i < first[k + 1]; i++) say(c, " %.9g", o[i]);
+            say(c, " (want");
+            for (int i = first[k]; i < first[k + 1]; i++) say(c, " %.9g", want[i]);
+            say(c, ")");
+        }
+    }
+    if (c->failed) {
+        c->want_flags |= VKB_PROBE_FLAG_MK_FP16;
+        say(c, " - 16-bit float arithmetic wrong");
+    } else
+        say(c, "fma, range, conversions, relaxed precision and a 16-bit accumulation right%s", o[4] == 0.0f ? " (16-bit denormals flushed)" : "");
+    outcome(c, c->failed ? PS_FAIL : PS_PASS);
+}
+
 /* MK-04 (Arm errata 3809538, 3893905, 3893903): dynamic state set before a pipeline bind lost at
  * the next draw. An 8x1 target with depth/stencil; pipelines A and B made alike with depth write
  * on, cull NONE, stencil write mask 0xFF (REPLACE, reference 1) and these dynamic: depth write,
@@ -2546,6 +2676,7 @@ static const probe_def probes[] = {
     {"vb_strides", p_vb_strides, 0, VKB_PROBE_FLAG_MK_VB | VKB_PROBE_FLAG_MK_VB_SINGLE, 0, "MK-05", 1, VKB_ERRATUM_VB_SPLIT, 0,
      "from_0,from_1,single"},
     {"view3d_layers", p_view3d_layers, 0, VKB_PROBE_FLAG_MK_VIEW3D, 0, "MK-07", 1, VKB_ERRATUM_VIEW_COUNTS, 0, "slices"},
+    {"fp16_math", p_fp16_math, 0, VKB_PROBE_FLAG_MK_FP16, 0, "MK-20", 1, VKB_ERRATUM_FP16_HIDE, 0, "fma,range,convert,relaxed,chain"},
     {"wait_eintr", p_wait_eintr, 0, VKB_PROBE_FLAG_MK_WAIT, 0, "MK-01", 1, VKB_ERRATUM_WAIT_RETRY, 1, "fence,semaphore"},
     {"rendering_churn", p_rendering_churn, 0, VKB_PROBE_FLAG_MK_CHURN, 0, "MK-06", 1, VKB_ERRATUM_VIEW_QUARANTINE, 1, "views"},
     {"compile_lut_standin", p_compile_lut_standin, 0, 0, 1, "F26"},
@@ -2587,6 +2718,7 @@ static const char *flag_text(uint32_t f)
     if (f & VKB_PROBE_FLAG_MK_VB) return "the bug's pattern (MK-05): strides by array index";
     if (f & VKB_PROBE_FLAG_MK_VIEW3D) return "the bug's pattern (MK-07): wrong slices";
     if (f & VKB_PROBE_FLAG_MK_WAIT) return "the bug's pattern (MK-01): waits fail after a signal";
+    if (f & VKB_PROBE_FLAG_MK_FP16) return "the bug's pattern (MK-20): 16-bit float arithmetic wrong; shaderFloat16 hidden from clients";
     if (f & VKB_PROBE_FLAG_MK_CHURN) return "the bug's pattern (MK-06): a re-made view rendered stale";
     if (f & VKB_PROBE_FLAG_LUT_NOW) return "UE4 LUT pipelines get their stand-in at once";
     if (f & VKB_PROBE_FLAG_GS_FOLD) return "layer-only geometry stages folded into the vertex shader";
@@ -3068,6 +3200,7 @@ static int applies(pctx *c, const probe_def *p)
     if (p->fn == p_dyn_state || p->fn == p_vb_strides) return c->eds;
     if (p->fn == p_rendering_churn) return c->dynrender;
     if (p->fn == p_view3d_layers) return c->api >= VK_API_VERSION_1_1;
+    if (p->fn == p_fp16_math) return c->fp16;
     return 1;
 }
 
@@ -3262,7 +3395,9 @@ static void profile_key(pprofile *pf, const VkPhysicalDeviceProperties *props, c
 {
     static const char *const envs[] = {"VKBRIDGE_FAKE_MISSING", "VKBRIDGE_SERVER_HIDE_EXTS", "VKBRIDGE_PROBE_FAKE", "VKBRIDGE_EMULATE",
                                        "VKBRIDGE_PROBE_APPLY", "VKBRIDGE_BC_TRANSCODE", "VKBRIDGE_ERRATA_IMITATE",
-                                       "VKBRIDGE_ERRATA_IMITATE_VB", "VKBRIDGE_WAIT_FAKE_ERROR"};
+                                       "VKBRIDGE_ERRATA_IMITATE_VB", "VKBRIDGE_WAIT_FAKE_ERROR",
+                                       /* a transcoder hang imitated, or a shorter limit, records what a real run must not reuse */
+                                       "VKBRIDGE_PROBE_TX_FAKE", "VKBRIDGE_PROBE_TX_TIMEOUT_S"};
     uint64_t h = 0xcbf29ce484222325ull;
     for (size_t i = 0; i < sizeof(envs) / sizeof(envs[0]); i++) h = fnv(h, vkb_srv_env(envs[i]));
     char u[2 * VK_UUID_SIZE + 1];

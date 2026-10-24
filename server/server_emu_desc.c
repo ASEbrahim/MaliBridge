@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Descriptor limits above the GPU's (VKB_EMU_DESC_LIMITS). vkd3d-proton's bindless path without
  * descriptor buffers wants 1,000,000 sampled images, storage images and storage buffers per stage

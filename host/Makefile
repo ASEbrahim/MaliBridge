@@ -11,14 +11,14 @@ CC ?= gcc
 CFLAGS ?= -O1 -g
 SAN := $(if $(TSAN),-fsanitize=thread -g)
 # The bridge build named in the startup probe's device profile and the session report.
-VKB_GIT := $(shell git -C $(VKB) describe --always --dirty 2>/dev/null || echo unknown)
+VKB_GIT := $(shell git -C $(VKB) describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo unknown)
 WARN := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-sign-compare
 INC := -I$(VKB)/third_party/Vulkan-Headers-1.4.341/include -I$(VKB)/common -I$(VKB)/common/gen
 COMMON_SRC := $(VKB)/common/vkb_wire.c $(VKB)/common/gen/vkb_gen_structs.c
 SERVER_SRC := $(wildcard $(SRV)/*.c) $(VKB)/common/gen/vkb_gen_server.c $(COMMON_SRC)
 CLIENT_SRC := $(wildcard $(VKB)/client/*.c) $(VKB)/common/gen/vkb_gen_client.c $(COMMON_SRC)
 
-TESTS := vkbridge-smoke bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus dynstate_check vbstride_check viewport_check flip_corpus clampzero_check clampzero_corpus begin_check shlbarrier_corpus cullmode_check dedimport_check cached_check polygon_check gpuview_check dedhint_check planar_check fdprops_check memclass_check procaddr_check exitclean_check
+TESTS := vkbridge-smoke bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus dynstate_check vbstride_check viewport_check flip_corpus clampzero_check clampzero_corpus begin_check shlbarrier_corpus cullmode_check dedimport_check cached_check polygon_check gpuview_check dedhint_check planar_check fdprops_check memclass_check procaddr_check exitclean_check effects_corpus asyncpipe_check texcap_check robust2_check fp16_check promote_check downgrade_corpus xfb_check shmbarrier_check shmbarrier_corpus stencillayout_check dynrend_check wave32_check wave32_corpus hotpath_bench hotpath_bench_old
 
 all: $(OUT)/vkbridge-server $(OUT)/libvulkan_droidbridge.so $(OUT)/vkbridge_icd.json $(addprefix $(OUT)/,$(TESTS))
 
@@ -48,6 +48,17 @@ $(OUT)/%_check: $(VKB)/tests/%_check.c $(VKB)/tests/smoke_spv.h
 
 $(OUT)/bcn_check: $(VKB)/server/bc_spv.h
 
+# hotpath_bench_old: the same with the arena and the null-descriptor set map as before 2026-10-21.
+$(OUT)/hotpath_bench: $(VKB)/tests/hotpath_bench.c $(COMMON_SRC) $(VKB)/server/nd_map.h
+	@mkdir -p $(OUT)
+	$(CC) -O2 $(SAN) -Wall $(INC) -I$(SRV) -o $@ $(VKB)/tests/hotpath_bench.c $(COMMON_SRC)
+
+$(OUT)/hotpath_bench_old: $(VKB)/tests/hotpath_bench.c $(COMMON_SRC) $(VKB)/server/nd_map.h
+	@mkdir -p $(OUT)
+	$(CC) -O2 $(SAN) -Wall -Wno-type-limits $(INC) -I$(SRV) -DARENA_SPARE_MAX=0 -DMAP_MAX_BUCKETS=8192 -o $@ $(VKB)/tests/hotpath_bench.c $(COMMON_SRC)
+
+$(OUT)/texcap_check: $(VKB)/tests/texcap_comp.inc
+
 $(OUT)/divisor_check: $(VKB)/tests/divisor_vert.inc $(VKB)/tests/divisor_frag.inc
 
 $(OUT)/vbstride_check: $(VKB)/tests/divisor_vert.inc $(VKB)/tests/divisor_frag.inc
@@ -60,11 +71,28 @@ $(OUT)/gsfold_check: $(VKB)/tests/gsfold_vert.inc $(VKB)/tests/gsfold_geom.inc $
 
 $(OUT)/bitwise_check: $(VKB)/tests/bitwise_comp.inc
 
+$(OUT)/xfb_check: $(VKB)/tests/xfb_xfb_vert.inc $(VKB)/tests/xfb_plain_vert.inc $(VKB)/tests/xfb_so_geom.inc
+
+$(OUT)/asyncpipe_check: $(VKB)/tests/cullmode_vert.inc $(VKB)/tests/dynstate_frag.inc
+
 $(OUT)/polygon_check: $(VKB)/tests/polygon_vert.inc $(VKB)/tests/polygon_frag.inc
+
+$(OUT)/dynrend_check: $(VKB)/tests/polygon_vert.inc $(VKB)/tests/polygon_frag.inc
 
 $(OUT)/clampzero_check: $(VKB)/tests/clampzero_comp.inc
 
+$(OUT)/shmbarrier_check: $(VKB)/tests/shmbarrier_comp.inc
+
+$(OUT)/wave32_check: $(VKB)/tests/wave32_comp.inc
+
 $(OUT)/viewport_check: $(VKB)/tests/viewport_vert.inc $(VKB)/tests/viewport_vert_mv.inc $(VKB)/tests/viewport_geom.inc $(VKB)/tests/viewport_frag.inc
+
+$(OUT)/promote_check: $(VKB)/tests/promote_comp15.inc $(VKB)/tests/promote_comp16.inc
+
+# Version promotion's SPIR-V lowering alone, over a corpus (host/promote_test.sh)
+$(OUT)/downgrade_corpus: $(VKB)/tests/downgrade_corpus.c $(SRV)/spirv_downgrade.c $(SRV)/spirv_downgrade.h $(SRV)/spirv_edit.c $(SRV)/spirv_edit.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -o $@ $(VKB)/tests/downgrade_corpus.c $(SRV)/spirv_downgrade.c $(SRV)/spirv_edit.c
 
 # The MK-02 SPIR-V pass alone, over a corpus (host/viewport_test.sh)
 $(OUT)/flip_corpus: $(VKB)/tests/flip_corpus.c $(SRV)/spirv_flip.c $(SRV)/spirv_flip.h $(SRV)/spirv_edit.c $(SRV)/spirv_edit.h
@@ -86,9 +114,41 @@ $(OUT)/shlbarrier_corpus: $(VKB)/tests/shlbarrier_corpus.c $(SRV)/spirv_shlbarri
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(SAN) $(WARN) -o $@ $(VKB)/tests/shlbarrier_corpus.c $(SRV)/spirv_shlbarrier.c
 
+# The shm_barrier SPIR-V pass alone, over a corpus (host/shmbarrier_test.sh)
+$(OUT)/shmbarrier_corpus: $(VKB)/tests/shmbarrier_corpus.c $(SRV)/spirv_shmbarrier.c $(SRV)/spirv_shmbarrier.h $(SRV)/spirv_uniform.c $(SRV)/spirv_uniform.h $(SRV)/spirv_lockstep.c $(SRV)/spirv_lockstep.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -o $@ $(VKB)/tests/shmbarrier_corpus.c $(SRV)/spirv_shmbarrier.c $(SRV)/spirv_uniform.c $(SRV)/spirv_lockstep.c
+
+# The wave32 SPIR-V pass alone, over a corpus (host/wave32_test.sh)
+$(OUT)/wave32_corpus: $(VKB)/tests/wave32_corpus.c $(SRV)/spirv_wave32.c $(SRV)/spirv_wave32.h $(SRV)/spirv_uniform.c $(SRV)/spirv_uniform.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -o $@ $(VKB)/tests/wave32_corpus.c $(SRV)/spirv_wave32.c $(SRV)/spirv_uniform.c
+
+# The asynchronous compile's shader scan alone (host/asyncpipe_test.sh)
+$(OUT)/effects_corpus: $(VKB)/tests/effects_corpus.c $(SRV)/spirv_effects.c $(SRV)/spirv_effects.h $(SRV)/spirv_opclass.inc \
+		$(VKB)/tests/bitwise_comp.inc $(VKB)/tests/clampzero_comp.inc $(VKB)/tests/dynstate_frag.inc $(VKB)/tests/cullmode_vert.inc
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -I$(SRV) -I$(VKB)/tests -o $@ $(VKB)/tests/effects_corpus.c $(SRV)/spirv_effects.c
+
 $(OUT)/flicker_check: $(VKB)/tests/flicker_check.c $(VKB)/tests/smoke_spv.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(SAN) -funsigned-char -Wall $(INC) -I$(VKB)/tests -o $@ $< -ldl -lm -lpthread
+
+# The device-profile check's layer beneath the Khronos Profiles layer (devprofile_check.sh; host only)
+VKH := $(VKB)/third_party/Vulkan-Headers-1.4.341
+DP := $(VKB)/host/devprofile
+$(OUT)/devprofile/devclamp_table.h: $(DP)/gen_devclamp_table.py $(VKH)/registry/vk.xml
+	@mkdir -p $(OUT)/devprofile
+	python3 $(DP)/gen_devclamp_table.py $(VKH)/registry/vk.xml $(VKH)/include/vulkan/vulkan_core.h $@
+
+$(OUT)/devprofile/libVkLayer_malibridge_devclamp.so: $(DP)/devclamp_layer.c $(OUT)/devprofile/devclamp_table.h
+	$(CC) $(CFLAGS) $(WARN) -fPIC -shared -fvisibility=hidden -DVK_ENABLE_BETA_EXTENSIONS $(INC) -I$(OUT)/devprofile -o $@ $< -lpthread -Wl,--no-undefined
+
+$(OUT)/devprofile/VkLayer_malibridge_devclamp.json:
+	@mkdir -p $(OUT)/devprofile
+	printf '{"file_format_version":"1.2.0","layer":{"name":"VK_LAYER_MALIBRIDGE_devclamp","type":"GLOBAL","library_path":"./libVkLayer_malibridge_devclamp.so","api_version":"1.4.341","implementation_version":"1","description":"devprofile_check: features and extensions the desktop driver lacks taken off at vkCreateDevice"}}\n' > $@
+
+devprofile: all $(OUT)/devprofile/libVkLayer_malibridge_devclamp.so $(OUT)/devprofile/VkLayer_malibridge_devclamp.json
 
 test: all
 	$(VKB)/host/run_tests.sh $(OUT)
@@ -96,4 +156,4 @@ test: all
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all test clean
+.PHONY: all test clean devprofile

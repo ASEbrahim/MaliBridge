@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * A small SPIR-V editor for the bridge's shader emulations: parse a module into instructions,
  * look things up, append/insert/remove instructions, and write it back.
@@ -75,6 +76,8 @@ uint32_t spv_annotations_end(const spv_mod *m); /* end of the decoration section
 uint32_t spv_type_float(spv_mod *m, uint32_t width);
 uint32_t spv_type_int(spv_mod *m, uint32_t width, uint32_t sign);
 uint32_t spv_type_bool(spv_mod *m);
+uint32_t spv_type_vector(spv_mod *m, uint32_t comp, uint32_t n);
+uint32_t spv_glsl_std450(spv_mod *m); /* the GLSL.std.450 import's id, added if missing */
 uint32_t spv_type_pointer(spv_mod *m, uint32_t storage, uint32_t pointee);
 uint32_t spv_type_array(spv_mod *m, uint32_t elem, uint32_t len_const);
 uint32_t spv_const_u32(spv_mod *m, uint32_t v);

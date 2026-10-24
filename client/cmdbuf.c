@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Command buffers: vkCmd* calls are encoded into the command buffer's own stream (no round trip
  * each); vkEndCommandBuffer sends the stream in one message and the server replays it.

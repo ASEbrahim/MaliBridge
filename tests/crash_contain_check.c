@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * crash_contain_check: a driver crash inside pipeline compilation fails that call, not the
  * session (server_guard.c; ULTRAKILL's SIGSEGV 0x40 in vkCreateGraphicsPipelines took it down).
@@ -375,6 +376,22 @@ static int spin_mode(int fc2)
     return failures ? 1 : 0;
 }
 
+/* --slow: the server runs with VKBRIDGE_TEST_CRASH_PIPELINE=slow: the marked compute pipeline takes
+ * a few seconds; asked for twice, each outcome on a "RESULT" line (compile_watchdog_test.sh judges
+ * them run by run: interrupted, then tried again with a longer limit, then built with it). */
+static int slow_mode(void)
+{
+    for (int i = 0; i < 2; i++) {
+        VkPipeline pipe = VK_NULL_HANDLE;
+        double t0 = secs();
+        VkResult r = compute_pipeline(1, &pipe);
+        printf("RESULT %d %s %.1f s\n", i, r == VK_SUCCESS && pipe && dispatch_ok(pipe) ? "built" : "failed", secs() - t0);
+    }
+    vkDestroyDevice(dev, NULL);
+    vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int spin = argc > 1 && !strcmp(argv[1], "--spin"), spinfc2 = argc > 1 && !strcmp(argv[1], "--spinfc2");
@@ -419,6 +436,7 @@ int main(int argc, char **argv)
         return 1;
     }
     if (spin || spinfc2) return spin_mode(spinfc2);
+    if (argc > 1 && !strcmp(argv[1], "--slow")) return slow_mode();
     VkPipeline pipe;
     VkResult r = graphics_pipeline(1, &pipe);
     expect_contained(r, pipe, "A: faulting graphics pipeline fails, not the connection");

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Host-visible memory shared with the client.
  *
@@ -72,6 +73,19 @@ static const vkb_native_handle *(*p_AHardwareBuffer_getNativeHandle)(const struc
 #define AHB_USAGE_CPU_READ_OFTEN 3ull
 #define AHB_USAGE_CPU_WRITE_OFTEN (3ull << 4)
 #define AHB_USAGE_GPU_DATA_BUFFER (1ull << 24)
+#endif
+
+/* AHB pages uncached (CPU usage "rarely"): -1 until decided, VKBRIDGE_AHB_RARELY forcing it. The
+ * memory self-test turns it on when cached AHBs share no coherent type: Huawei's Kirin 985
+ * (Mali-G77 r34p0, MaliBridge#10) lets a cached AHB into its cached type 1 only, and that phone has
+ * no dma-heaps, so no method worked and Linux programs got no host-visible memory. */
+static int ahb_rarely = -1;
+static int ahb_uncached(void)
+{
+    if (ahb_rarely < 0) ahb_rarely = getenv("VKBRIDGE_AHB_RARELY") != NULL;
+    return ahb_rarely;
+}
+#ifdef __ANDROID__
 
 static int ahb_load(void)
 {
@@ -652,8 +666,9 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
             r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
             break;
         }
-        /* CPU usage decides how gralloc caches the pages; VKBRIDGE_AHB_RARELY=1 asks for uncached. */
-        uint64_t cpu = getenv("VKBRIDGE_AHB_RARELY") ? (2ull | (2ull << 4)) : (AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN);
+        /* CPU usage decides how gralloc caches the pages: uncached where the self-test needed it
+         * (ahb_rarely) or VKBRIDGE_AHB_RARELY=1 asks. */
+        uint64_t cpu = ahb_uncached() ? (2ull | (2ull << 4)) : (AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN);
         vkb_ahb_desc d = {(uint32_t)sz, 1, 1, AHB_FORMAT_BLOB, cpu | AHB_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
         struct AHardwareBuffer *ahb = NULL;
         int ar = p_AHardwareBuffer_allocate(&d, &ahb);
@@ -979,7 +994,7 @@ void vkb_mem_instance_install(vkb_srv_table *t)
 /* ------------------------------------------------------------------ another Mali's memory table, imitated */
 
 /*
- * VKBRIDGE_FAKE_MISSING=...,xringmem or g720mem (host tests): the driver's memory types become
+ * VKBRIDGE_FAKE_MISSING=...,xringmem, o1mem or g720mem (host tests): the driver's memory types become
  * another Mali's, beneath everything the server does (vkb_gipa: the self-test, the probes and
  * the devices all see them). Each imitated type is backed by a desktop type with the same host
  * access; the resources' memoryTypeBits are what that Mali's are, as far as testers' logs show.
@@ -987,16 +1002,26 @@ void vkb_mem_instance_install(vkb_srv_table *t)
  * g720mem: the Mali-G720's and G925's four types (0:0x7 1:0xb 2:0x11 3:0x21/h1). Images and
  * buffers allow 0x3 (their self-tests: "images allow types 0x3, plain buffers 0x3").
  *
- * xringmem: Mali-G2-Ultra on the XRing O3 (driver 56, issue #1), 22 types: 0,3..8 0x7; 1,9..14
- * 0xb; 2,15..20 0x11 (lazily allocated); 21 0x21 (heap 1). Images do not list types 0 and 1 (here:
- * 6, 7, 8 and 14; the v0.5 client backed its device-local type with 6, and every image fit). A
- * buffer allows 0x3; a shareable one (the client makes all buffers so) depends on its usage, a
- * model that fits the tester's v0.5 logs: indirect buffers 0x43 (the self-test's draws: "no memory
- * type for the buffer (types 0x1 allowed)"), texel buffers 0x3 ("a resource allowing server types
- * 0x3 gets no client type (shared allowed; ...)"), the others 0x4000 (its sharing self-test passed
- * type 14 only, and its other checks passed).
+ * xringmem: Mali-G2-Ultra on the XRing O3 (driver r56p0, issue #1), 22 types: 0,3..8 0x7; 1,9..14
+ * 0xb; 2,15..20 0x11 (lazily allocated); 21 0x21 (heap 1). As measured there (the tester's v0.5.1
+ * logs): images allow 0x1040 (types 6 and 12), plain buffers 0x4100 (8 and 14); with the client's
+ * handle types (it makes every buffer so) indirect buffers allow 0x1040 like images, staging
+ * buffers (transfer source only: gamescope's upload buffer) and texel buffers 0x3, the others
+ * 0x4100 still - and so does any buffer that is also a transfer destination (the sharing
+ * self-test's buffers are, and it tried types 8 and 14 only: "dmaheap, type 8: allocation
+ * failed", "types 0x4000 shared"; dma-bufs go in 1, 9..14). So an indirect or staging buffer's
+ * mask has host-visible types (0, 1, 6, 12), none of them shareable: v0.5.1 offered it no type to map ("no memory type for the buffer (types 0x1
+ * allowed)", gamescope's "findMemoryType failed"). Unshared staging buffers allow 0x3 too (the
+ * self-test's "resource masks 0x4100->8 0x3->0").
  *
- * Both: memory is imported (dma-buf, host pointer) or made exportable only in a HOST_CACHED type
+ * o1mem: Mali-G925 on the XRing O1 (driver r49p1, Xiaomi Pad 7S Pro, issues #6 and #8), 6 types:
+ * 0 0x1 (device-local, no host access, not lazily allocated), 1 0x7, 2 0xb, 3 and 4 0x11 (lazily
+ * allocated), 5 0x21 (heap 1). Images and buffers allow 0x6 ("images allow types 0x6, plain buffers
+ * 0x6"): never type 0, the one a client takes for its device-local type when a driver has such a type.
+ * v0.5.2 gave every image and GPU-only buffer an empty mask (gamescope's "vkAllocateMemory in memory
+ * type 4294967295", then vulkan_create_flat_texture's assertion).
+ *
+ * All: memory is imported (dma-buf, host pointer) or made exportable only in a HOST_CACHED type
  * (the G925's self-test: "dmaheap, type 0: allocation failed (-1000072003)", type 1 shared OK),
  * and fd and host pointer properties list only those.
  */
@@ -1006,12 +1031,13 @@ typedef struct {
 } imit_type;
 
 static const imit_type imit_g720[] = {{0x7, 0}, {0xb, 0}, {0x11, 0}, {0x21, 1}};
+static const imit_type imit_o1[] = {{0x1, 0}, {0x7, 0}, {0xb, 0}, {0x11, 0}, {0x11, 0}, {0x21, 1}};
 static const imit_type imit_xring[] = {{0x7, 0},  {0xb, 0},  {0x11, 0}, {0x7, 0},  {0x7, 0},  {0x7, 0},  {0x7, 0},  {0x7, 0},
                                        {0x7, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0xb, 0},  {0x11, 0},
                                        {0x11, 0}, {0x11, 0}, {0x11, 0}, {0x11, 0}, {0x11, 0}, {0x21, 1}};
 
 static struct {
-    int on; /* 1 g720mem, 2 xringmem */
+    int on; /* 1 g720mem, 2 xringmem, 3 o1mem */
     const imit_type *types;
     uint32_t count;
     PFN_vkGetInstanceProcAddr gipa;
@@ -1052,7 +1078,7 @@ static struct {
 static int imit_on(void)
 {
     static int v = -1;
-    if (v < 0) v = vkb_emu_faked("xringmem") ? 2 : vkb_emu_faked("g720mem") ? 1 : 0;
+    if (v < 0) v = vkb_emu_faked("xringmem") ? 2 : vkb_emu_faked("o1mem") ? 3 : vkb_emu_faked("g720mem") ? 1 : 0;
     return v;
 }
 
@@ -1072,19 +1098,25 @@ static uint32_t imit_cached_types(void)
     return m;
 }
 
-static uint32_t imit_image_bits(void) { return imit.on == 2 ? 0x41c0u : 0x3u; }
+static uint32_t imit_image_bits(void) { return imit.on == 2 ? 0x1040u : imit.on == 3 ? 0x6u : 0x3u; }
 
 static uint32_t imit_buffer_bits(const VkBufferCreateInfo *ci)
 {
+    if (imit.on == 3) return 0x6u;
     if (imit.on != 2) return 0x3u;
     int external = 0;
     for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO && ((const VkExternalMemoryBufferCreateInfo *)b)->handleTypes)
             external = 1;
-    if (!external) return 0x3u;
-    if (ci->usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) return 0x43u;
+    /* staging: a transfer source only (gamescope's upload buffer; also one with storage, which the BCn
+     * emulation adds to every transfer source, server_emu_bcn.c - stricter than measured) */
+    if ((ci->usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && !(ci->usage & ~(VkBufferUsageFlags)(VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)))
+        return 0x3u;
+    if (!external) return 0x4100u;
+    if (ci->usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) return 0x4100u;
+    if (ci->usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) return 0x1040u;
     if (ci->usage & (VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)) return 0x3u;
-    return 0x4000u;
+    return 0x4100u;
 }
 
 /* The driver's bits -> the imitated types they back, of those `allow` lists. */
@@ -1398,10 +1430,12 @@ PFN_vkGetInstanceProcAddr vkb_mem_imitate_gipa(PFN_vkGetInstanceProcAddr gipa)
 {
     if (!imit_on()) return gipa;
     imit.on = imit_on();
-    imit.types = imit.on == 2 ? imit_xring : imit_g720;
-    imit.count = imit.on == 2 ? sizeof(imit_xring) / sizeof(imit_xring[0]) : sizeof(imit_g720) / sizeof(imit_g720[0]);
+    imit.types = imit.on == 2 ? imit_xring : imit.on == 3 ? imit_o1 : imit_g720;
+    imit.count = imit.on == 2   ? sizeof(imit_xring) / sizeof(imit_xring[0])
+                 : imit.on == 3 ? sizeof(imit_o1) / sizeof(imit_o1[0])
+                                : sizeof(imit_g720) / sizeof(imit_g720[0]);
     imit.gipa = gipa;
-    VKB_INFO("imitating %s's memory table: %u types, images allow 0x%x", imit.on == 2 ? "the XRing O3" : "the Mali-G720",
+    VKB_INFO("imitating %s's memory table: %u types, images allow 0x%x", imit.on == 2 ? "the XRing O3" : imit.on == 3 ? "the XRing O1" : "the Mali-G720",
              imit.count, imit_image_bits());
     return imit_GetInstanceProcAddr;
 }
@@ -2477,13 +2511,21 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         /* The client's buffers carry this strategy's handle type: their masks with it. */
         uint32_t dl = probe_dl_types(&st, k->info.image_types, strategy_handle_type(s), 1);
         st.more_usages = dl != 0;
-        for (uint32_t t = 0; t < st.mp.memoryTypeCount; t++) {
-            if (!(st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
-            if (st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_PROTECTED_BIT) continue;
-            int res = test_type(&st, s, t);
-            if (res) shareable |= 1u << t;
-            if (res == 1) coherent |= 1u << t;
+        for (int pass = 0; pass < 2; pass++) {
+            for (uint32_t t = 0; t < st.mp.memoryTypeCount; t++) {
+                if (!(st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+                if (st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_PROTECTED_BIT) continue;
+                int res = test_type(&st, s, t);
+                if (res) shareable |= 1u << t;
+                if (res == 1) coherent |= 1u << t;
+            }
+            /* AHBs again with uncached pages, which the driver may take into a coherent type */
+            if (coherent || s != VKB_MEM_AHB || ahb_uncached()) break;
+            VKB_INFO("ahb: no coherent type takes a cached AHB; trying again with uncached pages (CPU usage rarely)");
+            ahb_rarely = 1;
+            shareable = 0;
         }
+        if (s == VKB_MEM_AHB && !coherent && ahb_rarely && !getenv("VKBRIDGE_AHB_RARELY")) ahb_rarely = 0; /* no better: as before */
         if (coherent) {
             k->info.strategy = s;
             k->info.buffer_handle_types = strategy_handle_type(s);

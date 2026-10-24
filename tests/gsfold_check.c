@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * gsfold_check: a vertex + layer-only pass-through geometry + fragment pipeline (UE4's
  * WriteToSliceGS shape, which the Mali-G925 compiler never finished in Stray) draws into the

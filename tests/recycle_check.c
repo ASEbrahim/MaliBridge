@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * recycle_check: the bridge client's buffer view recycling (client/bufview.c). A view destroyed
  * and created again with the same parameters comes back without a round trip; it must still

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * dmabuf_image_check: dma-buf images at LINEAR tiling, as Zink makes its shared linear resources
  * (VkExternalMemoryImageCreateInfo with DMA_BUF, no DRM modifier). Mali r44 refuses them with

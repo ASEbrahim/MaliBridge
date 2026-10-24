@@ -34,6 +34,31 @@ run() {
   kill $srv 2>/dev/null; wait $srv 2>/dev/null; rm -f "$sock"; rm -rf "$work"
   [ $r = 0 ] || fails=$((fails+1))
 }
+# slow: a compute compile of 3 s under a 2 s limit, three runs sharing the cache directory. The
+# first is interrupted (no fallback helps: "fails", t=1); the next run tries it again with 4 s and
+# it builds (kept as "built with a longer limit"), and asked again it builds again; the third run
+# builds it with 4 s at once.
+slow() {
+  local work sock srv run res want
+  work=$(mktemp -d)
+  sock=${XDG_RUNTIME_DIR:-/tmp}/vkbridge-slow-$$.sock
+  for run in 1 2 3; do
+    VKBRIDGE_TEST_CRASH_PIPELINE=slow VKBRIDGE_TEST_SLOW_S=3 VKBRIDGE_COMPILE_WARN_S=1 VKBRIDGE_COMPILE_TIMEOUT_S=2 \
+      VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
+      "$out/vkbridge-server" --socket "$sock" --log "$work/server$run.log" --cache-dir "$work/c" >/dev/null 2>&1 &
+    srv=$!
+    for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
+    VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES= timeout 120 "$out/crash_contain_check" --slow >"$work/t$run.log" 2>&1
+    kill $srv 2>/dev/null; wait $srv 2>/dev/null; rm -f "$sock"
+    res=$(grep -o 'RESULT [01] [a-z]*' "$work/t$run.log" | awk '{print $3}' | tr '\n' ' ')
+    case $run in 1) want="failed failed " ;; *) want="built built " ;; esac
+    echo "  slow run $run: $res(want $want); stuck-pipelines: $(sed 's/ #.*//; s/.* m=/m=/' "$work/c/stuck-pipelines" 2>/dev/null | tr '\n' ' ')"
+    [ "$res" = "$want" ] || fails=$((fails+1))
+  done
+  tail -1 "$work/c/stuck-pipelines" | grep -q " m=5 .* t=2 " || { echo "  slow: no m=5 t=2 line"; fails=$((fails+1)); }
+  rm -rf "$work"
+}
 run spin
 run spinfc2
-if [ $fails = 0 ]; then echo "OK: spin and spinfc2 (interrupted, fallbacks built, remembered)"; else echo "FAILED: $fails run(s)"; exit 1; fi
+slow
+if [ $fails = 0 ]; then echo "OK: spin, spinfc2 and slow (interrupted, fallbacks built, remembered, a slow compute pipeline retried)"; else echo "FAILED: $fails run(s)"; exit 1; fi

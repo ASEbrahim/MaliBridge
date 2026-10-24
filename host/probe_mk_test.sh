@@ -2,13 +2,13 @@
 # The MK probes (server_probe.c: one per Mali driver erratum a probe can tell) and the errata
 # decisions they feed (server_errata.c), on the desktop driver with a server of its own per step
 # (socket, cache directory, session folder):
-#   1  every MK probe passes natively; the profile is PROBE_VERSION 2 with the sub-cases recorded;
+#   1  every MK probe passes natively; the profile is PROBE_VERSION 3 with the sub-cases recorded;
 #      safe mode: the always-on errata on, each with its probe's pass in the reason; the report
 #      lists every erratum with its probe result and both modes' decisions (Markdown and JSON);
 #   2  performance mode from the same profile (no re-probe): the probe-gated errata stay off;
 #   3  each erratum's bug imitated (VKBRIDGE_ERRATA_IMITATE): its probe fails with the bug's own
-#      pattern, the other MK probes pass, and the decision follows - viewport_flip, bitwise_scalar
-#      and dyn_reemit turn on in performance mode, the record-only ones say the probe failed; the
+#      pattern, the other MK probes pass, and the decision follows - viewport_flip, bitwise_scalar,
+#      dyn_reemit and fp16_hide turn on in performance mode, the record-only ones say the probe failed; the
 #      report diff tool shows the probe, its sub-cases and the decision it changed;
 #   4  vb_strides tells the two stride shapes apart (VKBRIDGE_ERRATA_IMITATE_VB=single: option B);
 #   5  viewport_flip on a probe failure in safe mode too; a crashed probe decides nothing;
@@ -55,7 +55,7 @@ export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILEN
 unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API VKBRIDGE_FAKE_MISSING
 fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
-mk="viewport_flip bitwise_vec dyn_state vb_strides view3d_layers wait_eintr rendering_churn"
+mk="viewport_flip bitwise_vec dyn_state vb_strides view3d_layers wait_eintr rendering_churn fp16_math"
 
 # 1
 start plain
@@ -63,7 +63,7 @@ device
 ok=1; res=
 for p in $mk; do st=$(status_of plain $p); res="$res $p=$st"; [ "$st" = pass ] || [ "$st" = skip ] || ok=0; done
 p1=$(prof plain)
-[ $ok = 1 ] && grep -q '"probe_version": 2' "$p1" && grep -q '"name": "dyn_state", "status": "pass", .*"cases": "0x[1-9a-f]*", "failed": "0x0"' "$p1"
+[ $ok = 1 ] && grep -q '"probe_version": 3' "$p1" && grep -q '"name": "dyn_state", "status": "pass", .*"cases": "0x[1-9a-f]*", "failed": "0x0"' "$p1"
 step $? "every MK probe passes:$res"
 got=$(on_set)
 [ "$got" = wait_retry,dyn_reemit,vb_split,view_counts,cull_nontri ] && echo "$new" | grep -q "errata: dyn_reemit ON (always; safe mode; probe dyn_state passed) - MK-04" &&
@@ -78,7 +78,8 @@ python3 - "$rep.json" <<'PY' 2>$work/1j.log
 import json, sys
 r = json.load(open(sys.argv[1]))
 e = {x["name"]: x for x in r["probe"][0]["errata"]}
-assert len(e) == 10, e.keys()
+assert len(e) == 13, e.keys()
+assert e["vb_bake"]["probe"] == "vb_strides" and e["vb_bake"]["probe_gates"], e["vb_bake"]
 assert not e["clamp_zero"]["probe"] and not e["clamp_zero"]["safe"]["on"], e["clamp_zero"]
 assert e["dyn_reemit"]["safe"]["on"] and not e["dyn_reemit"]["performance"]["on"], e["dyn_reemit"]
 assert e["viewport_flip"]["probe_status"] == "pass" and not e["viewport_flip"]["safe"]["on"]
@@ -118,6 +119,7 @@ imitate bitwise_scalar bitwise_vec 0x200 "errata: bitwise_scalar ON (probe bitwi
 imitate dyn_reemit dyn_state 0x400 "errata: dyn_reemit ON (probe dyn_state failed; performance mode) - MK-04"
 imitate vb_split vb_strides 0x800 "errata: vb_split ON (always; performance mode; probe vb_strides failed, recorded only)"
 imitate view_counts view3d_layers 0x4000 "errata: view_counts ON (always; performance mode; probe view3d_layers failed, recorded only)"
+imitate fp16_hide fp16_math 0x8000 "errata: fp16_hide ON (probe fp16_math failed; performance mode) - MK-20"
 imitate view_quarantine rendering_churn 0x2000 ""
 for _ in $(seq 100); do grep -q "^| view_quarantine" $work/view_quarantine/s/malibridge-report.md 2>/dev/null && break; sleep 0.1; done
 ! echo "$new" | grep -q "errata: view_quarantine ON" &&
@@ -170,7 +172,7 @@ cost=$(for p in $mk; do grep "probe: $p " $log | head -1 | awk -v p=$p '{for (i=
 first_bg=$(grep -n "continue in the background" $log | head -1 | cut -d: -f1)
 ok=1
 for p in wait_eintr rendering_churn; do [ "$(grep -n "probe: $p " $log | head -1 | cut -d: -f1)" -gt "${first_bg:-0}" ] || ok=0; done
-for p in viewport_flip bitwise_vec dyn_state vb_strides view3d_layers; do [ "$(grep -n "probe: $p " $log | head -1 | cut -d: -f1)" -lt "${first_bg:-0}" ] || ok=0; done
+for p in viewport_flip bitwise_vec dyn_state vb_strides view3d_layers fp16_math; do [ "$(grep -n "probe: $p " $log | head -1 | cut -d: -f1)" -lt "${first_bg:-0}" ] || ok=0; done
 [ $ok = 1 ] && [ -n "$bgs" ]
 step $? "default budget: start ${starts}ms, background ${bgs}(wait_eintr and rendering_churn there); ${cost%, }"
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Window-system integration implemented by the bridge client: the server's GPU has no Linux
  * window systems, so swapchains are built here from ordinary images and handed to the

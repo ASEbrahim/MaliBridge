@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * pervertex_pipeline: builds a graphics pipeline vs + gs + fs from SPIR-V files, draws one
  * triangle into a 16x16 RGBA8 target and checks the centre texel took the fragment shader's

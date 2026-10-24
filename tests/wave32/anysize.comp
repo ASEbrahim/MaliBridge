@@ -1,0 +1,22 @@
+#version 450
+// wave32 corpus: only subgroupBroadcastFirst (vkd3d-proton's uniform descriptor index): the same
+// at any size, left as it is.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_quad : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+shared uint s[64];
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    s[i] = o[i];
+    barrier();
+    o[i] = s[subgroupBroadcastFirst(o[0]) & 63u];
+}

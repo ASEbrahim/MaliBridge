@@ -1,0 +1,28 @@
+#version 450
+// shm_barrier (shmbarrier_check.c): shared memory written and read across the workgroup with NO
+// barrier, as shaders made for lockstep 32/64-wide waves do. 256 invocations: several subgroups
+// on any GPU, so without the pass the reads race. With it: a control barrier before the read of
+// another invocation's value, one before the second write (a write after reads), and one at the
+// entry of the if whose read sees the second writes. Then a tree sum over the workgroup in a
+// loop, no barrier either: level 1 can only order it at the loop's entry; level 2 sees the loop
+// is uniform (its counter in a Function variable, as DXVK keeps registers) and puts a barrier
+// at the inner if's entry in every iteration. glslc -O0.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+shared uint s[256];
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    s[i] = i * 7u + 1u;
+    uint a = s[255u - i];
+    s[i] = a + 1000u;
+    uint b = 0u;
+    if (i < 128u) b = s[i + 128u];
+    o[gl_WorkGroupID.x * 512u + i] = a;
+    o[gl_WorkGroupID.x * 512u + 256u + i] = b;
+    s[i] = i;
+    for (uint k = 128u; k > 0u; k >>= 1u)
+        if (i < k) s[i] += s[i + k];
+    if (i == 0u) o[gl_NumWorkGroups.x * 512u + gl_WorkGroupID.x] = s[0];
+}

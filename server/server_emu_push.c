@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * VK_KHR_push_descriptor on a driver without it (Mali-G720 r44p1). vkd3d-proton refuses to start
  * without it ("Push descriptors are not supported by this implementation"), so no D3D12 game ran.
@@ -85,6 +86,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL p_CreatePipelineLayout(VkDevice device, co
                                                              const VkAllocationCallbacks *a, VkPipelineLayout *out)
 {
     push_state *s = st();
+    vkb_srv_note_pipeline_layout(ci);
     VkResult r = s->create_pl(device, ci, a, out);
     if (r != VK_SUCCESS) return r;
     layout_rec *l = calloc(1, sizeof(*l));

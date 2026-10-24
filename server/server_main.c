@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * vkbridge server entry point.
  *
@@ -115,6 +116,8 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
         buf[n++] = '\n';
         buf[n] = 0;
     }
+    if (vkb_srv_crash_detail[0] && n > 0 && n < (int)sizeof(buf))
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "vkbridge-server E   %s\n", vkb_srv_crash_detail);
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
     if (log_file) {
         if (write(fileno(log_file), buf, (size_t)n) < 0) {}
@@ -237,6 +240,7 @@ static int server_init(const char *vk_lib, const char *cache_dir)
     vkb_pcache_set_dir(cache_dir);
     vkb_srv_env_reload(); /* <cache dir>/env: VKBRIDGE_FAKE_MISSING and the like reach the self-test */
     vkb_gipa = vkb_mem_imitate_gipa(vkb_gipa); /* host tests: another Mali's memory table (server_memory.c) */
+    vkb_gipa = vkb_emu_imitate_gipa(vkb_gipa); /* host tests: the G715 r54p3's robustness2 (server_emu.c) */
     vkb_mode_refresh();   /* logged with its source; the probe decides for both modes */
     vkb_selftest_all();
     return 1;

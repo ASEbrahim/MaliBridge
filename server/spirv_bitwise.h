@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MK-03 (bitwise_scalar): Mali drivers r18p0-r53p0 miscompile an integer vector bitwise op whose
  * operand is a lane swizzle or a vector built lane by lane (Arm erratum 3843237; Dolphin's

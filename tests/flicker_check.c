@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * flicker_check [frames] [draws]: descriptor traffic with DXVK's frame structure, which
  * desc_traffic_check (one frame at a time, one thread) does not have. Several frames in flight,

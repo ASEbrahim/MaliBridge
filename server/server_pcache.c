@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Persistent pipeline cache. Mali compiles every pipeline from scratch in each new process unless
  * it is handed a VkPipelineCache; games through DXVK pass none. With a cache directory set
@@ -26,18 +27,46 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
-/* One file per program, at most 64 MB: a single shared file grew to 58 MB over a night of games
+/* One file per program, with a limit: a single shared file grew to 58 MB over a night of games
  * and every device (gamescope, Xwayland, Steam, each game) loaded all of it, and every cache an app
  * made was seeded with another copy - the server ran out of memory in vkCreatePipelineCache. With
- * a file per game (and pre-caching folded into it) 32 MB was too tight. */
-#define PC_MAX_FILE (64u << 20)
+ * a file per game (and pre-caching folded into it) 32 MB was too tight, and 64 MB too: RE2 (vkd3d,
+ * ~9 KB a pipeline) passed it within minutes on two tablets, HL2 did too, and from then on nothing
+ * new was kept, so the same compile stutter came back at every launch.
+ *
+ * Now VKBRIDGE_PCACHE_MAX_MB, by default RAM/64 within 64-128 MB, never more than the total limit,
+ * and never more than a quarter of the memory free when the device starts (MemAvailable, at least
+ * 32 MB). The cache is one VkPipelineCache in the driver (a pipeline is created with one cache, so
+ * all that should hit has to be in it, and the driver holds all of it in memory however the files
+ * are cut), and a save that merges with what another process wrote holds about three of them in
+ * the driver for a moment (ours, the file's, the merge, while vkGetPipelineCacheData copies it):
+ * at 256 MB that was ~750 MB mid-game, enough for the low-memory killer on an 8 GB device. So the
+ * default stays at 128 MB until a big save's memory is measured on a tablet, and a merge is skipped
+ * when the memory free is under three times what it would hold (the save writes ours alone, said
+ * once). What this also keeps down is the server's own copies around it: files are mapped, not
+ * read into the heap, saves go from vkGetPipelineCacheData straight into the (preallocated) file's
+ * pages, and they come further apart as the cache grows (a save writes all of it). Past the limit
+ * the file keeps what it has, and that is said once per device. */
+#define PC_MAX_MB_MIN 64u
+#define PC_MAX_MB_MAX 128u
+#define PC_MAX_MB_UNKNOWN_RAM 64u
+#define PC_MAX_MB_LOW_MEM 32u /* the floor when the memory free sets the limit */
+#define PC_MAX_MB_SET_MAX (1u << 20) /* VKBRIDGE_PCACHE_MAX_MB above this is taken as this */
+/* A <file>.<pid>.<n>.tmp left by a killed save (its size reserved in full) goes at the next trim
+ * once its process is gone, or after this long whatever its pid (pids are reused). */
+#define PC_TMP_STALE_S 600
 /* App-made caches start from the program's cache only while it is this small, and only the first
  * few: Zink makes one per GL program (and keeps each in Mesa's disk cache), so every one of them
  * got - and wrote back to Mesa's cache, and copied over the socket - the whole Steam UI cache. */
@@ -45,11 +74,14 @@
  * is in the app's files now, which the system never trims, and a file per game adds up: past the
  * limit the files used longest ago go, at the server's start and now and then at a new device
  * (a file is touched when it is loaded, so its time is when it was last used or saved). */
-#define PC_TOTAL_MB_DEFAULT 512u
+#define PC_TOTAL_MB_DEFAULT 1024u
 #define PC_TRIM_PERIOD_S 300
 #define PC_SEED_MAX (8u << 20)
 #define PC_SEED_CACHES 2
 #define PC_SAVE_PERIOD_S 10
+/* Above this a save waits longer, in proportion (a 256 MB cache: every 60 s at most). */
+#define PC_SAVE_BIG (32u << 20)
+#define PC_SAVE_PERIOD_MAX_S 60
 #define PC_WARM_SAVE_PERIOD_S 30
 #define PC_WARM_KINDS 2
 
@@ -81,6 +113,9 @@ typedef struct vkb_pcache {
     pc_ident file;        /* the file as this cache last read or wrote it */
     int covers;           /* the file holds nothing `cache` lacks (it was written from it alone) */
     int full_warned;
+    int over_warned;      /* warn_over said for this device */
+    int nomerge_warned;   /* a merge skipped for want of memory, said */
+    uint64_t max;         /* the per-program limit in bytes (file_limit at the device's start) */
     int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
     time_t last_save;     /* CLOCK_MONOTONIC seconds */
@@ -100,7 +135,12 @@ typedef struct vkb_pcache {
 } vkb_pcache;
 
 static const char *pc_dir;
-static pthread_mutex_t pc_lock = PTHREAD_MUTEX_INITIALIZER; /* the list, and every save */
+/* pc_lock: the list and trim, held only briefly (a new device takes it). save_lock: every save, so
+ * the checks of a file against what another device in this process wrote hold until its rename; a
+ * cache is freed only with it held, so the saver can walk the list without pc_lock while saving. */
+static pthread_mutex_t pc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t save_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned tmp_seq;
 static vkb_pcache *pc_list;
 static int pc_thread_started;
 
@@ -335,10 +375,53 @@ static uint64_t total_limit(void)
     return (uint64_t)(v && *v ? strtoull(v, NULL, 10) : PC_TOTAL_MB_DEFAULT) << 20;
 }
 
+/* The limit of one program's file, in bytes (see the top). */
+static uint64_t file_limit(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PCACHE_MAX_MB");
+    double set = v && *v ? strtod(v, NULL) : 0; /* fractions too (the host tests' caches are KB) */
+    uint64_t bytes;
+    if (set > 0) {
+        if (set > PC_MAX_MB_SET_MAX) set = PC_MAX_MB_SET_MAX; /* (uint64_t) of a huge double is undefined */
+        bytes = set * 1048576.0 < 1024 ? 1024 : (uint64_t)(set * 1048576.0);
+    } else {
+        uint64_t ram = vkb_memtotal_mb(), mb = ram ? ram / 64 : PC_MAX_MB_UNKNOWN_RAM;
+        mb = mb < PC_MAX_MB_MIN ? PC_MAX_MB_MIN : mb > PC_MAX_MB_MAX ? PC_MAX_MB_MAX : mb;
+        uint64_t avail = vkb_memavail_kb() >> 10;
+        if (avail && avail / 4 < mb) mb = avail / 4 < PC_MAX_MB_LOW_MEM ? PC_MAX_MB_LOW_MEM : avail / 4;
+        bytes = mb << 20;
+    }
+    uint64_t total = total_limit();
+    return total && bytes > total ? total : bytes;
+}
+
+/* A limit for the log: "256 MB" (or "4 KB" below 1 MB). */
+static const char *limit_str(char out[32], uint64_t bytes)
+{
+    if (bytes >= (1u << 20)) snprintf(out, 32, "%llu MB", (unsigned long long)(bytes >> 20));
+    else snprintf(out, 32, "%llu KB", (unsigned long long)(bytes >> 10));
+    return out;
+}
+
 static time_t mono_s(void);
 
+/* <name> (in d) is a save's <file>.vkpc.<pid>[.<n>].tmp: removed when its process is gone, or when
+ * it is older than PC_TMP_STALE_S (a pid may be in use again by now); not one this server is
+ * writing (saves take far less than that). */
+static void stale_tmp(DIR *d, const char *name, time_t wall)
+{
+    const char *at = strstr(name, ".vkpc.") + 6;
+    long pid = strtol(at, NULL, 10);
+    struct stat st;
+    if (fstatat(dirfd(d), name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode)) return;
+    int gone = pid > 0 && pid != (long)getpid() && kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+    if (!gone && wall - st.st_mtim.tv_sec < PC_TMP_STALE_S) return;
+    if (unlinkat(dirfd(d), name, 0) == 0)
+        VKB_INFO("pipeline cache %s/%s (%lld KB) removed: left by a save that did not finish", pc_dir, name, (long long)(st.st_size >> 10));
+}
+
 /* The .vkpc files over the total limit, oldest first, but never one a device has open (keep: one
- * more, by path). With pc_lock held. */
+ * more, by path); and the temporary files of saves that were killed. With pc_lock held. */
 static void trim(const char *keep, int now)
 {
     static time_t last;
@@ -346,14 +429,18 @@ static void trim(const char *keep, int now)
     if (!pc_dir || (!now && last && t - last < PC_TRIM_PERIOD_S)) return;
     last = t;
     uint64_t limit = total_limit();
-    if (!limit) return;
     DIR *d = opendir(pc_dir);
     if (!d) return;
     pc_entry *e = NULL;
     size_t n = 0, cap = 0;
     uint64_t total = 0;
+    time_t wall = time(NULL);
     for (struct dirent *de; (de = readdir(d));) {
         size_t len = strlen(de->d_name);
+        if (len > 4 && !strcmp(de->d_name + len - 4, ".tmp") && strstr(de->d_name, ".vkpc.")) {
+            stale_tmp(d, de->d_name, wall);
+            continue;
+        }
         if (len < 6 || len >= sizeof(e->name) || strcmp(de->d_name + len - 5, ".vkpc")) continue;
         struct stat st;
         if (fstatat(dirfd(d), de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode)) continue;
@@ -370,7 +457,7 @@ static void trim(const char *keep, int now)
         n++;
     }
     closedir(d);
-    if (total > limit) {
+    if (limit && total > limit) {
         qsort(e, n, sizeof(*e), entry_older);
         uint64_t freed = 0;
         unsigned gone = 0;
@@ -441,71 +528,180 @@ static int ident_eq(const pc_ident *a, const pc_ident *b)
            a->mtime.tv_sec == b->mtime.tv_sec && a->mtime.tv_nsec == b->mtime.tv_nsec;
 }
 
-/* The file's contents (NULL: missing, empty, over the limit or unreadable); *id: what was read. */
-static uint8_t *read_file(const char *path, size_t *size, pc_ident *id)
+/* A file's data for the driver: read into the heap, or mapped read-only. A mapping is no heap (a
+ * file read into a buffer is that much more memory while the driver makes its copy), but a page
+ * that cannot be read (an I/O error, a file cut short under us, storage that goes away: FUSE,
+ * sdcardfs, a network or removable file system) is a SIGBUS in whatever touches it, here the
+ * driver, which no handler can safely leave. So only big files are mapped, and only on local
+ * file systems that do not compress the file; everything else is read, and a read error starts
+ * empty. Files are only ever replaced by a rename, never truncated, so a mapping of ours stays
+ * valid. VKBRIDGE_PCACHE_MMAP=0 never maps (saves too); =all maps any size where it may. */
+#define PC_MAP_MIN ((size_t)16 << 20)
+
+typedef struct pc_map {
+    uint8_t *data; /* NULL: missing, empty, over the limit or unreadable */
+    size_t size;
+    off_t over;    /* > 0: the file's size, over the limit (not loaded) */
+    int mapped;    /* data is a mapping (else the heap) */
+} pc_map;
+
+/* Local storage where a mapped page is not expected to fail. VKBRIDGE_PCACHE_FAKE_FS=fuse: the
+ * host test's stand-in for /sdcard. */
+static int fs_local(int fd)
 {
-    *size = 0;
+    const char *fake = vkb_srv_env_global("VKBRIDGE_PCACHE_FAKE_FS");
+    if (fake && *fake) return 0;
+    struct statfs sf;
+    if (fstatfs(fd, &sf) != 0) return 0;
+    switch ((unsigned long)sf.f_type) {
+    case 0xEF53UL:     /* ext2/3/4 */
+    case 0xF2F52010UL: /* f2fs */
+    case 0x01021994UL: /* tmpfs */
+    case 0x9123683EUL: /* btrfs */
+    case 0x58465342UL: /* xfs */
+        break;
+    default:
+        return 0;
+    }
+    int flags = 0;
+    /* f2fs and btrfs compression: blocks are not reserved, a full storage is a SIGBUS on write */
+    if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0 && (flags & FS_COMPR_FL)) return 0;
+    return 1;
+}
+
+/* Whether n bytes of fd are mapped rather than read or written through the heap. */
+static int map_ok(int fd, size_t n)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_PCACHE_MMAP");
+    if (v && !strcmp(v, "0")) return 0;
+    if (n < PC_MAP_MIN && !(v && !strcmp(v, "all"))) return 0;
+    return fs_local(fd);
+}
+
+static pc_map map_file(const char *path, uint64_t limit, pc_ident *id)
+{
+    pc_map m = {NULL, 0, 0, 0};
     if (id) memset(id, 0, sizeof(*id));
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return NULL;
+    if (fd < 0) return m;
     struct stat st;
-    uint8_t *buf = NULL;
     if (fstat(fd, &st) == 0) {
         if (id) ident_of(&st, id);
-        if (st.st_size > 0 && (uint64_t)st.st_size <= PC_MAX_FILE && (buf = malloc((size_t)st.st_size))) {
-            size_t got = 0;
-            while (got < (size_t)st.st_size) {
-                ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
-                if (r <= 0) break;
-                got += (size_t)r;
+        size_t n = (size_t)st.st_size;
+        if (st.st_size > 0 && (uint64_t)st.st_size > limit) {
+            m.over = st.st_size;
+        } else if (st.st_size > 0 && map_ok(fd, n)) {
+            void *a = mmap(NULL, n, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (a != MAP_FAILED) {
+                m.data = a;
+                m.size = n;
+                m.mapped = 1;
             }
-            if (got == (size_t)st.st_size) {
-                *size = got;
+        }
+        if (st.st_size > 0 && !m.over && !m.data) {
+            uint8_t *b = malloc(n);
+            size_t got = 0;
+            int e = b ? 0 : ENOMEM;
+            while (!e && got < n) {
+                ssize_t r = pread(fd, b + got, n - got, (off_t)got);
+                if (r < 0 && errno == EINTR) continue;
+                if (r <= 0) e = r < 0 ? errno : EIO; /* cut short under us */
+                else got += (size_t)r;
+            }
+            if (e) {
+                VKB_WARN("pipeline cache %s could not be read (%s): starting without it", path, strerror(e));
+                free(b);
             } else {
-                free(buf);
-                buf = NULL;
+                m.data = b;
+                m.size = n;
             }
         }
     }
     close(fd);
-    return buf;
+    return m;
 }
 
-/* Written next to the file and renamed over it, so a kill mid-write loses nothing. */
-static int write_file(const char *path, const uint8_t *buf, size_t size)
+static void unmap_file(pc_map *m)
+{
+    if (m->data && m->mapped) munmap(m->data, m->size);
+    else free(m->data);
+    m->data = NULL;
+    m->size = 0;
+    m->mapped = 0;
+}
+
+/* The cache's data written to path: next to it and renamed over it, so a kill mid-write loses
+ * nothing; for a big cache on local storage (map_ok) straight from the driver into the file's
+ * pages (its blocks reserved first, so a full storage is an error here and not a SIGBUS in the
+ * driver), else through the heap, as where the file system cannot reserve blocks.
+ * 0; 1: over limit (*size: how big); -1 with errno. */
+static int save_to(const vkb_dispatch *r, VkDevice d, VkPipelineCache c, const char *path, uint64_t limit, size_t *size)
 {
     char tmp[600];
-    snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0 && errno == ENOENT && vkb_cache_dir_ensure()) fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    int ok = fd >= 0;
-    for (size_t done = 0; ok && done < size;) {
-        ssize_t w = write(fd, buf + done, size - done);
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) ok = 0;
-        else done += (size_t)w;
-    }
-    if (ok && fsync(fd) != 0) ok = 0;
-    if (fd >= 0 && close(fd) != 0) ok = 0;
-    if (ok && rename(tmp, path) == 0) return 0;
-    int e = errno;
-    unlink(tmp);
-    errno = e;
-    return -1;
-}
-
-/* The cache's data, malloc'd (NULL: none, or over the limit when *size says so). */
-static uint8_t *cache_data(vkb_srv_table *t, VkPipelineCache c, size_t *size)
-{
-    *size = 0;
-    if (t->real.vkGetPipelineCacheData(t->device, c, size, NULL) != VK_SUCCESS || !*size || *size > PC_MAX_FILE) return NULL;
-    uint8_t *buf = malloc(*size);
-    if (buf && t->real.vkGetPipelineCacheData(t->device, c, size, buf) != VK_SUCCESS) {
-        free(buf);
-        buf = NULL;
+    snprintf(tmp, sizeof(tmp), "%s.%d.%u.tmp", path, (int)getpid(), __atomic_add_fetch(&tmp_seq, 1, __ATOMIC_RELAXED));
+    for (int tries = 0; tries < 3; tries++) {
+        size_t n = 0;
         *size = 0;
+        if (r->vkGetPipelineCacheData(d, c, &n, NULL) != VK_SUCCESS || !n) {
+            errno = EIO;
+            return -1;
+        }
+        *size = n;
+        if (n > limit) return 1;
+        /* Room for what other threads compile into it meanwhile (the background compiler does,
+         * all the time): the file is cut to what was written. */
+        n += n / 16 + 4096;
+        int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0 && errno == ENOENT && vkb_cache_dir_ensure()) fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0) return -1;
+        int e = 0;
+        size_t got = n;
+        VkResult vr = VK_ERROR_UNKNOWN;
+        uint8_t *heap = NULL;
+        void *map = MAP_FAILED;
+        int use_map = map_ok(fd, n);
+        if (use_map && fallocate(fd, 0, 0, (off_t)n) == 0) {
+            map = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (map == MAP_FAILED) e = errno;
+            else vr = r->vkGetPipelineCacheData(d, c, &got, map); /* the fsync below writes the pages */
+        } else if (use_map && (errno == ENOSPC || errno == EDQUOT || errno == EIO)) {
+            e = errno;
+        } else if (!(heap = malloc(n))) {
+            e = ENOMEM;
+        } else if ((vr = r->vkGetPipelineCacheData(d, c, &got, heap)) == VK_SUCCESS) {
+            for (size_t done = 0; !e && done < got;) {
+                ssize_t w = write(fd, heap + done, got - done);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) e = w < 0 ? errno : EIO;
+                else done += (size_t)w;
+            }
+        }
+        if (map != MAP_FAILED) munmap(map, n);
+        free(heap);
+        if (!e && vr == VK_SUCCESS) {
+            if (got < n && ftruncate(fd, (off_t)got) != 0) e = errno;
+            if (!e && fsync(fd) != 0) e = errno;
+        }
+        if (close(fd) != 0 && !e) e = errno;
+        if (!e && vr == VK_SUCCESS && got > limit) { /* it grew past the limit into the margin */
+            unlink(tmp);
+            *size = got;
+            return 1;
+        }
+        if (!e && vr == VK_SUCCESS) {
+            if (rename(tmp, path) == 0) {
+                *size = got;
+                return 0;
+            }
+            e = errno;
+        }
+        unlink(tmp);
+        if (!e && vr == VK_INCOMPLETE) continue; /* it grew between the two calls */
+        errno = e ? e : EIO;
+        return -1;
     }
-    return buf;
+    errno = EAGAIN; /* it kept growing faster than it was written: the next save tries again */
+    return -1;
 }
 
 /* A driver cache made from a file's data (VK_NULL_HANDLE: not this GPU's, or refused). */
@@ -518,12 +714,27 @@ static VkPipelineCache cache_from(vkb_srv_table *t, const uint8_t *data, size_t 
     return c;
 }
 
-static void warn_full(vkb_pcache *p, size_t size)
+/* merged: only ours with what another process saved is over (ours alone is not, but saving it
+ * would drop theirs). */
+static void warn_full(vkb_pcache *p, size_t size, int merged)
 {
     if (p->full_warned) return;
     p->full_warned = 1;
-    VKB_WARN("device %u: pipeline cache %s would be %zu KB, over the %u MB limit; it keeps what it has", p->t->id, p->path,
-             size >> 10, PC_MAX_FILE >> 20);
+    char lim[32];
+    VKB_WARN("device %u: pipeline cache %s would be %zu KB%s, over the %s limit for one program (VKBRIDGE_PCACHE_MAX_MB): the file "
+             "keeps what it has, pipelines compiled from now on are not kept",
+             p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max));
+}
+
+/* A file over the limit (a lower limit than when it was saved) is not loaded, and the next save
+ * replaces it: said, not done silently. */
+static void warn_over(vkb_pcache *p, const char *path, off_t size)
+{
+    if (p->over_warned) return;
+    p->over_warned = 1;
+    char lim[32];
+    VKB_WARN("device %u: %s is %lld KB, over the %s limit for one program (VKBRIDGE_PCACHE_MAX_MB): not loaded, and the next save replaces it", p->t->id, path,
+             (long long)(size >> 10), limit_str(lim, p->max));
 }
 
 /* Merges the app's caches into ours: all of them (the device is going) or those compiled into
@@ -556,7 +767,7 @@ static void consume_warm(vkb_pcache *p)
     p->nwarm = 0;
 }
 
-/* Called with pc_lock held (every save in the server is, so the checks of the file hold). */
+/* Called with save_lock held (every save in the server is, so the checks of the file hold). */
 static void save(vkb_pcache *p)
 {
     vkb_srv_table *t = p->t;
@@ -568,44 +779,54 @@ static void save(vkb_pcache *p)
         if (p->nwarm && p->file.valid) consume_warm(p);
         return;
     }
-    if (own > PC_MAX_FILE) {
-        warn_full(p, own);
+    if (own > p->max) {
+        warn_full(p, own, 0);
         return;
     }
     pc_ident now;
     int exists = ident_stat(p->path, &now);
     int changed = exists && !ident_eq(&now, &p->file);
-    uint8_t *out = NULL;
-    size_t size = 0;
-    int merged = 0;
-    if (exists && (changed || !p->covers)) {
+    VkPipelineCache tmp = VK_NULL_HANDLE;
+    int want_merge = exists && (changed || !p->covers);
+    if (want_merge) {
+        /* The driver holds ours, the file's and the merge while it is copied out: not when memory
+         * is that short (the low-memory killer would take the server, and the game's cache with it). */
+        uint64_t avail = vkb_memavail_kb(), need = (((uint64_t)own + (uint64_t)now.size) * 3) >> 10;
+        if (avail && avail < need) {
+            want_merge = 0;
+            if (!p->nomerge_warned) {
+                p->nomerge_warned = 1;
+                VKB_WARN("device %u: pipeline cache %s saved without what another process saved: %llu KB of memory free, a merge needs about %llu KB",
+                         t->id, p->path, (unsigned long long)avail, (unsigned long long)need);
+            }
+        }
+    }
+    if (want_merge) {
         /* Another process saved (or this one wrote a merge): ours goes on top of the file. */
-        size_t fsize;
-        uint8_t *fdata = read_file(p->path, &fsize, NULL);
-        VkPipelineCache tmp = cache_from(t, fdata, fsize);
-        free(fdata);
+        pc_map f = map_file(p->path, p->max, NULL);
+        if (f.over) warn_over(p, p->path, f.over);
+        tmp = cache_from(t, f.data, f.size);
+        unmap_file(&f);
         if (tmp) {
             pthread_rwlock_rdlock(&p->use);
             VkResult r = t->real.vkMergePipelineCaches(t->device, tmp, 1, &p->cache);
             pthread_rwlock_unlock(&p->use);
-            if (r == VK_SUCCESS) {
-                out = cache_data(t, tmp, &size);
-                if (!out && size > PC_MAX_FILE) {
-                    t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
-                    warn_full(p, size);
-                    return;
-                }
-                merged = out != NULL;
+            if (r != VK_SUCCESS) {
+                t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
+                tmp = VK_NULL_HANDLE;
             }
-            t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
         }
     }
-    if (!out) out = cache_data(t, p->cache, &size);
-    if (!out) {
-        __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
+    size_t size = 0;
+    int merged = tmp != VK_NULL_HANDLE;
+    int rc = save_to(&t->real, t->device, merged ? tmp : p->cache, p->path, p->max, &size);
+    int e = errno;
+    if (tmp) t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
+    if (rc == 1) {
+        warn_full(p, size, merged);
         return;
     }
-    if (write_file(p->path, out, size) == 0) {
+    if (rc == 0) {
         VKB_INFO("device %u: pipeline cache saved (%zu KB%s)", t->id, size >> 10, merged ? ", with what another process saved" : "");
         ident_stat(p->path, &p->file);
         p->saved_size = own;
@@ -614,14 +835,23 @@ static void save(vkb_pcache *p)
         vkb_cache_write_ok();
         consume_warm(p);
     } else {
-        /* Said once per cause, not at every try (every 10 s while the app compiles). */
-        int e = errno;
-        if (vkb_cache_write_failed("a pipeline cache", e) && e != p->save_err)
+        /* Said once per cause, not at every try (every 10 s while the app compiles). EAGAIN: it
+         * grew faster than it was written (compiles on other threads); the next save tries again. */
+        if (e != EAGAIN && vkb_cache_write_failed("a pipeline cache", e) && e != p->save_err)
             VKB_WARN("device %u: pipeline cache not saved to %s: %s (tried again quietly)", t->id, p->path, strerror(e));
         p->save_err = e;
         __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
     }
-    free(out);
+}
+
+/* Is a save due? Each writes the whole cache: a big one waits longer (PC_SAVE_BIG). */
+static int save_due(const vkb_pcache *p, time_t now)
+{
+    if (p->warm_role) return now - p->last_save >= PC_WARM_SAVE_PERIOD_S;
+    uint64_t period = PC_SAVE_PERIOD_S;
+    if (p->saved_size > PC_SAVE_BIG) period = (uint64_t)PC_SAVE_PERIOD_S * p->saved_size / PC_SAVE_BIG;
+    if (period > PC_SAVE_PERIOD_MAX_S) period = PC_SAVE_PERIOD_MAX_S;
+    return now - p->last_save >= (time_t)period - 1; /* the saver wakes every PC_SAVE_PERIOD_S */
 }
 
 static time_t mono_s(void)
@@ -637,16 +867,25 @@ static void *saver(void *arg)
     for (;;) {
         struct timespec ts = {PC_SAVE_PERIOD_S, 0};
         nanosleep(&ts, NULL);
-        pthread_mutex_lock(&pc_lock);
+        /* A cache is unlinked under pc_lock but freed only under save_lock (device_destroy), so
+         * with save_lock held every cache reached through the list stays valid; pc_lock is taken
+         * only to step, and a new device does not wait for a save. */
+        pthread_mutex_lock(&save_lock);
         time_t now = mono_s();
-        for (vkb_pcache *p = pc_list; p; p = p->next) {
-            if (!__atomic_load_n(&p->dirty, __ATOMIC_RELAXED)) continue;
-            if (p->warm_role && now - p->last_save < PC_WARM_SAVE_PERIOD_S) continue;
-            merge_apps(p, 0);
-            save(p);
-            p->last_save = now;
-        }
+        pthread_mutex_lock(&pc_lock);
+        vkb_pcache *p = pc_list;
         pthread_mutex_unlock(&pc_lock);
+        while (p) {
+            if (__atomic_load_n(&p->dirty, __ATOMIC_RELAXED) && save_due(p, now)) {
+                merge_apps(p, 0);
+                save(p);
+                p->last_save = now;
+            }
+            pthread_mutex_lock(&pc_lock);
+            p = p->next;
+            pthread_mutex_unlock(&pc_lock);
+        }
+        pthread_mutex_unlock(&save_lock);
     }
     return NULL;
 }
@@ -780,6 +1019,8 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     vkb_pcache *p = calloc(1, sizeof(*p));
     if (!p) return;
     p->t = t;
+    p->max = file_limit();
+    char lim[32];
     VkPhysicalDeviceProperties props;
     t->real.vkGetPhysicalDeviceProperties(t->physical, &props);
     char uuid[2 * VK_UUID_SIZE + 1];
@@ -797,21 +1038,22 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     /* Used now: the last the total limit removes (before it is read, so what is read is the file as it is). */
     if (!p->warm_role) utimensat(AT_FDCWD, p->path, NULL, 0);
 
-    size_t size = 0;
-    uint8_t *data = p->warm_role ? NULL : read_file(p->path, &size, &p->file);
+    pc_map fm = {NULL, 0, 0, 0};
+    if (!p->warm_role) fm = map_file(p->path, p->max, &p->file);
+    if (fm.over) warn_over(p, p->path, fm.over);
     const char *from = p->path;
     char legacy[512];
-    if (!data && !p->file.valid && key[0] && !p->warm_role) {
+    if (!fm.data && !p->file.valid && key[0] && !p->warm_role) {
         /* Before keys, the program's cache was by process name: start from that one. */
         snprintf(legacy, sizeof(legacy), "%s%s.vkpc", base, prog);
-        if ((data = read_file(legacy, &size, NULL))) from = legacy;
+        if ((fm = map_file(legacy, p->max, NULL)).data) from = legacy;
     }
-    if (data && !header_ok(t, data, size)) {
+    if (fm.data && !header_ok(t, fm.data, fm.size)) {
         VKB_WARN("device %u: %s is not this GPU's pipeline cache; starting empty", t->id, from);
-        free(data);
-        data = NULL;
-        size = 0;
+        unmap_file(&fm);
     }
+    const uint8_t *data = fm.data;
+    size_t size = fm.size;
     VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, data ? size : 0, data};
     VkResult r = t->real.vkCreatePipelineCache(t->device, &ci, NULL, &p->cache);
     if (r != VK_SUCCESS && data) {
@@ -821,7 +1063,9 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         size = 0;
         r = t->real.vkCreatePipelineCache(t->device, &ci, NULL, &p->cache);
     }
-    free(data);
+    int mapped = fm.mapped && size;
+    unmap_file(&fm);
+    data = NULL;
     if (r != VK_SUCCESS) {
         VKB_WARN("device %u: no pipeline cache (%d)", t->id, r);
         free(p);
@@ -832,22 +1076,23 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     if (p->warm_role)
         VKB_INFO("device %u: pipeline cache %s (Steam's shader pre-caching: starts empty, adds to the file)", t->id, p->path);
     else
-        VKB_INFO("device %u: pipeline cache %s (%zu KB loaded%s%s)", t->id, p->path, size >> 10, from == p->path ? "" : " from ",
-                 from == p->path ? "" : from);
+        VKB_INFO("device %u: pipeline cache %s (%zu KB loaded%s%s), limit %s%s", t->id, p->path, size >> 10, from == p->path ? "" : " from ",
+                 from == p->path ? "" : from, limit_str(lim, p->max), mapped ? ", mapped" : "");
 
     /* A game takes in what Steam's shader pre-caching compiled for it. */
     size_t total = size;
     for (int i = 0; key[0] && !p->warm_role && i < PC_WARM_KINDS; i++) {
         char wpath[512];
         snprintf(wpath, sizeof(wpath), "%s%s.%s.vkpc", base, key, warm_kinds[i]);
-        size_t wsize;
         pc_ident wid;
-        uint8_t *w = read_file(wpath, &wsize, &wid);
-        if (!w) continue;
+        pc_map wm = map_file(wpath, p->max, &wid);
+        size_t wsize = wm.data ? wm.size : (size_t)wm.over;
+        if (!wsize) continue;
         VkPipelineCache tmp = VK_NULL_HANDLE;
-        if (total + wsize > PC_MAX_FILE)
-            VKB_WARN("device %u: %s (%zu KB) left out: over the %u MB limit with the rest", t->id, wpath, wsize >> 10, PC_MAX_FILE >> 20);
-        else if (!(tmp = cache_from(t, w, wsize)))
+        if (total + wsize > p->max)
+            VKB_WARN("device %u: %s (%zu KB) left out: over the %s limit with the rest (VKBRIDGE_PCACHE_MAX_MB)", t->id, wpath,
+                     wsize >> 10, limit_str(lim, p->max));
+        else if (!(tmp = cache_from(t, wm.data, wm.size)))
             VKB_WARN("device %u: %s is not this GPU's pipeline cache; left out", t->id, wpath);
         else if (t->real.vkMergePipelineCaches(t->device, p->cache, 1, &tmp) == VK_SUCCESS) {
             VKB_INFO("device %u: %zu KB of Steam's shader pre-caching taken in from %s", t->id, wsize >> 10, wpath);
@@ -857,7 +1102,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
             p->dirty = 1;
         }
         if (tmp) t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
-        free(w);
+        unmap_file(&wm);
     }
 
     pthread_rwlockattr_t ra;
@@ -919,21 +1164,16 @@ VkPipelineCache vkb_pcache_own_open(const vkb_dispatch *r, const VkPhysicalDevic
     char uuid[2 * VK_UUID_SIZE + 1];
     for (int i = 0; i < VK_UUID_SIZE; i++) snprintf(uuid + 2 * i, 3, "%02x", props.pipelineCacheUUID[i]);
     snprintf(path, cap, "%s/%04x-%04x-%s-%s.vkpc", pc_dir, props.vendorID, props.deviceID, uuid, name);
-    size_t size = 0;
-    uint8_t *data = read_file(path, &size, NULL);
-    if (data && !header_for(&props, data, size)) {
-        free(data);
-        data = NULL;
-        size = 0;
-    }
-    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, data ? size : 0, data};
+    pc_map m = map_file(path, file_limit(), NULL);
+    if (m.data && !header_for(&props, m.data, m.size)) unmap_file(&m);
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, m.size, m.data};
     VkPipelineCache c = VK_NULL_HANDLE;
-    if (r->vkCreatePipelineCache(d, &ci, NULL, &c) != VK_SUCCESS && data) {
+    if (r->vkCreatePipelineCache(d, &ci, NULL, &c) != VK_SUCCESS && m.data) {
         ci.initialDataSize = 0;
         ci.pInitialData = NULL;
         if (r->vkCreatePipelineCache(d, &ci, NULL, &c) != VK_SUCCESS) c = VK_NULL_HANDLE;
     }
-    free(data);
+    unmap_file(&m);
     return c;
 }
 
@@ -944,11 +1184,13 @@ void vkb_pcache_own_close(const vkb_dispatch *r, VkDevice d, VkPipelineCache c, 
     size_t size = 0, had = 0;
     struct stat st;
     if (path[0] && stat(path, &st) == 0) had = (size_t)st.st_size;
-    if (path[0] && r->vkGetPipelineCacheData(d, c, &size, NULL) == VK_SUCCESS && size > had && size <= PC_MAX_FILE) {
-        uint8_t *buf = malloc(size);
-        if (buf && r->vkGetPipelineCacheData(d, c, &size, buf) == VK_SUCCESS && write_file(path, buf, size) == 0)
-            VKB_INFO("pipeline cache %s saved (%zu KB)", path, size >> 10);
-        free(buf);
+    if (path[0] && r->vkGetPipelineCacheData(d, c, &size, NULL) == VK_SUCCESS && size > had) {
+        pthread_mutex_lock(&save_lock);
+        int rc = save_to(r, d, c, path, file_limit(), &size), e = errno;
+        pthread_mutex_unlock(&save_lock);
+        if (rc == 0) VKB_INFO("pipeline cache %s saved (%zu KB)", path, size >> 10);
+        else if (rc == 1) VKB_WARN("pipeline cache %s would be %zu KB, over the limit for one program (VKBRIDGE_PCACHE_MAX_MB); not saved", path, size >> 10);
+        else if (vkb_cache_write_failed("a pipeline cache", e)) VKB_WARN("pipeline cache %s not saved: %s", path, strerror(e));
     }
     r->vkDestroyPipelineCache(d, c, NULL);
 }
@@ -962,13 +1204,15 @@ void vkb_pcache_device_destroy(vkb_srv_table *t)
     pthread_mutex_lock(&pc_lock);
     for (vkb_pcache **pp = &pc_list; *pp; pp = &(*pp)->next) {
         if (*pp == p) {
-            *pp = p->next;
+            *pp = p->next; /* p->next is left as it was: the saver may be stepping from p */
             break;
         }
     }
+    pthread_mutex_unlock(&pc_lock);
+    pthread_mutex_lock(&save_lock); /* after the saver's save of it, if it is in one */
     if (merge_apps(p, 1)) p->dirty = 1;
     if (p->dirty) save(p);
-    pthread_mutex_unlock(&pc_lock);
+    pthread_mutex_unlock(&save_lock);
     t->dt.vkCreateGraphicsPipelines = p->create_gfx;
     t->dt.vkCreateComputePipelines = p->create_compute;
     t->dt.vkCreatePipelineCache = p->create_cache;

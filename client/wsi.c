@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Surfaces and swapchains (backend-independent part).
  */
@@ -683,6 +684,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateSwapchainKHR(VkDevice device, cons
                                                           const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain)
 {
     (void)pAllocator;
+    vkb_frames_swapchain(); /* asked for (made or not): the process presents through the bridge (frames.c) */
     vkb_device *dev = vkb_dev(device);
     vkb_surface *s = surf(pCreateInfo->surface);
     if (pCreateInfo->oldSwapchain) chain(pCreateInfo->oldSwapchain)->retired = 1;

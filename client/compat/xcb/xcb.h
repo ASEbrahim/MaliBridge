@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  * Minimal xcb declarations for the bridge ICD: libxcb is opened at run time (dlopen), so only the
  * types and the few request/reply layouts the software present path uses are declared here. */
 #ifndef VKB_COMPAT_XCB_H

@@ -16,7 +16,11 @@
 #      a bad value in a preset warned and not applied;
 #   6  the real built-in entries (presets_builtin.inc) for Garry's Mod, DS:R, Poppy Playtime and
 #      The Forest: untested, so not applied on this GPU, and said with their lines;
-#   7  the protocol hash is unchanged.
+#   7  the safe-mode default for devices with 8704 MB of RAM or less (VKBRIDGE_FAKE_MEMTOTAL_MB):
+#      7680 MB -> 3584, 8704 -> 4096, 5000 -> 2048 (the floor), logged once; 8705 MB, performance
+#      mode, <cache dir>/env's VKBRIDGE_HEAP_MAX_MB=0 and the guest's =0 leave the heaps alone, and
+#      an explicit 1024 wins over it;
+#   8  the protocol hash is unchanged.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -35,7 +39,7 @@ start() { # start <name> [env...]: a server of its own, cache $work/<name>/c (ke
   log=$d/s/vkbridge-server.log
   : > "$log"
   env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_MODE -u VKBRIDGE_PRESET_FAKE_BUILTIN \
-      -u VKBRIDGE_HEAP_MAX_MB -u VKBRIDGE_SPOOF_GPU -u VKBRIDGE_EMULATE \
+      -u VKBRIDGE_HEAP_MAX_MB -u VKBRIDGE_SPOOF_GPU -u VKBRIDGE_EMULATE -u VKBRIDGE_FAKE_MEMTOTAL_MB \
       VKBRIDGE_PROBE_BUDGET_S=0 "$@" VK_DRIVER_FILES=$host_icd VK_ICD_FILENAMES= \
       "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$d/c" >/dev/null 2>&1 &
   srv=$!
@@ -143,6 +147,30 @@ grep -q 'preset for steam4000: a built-in preset exists but was not tested on .*
 step $? "built-in entries for 4000, 570940, 1721470, 242760: untested, not applied, said with their lines"
 
 # 7
+dl='heap cap: safe mode with %s MB of RAM (8704 or less): device-local heaps shown as at most %s MB (VKBRIDGE_HEAP_MAX_MB=0 turns this off)'
+r7= d7=
+for pair in 7680:3584 8704:4096 5000:2048; do
+  ram=${pair%:*} want=${pair#*:}
+  start ram$ram VKBRIDGE_FAKE_MEMTOTAL_MB=$ram
+  view; c=1; [ $rc = 0 ] && capped "$v" $want "$nat" && c=0
+  view; [ $rc = 0 ] && capped "$v" $want "$nat" || c=1
+  [ $c = 0 ] && [ "${big:-0}" -gt $want ] && [ "$(grep -cF "$(printf "$dl" $ram $want)" "$log")" = 1 ] &&
+    echo "$v" | grep -q "reported as $want MB, not [0-9]* MB (the server's VKBRIDGE_HEAP_MAX_MB" || r7="$r7 $ram"
+  d7="$d7 $ram->$want"
+done
+view VKBRIDGE_HEAP_MAX_MB=0; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] || r7="$r7 guest0"
+view VKBRIDGE_HEAP_MAX_MB=1024; [ $rc = 0 ] && capped "$v" 1024 "$nat" || r7="$r7 guest1024"
+start over VKBRIDGE_FAKE_MEMTOTAL_MB=8705
+view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap: safe mode' "$log" || r7="$r7 8705"
+start perf VKBRIDGE_FAKE_MEMTOTAL_MB=7680 VKBRIDGE_MODE=performance
+view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap: safe mode' "$log" || r7="$r7 perf"
+mkdir -p $work/env0/c && echo "VKBRIDGE_HEAP_MAX_MB=0" > $work/env0/c/env
+start env0 VKBRIDGE_FAKE_MEMTOTAL_MB=7680
+view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap: safe mode' "$log" || r7="$r7 env0"
+[ -z "$r7" ]
+step $? "safe-mode default for 8 GB devices:$d7 MB, logged once; 8705 MB, performance mode, <cache dir>/env =0 and the guest's =0 off, the guest's 1024 wins${r7:+ (failed:$r7)}"
+
+# 8
 stop
 grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"

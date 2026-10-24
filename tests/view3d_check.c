@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * view3d_check: image views whose counts are VK_REMAINING_ARRAY_LAYERS / VK_REMAINING_MIP_LEVELS,
  * rendered to and read back - above all a 2D-array view of a 3D image from slice 1 on, which Mali

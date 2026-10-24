@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MK-32 (clamp_zero): Mali drivers r38p1-r49p0 and r50p0-r51p0 (Arm erratum 3779215, fixed in
  * r49p1 and r52p0) miscompile a clamp whose limit is a constant zero when the clamped value is

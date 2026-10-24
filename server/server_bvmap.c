@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Texel buffer views named by the client. DXVK makes a view for each new slice of a discarded
  * buffer, so few creates repeat and the client's recycling (client/bufview.c) rarely hits:

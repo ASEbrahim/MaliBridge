@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Evidence: GPU hang detector. With VKBRIDGE_HANG_DETECT=1 (<cache dir>/env) or <cache dir>/hang-detect
  * present, every submission is followed by an empty one with a fence - a fence's first scope covers

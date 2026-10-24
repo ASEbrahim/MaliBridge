@@ -1,0 +1,22 @@
+#version 450
+// wave32 corpus: a ballot at the top level, then a waterfall loop over a per-invocation index
+// with subgroupBroadcastFirst (as dxil-spirv scalarizes descriptor indices): the ballot is
+// emulated, the BroadcastFirst in the non-uniform loop kept as it is.
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    uint n = bitCount(subgroupBallot(o[i] > 7u).x);
+    uint idx = o[i] & 3u, r = 0u;
+    for (;;) {
+        uint first = subgroupBroadcastFirst(idx);
+        if (first == idx) {
+            r = o[64u + first];
+            break;
+        }
+    }
+    o[i] = r + n;
+}

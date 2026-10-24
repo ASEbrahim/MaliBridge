@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * d3d11_bench.exe [draws] [frames]: a game-like D3D11 frame - many small draws, each with a
  * Map(WRITE_DISCARD) constant buffer update and its own texture/sampler binding - rendered

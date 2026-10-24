@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * fdprops_check: a dma-buf imported the way gamescope's DMA-BUF patch for other GPUs does it
  * (Droid-Deck's 0122: the memory type from vkGetMemoryFdPropertiesKHR's memoryTypeBits AND the
@@ -159,14 +160,22 @@ int main(void)
         return 1;
     }
 
-    /* the exporter: device-local memory exporting a dma-buf, filled on the GPU */
+    /* the exporter: device-local memory exporting a dma-buf, filled on the GPU - in the first
+     * device-local type the buffer allows that takes an export (on the XRing O3's imitated table
+     * the first is backed by type 8, which no dma-buf goes in; on the phone the server's export
+     * emulation moves the memory into one that takes it, which the imitation beneath the
+     * desktop's own export cannot) */
     VkBuffer src = buffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1);
     vkGetBufferMemoryRequirements(dev, src, &mr);
     VkExportMemoryAllocateInfo exp = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, NULL, DMABUF};
-    ai = (VkMemoryAllocateInfo){VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exp, mr.size, find_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     VkDeviceSize fd_size = mr.size;
-    VkDeviceMemory smem;
-    r = vkAllocateMemory(dev, &ai, NULL, &smem);
+    VkDeviceMemory smem = VK_NULL_HANDLE;
+    r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    for (uint32_t left = mr.memoryTypeBits, t; r && (t = find_type(left, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) != UINT32_MAX;
+         left &= ~(1u << t)) {
+        ai = (VkMemoryAllocateInfo){VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exp, mr.size, t};
+        r = vkAllocateMemory(dev, &ai, NULL, &smem);
+    }
     if (!r) r = vkBindBufferMemory(dev, src, smem, 0);
     int fd = -1;
     VkMemoryGetFdInfoKHR gi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, NULL, smem, DMABUF};

@@ -1,0 +1,46 @@
+; shm_barrier: write, read another lane's value, write again (a write after a read): two control barriers.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %lid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %lid BuiltIn LocalInvocationIndex
+               OpDecorate %Buf Block
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_4 = OpConstant %uint 4
+    %uint_16 = OpConstant %uint 16
+    %uint_63 = OpConstant %uint 63
+    %uint_64 = OpConstant %uint 64
+        %arr = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %arr
+       %pBuf = OpTypePointer StorageBuffer %Buf
+        %pSB = OpTypePointer StorageBuffer %uint
+        %buf = OpVariable %pBuf StorageBuffer
+        %pIn = OpTypePointer Input %uint
+        %lid = OpVariable %pIn Input
+       %sarr = OpTypeArray %uint %uint_64
+       %pWGa = OpTypePointer Workgroup %sarr
+        %pWG = OpTypePointer Workgroup %uint
+         %sh = OpVariable %pWGa Workgroup
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %i = OpLoad %uint %lid
+          %p = OpAccessChain %pWG %sh %i
+               OpStore %p %i
+          %j = OpBitwiseXor %uint %i %uint_1
+          %q = OpAccessChain %pWG %sh %j
+          %v = OpLoad %uint %q
+          %w = OpIAdd %uint %v %uint_16
+               OpStore %p %w
+          %o = OpAccessChain %pSB %buf %uint_0 %i
+               OpStore %o %v
+               OpReturn
+               OpFunctionEnd

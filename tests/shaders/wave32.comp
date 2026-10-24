@@ -1,0 +1,29 @@
+#version 450
+// wave32 (wave32_check.c): a compute shader written for 32-wide subgroups, as D3D12 shaders made
+// for 32-wide waves are: a ballot whose bits 16-31 count, a butterfly sum by shuffles 16 apart and
+// less, the lane and the subgroup size and id in arithmetic, and an exclusive prefix sum (the
+// compaction pattern of culling shaders). 64 invocations: two virtual subgroups. On a GPU whose
+// subgroups are narrower (Mali 16, llvmpipe 8), or wider (64), the results differ; through
+// VKBRIDGE_WAVE32 they are the 32-lane ones everywhere. glslc -O0 (the loop stays a loop, its
+// counter in a Function variable).
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint g = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+    uint x = (g * 2654435761u) >> 20;
+    uvec4 b = subgroupBallot((x & 1u) != 0u);
+    uint count = bitCount(b.x);
+    uint s = x;
+    for (uint d = 16u; d > 0u; d >>= 1u)
+        s += subgroupShuffleXor(s, d);
+    uint pre = subgroupExclusiveAdd(x & 7u);
+    o[g * 4u + 0u] = count;
+    o[g * 4u + 1u] = s;
+    o[g * 4u + 2u] = gl_SubgroupInvocationID | (gl_SubgroupSize << 8) | (gl_SubgroupID << 16) | (gl_NumSubgroups << 24);
+    o[g * 4u + 3u] = pre;
+}

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * opaque_check: OPAQUE_FD external memory shared between two processes, as DXVK's D3D11 shared
  * resources use it through Wine (OMORI's Chromium: "Some formats not supported for resource

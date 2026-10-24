@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 ASEbrahim and MaliBridge contributors */
 #include "spirv_edit.h"
 
 #include <stdlib.h>
@@ -162,6 +163,31 @@ uint32_t spv_type_bool(spv_mod *m)
     uint32_t id = spv_new_id(m);
     add_global(m, SpvOpTypeBool, &id, 1);
     return id;
+}
+
+uint32_t spv_type_vector(spv_mod *m, uint32_t comp, uint32_t n)
+{
+    for (uint32_t i = 0; i < m->count; i++)
+        if (m->ins[i].op == SpvOpTypeVector && m->ins[i].w[1] == comp && m->ins[i].w[2] == n) return m->ins[i].w[0];
+    uint32_t id = spv_new_id(m), ops[3] = {id, comp, n};
+    add_global(m, SpvOpTypeVector, ops, 3);
+    return id;
+}
+
+/* The module's GLSL.std.450 import, added before the memory model if it has none */
+uint32_t spv_glsl_std450(spv_mod *m)
+{
+    for (uint32_t i = 0; i < m->count; i++)
+        if (m->ins[i].op == SpvOpExtInstImport && m->ins[i].n >= 6 && !memcmp(&m->ins[i].w[1], "GLSL.std.450", 13)) return m->ins[i].w[0];
+    int at = spv_find_op(m, SpvOpMemoryModel, 0);
+    if (at < 0) {
+        m->err = 1;
+        return 0;
+    }
+    uint32_t ops[5] = {spv_new_id(m)};
+    memcpy(ops + 1, "GLSL.std.450\0\0\0", 16);
+    spv_insert(m, (uint32_t)at, SpvOpExtInstImport, ops, 5);
+    return ops[0];
 }
 
 uint32_t spv_type_pointer(spv_mod *m, uint32_t storage, uint32_t pointee)

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MK-02: gl_Position.y negated in the last pre-rasterization stage (see spirv_flip.h). At each
  * site, for a block member (a loose output is the variable itself):

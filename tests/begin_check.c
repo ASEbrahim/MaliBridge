@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * begin_check: vkBeginCommandBuffer's begin info as the server decodes it. Records a primary
  * command buffer and a secondary one with inheritance info (both single-element pointers on the

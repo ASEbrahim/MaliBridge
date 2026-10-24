@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 ASEbrahim and MaliBridge contributors
 """
 Generates the Vulkan bridge's wire code from the pinned Khronos registry (vk.xml 1.4.341).
 

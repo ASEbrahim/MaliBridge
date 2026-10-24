@@ -1,0 +1,21 @@
+#version 450
+// wave32 corpus: a ballot inside an if only some invocations take: left as it is (the exchange's
+// barriers need the whole workgroup).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_quad : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    uint r = 0u;
+    if (o[i] > 3u) r = subgroupBallot(o[i] > 7u).x;
+    o[i] = r;
+}

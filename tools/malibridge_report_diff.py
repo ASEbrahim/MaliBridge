@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 ASEbrahim and MaliBridge contributors
 """Compares two MaliBridge session reports (malibridge-report.json) or two startup-probe device
 profiles (<cache dir>/probe-*.json): S10+ against S11 Ultra, or a build before and after a change.
 

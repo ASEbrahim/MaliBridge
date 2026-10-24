@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * X11 presentation, software path: the frame is read back and drawn with PutImage. Used only
  * when nothing better exists - under gamescope its WSI layer turns X11 swapchains into Wayland

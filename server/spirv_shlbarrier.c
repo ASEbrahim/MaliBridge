@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * shl_barrier: a no-op OpBitFieldInsert after each left shift by a constant (see spirv_shlbarrier.h).
  * A port of Lee Gao's MaliOptimizationBarrierPass

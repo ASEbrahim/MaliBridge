@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 ASEbrahim and MaliBridge contributors */
 #include "vkb_wire.h"
 #include "vkb_log.h"
 
@@ -18,6 +19,16 @@ struct vkb_arena_block {
 };
 
 #define ARENA_HDR ((sizeof(vkb_arena_block) + 15) & ~(size_t)15)
+#define ARENA_BLOCK ((size_t)65536)
+/* Default-size blocks a reset keeps beyond the first, for the next requests: a request past 64 KiB
+ * (a command buffer's commands at vkEndCommandBuffer, a batch's large update) took fresh blocks and
+ * gave them back each time, and a 64 KiB block is past bionic's (scudo's) largest size class, so
+ * each was an mmap, prctl and munmap/madvise (RE2 on the S11 Ultra: ~7% of the server's CPU in
+ * scudo's secondary allocator and those calls, 2026-10-21). At most 2 MiB per connection, and only
+ * what its largest requests used. */
+#ifndef ARENA_SPARE_MAX /* tests/hotpath_bench.c builds the old arena with 0 */
+#define ARENA_SPARE_MAX 32u
+#endif
 
 void *vkb_arena_alloc(vkb_arena *a, size_t n)
 {
@@ -25,9 +36,15 @@ void *vkb_arena_alloc(vkb_arena *a, size_t n)
     if (n == 0) n = 16;
     vkb_arena_block *b = a->head;
     if (!b || b->cap - b->used < n) {
-        size_t cap = n > 65536 ? n : 65536;
-        b = malloc(ARENA_HDR + cap);
-        if (!b) return NULL;
+        size_t cap = n > ARENA_BLOCK ? n : ARENA_BLOCK;
+        if (cap == ARENA_BLOCK && a->spare) {
+            b = a->spare;
+            a->spare = b->next;
+            a->nspare--;
+        } else {
+            b = malloc(ARENA_HDR + cap);
+            if (!b) return NULL;
+        }
         b->next = a->head;
         b->used = 0;
         b->cap = cap;
@@ -42,14 +59,22 @@ void *vkb_arena_alloc(vkb_arena *a, size_t n)
 
 void vkb_arena_reset(vkb_arena *a)
 {
-    /* Keep the most recent block if it is the default size; free the rest. */
+    /* Keep the most recent default-size block as the head and up to ARENA_SPARE_MAX more as
+     * spares; free the rest (the large ones always). */
     vkb_arena_block *b = a->head, *keep = NULL;
     while (b) {
         vkb_arena_block *n = b->next;
-        if (!keep && b->cap == 65536) {
+        if (b->cap != ARENA_BLOCK) {
+            free(b);
+        } else if (!keep) {
             keep = b;
             keep->next = NULL;
             keep->used = 0;
+        } else if (a->nspare < ARENA_SPARE_MAX) {
+            b->used = 0;
+            b->next = a->spare;
+            a->spare = b;
+            a->nspare++;
         } else {
             free(b);
         }
@@ -68,6 +93,13 @@ void vkb_arena_free(vkb_arena *a)
         b = n;
     }
     a->head = NULL;
+    for (b = a->spare; b;) {
+        vkb_arena_block *n = b->next;
+        free(b);
+        b = n;
+    }
+    a->spare = NULL;
+    a->nspare = 0;
 }
 
 /* ------------------------------------------------------------------ encoder */

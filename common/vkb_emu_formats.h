@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * BCn emulation: what each block-compressed format is decoded into. Shared by the client (format
  * queries) and the server (image creation, decode). The decoded image is created with the UNORM
@@ -72,8 +73,8 @@ static inline VkFormat vkb_bc_storage_format(VkFormat f)
     }
 }
 
-/* Bytes per 4x4 block of a format BC is transcoded to (ETC2 / EAC / ASTC 4x4, HDR for BC6H;
- * server_emu_bcn.c), 0 for any other. */
+/* Bytes per block of a format BC is transcoded to (ETC2 / EAC / ASTC 4x4, HDR for BC6H, ASTC 6x6 /
+ * 8x8 by choice; server_emu_bcn.c), 0 for any other. */
 static inline uint32_t vkb_tx_block_bytes(VkFormat f)
 {
     switch (f) {
@@ -87,8 +88,24 @@ static inline uint32_t vkb_tx_block_bytes(VkFormat f)
     case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
     case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
     case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
-    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK: return 16;
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SRGB_BLOCK: return 16;
     default: return 0;
+    }
+}
+
+/* Texels a side of such a block: 4, or 6 / 8 for ASTC 6x6 / 8x8. */
+static inline uint32_t vkb_tx_block_dim(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SRGB_BLOCK: return 6;
+    case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SRGB_BLOCK: return 8;
+    default: return 4;
     }
 }
 

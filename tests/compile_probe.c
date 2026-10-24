@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * compile_probe: how long the GPU driver takes to compile a graphics pipeline from given SPIR-V,
  * each in a child process killed after a timeout - for bisecting shaders a driver's compiler

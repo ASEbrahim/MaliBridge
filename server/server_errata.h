@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * The driver-errata layer's insides, shared by server_errata.c (the decisions) and the files that
  * hold its fixes (server_errata_*.c).
@@ -24,6 +25,10 @@ typedef struct vkb_errata_dev {
     struct vkb_errata_flip *flip;       /* server_errata_flip.c (MK-02) */
     struct vkb_errata_clampzero *clampzero; /* server_errata_clampzero.c (MK-32) */
     struct vkb_errata_mem *mem;     /* server_errata_mem.c (MK-39) */
+    PFN_vkCreateShaderModule fp16_imi_next; /* server_errata_fp16.c (MK-20): beneath its imitation */
+    struct vkb_errata_ds *ds;       /* server_errata_ds.c (MK-11) */
+    struct vkb_errata_vbbake *vbbake;  /* server_errata_vbbake.c (MK-05 option B) */
+    struct vkb_vbbake_imi *vbbake_imi;
     int probe; /* the startup probe's: an imitation only, for one probe (vkb_errata_probe_begin);
                   it publishes nothing a server thread without a table would fall back to, and logs
                   no totals */
@@ -87,6 +92,21 @@ void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_dedicated_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_dedicated_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_mem_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+
+/* server_errata_fp16.c: fp16_hide (MK-20). The fix is in the feature queries and vkCreateDevice
+ * (vkb_errata_fp16_hidden and the functions after it, vkb_server.h); its install logs what the
+ * device gets. The imitation (host) miscompiles 16-bit float multiplies and fmas. */
+void vkb_errata_fp16_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_fp16_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+/* server_errata_ds.c: stencil_layout (MK-11), separate stencil layouts of render passes (and of
+ * vkCmdBeginRendering) merged into combined ones; the imitation loses the stencil at the end of
+ * a pass with a read-only depth and a writable stencil layout */
+void vkb_errata_stencil_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_vbbake_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_vbbake_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_vbbake_destroy(vkb_errata_dev *e); /* totals logged, tables freed */
+void vkb_errata_stencil_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_ds_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 /* A module an erratum rewrote is named by the code it came from (vkb_spv_app_hash): registers
  * the new code's hash -> the app's hash of `in` (itself maybe an erratum's output); 1 when the

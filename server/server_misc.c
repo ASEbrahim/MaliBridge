@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Descriptor update templates. The client repacks the app's data to the layout of the template
  * it created on the server (entries rewritten to packed offsets), so the blob is used as is.

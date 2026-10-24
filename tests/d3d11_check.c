@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * d3d11_check.exe - checks the D3D11 features the Mali bridge emulates, through DXVK, by reading
  * back pixels: BC1/BC3/BC4/BC5/BC7 sampling, SV_ClipDistance, instance data step rates

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Client transport: one Unix-socket connection per thread (the server mirrors it with one thread),
  * so calls from different threads run in parallel exactly as they would on a local driver.

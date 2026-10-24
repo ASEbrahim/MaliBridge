@@ -26,6 +26,16 @@ shader() {
       grep -q "$op" "$tmp/$name.txt" || { echo "bitwise.comp: no $op left in the SPIR-V" >&2; exit 1; }
     done
   fi
+  if [ "$name" = fp16 ]; then
+    # MK-20's probe must compute in 16 bits: Float16, multiplies of half types and relaxed-precision
+    # 32-bit maths left in the SPIR-V (-O0)
+    local dis=${SPIRV_DIS:-$(dirname "$glslc")/spirv-dis}
+    [ -x "$dis" ] || dis=spirv-dis
+    "$dis" "$tmp/$name.spv" > "$tmp/$name.txt"
+    for pat in "OpCapability Float16" "OpFMul %half" "OpVectorTimesScalar %v4half" "Fma" "OpDot %half" "RelaxedPrecision"; do
+      grep -q "$pat" "$tmp/$name.txt" || { echo "fp16.comp: no $pat in the SPIR-V" >&2; exit 1; }
+    done
+  fi
   if [ "$name" = spec ]; then
     # DXVK's form: the composite of specialization constants declared OpConstantComposite (44)
     # instead of OpSpecConstantComposite (51) - what server_spvfix.c undoes for the driver.
@@ -70,4 +80,5 @@ shader quad_vp quad_vp.vert vulkan1.2
 shader face face.frag vulkan1.0
 shader vbs vbs.vert vulkan1.0
 shader bitwise bitwise.comp vulkan1.0 -O0
+shader fp16 fp16.comp vulkan1.2 -O0
 echo "wrote $out"

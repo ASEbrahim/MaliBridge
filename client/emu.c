@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Client side of feature emulation: the app sees a feature when the GPU has it or the server
  * emulates it (vkb_server_pd_info.emu), and does not see one the GPU lacks (.missing).
@@ -29,6 +30,7 @@ const VkExtensionProperties *vkb_emu_extensions(vkb_physdev *pd, uint32_t *n)
     if (EMU(pd, VKB_EMU_MAINT6)) list[c++] = (VkExtensionProperties){"VK_KHR_maintenance6", 1};
     if (EMU(pd, VKB_EMU_LOADSTORE_NONE)) list[c++] = (VkExtensionProperties){"VK_KHR_load_store_op_none", 1};
     if (EMU(pd, VKB_EMU_PUSH_DESC)) list[c++] = (VkExtensionProperties){"VK_KHR_push_descriptor", 2};
+    if (EMU(pd, VKB_EMU_DYN_RENDER)) list[c++] = (VkExtensionProperties){"VK_KHR_dynamic_rendering", 1};
     *n = c;
     return list;
 }
@@ -168,7 +170,17 @@ void vkb_emu_patch_features_chain(vkb_physdev *pd, VkBaseOutStructure *b)
         if (EMU(pd, VKB_EMU_ROBUSTNESS2)) {
             VkPhysicalDeviceRobustness2FeaturesEXT *r = (void *)b;
             r->robustBufferAccess2 = r->robustImageAccess2 = r->nullDescriptor = VK_TRUE;
+        } else if (EMU(pd, VKB_EMU_ROBUST2_ACCESS)) {
+            /* the driver's null descriptors, its core robustness for the rest (server_emu.c) */
+            VkPhysicalDeviceRobustness2FeaturesEXT *r = (void *)b;
+            r->robustBufferAccess2 = r->robustImageAccess2 = VK_TRUE;
         }
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
+        set_feature(pd, VKB_EMU_DYN_RENDER, &((VkPhysicalDeviceDynamicRenderingFeatures *)b)->dynamicRendering);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
+        set_feature(pd, VKB_EMU_DYN_RENDER, &((VkPhysicalDeviceVulkan13Features *)b)->dynamicRendering);
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
         set_feature(pd, VKB_EMU_DEPTH_CLIP, &((VkPhysicalDeviceDepthClipEnableFeaturesEXT *)b)->depthClipEnable);
@@ -204,6 +216,18 @@ int vkb_emu_is_emulated_format(vkb_physdev *pd, VkFormat format)
 
 int vkb_emu_format_properties(vkb_physdev *pd, VkFormat format, VkFormatProperties *fp, VkFormatProperties2 *fp2)
 {
+    if ((vkb_bgr10_rgba(format) != VK_FORMAT_UNDEFINED && EMU(pd, VKB_EMU_BGR10_VTX)) ||
+        (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && EMU(pd, VKB_EMU_UF11_VTX))) {
+        /* Vertex fetch: done as the A2B10G10R10 format with red and blue swapped, or as R32_UINT
+         * unpacked, in the vertex shader (server_emu_shader.c), exact also where the driver has it;
+         * everything else as the driver says. */
+        if (fp2) vkb_wire_vkGetPhysicalDeviceFormatProperties2((VkPhysicalDevice)pd, format, fp2);
+        else vkb_wire_vkGetPhysicalDeviceFormatProperties((VkPhysicalDevice)pd, format, fp);
+        fp->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+        for (VkBaseOutStructure *b = fp2 ? (VkBaseOutStructure *)fp2->pNext : NULL; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) ((VkFormatProperties3 *)b)->bufferFeatures |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+        return 1;
+    }
     if (!vkb_is_bc(format) || !(pd->info.missing & VKB_EMU_BCN)) return 0;
     memset(fp, 0, sizeof(*fp));
     if (EMU(pd, VKB_EMU_BCN)) {

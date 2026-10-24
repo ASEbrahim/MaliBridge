@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * SPIR-V fixes for Mali's shader compiler, applied to every module the app hands the driver.
  *
@@ -29,17 +30,33 @@
  * VKBRIDGE_SHL_BARRIER=1/0 forces it (on a host GPU it alone installs these wrappers, without the
  * fixes above). Its output is named by the code it came from (vkb_errata_spv_origin), so the hang
  * detector's dumps and stuck-pipeline lists keep their names.
+ *
+ * And, off unless asked for (VKBRIDGE_SHARED_BARRIER=1 or 2, a per-game preset key): workgroup
+ * barriers between shared-memory writes and the reads after them in compute shaders
+ * (spirv_shmbarrier.c; 2 also inside workgroup-uniform ifs and loops, spirv_uniform.c), for games whose shaders count on 32-wide subgroups in lockstep where
+ * Mali's are 16 wide (Resident Evil 2's occlusion culling). Its output is named by the code it
+ * came from too.
+ *
+ * And, off unless asked for (VKBRIDGE_WAVE32=1, a per-game preset key; on only where the GPU's
+ * subgroups are narrower than 32, =force anywhere): compute shaders whose subgroup operations
+ * count on 32 lanes get virtual 32-lane subgroups done through shared memory (spirv_wave32.c),
+ * for D3D12 games made for 32-wide waves. After shm_barrier; named by the code it came from too.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "server_errata.h"
 #include "spirv_pervertex.h"
 #include "spirv_shlbarrier.h"
+#include "spirv_lockstep.h"
+#include "spirv_shmbarrier.h"
+#include "spirv_wave32.h"
 
 #include <errno.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define OP_SPEC_CONSTANT_TRUE 48
 #define OP_SPEC_CONSTANT_FALSE 49
@@ -75,6 +92,23 @@ typedef struct vkb_spvfix {
     int fixes;           /* VKBRIDGE_SPIRV_FIX: the composites, per-vertex blocks, YCbCr samplers */
     int shl;             /* VKBRIDGE_SHL_BARRIER: barriers after constant left shifts */
     unsigned long shl_modules, shl_barriers, shl_seen;
+    int shm;             /* VKBRIDGE_SHARED_BARRIER: barriers between shared-memory writes and reads
+                            (1: at the top level, 2: also inside workgroup-uniform ifs and loops) */
+    int shm_dump;        /* VKBRIDGE_SHARED_BARRIER_DUMP=1: the compute modules with shared memory saved */
+    unsigned long shm_inside, shm_constructs, shm_uniform;
+    unsigned long shm_modules, shm_control, shm_memory, shm_seen, shm_shared, shm_subgroup, shm_saved;
+    unsigned long shm_adapts, shm_anysize; /* of shm_shared: the subgroup operations adapt to the size / only BroadcastFirst, Elect */
+    unsigned long dump_max;                /* VKBRIDGE_SHARED_BARRIER_DUMP_MAX: at most this many saved (default 1024) */
+    int wave32;                            /* VKBRIDGE_WAVE32: 32-lane subgroups emulated in compute shaders */
+    unsigned shared_limit, hw_subgroup;    /* maxComputeSharedMemorySize, the GPU's subgroup size */
+    unsigned long w32_seen, w32_fixed, w32_adapts, w32_anysize, w32_modules, w32_ops, w32_barriers, w32_left;
+    char *shm_only, *shm_skip;             /* VKBRIDGE_SHARED_BARRIER_ONLY / _SKIP: app hashes (or their first hex digits) */
+    char *shm_lockstep;                    /* VKBRIDGE_SHARED_BARRIER_LOCKSTEP: app hashes whose strided loops get a uniform
+                                              trip count first (spirv_lockstep.h), or "all" */
+    unsigned long shm_lock_modules, shm_lock_loops;
+    unsigned long shm_filtered;            /* modules shm_barrier would have changed, left by those lists */
+    int subst;                             /* VKBRIDGE_SPIRV_SUBST=1: <cache dir>/spv-subst/<app hash>.spv used in place of a module */
+    unsigned long subst_n;
 } vkb_spvfix;
 
 static vkb_spvfix *cur(void)
@@ -162,6 +196,51 @@ static uint32_t *wrap_pervertex(const uint32_t *code, size_t size, size_t *out_s
     return NULL;
 }
 
+/* A module's app hash in a comma-separated list of hashes, each the whole 16 hex digits or its
+ * first ones (at least 4) */
+static int hash_listed(const char *list, uint64_t h)
+{
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+    for (const char *p = list; p && *p;) {
+        while (*p == ',' || *p == ' ') p++;
+        size_t n = strcspn(p, ", ");
+        if (n >= 4 && n <= 16 && !strncasecmp(p, hex, n)) return 1;
+        p += n;
+    }
+    return 0;
+}
+
+/* VKBRIDGE_SPIRV_SUBST=1 (a debugging switch): a module whose app hash names a file in <pipeline
+ * cache dir>/spv-subst/ (<16 hex digits>.spv, pushed there with run-as) gets that file's code in
+ * its place, before the other rewrites; for trying a changed shader without a new build. NULL
+ * when there is none (or it is not SPIR-V). */
+static uint32_t *subst_code(vkb_spvfix *f, const uint32_t *code, size_t size, size_t *out_size)
+{
+    const char *dir = vkb_pcache_dir();
+    if (!f->subst || !dir) return NULL;
+    uint64_t h = vkb_spv_app_hash(code, size);
+    char path[700];
+    snprintf(path, sizeof(path), "%s/spv-subst/%016llx.spv", dir, (unsigned long long)h);
+    FILE *in = fopen(path, "rb");
+    if (!in) return NULL;
+    uint32_t *out = NULL;
+    long n = fseek(in, 0, SEEK_END) == 0 ? ftell(in) : -1;
+    if (n >= 20 && n < (64l << 20) && !(n & 3) && fseek(in, 0, SEEK_SET) == 0 && (out = malloc((size_t)n)) &&
+        fread(out, 1, (size_t)n, in) == (size_t)n && out[0] == 0x07230203u) {
+        *out_size = (size_t)n;
+        __atomic_add_fetch(&f->subst_n, 1, __ATOMIC_RELAXED);
+        VKB_INFO("SPIR-V subst: module %016llx (%zu bytes) replaced by spv-subst/%016llx.spv (%ld bytes)", (unsigned long long)h, size,
+                 (unsigned long long)h, n);
+    } else {
+        VKB_WARN("SPIR-V subst: %s is not a SPIR-V module; not used", path);
+        free(out);
+        out = NULL;
+    }
+    fclose(in);
+    return out;
+}
+
 /* The shl_barrier rewrite of one module's code; NULL when nothing changes. */
 static uint32_t *shl_barrier(vkb_spvfix *f, const uint32_t *code, size_t size, size_t *out_size)
 {
@@ -184,19 +263,171 @@ static uint32_t *shl_barrier(vkb_spvfix *f, const uint32_t *code, size_t size, s
     return out;
 }
 
-/* The rewrites of one module's code (per-vertex blocks when pervertex, then shl_barrier): new
+/* VKBRIDGE_SHARED_BARRIER_DUMP=1: a compute module with shared memory, or (with wave32 on) with
+ * subgroup operations, saved as the app gave it, for a look at its pattern (<pipeline cache
+ * dir>/shm-spirv/<app hash>-<c>c<i>i<e>e<m>m<tags>.spv: the barriers shm_barrier put in (top
+ * level, inside uniform constructs, at entries, memory); tags: -sg its subgroup operations may
+ * count on a size, -ad they adapt to it, -bf only BroadcastFirst / Elect, -w32 wave32 emulated
+ * it, -w32left it could not, -left shm_barrier could not; at most VKBRIDGE_SHARED_BARRIER_DUMP_MAX) */
+static void save_shared(vkb_spvfix *f, const uint32_t *code, size_t size, int r, const vkb_shmbarrier_stats *st, int cls, int w32)
+{
+    const char *dir = vkb_pcache_dir();
+    if (!dir || __atomic_fetch_add(&f->shm_saved, 1, __ATOMIC_RELAXED) >= f->dump_max) return;
+    char path[700];
+    snprintf(path, sizeof(path), "%s/shm-spirv", dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/shm-spirv/%016llx-%uc%ui%ue%um%s%s%s.spv", dir, (unsigned long long)vkb_spv_app_hash(code, size),
+             r > 0 ? st->control : 0, r > 0 ? st->inside : 0, r > 0 ? st->entry : 0, r > 0 ? st->memory : 0,
+             cls == VKB_SG_FIXED ? "-sg" : cls == VKB_SG_ADAPTS ? "-ad" : cls == VKB_SG_ANY_SIZE ? "-bf" : "",
+             w32 > 0 ? "-w32" : w32 < 0 ? "-w32left" : "", r < 0 ? "-left" : "");
+    FILE *o = fopen(path, "wb");
+    if (!o) return;
+    fwrite(code, 1, size, o);
+    fclose(o);
+}
+
+/* The shm_barrier rewrite of one module's code; NULL when nothing changes. *r: the pass's
+ * answer, *cls: the class of its subgroup operations when it has shared memory (else -1) */
+static uint32_t *shm_barrier(vkb_spvfix *f, const uint32_t *code, size_t size, size_t *out_size, vkb_shmbarrier_stats *st, int *r,
+                             int *cls)
+{
+    memset(st, 0, sizeof(*st));
+    *r = 0, *cls = -1;
+    if (!f->shm) return NULL;
+    __atomic_add_fetch(&f->shm_seen, 1, __ATOMIC_RELAXED);
+    uint32_t *out = NULL, *lock = NULL;
+    const char *why = NULL;
+    const uint32_t *in = code;
+    size_t in_size = size, lock_size = 0;
+    unsigned nloops = 0;
+    if (f->shm_lockstep && (!strcmp(f->shm_lockstep, "all") || hash_listed(f->shm_lockstep, vkb_spv_app_hash(code, size)))) {
+        const char *lwhy = NULL;
+        int lr = vkb_spv_lockstep_loops(code, size, &lock, &lock_size, &nloops, &lwhy);
+        if (lr < 0) VKB_ONCE(VKB_LOG_WARN, "SPIR-V fix: shm_barrier: lockstep: a module's loops left as they are (%s)", lwhy);
+        if (lr > 0) in = lock, in_size = lock_size;
+    }
+    *r = vkb_spv_shm_barrier(in, in_size, f->shm, &out, out_size, st, &why);
+    if (lock && *r == 0) /* the loops changed, no barrier added */
+        out = lock, *out_size = lock_size, *r = 1;
+    else free(lock);
+    if (*r > 0 && nloops) {
+        __atomic_add_fetch(&f->shm_lock_modules, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&f->shm_lock_loops, nloops, __ATOMIC_RELAXED);
+        VKB_INFO("SPIR-V fix: shm_barrier: lockstep: module %016llx: %u strided loop(s) given the trip count of invocation 0, "
+                 "then %u control barrier(s) inside uniform constructs, %u at entries, %u memory",
+                 (unsigned long long)vkb_spv_app_hash(code, size), nloops, st->inside, st->entry, st->memory);
+    }
+    if (st->shared) {
+        __atomic_add_fetch(&f->shm_shared, 1, __ATOMIC_RELAXED);
+        /* BroadcastFirst / Elect alone (vkd3d-proton's uniform descriptor index) give the same
+         * result at any size: counted apart; the rest may count on one */
+        *cls = vkb_spv_subgroup_class(code, size, NULL);
+        if (*cls == VKB_SG_ANY_SIZE) __atomic_add_fetch(&f->shm_anysize, 1, __ATOMIC_RELAXED);
+        if (*cls == VKB_SG_ADAPTS) __atomic_add_fetch(&f->shm_adapts, 1, __ATOMIC_RELAXED);
+        if (*cls >= VKB_SG_ADAPTS && !__atomic_fetch_add(&f->shm_subgroup, 1, __ATOMIC_RELAXED))
+            VKB_INFO("SPIR-V fix: shm_barrier: a compute shader with shared memory also uses subgroup operations (barriers do "
+                     "not fix one that counts on a subgroup size this GPU does not have: VKBRIDGE_WAVE32)");
+        __atomic_add_fetch(&f->shm_constructs, st->constructs, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&f->shm_uniform, st->uniform, __ATOMIC_RELAXED);
+    }
+    if (*r < 0) {
+        VKB_ONCE(VKB_LOG_WARN, "SPIR-V fix: shm_barrier: a compute module left as it is (%s)", why);
+        return NULL;
+    }
+    if (*r == 0) return NULL;
+    if (f->shm_only || f->shm_skip) {
+        /* only some modules (by app hash): the others keep their code, and their stats say 0 */
+        uint64_t h = vkb_spv_app_hash(code, size);
+        if ((f->shm_only && !hash_listed(f->shm_only, h)) || (f->shm_skip && hash_listed(f->shm_skip, h))) {
+            __atomic_add_fetch(&f->shm_filtered, 1, __ATOMIC_RELAXED);
+            free(out);
+            *r = 0;
+            st->control = st->inside = st->entry = st->memory = 0;
+            return NULL;
+        }
+    }
+    unsigned long before = __atomic_fetch_add(&f->shm_modules, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&f->shm_control, st->control + st->entry + st->inside, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&f->shm_inside, st->inside, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&f->shm_memory, st->memory, __ATOMIC_RELAXED);
+    if (!before)
+        VKB_INFO("SPIR-V fix: shm_barrier: barriers between shared-memory writes and reads in compute shaders, level %d (first "
+                 "module: %u control, %u inside uniform constructs, %u at a construct's entry, %u memory)",
+                 f->shm, st->control, st->inside, st->entry, st->memory);
+    return out;
+}
+
+/* The wave32 rewrite of one module's code; NULL when nothing changes. orig: the app's code (its
+ * name in the log). *r: the pass's answer. */
+static uint32_t *wave32(vkb_spvfix *f, const uint32_t *code, size_t size, const uint32_t *orig, size_t orig_size, size_t *out_size,
+                        vkb_wave32_stats *st, int *r)
+{
+    memset(st, 0, sizeof(*st));
+    *r = 0;
+    if (!f->wave32) return NULL;
+    uint32_t *out = NULL;
+    const char *why = NULL;
+    *r = vkb_spv_wave32(code, size, f->shared_limit, &out, out_size, st, &why);
+    if (!st->compute) return NULL;
+    __atomic_add_fetch(&f->w32_seen, 1, __ATOMIC_RELAXED);
+    if (st->cls == VKB_SG_FIXED) __atomic_add_fetch(&f->w32_fixed, 1, __ATOMIC_RELAXED);
+    if (st->cls == VKB_SG_ADAPTS) __atomic_add_fetch(&f->w32_adapts, 1, __ATOMIC_RELAXED);
+    if (st->cls == VKB_SG_ANY_SIZE) __atomic_add_fetch(&f->w32_anysize, 1, __ATOMIC_RELAXED);
+    if (*r < 0) {
+        /* each of the first 16 by name: which shaders a game still runs 16 wide */
+        if (__atomic_fetch_add(&f->w32_left, 1, __ATOMIC_RELAXED) < 16)
+            VKB_INFO("SPIR-V fix: wave32: compute module %016llx left as it is (%s; %u invocations)",
+                     (unsigned long long)vkb_spv_app_hash(orig, orig_size), why, st->invocations);
+        return NULL;
+    }
+    if (*r == 0) return NULL;
+    unsigned long before = __atomic_fetch_add(&f->w32_modules, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&f->w32_ops, st->ops, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&f->w32_barriers, st->barriers, __ATOMIC_RELAXED);
+    if (!before)
+        VKB_INFO("SPIR-V fix: wave32: 32-lane subgroups emulated in compute shaders (first module %016llx: %u subgroup operation(s), "
+                 "%u built-in(s), %u barrier(s), %u bytes of shared memory, %u invocations)",
+                 (unsigned long long)vkb_spv_app_hash(orig, orig_size), st->ops, st->builtins, st->barriers, st->shared, st->invocations);
+    return out;
+}
+
+/* The rewrites of one module's code (per-vertex blocks when pervertex, then shl_barrier, then
+ * shm_barrier, then wave32): new
  * code (malloc'd) or NULL when nothing changes. shl_barrier's output is named by the code it came
  * from (vkb_errata_spv_origin); the per-vertex rewrite's keeps its own name, as before. */
 static uint32_t *rewrite(vkb_spvfix *f, const uint32_t *code, size_t size, int pervertex, size_t *out_size)
 {
     size_t s1 = 0, s2 = 0;
-    uint32_t *c1 = f->fixes && pervertex ? wrap_pervertex(code, size, &s1) : NULL;
-    uint32_t *c2 = shl_barrier(f, c1 ? c1 : code, c1 ? s1 : size, &s2);
+    uint32_t *c1 = subst_code(f, code, size, &s1), *c2;
+    if (c1) vkb_errata_spv_origin(c1, s1, code, size);
+    if (f->fixes && pervertex && (c2 = wrap_pervertex(c1 ? c1 : code, c1 ? s1 : size, &s2))) {
+        free(c1);
+        c1 = c2, s1 = s2;
+    }
+    c2 = shl_barrier(f, c1 ? c1 : code, c1 ? s1 : size, &s2);
     if (c2) {
         vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
         free(c1);
         c1 = c2, s1 = s2;
     }
+    vkb_shmbarrier_stats ss;
+    int sr, cls;
+    c2 = shm_barrier(f, c1 ? c1 : code, c1 ? s1 : size, &s2, &ss, &sr, &cls);
+    if (c2) {
+        vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
+        free(c1);
+        c1 = c2, s1 = s2;
+    }
+    vkb_wave32_stats ws;
+    int wr;
+    c2 = wave32(f, c1 ? c1 : code, c1 ? s1 : size, code, size, &s2, &ws, &wr);
+    if (c2) {
+        vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
+        free(c1);
+        c1 = c2, s1 = s2;
+    }
+    if (f->shm_dump && (ss.shared || (ws.compute && ws.cls >= VKB_SG_ADAPTS)))
+        save_shared(f, code, size, sr, &ss, ss.shared ? cls : ws.cls, wr);
     if (c1) *out_size = s1;
     return c1;
 }
@@ -229,7 +460,7 @@ static void rewrite_stage(vkb_spvfix *f, const VkPipelineShaderStageCreateInfo *
 {
     int pervertex = (st->stage & (VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) != 0;
-    if (!f->shl && !(f->fixes && pervertex)) return;
+    if (!f->shl && !f->shm && !f->wave32 && !f->subst && !(f->fixes && pervertex)) return;
     for (VkBaseInStructure *b = (VkBaseInStructure *)st->pNext; b; b = (VkBaseInStructure *)b->pNext) {
         if (b->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) continue;
         VkShaderModuleCreateInfo *mi = (VkShaderModuleCreateInfo *)b;
@@ -402,11 +633,42 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
      * shift and, once, the driver's pipeline cache entries of the modules it changes) */
     const char *shl_env = vkb_srv_env("VKBRIDGE_SHL_BARRIER");
     int shl = shl_env && *shl_env ? strcmp(shl_env, "0") != 0 : p.vendorID == 0x13B5;
-    if ((!on && !shl) || !t->dt.vkCreateShaderModule) return;
+    /* shm_barrier: only when asked for (a per-game preset): it adds barriers, which cost time */
+    const char *shm_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER");
+    int shm = shm_env && *shm_env && strcmp(shm_env, "0") != 0 ? (strcmp(shm_env, "2") ? 1 : 2) : 0;
+    /* wave32: only when asked for (a per-game preset), and only where it is needed: it adds
+     * barriers and shared memory */
+    VkPhysicalDeviceSubgroupProperties sgp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sgp};
+    if (t->real.vkGetPhysicalDeviceProperties2 && p.apiVersion >= VK_API_VERSION_1_1) t->real.vkGetPhysicalDeviceProperties2(t->physical, &p2);
+    const char *w32_env = vkb_srv_env("VKBRIDGE_WAVE32");
+    int w32_force = w32_env && !strcmp(w32_env, "force");
+    int w32_asked = w32_env && *w32_env && strcmp(w32_env, "0") != 0 && strcmp(w32_env, "off") != 0;
+    int w32 = w32_asked && (w32_force || (sgp.subgroupSize && sgp.subgroupSize < 32));
+    if (w32_asked && !w32)
+        VKB_INFO("device %u: wave32 not needed: subgroups are %u wide (VKBRIDGE_WAVE32=force to have it anyway)", t->id, sgp.subgroupSize);
+    const char *dump_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_DUMP");
+    int shm_dump = (shm || w32) && dump_env && *dump_env && strcmp(dump_env, "0") != 0;
+    const char *max_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_DUMP_MAX");
+    const char *only_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_ONLY"), *skip_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_SKIP");
+    const char *subst_env = vkb_srv_env("VKBRIDGE_SPIRV_SUBST");
+    int subst = subst_env && *subst_env && strcmp(subst_env, "0") != 0;
+    if ((!on && !shl && !shm && !w32 && !subst) || !t->dt.vkCreateShaderModule) return;
     vkb_spvfix *f = calloc(1, sizeof(*f));
     if (!f) return;
     f->fixes = on;
     f->shl = shl;
+    f->shm = shm;
+    f->shm_dump = shm_dump;
+    f->dump_max = max_env && *max_env ? strtoul(max_env, NULL, 10) : 1024;
+    f->wave32 = w32;
+    f->shared_limit = p.limits.maxComputeSharedMemorySize;
+    f->hw_subgroup = sgp.subgroupSize;
+    f->shm_only = shm && only_env && *only_env ? strdup(only_env) : NULL;
+    f->shm_skip = shm && skip_env && *skip_env ? strdup(skip_env) : NULL;
+    const char *lock_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_LOCKSTEP");
+    f->shm_lockstep = shm >= 2 && lock_env && *lock_env && strcmp(lock_env, "0") ? strdup(lock_env) : NULL;
+    f->subst = subst;
     pthread_mutex_init(&f->lock, NULL);
     vkb_dispatch *dt = &t->dt;
     f->create_module = dt->vkCreateShaderModule;
@@ -424,8 +686,18 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
         dt->vkCreateDescriptorSetLayout = fx_CreateDescriptorSetLayout;
     }
     t->spvfix = f;
-    VKB_INFO("device %u: Mali SPIR-V fixes %s, shl_barrier %s%s", t->id, on ? "on" : "off", shl ? "on" : "off",
-             shl_env && *shl_env ? " (VKBRIDGE_SHL_BARRIER)" : "");
+    VKB_INFO("device %u: Mali SPIR-V fixes %s, shl_barrier %s%s%s", t->id, on ? "on" : "off", shl ? "on" : "off",
+             shl_env && *shl_env ? " (VKBRIDGE_SHL_BARRIER)" : "", shm == 2   ? ", shm_barrier on, level 2 (VKBRIDGE_SHARED_BARRIER)"
+             : shm ? ", shm_barrier on (VKBRIDGE_SHARED_BARRIER)"
+                   : "");
+    if (f->shm_only || f->shm_skip)
+        VKB_INFO("device %u: shm_barrier only for %s%s%s%s", t->id, f->shm_only ? "VKBRIDGE_SHARED_BARRIER_ONLY=" : "",
+                 f->shm_only ? f->shm_only : "", f->shm_skip ? ", not for VKBRIDGE_SHARED_BARRIER_SKIP=" : "", f->shm_skip ? f->shm_skip : "");
+    if (f->shm_lockstep) VKB_INFO("device %u: shm_barrier lockstep loops for VKBRIDGE_SHARED_BARRIER_LOCKSTEP=%s", t->id, f->shm_lockstep);
+    if (subst) VKB_INFO("device %u: SPIR-V subst on (VKBRIDGE_SPIRV_SUBST): modules named in spv-subst/ replaced", t->id);
+    if (w32)
+        VKB_INFO("device %u: wave32 on (VKBRIDGE_WAVE32%s): compute shaders that count on 32-lane subgroups get them emulated "
+                 "(this GPU's are %u wide, %u bytes of shared memory)", t->id, w32_force ? "=force" : "", sgp.subgroupSize, f->shared_limit);
 }
 
 void vkb_spvfix_device_destroy(vkb_srv_table *t)
@@ -443,7 +715,32 @@ void vkb_spvfix_device_destroy(vkb_srv_table *t)
     if (f->shl)
         VKB_INFO("device %u: shl_barrier: %lu of %lu module(s) rewritten, %lu barrier(s)", t->id, f->shl_modules, f->shl_seen,
                  f->shl_barriers);
+    if (f->shm)
+        VKB_INFO("device %u: shm_barrier: %lu of %lu module(s) rewritten, %lu control and %lu memory barrier(s); %lu compute "
+                 "module(s) with shared memory, %lu of them with subgroup operations (%lu adapt to the subgroup size), %lu with only "
+                 "BroadcastFirst/Elect (any size); level %d: %lu control barrier(s) inside uniform constructs, %lu of %lu construct(s) "
+                 "uniform%s",
+                 t->id, f->shm_modules, f->shm_seen, f->shm_control, f->shm_memory, f->shm_shared, f->shm_subgroup, f->shm_adapts,
+                 f->shm_anysize, f->shm, f->shm_inside, f->shm_uniform, f->shm_constructs,
+                 f->shm_dump ? " (saved to shm-spirv/)" : "");
+    if (f->wave32)
+        VKB_INFO("device %u: wave32: %lu of %lu compute module(s) emulated at 32 lanes, %lu subgroup operation(s), %lu barrier(s); "
+                 "%lu count on a subgroup size, %lu adapt to it, %lu only BroadcastFirst/Elect; %lu left as they were%s",
+                 t->id, f->w32_modules, f->w32_seen, f->w32_ops, f->w32_barriers, f->w32_fixed, f->w32_adapts, f->w32_anysize,
+                 f->w32_left, f->shm_dump ? " (saved to shm-spirv/)" : "");
+    if (f->shm_lockstep)
+        VKB_INFO("device %u: shm_barrier: lockstep: %lu module(s), %lu loop(s) given a uniform trip count", t->id, f->shm_lock_modules,
+                 f->shm_lock_loops);
+    if (f->shm_filtered)
+        VKB_INFO("device %u: shm_barrier: %lu module(s) left as they were by VKBRIDGE_SHARED_BARRIER_ONLY/_SKIP", t->id, f->shm_filtered);
+    if (f->subst) VKB_INFO("device %u: SPIR-V subst: %lu module(s) replaced", t->id, f->subst_n);
+    if (f->shm_dump && f->shm_saved > f->dump_max)
+        VKB_INFO("device %u: shm-spirv/: %lu module(s) saved, %lu more not (VKBRIDGE_SHARED_BARRIER_DUMP_MAX=%lu)", t->id, f->dump_max,
+                 f->shm_saved - f->dump_max, f->dump_max);
     for (int i = 0; i < KEEP; i++) free(f->kept[i].code);
+    free(f->shm_only);
+    free(f->shm_skip);
+    free(f->shm_lockstep);
     pthread_mutex_destroy(&f->lock);
     free(f);
     t->spvfix = NULL;

@@ -1,0 +1,107 @@
+; tests/downgrade/src/di_bda.comp by glslc --target-env=vulkan1.2, spirv-dis --raw-id
+; SPIR-V
+; Version: 1.5
+; Generator: Google Shaderc over Glslang; 10
+; Bound: 51
+; Schema: 0
+               OpCapability Shader
+               OpCapability StorageBuffer8BitAccess
+               OpCapability ShaderNonUniform
+               OpCapability RuntimeDescriptorArray
+               OpCapability StorageBufferArrayNonUniformIndexing
+               OpCapability VulkanMemoryModel
+               OpCapability PhysicalStorageBufferAddresses
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel PhysicalStorageBuffer64 Vulkan
+               OpEntryPoint GLCompute %4 "main" %10 %17 %29
+               OpExecutionMode %4 LocalSize 64 1 1
+               OpSource GLSL 450
+               OpSourceExtension "GL_EXT_buffer_reference"
+               OpSourceExtension "GL_EXT_nonuniform_qualifier"
+               OpSourceExtension "GL_EXT_shader_8bit_storage"
+               OpSourceExtension "GL_EXT_shader_explicit_arithmetic_types_int8"
+               OpSourceExtension "GL_GOOGLE_cpp_style_line_directive"
+               OpSourceExtension "GL_GOOGLE_include_directive"
+               OpSourceExtension "GL_KHR_memory_scope_semantics"
+               OpName %4 "main"
+               OpName %8 "i"
+               OpName %10 "gl_LocalInvocationIndex"
+               OpName %13 "PC"
+               OpMemberName %13 0 "p"
+               OpMemberName %13 1 "idx"
+               OpName %15 "Ptr"
+               OpMemberName %15 0 "v"
+               OpName %17 "pc"
+               OpName %26 "Bytes"
+               OpMemberName %26 0 "b"
+               OpName %29 "bufs"
+               OpDecorate %10 BuiltIn LocalInvocationIndex
+               OpMemberDecorate %13 0 Offset 0
+               OpMemberDecorate %13 1 Offset 8
+               OpDecorate %13 Block
+               OpDecorate %14 ArrayStride 4
+               OpMemberDecorate %15 0 Offset 0
+               OpDecorate %15 Block
+               OpDecorate %25 ArrayStride 1
+               OpMemberDecorate %26 0 Offset 0
+               OpDecorate %26 Block
+               OpDecorate %29 DescriptorSet 0
+               OpDecorate %29 Binding 0
+               OpDecorate %38 NonUniform
+               OpDecorate %41 NonUniform
+               OpDecorate %42 NonUniform
+               OpDecorate %50 BuiltIn WorkgroupSize
+          %2 = OpTypeVoid
+          %3 = OpTypeFunction %2
+          %6 = OpTypeInt 32 0
+          %7 = OpTypePointer Function %6
+          %9 = OpTypePointer Input %6
+         %10 = OpVariable %9 Input
+               OpTypeForwardPointer %12 PhysicalStorageBuffer
+         %13 = OpTypeStruct %12 %6
+         %14 = OpTypeRuntimeArray %6
+         %15 = OpTypeStruct %14
+         %12 = OpTypePointer PhysicalStorageBuffer %15
+         %16 = OpTypePointer PushConstant %13
+         %17 = OpVariable %16 PushConstant
+         %18 = OpTypeInt 32 1
+         %19 = OpConstant %18 0
+         %20 = OpTypePointer PushConstant %12
+         %24 = OpTypeInt 8 0
+         %25 = OpTypeRuntimeArray %24
+         %26 = OpTypeStruct %25
+         %27 = OpTypeRuntimeArray %26
+         %28 = OpTypePointer StorageBuffer %27
+         %29 = OpVariable %28 StorageBuffer
+         %30 = OpConstant %18 1
+         %31 = OpTypePointer PushConstant %6
+         %35 = OpConstant %6 2
+         %40 = OpTypePointer StorageBuffer %24
+         %44 = OpConstant %6 1
+         %46 = OpTypePointer PhysicalStorageBuffer %6
+         %48 = OpTypeVector %6 3
+         %49 = OpConstant %6 64
+         %50 = OpConstantComposite %48 %49 %44 %44
+          %4 = OpFunction %2 None %3
+          %5 = OpLabel
+          %8 = OpVariable %7 Function
+         %11 = OpLoad %6 %10
+               OpStore %8 %11
+         %21 = OpAccessChain %20 %17 %19
+         %22 = OpLoad %12 %21
+         %23 = OpLoad %6 %8
+         %32 = OpAccessChain %31 %17 %30
+         %33 = OpLoad %6 %32
+         %34 = OpLoad %6 %8
+         %36 = OpUMod %6 %34 %35
+         %37 = OpIAdd %6 %33 %36
+         %38 = OpCopyObject %6 %37
+         %39 = OpLoad %6 %8
+         %41 = OpAccessChain %40 %29 %38 %19 %39
+         %42 = OpLoad %24 %41
+         %43 = OpUConvert %6 %42
+         %45 = OpIAdd %6 %43 %44
+         %47 = OpAccessChain %46 %22 %19 %23
+               OpStore %47 %45 Aligned 4
+               OpReturn
+               OpFunctionEnd

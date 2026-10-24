@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * OPAQUE_FD external memory on dma-bufs (VKB_EMU_OPAQUE_FD).
  *

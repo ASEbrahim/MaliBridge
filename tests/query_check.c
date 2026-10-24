@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * query_check: occlusion and timestamp query results through the bridge (client/query.c answers
  * them from a mirror). Occlusion queries count the samples of a full-screen triangle cut by a

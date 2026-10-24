@@ -1,0 +1,106 @@
+; shm_barrier -L (lockstep): Resident Evil 2's draw-list compaction, 32 invocations, a 32-lane ballot done with shared memory
+; and no barrier: for (i = tid; ; i += 32) { g = 0; v = i < n ? items[i] : 0; atomicOr(g, bit); m = g; ...; if (n <= i) break; }
+; The exit is per invocation, so level 2 alone only gets memory barriers in; with the lockstep rewrite the loop exits on
+; b = 0, 32, 64... (invocation 0's i) and level 2 puts 3 control barriers inside it: before the atomic, before the load, and
+; at the next iteration's store (the read of g in the one before).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %lid
+               OpExecutionMode %main LocalSize 32 1 1
+               OpDecorate %lid BuiltIn LocalInvocationId
+               OpMemberDecorate %U 0 Offset 0
+               OpDecorate %U Block
+               OpDecorate %u DescriptorSet 0
+               OpDecorate %u Binding 1
+               OpDecorate %rta ArrayStride 4
+               OpMemberDecorate %B 0 Offset 0
+               OpMemberDecorate %B 1 Offset 4
+               OpDecorate %B Block
+               OpDecorate %b DescriptorSet 0
+               OpDecorate %b Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+     %v3uint = OpTypeVector %uint 3
+     %pv3in = OpTypePointer Input %v3uint
+        %lid = OpVariable %pv3in Input
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+    %uint_31 = OpConstant %uint 31
+    %uint_32 = OpConstant %uint 32
+       %puin = OpTypePointer Input %uint
+          %U = OpTypeStruct %uint
+        %pUu = OpTypePointer Uniform %U
+          %u = OpVariable %pUu Uniform
+      %pUuint = OpTypePointer Uniform %uint
+       %bool = OpTypeBool
+       %pwg = OpTypePointer Workgroup %uint
+          %g = OpVariable %pwg Workgroup
+        %rta = OpTypeRuntimeArray %uint
+          %B = OpTypeStruct %uint %rta
+        %pSB = OpTypePointer StorageBuffer %B
+          %b = OpVariable %pSB StorageBuffer
+      %pSBu = OpTypePointer StorageBuffer %uint
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+       %tidp = OpAccessChain %puin %lid %uint_0
+        %tid = OpLoad %uint %tidp
+         %np = OpAccessChain %pUuint %u %uint_0
+          %n = OpLoad %uint %np
+               OpBranch %head
+       %head = OpLabel
+        %cnt = OpPhi %uint %uint_0 %entry %cnt2 %cont
+          %i = OpPhi %uint %tid %entry %i2 %cont
+               OpLoopMerge %done %cont None
+               OpBranch %body
+       %body = OpLabel
+               OpStore %g %uint_0
+         %in = OpULessThan %bool %i %n
+               OpSelectionMerge %m1 None
+               OpBranchConditional %in %rd %m1
+         %rd = OpLabel
+        %ip = OpAccessChain %pSBu %b %uint_1 %i
+         %vv = OpLoad %uint %ip
+               OpBranch %m1
+         %m1 = OpLabel
+          %v = OpPhi %uint %vv %rd %uint_0 %body
+       %keep = OpINotEqual %bool %v %uint_0
+        %lane = OpBitwiseAnd %uint %tid %uint_31
+        %bit = OpShiftLeftLogical %uint %uint_1 %lane
+       %bit2 = OpSelect %uint %keep %bit %uint_0
+          %o = OpAtomicOr %uint %g %uint_1 %uint_0 %bit2
+          %m = OpLoad %uint %g
+               OpSelectionMerge %m2 None
+               OpBranchConditional %keep %wr %m2
+         %wr = OpLabel
+         %lt = OpISub %uint %bit %uint_1
+         %pm = OpBitwiseAnd %uint %m %lt
+         %pc = OpBitCount %uint %pm
+         %at = OpIAdd %uint %cnt %pc
+         %op = OpAccessChain %pSBu %b %uint_1 %at
+               OpStore %op %v
+               OpBranch %m2
+         %m2 = OpLabel
+         %mc = OpBitCount %uint %m
+       %cnt2 = OpIAdd %uint %cnt %mc
+       %last = OpULessThanEqual %bool %n %i
+               OpSelectionMerge %m3 None
+               OpBranchConditional %last %out %m3
+        %out = OpLabel
+               OpBranch %done
+         %m3 = OpLabel
+         %i2 = OpIAdd %uint %i %uint_32
+               OpBranch %cont
+       %cont = OpLabel
+               OpBranch %head
+       %done = OpLabel
+         %t0 = OpIEqual %bool %tid %uint_0
+               OpSelectionMerge %end None
+               OpBranchConditional %t0 %wt %end
+         %wt = OpLabel
+         %tp = OpAccessChain %pSBu %b %uint_0
+               OpStore %tp %cnt2
+               OpBranch %end
+        %end = OpLabel
+               OpReturn
+               OpFunctionEnd

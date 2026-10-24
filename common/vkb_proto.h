@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Bridge-specific (non-Vulkan) parts of the protocol: hello, server query, memory sharing.
  */
@@ -49,6 +50,24 @@ static inline const char *vkb_mem_strategy_name(uint32_t s)
 #define VKB_EMU_OPAQUE_FD      (1u << 17)  /* OPAQUE_FD external memory as dma-bufs (DXVK shared resources) */
 #define VKB_EMU_MULTI_DRAW     (1u << 18)  /* multiDrawIndirect: an indirect draw of n becomes n single draws (Mali-G57 r32-r38) */
 #define VKB_EMU_ROBUSTNESS2    (1u << 7)   /* VK_EXT_robustness2 reported, not enforced (GameNative's r44 profile) */
+#define VKB_EMU_DYN_RENDER     (1u << 20)  /* VK_KHR_dynamic_rendering as render passes (Mali Vulkan 1.1: Zink) */
+#define VKB_EMU_BGR10_VTX      (1u << 21)  /* A2R10G10B10 SNORM/USCALED/SSCALED vertex fetch as the A2B10G10R10 ones, red and blue
+                                            * swapped in the vertex shader (Zink's GL_ARB_vertex_type_2_10_10_10_rev: OpenGL 3.3) */
+
+/* VKB_EMU_BGR10_VTX: the RGBA format a BGRA 10-10-10-2 vertex format is fetched as, or UNDEFINED */
+static inline VkFormat vkb_bgr10_rgba(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_A2R10G10B10_SNORM_PACK32: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+    case VK_FORMAT_A2R10G10B10_USCALED_PACK32: return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
+    case VK_FORMAT_A2R10G10B10_SSCALED_PACK32: return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+#define VKB_EMU_UF11_VTX       (1u << 22)  /* B10G11R11_UFLOAT vertex fetch as R32_UINT, unpacked in the vertex shader
+                                            * (Zink's GL_ARB_vertex_type_10f_11f_11f_rev: OpenGL 4.4 and up) */
+#define VKB_EMU_ROBUST2_ACCESS (1u << 19)  /* robustBufferAccess2/robustImageAccess2 reported where the driver's robustness2
+                                            * has nullDescriptor only (Mali-G715 r54p3); core robustness on instead (DXVK 3) */
 
 /* vkbQueryServer reply (per physical device). */
 typedef struct vkb_server_pd_info {

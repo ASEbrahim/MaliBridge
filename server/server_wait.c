@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * wait_retry (MK-01): waits the driver ends with an error it may not return. Arm's blob waits
  * with ppoll() and does not restart it when a signal interrupts it (EINTR); the wait then fails

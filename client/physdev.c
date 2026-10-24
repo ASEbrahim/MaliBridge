@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Physical device queries: what the app sees is the server's GPU, with the bridge's memory
  * model, its extension list and the features the server emulates.
@@ -118,7 +119,14 @@ static void build_memory_model(vkb_physdev *pd)
             break;
         }
     }
-    int uma = pure_dl < 0;
+    /* A driver whose one plain device-local type is not one images allow is taken as one without
+     * such a type: the device-local type the client offers is backed by one images do allow (the
+     * XRing O1's Mali-G925, r49p1: type 0 is 0x1, but images and buffers allow types 1 and 2 only,
+     * so every image's mask came out empty and gamescope could not start, issues #6 and #8). */
+    int uma = pure_dl < 0 || (pd->info.image_types && !(pd->info.image_types & (1u << pure_dl)));
+    if (pure_dl >= 0 && uma)
+        VKB_INFO("memory: images do not allow the plain device-local type %d (they allow 0x%x): device-local types backed by those",
+                 pure_dl, pd->info.image_types);
     /* Heaps: the server's, plus (UMA) a host heap for shared types so they are not "device local". */
     for (uint32_t h = 0; h < s->memoryHeapCount; h++) {
         c->memoryHeaps[h] = s->memoryHeaps[h];
@@ -291,6 +299,48 @@ uint32_t vkb_mem_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow
                  allow_shared ? "shared allowed" : "not shareable", line);
     }
     return bits;
+}
+
+/*
+ * A buffer's types. The spec promises a host-visible coherent type to every buffer that is not
+ * sparse, and the client's host-visible types are its shared ones only. On a unified-memory Mali
+ * the driver's device-local types are host-visible too (0x7, 0xb), and the client offers them
+ * without host access (dl_types: one per backing resources need). Where a buffer's mask holds
+ * host-visible types but none the shared pages are made in, it got no type an app can map: the
+ * XRing O3 (driver 56, issue #1) puts dma-heap pages in type 14 only, while its indirect buffers
+ * allow 0x1040 and gamescope's upload buffer 0x3 ("no memory type for the buffer (types 0x1
+ * allowed)", gamescope's "findMemoryType failed"). Such a buffer is offered the shared types as
+ * well: memory the driver could map anyway, in another of its host-visible types, which the
+ * driver binds it to (the tester's runs on that phone). A buffer whose mask has no host-visible
+ * type (GPU-only) is left as it is, and so is one that already has a shared type (G720, G925:
+ * buffers allow 0x3, the shared type is backed by type 1). A buffer that is not shareable (made
+ * without the bridge's handle types: no sharing strategy, sparse, or the driver refused) cannot
+ * take shared pages: nothing to offer, said once.
+ */
+uint32_t vkb_mem_buffer_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow_shared)
+{
+    uint32_t bits = vkb_mem_bits_to_client(pd, server_bits, allow_shared);
+    const VkPhysicalDeviceMemoryProperties *s = &pd->server_mem;
+    uint32_t hv = 0;
+    for (uint32_t t = 0; t < s->memoryTypeCount; t++)
+        if ((server_bits & (1u << t)) && (s->memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) hv |= 1u << t;
+    if (!hv) return bits;
+    uint32_t mappable = 0, shared = 0;
+    for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount; i++) {
+        if (pd->type_map[i].shared) shared |= 1u << i;
+        if ((bits & (1u << i)) && (pd->client_mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) mappable |= 1u << i;
+    }
+    if (mappable) return bits;
+    if (!allow_shared || !shared) {
+        VKB_ONCE(VKB_LOG_WARN, "memory: a buffer allowing server types 0x%x (host-visible 0x%x) has no type an app can map: %s (logged once)",
+                 server_bits, hv, !shared ? "the client has no shared type" : "the buffer is not shareable");
+        return bits;
+    }
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+        VKB_INFO("memory: a buffer allowing server types 0x%x (host-visible 0x%x, none shared) also gets the shared types 0x%x (client 0x%x)",
+                 server_bits, hv, shared, bits | shared);
+    return bits | shared;
 }
 
 /* ------------------------------------------------------------------ setup */

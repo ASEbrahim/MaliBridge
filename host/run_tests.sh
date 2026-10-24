@@ -36,22 +36,58 @@ run_mode() {
     grep -q "imitating Mali's memory types" "$VKB_SERVER_LOG" && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG" &&
       ! grep -q "no ordinary device-local type" out/t-smoke.log
     result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' "$VKB_SERVER_LOG"))"
-    # The XRing O3's memory table (xringmem, issue #1): 22 types; images allow type 6 but not 0
-    # or 1, buffers 0x3 and by usage more (indirect 6, the others 14). v0.5 had one device-local
-    # type (type 6's) and one shared type (14): images fit, the draws' indirect buffers had no
-    # host-visible type ("no memory type for the buffer (types 0x1 allowed)"), texel buffers none
-    # at all. Now a device-local type for each backing resources need and every shareable type.
+    # The XRing O3's memory table (xringmem, issue #1), as measured on r56p0: 22 types; images
+    # allow 0x1040, buffers 0x4100, shareable indirect buffers 0x1040 and staging buffers 0x3;
+    # dma-heap pages only in type 14. v0.5 had one device-local type (type 6's) and one shared
+    # type (14): texel buffers had no type at all. v0.5.1 added a device-local type for each
+    # backing, but indirect and staging buffers still had no host-visible type ("no memory type
+    # for the buffer (types 0x1 allowed)", gamescope's findMemoryType): now they get the shared ones.
     VKB_MISSING_ADD=xringmem . ./mali_env.sh >/dev/null
     timeout 120 ./out/vkbridge-smoke >out/t-smoke-xring.log 2>&1 && grep -q "imitating the XRing O3's memory table" "$VKB_SERVER_LOG" &&
       grep -q "resources disagree on device-local types" "$VKB_SERVER_LOG" &&
       ! grep -q "no memory type for the" out/t-smoke-xring.log && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG"
     result $? "smoke, XRing O3's memory table ($(tail -1 out/t-smoke-xring.log))"
-    timeout 60 ./out/memclass_check >out/t-memclass-xring.log 2>&1 && ! grep -q "gets no client type" out/t-memclass-xring.log
+    timeout 60 ./out/memclass_check >out/t-memclass-xring.log 2>&1 && ! grep -q "gets no client type" out/t-memclass-xring.log &&
+      grep -q "chosen, types 0x4000 shared" "$VKB_SERVER_LOG"
     result $? "memclass_check, XRing O3's memory table: every image and buffer kind has a type ($(tail -1 out/t-memclass-xring.log))"
+    # The XRing O1's memory table (o1mem, issues #6 and #8): a plain device-local type 0 (0x1)
+    # that images and buffers never allow (0x6). v0.5.2 backed the client's device-local type by
+    # type 0, and every image's mask was empty (gamescope's flat texture). Without lazymem: the
+    # O1's type 0 is not lazily allocated.
+    VKB_MISSING=bc,clip,cull,divisor,maint5,depthclip,push,robustness2,dualsrc,fillmode,multiviewport,maint6,desclimits,opaquefd,dmabuflinear,planarext,o1mem \
+      . ./mali_env.sh >/dev/null
+    timeout 120 ./out/vkbridge-smoke >out/t-smoke-o1.log 2>&1 && grep -q "imitating the XRing O1's memory table" "$VKB_SERVER_LOG" &&
+      ! grep -q "gets no client type" out/t-smoke-o1.log
+    result $? "smoke, XRing O1's memory table ($(tail -1 out/t-smoke-o1.log))"
+    timeout 60 ./out/memclass_check >out/t-memclass-o1.log 2>&1 && ! grep -q "gets no client type" out/t-memclass-o1.log
+    result $? "memclass_check, XRing O1's memory table: every image and buffer kind has a type ($(tail -1 out/t-memclass-o1.log))"
+    unset VKB_MISSING # an assignment before "." stays in the shell: the tests after it get the usual list
     # ... with Mali's dma-buf fd properties too (gamescope's DMA-BUF import: a type both allow)
     VKB_MISSING_ADD=xringmem,dmabuftypes . ./mali_env.sh >/dev/null
     timeout 60 ./out/fdprops_check >out/t-fdprops-xring.log 2>&1 && grep -q "imitating Mali's dma-buf fd properties" "$VKB_SERVER_LOG"
     result $? "fdprops_check, XRing O3's memory table and Mali's fd properties ($(tail -1 out/t-fdprops-xring.log))"
+    # BGRA 10-10-10-2 signed vertex fetch (VKB_EMU_BGR10_VTX): Mali lacks A2R10G10B10_SNORM, which
+    # held Zink at OpenGL 3.2; fetched as A2B10G10R10_SNORM with red and blue swapped back in the
+    # vertex shader. A GL 3.3 core program reads (204, 0, 51) through Zink with the format imitated
+    # missing. The desktop driver offers VK_EXT_vertex_input_dynamic_state, as Mali r48 and later
+    # do: the server hides it from Zink only, and a Vulkan client that is not Zink still lists it.
+    VKB_MISSING_ADD=bgr10vtx . ./mali_env.sh >/dev/null
+    MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink timeout 60 python3 -I ../tests/gl/glbgr10.py >out/t-bgr10.log 2>&1
+    timeout 60 vulkaninfo 2>/dev/null | grep -c "VK_EXT_vertex_input_dynamic_state" >out/t-bgr10-vulkaninfo.log
+    grep -q "^RESULT ok" out/t-bgr10.log && grep -q "red and blue swapped back in the vertex shader" "$VKB_SERVER_LOG" &&
+      grep -q "hidden from Zink" "$VKB_SERVER_LOG" && [ "$(cat out/t-bgr10-vulkaninfo.log)" -ge 1 ]
+    result $? "BGRA 10-10-10-2 vertex fetch through Zink ($(grep -o 'RESULT.*' out/t-bgr10.log | cut -c1-60)); vulkaninfo still lists vertex input dynamic state"
+    unset VKB_MISSING_ADD
+    # B10G11R11 float vertex fetch (VKB_EMU_UF11_VTX): Mali before r49 lacks it, which held Zink below
+    # OpenGL 4.4; fetched as R32_UINT and unpacked in the vertex shader. A GL program reads
+    # (191, 64, 128) through Zink with the format imitated missing, and Zink still offers 4.4 or newer.
+    VKB_MISSING_ADD=uf11vtx . ./mali_env.sh >/dev/null
+    MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink timeout 60 python3 -I ../tests/gl/gluf11.py >out/t-uf11.log 2>&1
+    v=$(grep -o 'GL_VERSION_MAX [0-9.]*' out/t-uf11.log | cut -d' ' -f2)
+    grep -q "^RESULT ok" out/t-uf11.log && grep -q "unpacked in the vertex shader" "$VKB_SERVER_LOG" &&
+      [ "${v%%.*}" -ge 4 ] && [ "${v#*.}" -ge 4 -o "${v%%.*}" -gt 4 ]
+    result $? "B10G11R11 float vertex fetch through Zink ($(grep -o 'RESULT.*' out/t-uf11.log | cut -c1-60)); GL $v"
+    unset VKB_MISSING_ADD
     # The G720's and G925's memory table (g720mem): images and buffers agree on type 0, so the
     # client's types are what v0.5 made of it on those tablets, and nothing disagrees
     from=$(($(wc -l <"$VKB_SERVER_LOG") + 1)) # this server's lines only (the log goes on across restarts)
@@ -74,6 +110,23 @@ run_mode() {
     timeout 180 ./out/bcn_check transcode >out/t-bcn.log 2>&1; result $? "bcn_check, BC transcoded ($(tail -1 out/t-bcn.log))"
     VKB_BC_TRANSCODE=0 . ./mali_env.sh >/dev/null
     timeout 180 ./out/bcn_check >out/t-bcn-decode.log 2>&1; result $? "bcn_check, BC decoded ($(tail -1 out/t-bcn-decode.log))"
+    # BC2 / BC3 / BC7 into ASTC 6x6 and 8x8 blocks (VKBRIDGE_BC_ASTC_BLOCK): the same checks by PSNR
+    # with those blocks' floors, and the server's images in that format
+    for n in 6 8; do
+      VKB_BC_ASTC_BLOCK=${n}x$n . ./mali_env.sh >/dev/null
+      BCN_NO_LEVELS=1 timeout 300 ./out/bcn_check transcode astc$n >out/t-bcn-astc$n.log 2>&1 &&
+        grep -q "ASTC ${n}x$n (VKBRIDGE_BC_ASTC_BLOCK)" "$VKB_SERVER_LOG"
+      result $? "bcn_check, BC2/BC3/BC7 transcoded to ASTC ${n}x$n ($(tail -1 out/t-bcn-astc$n.log); BC7 photo $(grep -m1 -o 'BC7 -> ASTC [0-9x]*, photo: PSNR [0-9.]* dB' out/t-bcn-astc$n.log | grep -o '[0-9.]* dB'))"
+    done
+    # The texture cap (VKBRIDGE_TEX_MAXDIM): BC textures over 512 created without their top levels
+    # (memory, every level's colour through views at each LOD, barriers, copies, textureSize); with
+    # ",all" a sampled-only RGBA8 one too (clears, blits and readbacks across the cut); with
+    # ",strict" none after a shader reads texture sizes
+    for v in "" all strict; do
+      VKB_TEX_MAXDIM=512${v:+,$v} . ./mali_env.sh >/dev/null
+      timeout 120 ./out/texcap_check $v >out/t-texcap${v:+-$v}.log 2>&1 && grep -q "texture cap: image 2048x2048 (12 mips, format 131) created as 512x512" "$VKB_SERVER_LOG"
+      result $? "texcap_check, VKBRIDGE_TEX_MAXDIM=512${v:+,$v} ($(tail -1 out/t-texcap${v:+-$v}.log); $(grep -m1 -o 'uncapped [0-9]* ([0-9.]*%)' out/t-texcap${v:+-$v}.log))"
+    done
     . ./mali_env.sh >/dev/null
   else
     timeout 180 ./out/bcn_check >out/t-bcn.log 2>&1; result $? "bcn_check ($(tail -1 out/t-bcn.log))"
@@ -191,6 +244,9 @@ run_mode() {
     # A start that ends inside a probe: a stop or a kill runs it again, an abort or a hang past the
     # watchdog is died and decided; the default budget defers the heavy probes, both parts timed
     timeout 300 ./probe_end_test.sh >out/t-probe-end.log 2>&1; result $? "probe_end_test ($(tail -1 out/t-probe-end.log))"
+    # The BC transcoder builds: a slow one passes, one past their own limit leaves only its formats
+    # decoded, those after a hang are not tried (a server of its own; once)
+    timeout 300 ./probe_tx_test.sh >out/t-probe-tx.log 2>&1; result $? "probe_tx_test ($(tail -1 out/t-probe-tx.log))"
     # The driver-errata layer: decisions by driver version, mode, probe and switch; a fix with its
     # imitation beneath it, the bridge's own calls through both (a server of its own; once)
     timeout 300 ./errata_test.sh >out/t-errata.log 2>&1; result $? "errata_test ($(tail -1 out/t-errata.log))"
@@ -200,6 +256,18 @@ run_mode() {
     # shl_barrier: the no-op after constant left shifts, forced on: right values in bitwise_check and
     # vkbridge-smoke, modules named by the app's code, the corpus through the pass spirv-val clean
     timeout 600 ./shlbarrier_test.sh >out/t-shlbarrier.log 2>&1; result $? "shlbarrier_test ($(tail -1 out/t-shlbarrier.log))"
+    # Version promotion: the desktop driver taken as a 1.1 / 1.2 one offered as 1.3 (or 1.2 when a
+    # piece is missing), core structures and names through the extensions, SPIR-V lowered (the corpus
+    # spirv-val clean), the switch, Mali's gaps on top (a server of its own per step; once)
+    timeout 600 ./promote_test.sh >out/t-promote.log 2>&1; result $? "promote_test ($(tail -1 out/t-promote.log))"
+    # shm_barrier: barriers between shared-memory writes and reads in compute shaders (per-game:
+    # RE Engine titles), forced on and from a preset file: right values in shmbarrier_check, the
+    # corpus cases' barriers where expected and spirv-val clean
+    timeout 600 ./shmbarrier_test.sh >out/t-shmbarrier.log 2>&1; result $? "shmbarrier_test ($(tail -1 out/t-shmbarrier.log))"
+    # wave32: 32-lane subgroups emulated in compute shaders (per-game: RE Engine titles) on llvmpipe's
+    # 8-wide subgroups: wave32_check right, allops/wg32 bit-exact with RADV at a required 32, the
+    # corpus cases where expected and spirv-val clean
+    timeout 600 ./wave32_test.sh >out/t-wave32.log 2>&1; result $? "wave32_test ($(tail -1 out/t-wave32.log))"
     # MK-32 clamp_zero: the zero limit dropped (imitated) fails clampzero_check, the opaque zero over it
     # passes, narrow from the version gate and wide when forced; the corpus through both is spirv-val clean
     timeout 600 ./clampzero_test.sh >out/t-clampzero.log 2>&1; result $? "clampzero_test ($(tail -1 out/t-clampzero.log); $(grep -o 'corpus, narrow: [0-9]* modules' out/t-clampzero.log))"
@@ -211,12 +279,19 @@ run_mode() {
     # split vertex buffer binds, each failing with its bug imitated and the fix off and passing
     # with the fix; the two stride shapes the probe tells apart (a server of its own; once)
     timeout 300 ./cmdstate_test.sh >out/t-cmdstate.log 2>&1; result $? "cmdstate_test ($(tail -1 out/t-cmdstate.log))"
+    timeout 300 ./vbbake_test.sh >out/t-vbbake.log 2>&1; result $? "vbbake_test ($(tail -1 out/t-vbbake.log))"
     # MK-16 cull_nontri (a dynamic cull mode culls points and lines): failing with its bug imitated
     # and the fix off, passing with the fix; the version gate (a server of its own; once)
     timeout 300 ./cullmode_test.sh >out/t-cullmode-test.log 2>&1; result $? "cullmode_test ($(tail -1 out/t-cullmode-test.log))"
     # MK-39 dedicated_import (a dedicated struct on an import into a resource not made for its handle
     # type): failing with its bug imitated and the fix off, passing with the fix; the version gate
     timeout 300 ./dedimport_test.sh >out/t-dedimport.log 2>&1; result $? "dedimport_test ($(tail -1 out/t-dedimport.log))"
+    # MK-11 stencil_layout (a separate stencil layout ignored, Arm 4021056): failing with its bug
+    # imitated and the fix off, passing with the fix; the version gate (r41p0-r54p0)
+    timeout 300 ./stencillayout_test.sh >out/t-stencillayout.log 2>&1; result $? "stencillayout_test ($(tail -1 out/t-stencillayout.log))"
+    # Dynamic rendering as render passes (Zink's requirement; Mali's Vulkan 1.1 drivers lack it): the
+    # driver's own, emulated at 1.2, switched off, and on a 1.1 driver promoted to 1.2
+    timeout 300 ./dynrend_test.sh >out/t-dynrend.log 2>&1; result $? "dynrend_test ($(tail -1 out/t-dynrend.log))"
     # The MK probes: each erratum's bug imitated beneath its probe makes it fail with the bug's
     # pattern and the decision follow (probe-gated errata on in performance mode), none without;
     # the report's errata table; the slow light probes in the background (a server of its own; once)
@@ -237,6 +312,15 @@ run_mode() {
     # VKBRIDGE_HIDE_CALIBRATED_TS (opt-in, per game): both names or the EXT name only hidden, from
     # <cache dir>/env and from one game's preset (a server of its own; once)
     timeout 300 ./calts_test.sh >out/t-calts.log 2>&1; result $? "calts_test ($(tail -1 out/t-calts.log))"
+    # The Mali-G715 r54p3's robustness2 (nullDescriptor only): with the emulation off DXVK finds no
+    # adapter (the Pixel testers' CreateDXGIFactory E_FAIL); on, both robust-access features are
+    # reported and taken off before the driver, DXVK's d3d11_check passes (a server of its own; once)
+    timeout 600 ./robust2_test.sh >out/t-robust2.log 2>&1; result $? "robust2_test ($(tail -1 out/t-robust2.log))"
+    # MK-20 fp16_hide: a driver computing 16-bit floats wrong (imitated) fails fp16_math and has
+    # shaderFloat16 hidden (16-bit storage kept: DXVK requires it), an app enabling it anyway has it taken off;
+    # VKBRIDGE_NO_FP16=0/1 from the environment and a game's preset; unchanged on a right driver
+    # (a server of its own; once)
+    timeout 600 ./fp16_test.sh >out/t-fp16.log 2>&1; result $? "fp16_test ($(tail -1 out/t-fp16.log))"
     # vkBeginCommandBuffer's begin info: primary and secondary (inheritance info) round trips; one
     # encoded without its count (the 2026-10-10 copy's bug, SIGSEGV at 0x10 in Mali's
     # vkBeginCommandBuffer) is refused before the driver, its commands dropped (a server of its own; once)
@@ -250,6 +334,15 @@ run_mode() {
     # guest, a preset file and a built-in preset; the untested built-in entries not applied (a
     # server of its own; once)
     timeout 300 ./heapcap_test.sh >out/t-heapcap.log 2>&1; result $? "heapcap_test ($(tail -1 out/t-heapcap.log))"
+    # Asynchronous pipeline compiles (VKBRIDGE_ASYNC_COMPILE) with a slow compiler imitated: draws
+    # skipped until the pipeline is there, depth-only and full-screen pipelines synchronous, objects
+    # destroyed during a compile; off by default; the other checks unchanged through the layer
+    timeout 300 ./asyncpipe_test.sh >out/t-asyncpipe.log 2>&1; result $? "asyncpipe_test ($(tail -1 out/t-asyncpipe.log))"
+    # Steam's shader pre-caching end to end: Steam's fossilize_replay on an archive recorded through
+    # the bridge and on one recorded with GPL on the desktop driver, then the game finds those
+    # pipelines in its cache (the driver's creation feedback); skipped without Proton or Steam's
+    # replayer and layer (a Mali-imitating server of its own; once)
+    timeout 600 ./fossilize_test.sh >out/t-fossilize.log 2>&1; result $? "fossilize_test ($(tail -1 out/t-fossilize.log))"
   fi
   # Negative and positive viewports, static and dynamic, two of them, points, a geometry stage,
   # pipeline libraries: every pixel against the CPU's (facing, gl_FragCoord, dFdy) - MK-02's check
@@ -282,6 +375,24 @@ run_mode() {
     [ $rc = 0 ] && [ -n "$(grep -o 'requires [01]' out/t-dedhint-r1.log)" ] &&
       [ "$(grep -o 'requires [01]' out/t-dedhint-r1.log)" = "$(grep -o 'requires [01]' out/t-dedhint-r0.log)" ]
     result $? "dedhint_check (on: $(tail -1 out/t-dedhint-1.log); off: $(tail -1 out/t-dedhint-0.log); default: $(tail -1 out/t-dedhint-def.log); requires unchanged: $(grep -c 'requires 1' out/t-dedhint-r1.log) required)"
+  fi
+  # Transform feedback as DXVK's D3D11 stream output uses it (two buffers, counters resumed,
+  # vkCmdDrawIndirectByteCountEXT), captured by the vertex stage and by DXVK's pass-through point
+  # geometry stage; on mali that stage is folded into the vertex shader (Mali's geometry shaders are
+  # slow) and must capture the same bytes, and with VKBRIDGE_NO_XFB_FOLD=1 it is kept. 77: no XFB.
+  for st in vs gs; do
+    timeout 60 ./out/xfb_check $st >out/t-xfb-$st.log 2>&1; rc=$?; [ $rc = 77 ] && rc=0
+    [ $rc = 0 ] && [ "$mode" = mali ] && [ $st = gs ] && ! grep -q "skipped" out/t-xfb-$st.log &&
+      { grep -q "stream output geometry shaders folded into their vertex shaders" "$VKB_SERVER_LOG" || rc=1; }
+    result $rc "xfb_check, $st captures ($(tail -1 out/t-xfb-$st.log))"
+  done
+  if [ "$mode" = mali ]; then
+    from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+    VKB_SERVER_ENV=VKBRIDGE_NO_XFB_FOLD=1 . ./mali_env.sh >/dev/null
+    timeout 60 ./out/xfb_check gs >out/t-xfb-nofold.log 2>&1; rc=$?; [ $rc = 77 ] && rc=0
+    [ $rc = 0 ] && tail -n +$from "$VKB_SERVER_LOG" | grep -q "stream output geometry shaders folded" && rc=1
+    result $rc "xfb_check, gs captures with VKBRIDGE_NO_XFB_FOLD=1: the geometry stage kept ($(tail -1 out/t-xfb-nofold.log))"
+    . ./mali_env.sh >/dev/null
   fi
   # Points and lines with a dynamic cull mode set, triangles culled after them (MK-16, on in safe mode)
   timeout 60 ./out/cullmode_check >out/t-cullmode.log 2>&1; result $? "cullmode_check ($(tail -1 out/t-cullmode.log))"
@@ -335,6 +446,14 @@ divisor_variants() {
     ! tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "emulation 0x[0-9a-f]* installed"
   result $? "divisor_check, complete KHR-only divisor: EXT name aliased, native ($(tail -1 out/t-divisor-khr.log))"
 }
+# The request arena and the null-descriptor set map on their own (no driver): checks, and the
+# times against the code before 2026-10-21 (hotpath_bench_old), shown, not judged
+if [ -x out/hotpath_bench ]; then
+  timeout 120 ./out/hotpath_bench >out/t-hotpath.log 2>&1
+  r=$?
+  [ -x out/hotpath_bench_old ] && timeout 120 ./out/hotpath_bench_old >out/t-hotpath-old.log 2>&1
+  result $r "hotpath_bench ($(grep -m1 -o '[0-9.]* us per request' out/t-hotpath.log | cut -d' ' -f1-2) per ~600 KiB request, was $(grep -m1 -o '[0-9.]* us per request' out/t-hotpath-old.log 2>/dev/null | cut -d' ' -f1-2); 1M sets: $(grep '1000000 sets' out/t-hotpath.log | grep -o '[0-9.]* ns per lookup'), was $(grep '1000000 sets' out/t-hotpath-old.log 2>/dev/null | grep -o '[0-9.]* ns per lookup'))"
+fi
 run_mode plain
 divisor_variants
 server_errors; result $? "no protocol errors in the server log (plain)"

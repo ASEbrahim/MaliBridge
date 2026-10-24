@@ -40,5 +40,11 @@ variant spv_bc4_eac -DFMT_BC4 -DENC_EAC
 variant spv_bc5_eac -DFMT_BC5 -DENC_EAC
 variant spv_bc7_astc -DFMT_BC7 -DENC_ASTC
 variant spv_bc6h_astc -DFMT_BC6H -DENC_ASTC_HDR
+# ASTC 6x6 / 8x8 (VKBRIDGE_BC_ASTC_BLOCK): BC2, BC3, BC7
+for n in 6 8; do
+  for f in BC2 BC3 BC7; do
+    variant spv_$(echo $f | tr A-Z a-z)_astc$n -DFMT_$f -DENC_ASTCN -DASTC_N=$n
+  done
+done
 rm -rf "$tmp"
 echo "wrote $out"

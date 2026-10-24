@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 ASEbrahim and MaliBridge contributors
 """Writes astc_tables.glsl: for each BC7 partition (64 of 2 subsets, then 64 of 3 subsets x the
 subset left alone when the other two merge) the ASTC 4x4 two-partition seed whose pattern differs
 from it in the fewest texels, as seed << 16 | partition-1 texels (bit y * 4 + x). The ASTC

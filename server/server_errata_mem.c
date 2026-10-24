@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * dedicated_import (MK-39): on older Mali drivers an allocation that imports external memory (a
  * dma-buf or opaque fd, an AHardwareBuffer, a host pointer) and also carries a

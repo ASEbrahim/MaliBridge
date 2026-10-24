@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * vbstride_check: vkCmdBindVertexBuffers2's pStrides must reach the bindings they are given for
  * (MK-05, Arm erratum 3786496: Mali drivers before r48 apply them by array index). One pipeline,

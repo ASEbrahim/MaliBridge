@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Evidence: where the GPU's time goes. With VKBRIDGE_GPU_PROF=1 (<cache dir>/env, read at device
  * creation) every primary command buffer gets timestamps at its start, around each render pass and

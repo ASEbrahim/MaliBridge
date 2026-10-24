@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(binding = 0) uniform sampler2D tex;
+layout(binding = 1, std430) buffer Out { vec4 v[]; } o;
+layout(push_constant) uniform P { float lod; uint slot; uint mode; } p;
+void main()
+{
+    if (p.mode == 0u) o.v[p.slot] = textureLod(tex, vec2(0.5), p.lod);
+    else o.v[p.slot] = vec4(vec2(textureSize(tex, int(p.lod))), float(textureQueryLevels(tex)), 0.0);
+}

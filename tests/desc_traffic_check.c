@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * desc_traffic_check [draws] [frames]: descriptor traffic as DXVK makes it - per draw a set
  * allocated from a pool reset every frame and one vkUpdateDescriptorSets writing every binding

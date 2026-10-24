@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * pervertex_check: runs the server's per-vertex block rewrite (spirv_pervertex.c) on SPIR-V files
  * and checks the result: rewritten, no loose Position/PointSize/ClipDistance/CullDistance

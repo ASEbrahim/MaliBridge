@@ -1,0 +1,55 @@
+#version 450
+// wave32 corpus and differential check (host/wave32_test.sh): every subgroup operation the pass
+// does, at the top level of a 64-invocation workgroup. Its output through the bridge on a GPU
+// with narrow subgroups must equal the GPU's own with a required subgroup size of 32 (RADV).
+// Floats hold small integers, so sums are exact in any order. glslc -O0.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_quad : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint g = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+    uint x = (g * 2654435761u) >> 24;
+    uint lane = gl_SubgroupInvocationID;
+    int si = int(x) - 128;
+    vec2 f = vec2(float(x & 15u), float(x >> 4));
+    bool p = (x & 3u) == 0u;
+    uint b = g * 20u;
+    o[b + 0u] = (subgroupAll(x < 250u) ? 1u : 0u) | (subgroupAny(p) ? 2u : 0u) | (subgroupAllEqual(x >> 9) ? 4u : 0u) |
+                (subgroupElect() ? 8u : 0u) | (subgroupAllEqual(vec2(1.0, f.x * 0.0)) ? 16u : 0u);
+    uvec4 bal = subgroupBallot(p);
+    o[b + 1u] = bal.x;
+    o[b + 2u] = subgroupBallotBitCount(bal) | (subgroupBallotInclusiveBitCount(bal) << 8) | (subgroupBallotExclusiveBitCount(bal) << 16) |
+                ((subgroupBallotBitExtract(bal, 5u) ? 1u : 0u) << 24) | ((subgroupInverseBallot(bal) ? 1u : 0u) << 25);
+    o[b + 3u] = bal.x != 0u ? subgroupBallotFindLSB(bal) | (subgroupBallotFindMSB(bal) << 8) : 0xffffu;
+    o[b + 4u] = subgroupBroadcast(x, 7u) | (subgroupBroadcastFirst(x) << 8) | (subgroupShuffle(x, x & 31u) << 16);
+    uint up = subgroupShuffleUp(x, 3u), down = subgroupShuffleDown(x, 5u);
+    o[b + 5u] = (lane >= 3u ? up : 0u) | ((lane + 5u < 32u ? down : 0u) << 8) | (subgroupShuffleXor(x, 21u) << 16);
+    o[b + 6u] = uint(subgroupAdd(si)) ^ (uint(subgroupMin(si)) << 12) ^ (uint(subgroupMax(si)) << 20);
+    o[b + 7u] = subgroupMin(x) | (subgroupMax(x) << 8) | (subgroupInclusiveMin(x) << 16) | (subgroupExclusiveMax(x) << 24);
+    o[b + 8u] = floatBitsToUint(subgroupAdd(f).y);
+    o[b + 9u] = floatBitsToUint(subgroupInclusiveAdd(f).x) ^ floatBitsToUint(subgroupExclusiveMin(f.y));
+    o[b + 10u] = floatBitsToUint(subgroupMax(f.x)) ^ floatBitsToUint(subgroupExclusiveMax(f).y);
+    o[b + 11u] = subgroupInclusiveAnd(x | 0xf0u) ^ (subgroupExclusiveXor(x) << 8) ^ (subgroupInclusiveOr(x) << 16);
+    o[b + 12u] = subgroupClusteredAdd(x, 4u) | (subgroupClusteredMax(x, 8u) << 16);
+    o[b + 13u] = subgroupQuadBroadcast(x, 2u) | (subgroupQuadSwapHorizontal(x) << 8) | (subgroupQuadSwapVertical(x) << 16) |
+                 (subgroupQuadSwapDiagonal(x) << 24);
+    o[b + 14u] = (subgroupAnd(p) ? 1u : 0u) | (subgroupOr(p) ? 2u : 0u) | (subgroupXor(p) ? 4u : 0u) |
+                 (subgroupInclusiveXor(p) ? 8u : 0u) | (subgroupExclusiveOr(p) ? 16u : 0u);
+    o[b + 15u] = gl_SubgroupLtMask.x ^ (gl_SubgroupLeMask.x * 3u) ^ (gl_SubgroupGeMask.x * 5u) ^ (gl_SubgroupGtMask.x * 7u) ^
+                 (gl_SubgroupEqMask.x * 11u);
+    uvec3 v3 = subgroupAdd(uvec3(x, x * 3u, g));
+    o[b + 16u] = v3.x ^ (v3.y << 3) ^ (v3.z << 7);
+    bvec2 bs = subgroupShuffleXor(bvec2(p, !p), 1u);
+    o[b + 17u] = (bs.x ? 1u : 0u) | (bs.y ? 2u : 0u) | (uint(subgroupExclusiveMul(int(x & 1u) + 1)) << 2);
+    o[b + 18u] = gl_SubgroupSize | (gl_NumSubgroups << 8) | (gl_SubgroupID << 16);
+    o[b + 19u] = subgroupExclusiveAdd(x) ^ (subgroupInclusiveAdd(x) << 13);
+}

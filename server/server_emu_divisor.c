@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Vertex attribute divisor (VK_EXT/KHR_vertex_attribute_divisor) on a GPU without it.
  *

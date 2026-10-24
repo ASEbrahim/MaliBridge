@@ -1,0 +1,36 @@
+; A packed 4x8-bit dot product (SPIR-V 1.6 core; SPV_KHR_integer_dot_product before it). Written by hand.
+               OpCapability Shader
+               OpCapability DotProduct
+               OpCapability DotProductInput4x8BitPacked
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %buf
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %B Block
+               OpMemberDecorate %B 0 Offset 0
+               OpMemberDecorate %B 1 Offset 4
+               OpMemberDecorate %B 2 Offset 8
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+          %B = OpTypeStruct %uint %uint %int
+         %pB = OpTypePointer StorageBuffer %B
+        %buf = OpVariable %pB StorageBuffer
+         %pu = OpTypePointer StorageBuffer %uint
+         %pi = OpTypePointer StorageBuffer %int
+         %c0 = OpConstant %int 0
+         %c1 = OpConstant %int 1
+         %c2 = OpConstant %int 2
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+         %pa = OpAccessChain %pu %buf %c0
+         %pb = OpAccessChain %pu %buf %c1
+          %a = OpLoad %uint %pa
+          %b = OpLoad %uint %pb
+          %d = OpSDot %int %a %b PackedVectorFormat4x8Bit
+         %pr = OpAccessChain %pi %buf %c2
+               OpStore %pr %d
+               OpReturn
+               OpFunctionEnd

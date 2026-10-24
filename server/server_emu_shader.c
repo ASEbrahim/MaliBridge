@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Shader-side emulations, done when a graphics pipeline is created (both ends of the vertex ->
  * fragment interface are known then):
@@ -41,7 +42,7 @@ typedef struct shader_state {
 
 #define SHADER_EMU (VKB_EMU_CLIP_DISTANCE | VKB_EMU_CULL_DISTANCE | VKB_EMU_POINT_SIZE)
 /* Emulations that need the shader modules' SPIR-V kept. */
-#define SHADER_STORE (SHADER_EMU | VKB_EMU_DIVISOR | VKB_EMU_DUAL_SRC)
+#define SHADER_STORE (SHADER_EMU | VKB_EMU_DIVISOR | VKB_EMU_DUAL_SRC | VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)
 
 static unsigned mh(VkShaderModule m)
 {
@@ -202,9 +203,33 @@ static VKAPI_ATTR void VKAPI_CALL emu_DestroyShaderModule(VkDevice device, VkSha
     vkb_emu_real()->vkDestroyShaderModule(device, module, pAllocator);
 }
 
-/* The SPIR-V of a stage: its module's (kept here) or the inline VkShaderModuleCreateInfo's. */
+/* Stages rewritten during this vkCreateGraphicsPipelines call (set_stage_module): their new
+ * module's SPIR-V, so a later rewrite of the same stage builds on it. Freed when the call ends
+ * (vkb_emu_shader_call_end). */
+#define REWRITTEN_MAX 64
+static __thread struct {
+    VkShaderModule module;
+    uint32_t *code;
+    size_t size;
+} rewritten[REWRITTEN_MAX];
+static __thread int nrewritten;
+
+void vkb_emu_shader_call_end(void)
+{
+    for (int i = 0; i < nrewritten; i++) free(rewritten[i].code);
+    nrewritten = 0;
+}
+
+/* The SPIR-V of a stage: its module's (kept here, or rewritten in this call) or the inline
+ * VkShaderModuleCreateInfo's. */
 static int stage_code(vkb_emu_device *e, const VkPipelineShaderStageCreateInfo *st, const uint32_t **code, size_t *size)
 {
+    for (int i = 0; st->module && i < nrewritten; i++)
+        if (rewritten[i].module == st->module) {
+            *code = rewritten[i].code;
+            *size = rewritten[i].size;
+            return 1;
+        }
     if (st->module) {
         const shader_rec *r = find_module(e, st->module);
         if (!r) return 0;
@@ -230,6 +255,11 @@ static void set_stage_module(VkDevice device, VkPipelineShaderStageCreateInfo *s
     if (*nmods >= cap || make_module(device, m, &mod) != VK_SUCCESS) return;
     mods[(*nmods)++] = mod;
     st->module = mod;
+    if (nrewritten < REWRITTEN_MAX) {
+        uint32_t *code;
+        size_t size = spv_write(m, &code);
+        if (size) rewritten[nrewritten].module = mod, rewritten[nrewritten].code = code, rewritten[nrewritten++].size = size;
+    }
     vkb_emu_chain_take(st, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
 }
 
@@ -581,6 +611,267 @@ void vkb_emu_shader_drop_second_output(vkb_emu_device *e, VkDevice device, VkGra
         spv_free(&m);
         return;
     }
+}
+
+/* ------------------------------------------------------------------ BGRA 10-10-10-2 vertex fetch */
+
+/* VKB_EMU_BGR10_VTX (server_emu.c): an attribute in A2R10G10B10_SNORM/USCALED/SSCALED_PACK32, which
+ * the driver cannot fetch, becomes its A2B10G10R10 twin - the same 32 bits read with red and blue the other
+ * way round - and the vertex shader puts them back: each whole load of that location gets a zyx(w)
+ * shuffle (the load's result is renamed and the shuffle takes its id, so every use stays), and an
+ * access chain into it picks component 2 for 0 and 0 for 2. A read this does not handle (a variable
+ * of fewer than three components, a dynamic index, the variable passed on whole) is logged once and
+ * the attribute fetched swapped. */
+#define SpvOpVectorShuffle 79
+
+void vkb_emu_shader_bgr10(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
+                          uint32_t *nmods, uint32_t cap)
+{
+    if (!(e->flags & VKB_EMU_BGR10_VTX) || !e->shaders || !ci->pVertexInputState || !ci->pStages) return;
+    VkPipelineVertexInputStateCreateInfo *vi = (VkPipelineVertexInputStateCreateInfo *)ci->pVertexInputState;
+    uint64_t locs = 0;
+    for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount; a++) {
+        VkVertexInputAttributeDescription *ad = (VkVertexInputAttributeDescription *)&vi->pVertexAttributeDescriptions[a];
+        VkFormat rgba = vkb_bgr10_rgba(ad->format);
+        if (rgba == VK_FORMAT_UNDEFINED || ad->location >= 64) continue;
+        ad->format = rgba;
+        locs |= 1ull << ad->location;
+    }
+    if (!locs) return;
+    VkPipelineShaderStageCreateInfo *st = NULL;
+    for (uint32_t i = 0; i < ci->stageCount; i++)
+        if (ci->pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT) st = (VkPipelineShaderStageCreateInfo *)&ci->pStages[i];
+    const uint32_t *code;
+    size_t size;
+    spv_mod m;
+    if (!st || !stage_code(e, st, &code, &size) || spv_parse(&m, code, size) != 0) {
+        VKB_ONCE(VKB_LOG_WARN, "emulation: BGRA 10-10-10-2 vertex input with a vertex shader not at hand: red and blue swapped (logged once)");
+        return;
+    }
+    uint32_t vars[64];
+    int nv = 0, bad = 0, changed = 0;
+    /* made before the walk: a new constant goes into the types section and moves what follows */
+    uint32_t c0 = spv_const_u32(&m, 0), c2 = spv_const_u32(&m, 2);
+    for (uint32_t i = 0; i < m.count && nv < 64; i++) {
+        const spv_inst *in = &m.ins[i];
+        if (in->op != SpvOpDecorate || in->n < 4 || in->w[1] != SpvDecorationLocation || in->w[2] >= 64 || !(locs >> in->w[2] & 1)) continue;
+        uint32_t var = in->w[0];
+        int64_t comp = spv_get_decoration(&m, var, SpvDecorationComponent);
+        if (var_type(&m, var, SpvStorageClassInput) && comp <= 0) vars[nv++] = var;
+    }
+    for (int v = 0; v < nv; v++) {
+        uint32_t var = vars[v], n = comps32(&m, var_type(&m, var, SpvStorageClassInput));
+        for (uint32_t i = 0; i < m.count; i++) {
+            spv_inst *in = &m.ins[i];
+            if (in->op == SpvOpLoad && in->n >= 4 && in->w[2] == var) {
+                if (n < 3) {
+                    bad = 1;
+                    continue;
+                }
+                uint32_t type = in->w[0], old = in->w[1], renamed = spv_new_id(&m);
+                in->w[1] = renamed;
+                uint32_t ops[8] = {type, old, renamed, renamed, 2, 1, 0, 3};
+                spv_insert(&m, i + 1, SpvOpVectorShuffle, ops, (uint16_t)(4 + n));
+                i++;
+                changed = 1;
+            } else if ((in->op == SpvOpAccessChain || in->op == SpvOpInBoundsAccessChain) && in->n >= 5 && in->w[2] == var) {
+                uint32_t idx;
+                if (!const_u32(&m, in->w[3], &idx)) {
+                    bad = 1;
+                    continue;
+                }
+                if (idx == 0 || idx == 2) {
+                    in->w[3] = idx == 0 ? c2 : c0;
+                    changed = 1;
+                }
+            } else if (in->op != SpvOpDecorate && in->op != SpvOpName && in->op != SpvOpEntryPoint && in->op != SpvOpVariable) {
+                for (uint32_t k = 0; k + 1 < in->n; k++)
+                    if (in->w[k] == var && !(in->op == SpvOpLoad && k == 2)) bad = 1;
+            }
+        }
+    }
+    if (bad) VKB_ONCE(VKB_LOG_WARN, "emulation: BGRA 10-10-10-2 vertex input read in a way not handled: red and blue may be swapped (logged once)");
+    if (changed) set_stage_module(device, st, &m, mods, nmods, cap);
+    VKB_ONCE(VKB_LOG_INFO, "emulation: BGRA 10-10-10-2 vertex input fetched as RGBA, red and blue swapped back in the vertex shader");
+    spv_free(&m);
+}
+
+/* ------------------------------------------------------------------ B10G11R11 float vertex fetch */
+
+/* VKB_EMU_UF11_VTX (server_emu.c): an attribute in B10G11R11_UFLOAT_PACK32, which the driver cannot
+ * fetch, is read as R32_UINT and unpacked in the vertex shader. Each packed float is a half float
+ * without its sign and its low mantissa bits (the same 5-bit exponent and bias, infinity and NaN
+ * included): red and green shifted into place make one UnpackHalf2x16, blue another. The input
+ * becomes a private variable of the type the shader gave it, filled at the start of the entry point
+ * from a new uint input at the same location, so every read of it stays as it was. A shader this does
+ * not handle (an input that is not 32-bit float, or used other than loaded or indexed) keeps the
+ * format, which the driver then refuses as it did before (logged once). */
+#define SpvOpShiftRightLogical 194
+#define SpvOpShiftLeftLogical 196
+#define SpvOpBitwiseOr 197
+#define SpvOpBitwiseAnd 199
+#define GLSLstd450UnpackHalf2x16 62
+
+/* The interface ids of an OpEntryPoint start after its name string */
+static uint32_t entry_iface_at(const spv_inst *ep)
+{
+    uint32_t k = 2;
+    while (k + 1 < ep->n) {
+        uint32_t w = ep->w[k++];
+        if (!(w & 0xff000000u) || !(w & 0xff0000u) || !(w & 0xff00u) || !(w & 0xffu)) break;
+    }
+    return k;
+}
+
+/* Whether the input variable is read only by whole loads and access chains (whose results are
+ * loaded), with a 32-bit float scalar or vector type: what the rewrite below handles. */
+static int uf11_var_ok(const spv_mod *m, uint32_t var)
+{
+    uint32_t t = var_type(m, var, SpvStorageClassInput);
+    int d = t ? spv_find_def(m, t) : -1;
+    if (d < 0) return 0;
+    const spv_inst *ty = &m->ins[d];
+    if (ty->op == SpvOpTypeVector) {
+        if (ty->w[2] > 4) return 0;
+        d = spv_find_def(m, ty->w[1]);
+        if (d < 0) return 0;
+        ty = &m->ins[d];
+    }
+    if (ty->op != SpvOpTypeFloat || ty->w[1] != 32) return 0;
+    for (uint32_t i = 0; i < m->count; i++) {
+        const spv_inst *in = &m->ins[i];
+        if (in->op == SpvOpDecorate || in->op == SpvOpName || in->op == SpvOpEntryPoint || in->op == SpvOpVariable) continue;
+        int access = in->op == SpvOpAccessChain || in->op == SpvOpInBoundsAccessChain;
+        for (uint32_t k = 0; k + 1 < in->n; k++)
+            if (in->w[k] == var && !(in->op == SpvOpLoad && k == 2) && !(access && k == 2)) return 0;
+    }
+    return 1;
+}
+
+static void uf11_rewrite(spv_mod *m, uint32_t var, uint32_t loc)
+{
+    uint32_t vt = var_type(m, var, SpvStorageClassInput), n = comps32(m, vt);
+    uint32_t u32 = spv_type_int(m, 32, 0), f32 = spv_type_float(m, 32), v2 = spv_type_vector(m, f32, 2);
+    uint32_t glsl = spv_glsl_std450(m);
+    uint32_t c4 = spv_const_u32(m, 4), c5 = spv_const_u32(m, 5), c11 = spv_const_u32(m, 11), c20 = spv_const_u32(m, 20),
+             c22 = spv_const_u32(m, 22), c7ff = spv_const_u32(m, 0x7ff), one = spv_const_f32(m, 1.0f);
+    uint32_t priv = spv_type_pointer(m, SpvStorageClassPrivate, vt), in_ptr = spv_type_pointer(m, SpvStorageClassInput, u32);
+    /* access chains into it point at Private now */
+    for (uint32_t i = 0; i < m->count; i++) {
+        spv_inst *in = &m->ins[i];
+        if ((in->op != SpvOpAccessChain && in->op != SpvOpInBoundsAccessChain) || in->n < 4 || in->w[2] != var) continue;
+        int p = spv_find_def(m, in->w[0]);
+        if (p < 0 || m->ins[p].op != SpvOpTypePointer) continue;
+        uint32_t result = in->w[1], pt = spv_type_pointer(m, SpvStorageClassPrivate, m->ins[p].w[2]);
+        m->ins[spv_find_def(m, result)].w[0] = pt; /* the type's insert may have moved it */
+    }
+    /* declared again after its new pointer type, which went to the end of the globals */
+    spv_remove(m, (uint32_t)spv_find_def(m, var));
+    uint32_t pops[3] = {priv, var, SpvStorageClassPrivate};
+    spv_insert(m, spv_types_end(m), SpvOpVariable, pops, 3);
+    uint32_t input = spv_new_id(m), vops[3] = {in_ptr, input, SpvStorageClassInput};
+    spv_insert(m, spv_types_end(m), SpvOpVariable, vops, 3);
+    spv_remove_decoration(m, var, SpvDecorationLocation);
+    uint32_t dec[3] = {input, SpvDecorationLocation, loc};
+    spv_insert(m, spv_annotations_end(m), SpvOpDecorate, dec, 3);
+    /* the entry point's interface: the new input in its place (the private one too from SPIR-V 1.4) */
+    for (uint32_t i = 0; i < m->count; i++) {
+        spv_inst *ep = &m->ins[i];
+        if (ep->op != SpvOpEntryPoint) continue;
+        for (uint32_t k = entry_iface_at(ep); k + 1 < ep->n; k++)
+            if (ep->w[k] == var) ep->w[k] = input;
+    }
+    if (spv_version(m) >= 0x00010400) spv_add_interface(m, var);
+
+    int ep = spv_find_op(m, SpvOpEntryPoint, 0);
+    uint32_t fn = m->ins[ep].w[1];
+    int fi = -1;
+    for (uint32_t i = 0; i < m->count; i++)
+        if (m->ins[i].op == SpvOpFunction && m->ins[i].w[1] == fn) fi = (int)i;
+    int li = fi < 0 ? -1 : spv_find_op(m, SpvOpLabel, (uint32_t)fi);
+    if (li < 0) {
+        m->err = 1;
+        return;
+    }
+    uint32_t at = (uint32_t)li + 1;
+    while (at < m->count && (m->ins[at].op == SpvOpVariable || m->ins[at].op == SpvOpLine || m->ins[at].op == SpvOpNoLine)) at++;
+#define EMIT(op, ...)                                                                    \
+    do {                                                                                 \
+        const uint32_t o_[] = {__VA_ARGS__};                                             \
+        at = spv_insert(m, at, op, o_, (uint16_t)(sizeof(o_) / sizeof(o_[0]))) + 1;      \
+    } while (0)
+    uint32_t u = spv_new_id(m), r0 = spv_new_id(m), r = spv_new_id(m), g0 = spv_new_id(m), g1 = spv_new_id(m), g = spv_new_id(m),
+             rg = spv_new_id(m), b0 = spv_new_id(m), b = spv_new_id(m), hrg = spv_new_id(m), hb = spv_new_id(m);
+    EMIT(SpvOpLoad, u32, u, input);
+    EMIT(SpvOpBitwiseAnd, u32, r0, u, c7ff);
+    EMIT(SpvOpShiftLeftLogical, u32, r, r0, c4);         /* red: half bits 4-14 */
+    EMIT(SpvOpShiftRightLogical, u32, g0, u, c11);
+    EMIT(SpvOpBitwiseAnd, u32, g1, g0, c7ff);
+    EMIT(SpvOpShiftLeftLogical, u32, g, g1, c20);        /* green: the high half's bits 4-14 */
+    EMIT(SpvOpBitwiseOr, u32, rg, r, g);
+    EMIT(SpvOpShiftRightLogical, u32, b0, u, c22);
+    EMIT(SpvOpShiftLeftLogical, u32, b, b0, c5);         /* blue: half bits 5-14 */
+    EMIT(SpvOpExtInst, v2, hrg, glsl, GLSLstd450UnpackHalf2x16, rg);
+    EMIT(SpvOpExtInst, v2, hb, glsl, GLSLstd450UnpackHalf2x16, b);
+    uint32_t c[4] = {spv_new_id(m), spv_new_id(m), spv_new_id(m), one};
+    EMIT(SpvOpCompositeExtract, f32, c[0], hrg, 0);
+    if (n >= 2) EMIT(SpvOpCompositeExtract, f32, c[1], hrg, 1);
+    if (n >= 3) EMIT(SpvOpCompositeExtract, f32, c[2], hb, 0);
+    uint32_t val = c[0];
+    if (n >= 2) {
+        uint32_t ops[6] = {vt, val = spv_new_id(m), c[0], c[1], c[2], c[3]};
+        at = spv_insert(m, at, SpvOpCompositeConstruct, ops, (uint16_t)(2 + n)) + 1;
+    }
+    EMIT(SpvOpStore, var, val);
+#undef EMIT
+}
+
+void vkb_emu_shader_uf11(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
+                         uint32_t *nmods, uint32_t cap)
+{
+    if (!(e->flags & VKB_EMU_UF11_VTX) || !e->shaders || !ci->pVertexInputState || !ci->pStages) return;
+    VkPipelineVertexInputStateCreateInfo *vi = (VkPipelineVertexInputStateCreateInfo *)ci->pVertexInputState;
+    uint64_t locs = 0;
+    for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount; a++)
+        if (vi->pVertexAttributeDescriptions[a].format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && vi->pVertexAttributeDescriptions[a].location < 64)
+            locs |= 1ull << vi->pVertexAttributeDescriptions[a].location;
+    if (!locs) return;
+    VkPipelineShaderStageCreateInfo *st = NULL;
+    for (uint32_t i = 0; i < ci->stageCount; i++)
+        if (ci->pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT) st = (VkPipelineShaderStageCreateInfo *)&ci->pStages[i];
+    const uint32_t *code;
+    size_t size;
+    spv_mod m;
+    if (!st || !stage_code(e, st, &code, &size) || spv_parse(&m, code, size) != 0) {
+        VKB_ONCE(VKB_LOG_WARN, "emulation: B10G11R11 float vertex input with a vertex shader not at hand: left to the driver (logged once)");
+        return;
+    }
+    uint32_t vars[64], vlocs[64];
+    int nv = 0, bad = 0;
+    for (uint32_t i = 0; i < m.count && nv < 64; i++) {
+        const spv_inst *in = &m.ins[i];
+        if (in->op != SpvOpDecorate || in->n < 4 || in->w[1] != SpvDecorationLocation || in->w[2] >= 64 || !(locs >> in->w[2] & 1)) continue;
+        uint32_t var = in->w[0];
+        if (!var_type(&m, var, SpvStorageClassInput)) continue;
+        if (spv_get_decoration(&m, var, SpvDecorationComponent) > 0 || !uf11_var_ok(&m, var)) bad = 1;
+        vlocs[nv] = in->w[2];
+        vars[nv++] = var;
+    }
+    if (!bad)
+        for (int v = 0; v < nv && !m.err; v++) uf11_rewrite(&m, vars[v], vlocs[v]);
+    if (bad || m.err) {
+        VKB_ONCE(VKB_LOG_WARN, "emulation: B10G11R11 float vertex input read in a way not handled: left to the driver (logged once)");
+        spv_free(&m);
+        return;
+    }
+    /* the shader reads the attribute as a uint now; one it does not read is fetched as one all the same */
+    for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount; a++) {
+        VkVertexInputAttributeDescription *ad = (VkVertexInputAttributeDescription *)&vi->pVertexAttributeDescriptions[a];
+        if (ad->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) ad->format = VK_FORMAT_R32_UINT;
+    }
+    if (nv) set_stage_module(device, st, &m, mods, nmods, cap);
+    VKB_ONCE(VKB_LOG_INFO, "emulation: B10G11R11 float vertex input fetched as R32_UINT, unpacked in the vertex shader");
+    spv_free(&m);
 }
 
 void vkb_emu_shader_install(vkb_srv_table *dev)

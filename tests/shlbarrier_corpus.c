@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * The shl_barrier pass (server/spirv_shlbarrier.c) over a corpus of SPIR-V modules:
  *   shlbarrier_corpus [-q] outdir file.spv... | @list (one path a line)

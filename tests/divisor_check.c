@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * divisor_check: the vertex attribute divisor as vkd3d-proton asks for it. vkd3d-proton 3 refuses a
  * device unless VK_EXT_vertex_attribute_divisor (spec version 3 or later) is listed and both

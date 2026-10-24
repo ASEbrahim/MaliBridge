@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * dedhint_check: the dedicated-allocation hint (client/memory.c, VKBRIDGE_DEDICATED_HINT) as an app
  * sees it in VkMemoryDedicatedRequirements, with Mali's preference imitated beneath it

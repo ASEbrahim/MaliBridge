@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * viewport_check: MK-02 (a negative viewport height ignored, Mali-G715 r54p2). Two triangles of
  * opposite winding - upper left and lower right with y up - are drawn into a 32x32 RGBA32UI

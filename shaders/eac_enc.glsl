@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * EAC R11 block encoder for the Mali bridge's BC4/BC5 transcoding (bc_decode.comp, ENC_EAC). A
  * block is a base codeword, a multiplier and one of 16 modifier tables, each texel one of the

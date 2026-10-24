@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Device memory on the client side: the memory-type translation of physdev.c applied to every
  * allocation and requirement, and mapping of shared allocations (server_memory.c explains how
@@ -380,6 +381,13 @@ static void fix_reqs(vkb_device *dev, VkMemoryRequirements *r, int allow_shared)
     r->memoryTypeBits = vkb_mem_bits_to_client(dev->pd, r->memoryTypeBits, allow_shared);
 }
 
+/* Buffers: vkb_mem_buffer_bits_to_client (physdev.c) adds the shared types where the driver's
+ * mask has host-visible types but none of those (the XRing O3, issue #1). */
+static void fix_buf_reqs(vkb_device *dev, VkMemoryRequirements *r, int allow_shared)
+{
+    r->memoryTypeBits = vkb_mem_buffer_bits_to_client(dev->pd, r->memoryTypeBits, allow_shared);
+}
+
 static int buffer_shareable(vkb_device *dev, VkBuffer b)
 {
     return can_share(dev) && !vkb_map_get(&dev->unshared, (uint64_t)b);
@@ -395,7 +403,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetBufferMemoryRequirements(VkDevice device,
     vkb_device *dev = vkb_dev(device);
     if (rq_lookup(dev, buffer, pReq, NULL)) return;
     vkb_wire_vkGetBufferMemoryRequirements(device, buffer, pReq);
-    fix_reqs(dev, pReq, buffer_shareable(dev, buffer));
+    fix_buf_reqs(dev, pReq, buffer_shareable(dev, buffer));
     rq_store(dev, buffer, pReq, NULL);
 }
 
@@ -413,7 +421,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetBufferMemoryRequirements2(VkDevice device
     /* The cache keeps the driver's answer; the hint is applied to what the app gets. */
     if (!(plain && rq_lookup(dev, pInfo->buffer, &pReq->memoryRequirements, ded))) {
         vkb_wire_vkGetBufferMemoryRequirements2(device, pInfo, pReq);
-        fix_reqs(dev, &pReq->memoryRequirements, buffer_shareable(dev, pInfo->buffer));
+        fix_buf_reqs(dev, &pReq->memoryRequirements, buffer_shareable(dev, pInfo->buffer));
         if (plain) rq_store(dev, pInfo->buffer, &pReq->memoryRequirements, ded);
     }
     ded_hint(dev, pReq, ded_kept(dev, (uint64_t)pInfo->buffer));
@@ -439,9 +447,12 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceBufferMemoryRequirements(VkDevice d
                                                                       VkMemoryRequirements2 *pReq)
 {
     vkb_device *dev = vkb_dev(device);
-    if (!can_share(dev)) {
+    /* Asked of the buffer create_buffer would make: unshared without sharing or when sparse, else
+     * with the bridge's handle types (added to the app's own, if it has some) - they change the
+     * masks on the XRing O3. */
+    if (!can_share(dev) || (pInfo->pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)) {
         vkb_wire_vkGetDeviceBufferMemoryRequirements(device, pInfo, pReq);
-        fix_reqs(dev, &pReq->memoryRequirements, 0);
+        fix_buf_reqs(dev, &pReq->memoryRequirements, 0);
         ded_hint(dev, pReq, ded_external(pInfo->pCreateInfo->pNext));
         return;
     }
@@ -451,11 +462,20 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceBufferMemoryRequirements(VkDevice d
     int had = 0;
     for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci.pNext; b; b = b->pNext)
         had |= b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
-    if (!had) ci.pNext = &ext;
+    void *mem = NULL;
+    if (had) {
+        ci.pNext = vkb_chain_clone(ci.pNext, &mem);
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci.pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO)
+                ((VkExternalMemoryBufferCreateInfo *)b)->handleTypes |= dev->pd->info.buffer_handle_types;
+    } else {
+        ci.pNext = &ext;
+    }
     VkDeviceBufferMemoryRequirements info = *pInfo;
     info.pCreateInfo = &ci;
     vkb_wire_vkGetDeviceBufferMemoryRequirements(device, &info, pReq);
-    fix_reqs(dev, &pReq->memoryRequirements, 1);
+    free(mem);
+    fix_buf_reqs(dev, &pReq->memoryRequirements, 1);
     ded_hint(dev, pReq, ded_external(pInfo->pCreateInfo->pNext));
 }
 
@@ -657,7 +677,16 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateMemory(VkDevice device, const Vk
     }
     VkMemoryAllocateInfo ai = *pAllocateInfo;
     ai.memoryTypeIndex = pd->type_map[ct].server_type;
-    return alloc_memory(device, pAllocateInfo, ai, ct, pd->type_map[ct].shared, pd->type_map[ct].cached, pMemory);
+    VkResult r = alloc_memory(device, pAllocateInfo, ai, ct, pd->type_map[ct].shared, pd->type_map[ct].cached, pMemory);
+    /* Memory exported or imported as an fd: how a process without a swapchain of the bridge's
+     * shows its frames (nested gamescope, Xwayland, Zink under X), for the report (frames.c). */
+    for (const VkBaseInStructure *b = pAllocateInfo->pNext; b && r == VK_SUCCESS; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR ||
+            (b->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO && ((const VkExportMemoryAllocateInfo *)b)->handleTypes)) {
+            vkb_frames_external();
+            break;
+        }
+    return r;
 }
 
 /* The client's own readback memory (client/wsi.c): `size` bytes for `buffer` in the hidden cached

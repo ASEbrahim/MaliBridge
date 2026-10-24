@@ -13,8 +13,9 @@ srv=$root/server
 cc=$(ls -d "$ndk"/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android26-clang | head -1)
 [ -x "$cc" ] || { echo "no NDK clang under $ndk" >&2; exit 1; }
 mkdir -p "$out"
-# the build named in the startup probe's device profile and the session report
-git=$(git -C "$root" describe --always --dirty 2>/dev/null || echo unknown)
+# the build named in the startup probe's device profile and the session report: the nearest release
+# tag (lightweight ones count too, so a tag put on the built commit names it exactly)
+git=$(git -C "$root" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo unknown)
 "$cc" -O2 -g0 -fPIE -pie -Wall -Wno-unused-parameter -Wno-missing-field-initializers \
     -I"$root/third_party/Vulkan-Headers-1.4.341/include" -I"$root/common" -I"$root/common/gen" -I"$srv" \
     -Wl,-z,max-page-size=16384 -Wl,--build-id=none -DVKB_GIT="\"$git\"" \

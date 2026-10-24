@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * gpuview_check: the GPU as an app sees it - identity (vkGetPhysicalDeviceProperties and
  * Properties2 with VkPhysicalDeviceDriverProperties) and memory heaps (MemoryProperties and

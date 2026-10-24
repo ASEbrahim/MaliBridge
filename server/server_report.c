@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * The session report: one file a developer reads to know every issue a session hit, with what is
  * needed to reproduce each - <log dir>/malibridge-report.md for people and malibridge-report.json
@@ -81,6 +82,7 @@ typedef struct rp_proc {
     uint64_t compiles, compile_fail;
     double compile_ms, compile_max_ms;
     uint32_t hist[8];
+    uint64_t fb_built, fb_hits; /* with the driver's creation feedback: built, found in the pipeline cache */
     char slow[RP_SLOW][220];
     uint32_t nslow;
     char features[400], exts[600];
@@ -97,7 +99,20 @@ typedef struct rp_proc {
     char frames[700];
     double first_frame_s;
     double fps_p50;
+    /* from the same line (a newer client's): swapchains asked for, memory exported or imported as
+     * fds; -1: not said */
+    int swapchains;
+    long long external;
 } rp_proc;
+
+/* A process that shows its frames some other way than a swapchain of the bridge's: none asked
+ * for, and memory passed on as fds (nested gamescope to the outer compositor, Xwayland, Zink
+ * under X: steamwebhelper). The bridge does not see those frames; "no frame presented" would be
+ * wrong. */
+static int presents_elsewhere(const rp_proc *p)
+{
+    return p->swapchains == 0 && p->external > 0;
+}
 
 static pthread_mutex_t rlock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int in_report; /* our own log lines are not fed back in */
@@ -151,6 +166,8 @@ static rp_proc *proc_find(int pid, int make)
     p->pid = pid;
     p->avail_min_kb = -1;
     p->first_frame_s = -1;
+    p->swapchains = -1;
+    p->external = -1;
     return p;
 }
 
@@ -327,6 +344,19 @@ void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, Vk
                      r == VK_SUCCESS ? "built" : "failed", slow);
             dirty = 1;
         }
+    }
+    pthread_mutex_unlock(&rlock);
+}
+
+void vkb_report_cache_hits(vkb_srv_table *t, uint64_t built, uint64_t hits)
+{
+    if (!t || !t->proc || !rdir[0]) return;
+    pthread_mutex_lock(&rlock);
+    rp_proc *p = proc_find(t->proc->pid, 1);
+    if (p) {
+        p->fb_built += built;
+        p->fb_hits += hits;
+        dirty = 1;
     }
     pthread_mutex_unlock(&rlock);
 }
@@ -586,6 +616,10 @@ static void read_frames(void)
             if (tf > 0) pr->first_frame_s = tf - t0_mono;
             s = strstr(line, "fps_p50=");
             pr->fps_p50 = s ? atof(s + 8) : 0;
+            s = strstr(line, " swapchains=");
+            pr->swapchains = s ? atoi(s + 12) : -1;
+            s = strstr(line, " external=");
+            pr->external = s ? atoll(s + 10) : -1;
             if (!pr->comm[0] && (s = strstr(line, "comm="))) sscanf(s + 5, "%31s", pr->comm);
             dirty = 1;
         }
@@ -797,7 +831,8 @@ static int list_issues(FILE *f, int json)
         if (p->long_waits) issue(&is, "%s: %u GPU wait(s) longer than 2 s (longest %.1f s)", nm, p->long_waits, p->long_wait_max_ms / 1000.0);
         if (p->compile_fail) issue(&is, "%s: %llu pipeline(s) failed to build", nm, (unsigned long long)p->compile_fail);
         if (p->fps_p50 > 0 && p->fps_p50 < 20) issue(&is, "%s: low frame rate, median %.1f fps", nm, p->fps_p50);
-        if (p->devices && p->first_frame_s < 0 && p->t_device > 0 && (p->alive ? now_s() : p->t_gone) - p->t_device > 60)
+        if (p->devices && p->first_frame_s < 0 && p->t_device > 0 && !presents_elsewhere(p) &&
+            (p->alive ? now_s() : p->t_gone) - p->t_device > 60)
             issue(&is, "%s: a device for %.0f s and no frame presented", nm, (p->alive ? now_s() : p->t_gone) - p->t_device);
         if (p->samples && p->cpu_cap_min < 70) issue(&is, "%s: CPU clocks capped to %u%% of their maximum while it ran (thermal)", nm, p->cpu_cap_min);
         if (p->thermal_max >= 3) issue(&is, "%s: Android thermal status reached %d", nm, p->thermal_max);
@@ -950,6 +985,11 @@ static void write_md(FILE *f, int final)
         fprintf(f, "| GPU %d | %s, Vulkan %u.%u.%u to the server; memory sharing %s; missing 0x%x, emulating 0x%x |\n", i, k->name,
                 VK_API_VERSION_MAJOR(k->info.real_api_version), VK_API_VERSION_MINOR(k->info.real_api_version),
                 VK_API_VERSION_PATCH(k->info.real_api_version), vkb_mem_strategy_name(k->info.strategy), k->info.missing, k->info.emu);
+        uint32_t offered, drv;
+        const char *lacks;
+        if (vkb_promote_describe(k->uuid, &offered, &drv, &lacks) && (offered != drv || *lacks))
+            fprintf(f, "| GPU %d to apps | Vulkan %u.%u (version promotion, server_promote.c)%s%s |\n", i, VK_API_VERSION_MAJOR(offered),
+                    VK_API_VERSION_MINOR(offered), *lacks ? "; " : "", lacks);
     }
     fprintf(f, "\n## Bridge\n\nBuild `%s`, protocol `%016llx`. Cache directory `%s`.\n\n", VKB_GIT, (unsigned long long)VKB_PROTOCOL_HASH,
             vkb_pcache_dir() ? vkb_pcache_dir() : "(none)");
@@ -985,7 +1025,10 @@ static void write_md(FILE *f, int final)
             md_text(f, p->preset_note);
             fprintf(f, "\n");
         }
-        if (p->frames[0]) {
+        if (presents_elsewhere(p) && p->first_frame_s < 0) {
+            fprintf(f, "- frames: not through the bridge (no swapchain; %lld allocation(s) exported or imported as fds: it presents "
+                       "through a compositor or another path)\n", p->external);
+        } else if (p->frames[0]) {
             fprintf(f, "- frames: `");
             md_text(f, p->frames);
             fprintf(f, "`\n");
@@ -998,6 +1041,9 @@ static void write_md(FILE *f, int final)
                     (unsigned long long)p->compiles, p->compile_ms / 1000.0, p->compile_max_ms, (unsigned long long)p->compile_fail, p->hist[0],
                     p->hist[1], p->hist[2], p->hist[3], p->hist[4], p->hist[5], p->hist[6], p->hist[7]);
             for (uint32_t s = 0; s < p->nslow; s++) fprintf(f, "  - slow: %s\n", p->slow[s]);
+            if (p->fb_built)
+                fprintf(f, "  - pipeline cache: %llu of %llu found in it (%.0f%%; the driver's creation feedback)\n", (unsigned long long)p->fb_hits,
+                        (unsigned long long)p->fb_built, 100.0 * (double)p->fb_hits / (double)p->fb_built);
         }
         if (p->exts[0]) fprintf(f, "- device extensions it asked for that the driver lacks (emulated, aliased or client-side): %s\n", p->exts);
         if (p->features[0]) fprintf(f, "- features it enabled that the GPU lacks (emulated): %s\n", p->features);
@@ -1087,7 +1133,14 @@ static void write_json(FILE *f, int final)
         fprintf(f, ", \"api\": \"%u.%u.%u\", \"memory_sharing\": ", VK_API_VERSION_MAJOR(k->info.real_api_version), VK_API_VERSION_MINOR(k->info.real_api_version),
                 VK_API_VERSION_PATCH(k->info.real_api_version));
         js(f, vkb_mem_strategy_name(k->info.strategy));
-        fprintf(f, ", \"missing\": \"0x%x\", \"emulating\": \"0x%x\"}", k->info.missing, k->info.emu);
+        fprintf(f, ", \"missing\": \"0x%x\", \"emulating\": \"0x%x\"", k->info.missing, k->info.emu);
+        uint32_t offered, drv;
+        const char *lacks;
+        if (vkb_promote_describe(k->uuid, &offered, &drv, &lacks)) {
+            fprintf(f, ", \"offered_api\": \"%u.%u\", \"promotion_lacks\": ", VK_API_VERSION_MAJOR(offered), VK_API_VERSION_MINOR(offered));
+            js(f, lacks);
+        }
+        fprintf(f, "}");
     }
     fprintf(f, "],\n  \"probe\": ");
     vkb_probe_write_json(f);
@@ -1113,10 +1166,12 @@ static void write_json(FILE *f, int final)
                 p->alive ? "true" : "false", p->t_hello, p->devices ? p->t_device : -1.0, p->first_frame_s, p->alive ? -1.0 : p->t_gone, p->devices,
                 p->devices_failed);
         js(f, p->frames);
+        fprintf(f, ", \"presents_elsewhere\": %s", presents_elsewhere(p) ? "true" : "false");
         fprintf(f, ", \"fps_p50\": %.1f,\n     \"compiles\": %llu, \"compile_ms\": %.1f, \"compile_max_ms\": %.1f, \"compile_failed\": %llu, "
-                   "\"compile_hist\": [%u, %u, %u, %u, %u, %u, %u, %u], \"slow_compiles\": [",
+                   "\"compile_hist\": [%u, %u, %u, %u, %u, %u, %u, %u], \"feedback_built\": %llu, \"cache_hits\": %llu, \"slow_compiles\": [",
                 p->fps_p50, (unsigned long long)p->compiles, p->compile_ms, p->compile_max_ms, (unsigned long long)p->compile_fail, p->hist[0],
-                p->hist[1], p->hist[2], p->hist[3], p->hist[4], p->hist[5], p->hist[6], p->hist[7]);
+                p->hist[1], p->hist[2], p->hist[3], p->hist[4], p->hist[5], p->hist[6], p->hist[7], (unsigned long long)p->fb_built,
+                (unsigned long long)p->fb_hits);
         for (uint32_t s = 0; s < p->nslow; s++) {
             if (s) fprintf(f, ", ");
             js(f, p->slow[s]);

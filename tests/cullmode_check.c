@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * cullmode_check: a dynamic cull mode (vkCmdSetCullMode) must not cull points and lines (MK-16, Arm
  * erratum 3786517: Mali drivers below r52 do, and those draws vanish), and must still cull the

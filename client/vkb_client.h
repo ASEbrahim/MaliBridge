@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MaliBridge - client ICD (libvulkan_droidbridge.so, glibc).
  *
@@ -190,6 +191,8 @@ void *vkb_wrap(VkObjectType type, const void *parent, uint64_t remote);
 /* physdev.c */
 int vkb_physdev_ready(vkb_physdev *pd);
 uint32_t vkb_mem_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow_shared);
+/* a buffer's: also the shared types where its mask has host-visible types but none of them */
+uint32_t vkb_mem_buffer_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow_shared);
 
 /* memory.c */
 void vkb_memory_init_device(vkb_device *d);
@@ -223,5 +226,7 @@ int vkb_is_client_device_ext(const char *n);
 /* misc */
 int vkb_memfd(const char *name, size_t size);
 void vkb_frames_present(void); /* frames.c: frame statistics for the server's session report */
+void vkb_frames_swapchain(void); /* frames.c: a swapchain made */
+void vkb_frames_external(void);  /* frames.c: memory the app exported or imported as an fd */
 
 #endif

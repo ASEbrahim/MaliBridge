@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * planar_check: NV12 (G8_B8R8_2PLANE_420) textures as DXVK makes them for D3D11 - what Media
  * Foundation's H.264 decoder allocates its output samples as. DXVK creates every multi-planar

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * desc_limits_check: descriptor limits as vkd3d-proton's legacy bindless path wants them (1,000,000
  * sampled images, storage images and storage buffers per stage after bind) on a GPU with fewer

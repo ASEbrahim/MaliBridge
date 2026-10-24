@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Device extensions a newer driver may expose only under their promoted KHR name, while apps still
  * ask for the EXT one: same structures (aliased sTypes), enumerants and commands. Where the driver

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * pcache_check: compiles distinct compute pipelines (one shader, a different specialization map
  * per pipeline) for the persistent pipeline cache checks in host/pcache_test.sh. Every argument

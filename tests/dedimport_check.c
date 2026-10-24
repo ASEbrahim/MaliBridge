@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * dedimport_check: dma-buf imports with a dedicated-allocation struct (MK-39, dedicated_import).
  * Older Mali drivers fail or crash on an import (dma-buf, AHardwareBuffer, host pointer) that

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Feature emulation: entry point. What the GPU lacks and the bridge can make up for is decided
  * here per physical device; the client reports those features as present, the server strips
@@ -59,6 +60,7 @@ static const struct {
     {"push", {"VK_KHR_push_descriptor", NULL}},
     {"robustness2", {"VK_EXT_robustness2", "VK_KHR_robustness2"}},
     {"loadstorenone", {"VK_KHR_load_store_op_none", NULL}},
+    {"dynrend", {"VK_KHR_dynamic_rendering", NULL}},
 };
 
 /* A driver extension the clients are not shown: named in VKBRIDGE_FAKE_MISSING (as itself or
@@ -131,10 +133,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
     }
     uint32_t kept = 0;
     const char *erratum = vkb_errata_hidden_ext(t, pd);
+    /* Zink on a driver that needs the BGRA 10-10-10-2 emulation: its vertex formats at pipeline
+     * creation, where the vertex shader can be fitted to them (vkb_emu_bgr10_for). */
+    const vkb_srv_table *inst = t->is_device ? t->parent : t;
+    const vkb_pd_knowledge *k = inst && inst->zink ? vkb_pd_lookup(&t->real, pd) : NULL;
+    int hide_vi_dyn = k && (k->info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX));
     for (uint32_t i = 0; i < n; i++)
         if (!vkb_emu_ext_hidden(all[i].extensionName) && !(erratum && !strcmp(all[i].extensionName, erratum)) &&
-            !calts_hidden(all[i].extensionName))
+            !calts_hidden(all[i].extensionName) && !(hide_vi_dyn && !strcmp(all[i].extensionName, "VK_EXT_vertex_input_dynamic_state")))
             all[kept++] = all[i];
+    if (hide_vi_dyn) VKB_ONCE(VKB_LOG_INFO, "emulation: VK_EXT_vertex_input_dynamic_state hidden from Zink (packed vertex fetch emulated)");
     if (!props) {
         *count = kept;
         free(all);
@@ -202,11 +210,155 @@ void vkb_emu_instance_install(vkb_srv_table *t)
         }
         VKB_ONCE(VKB_LOG_INFO, "imitating Mali's refusal of extended usage on multi-planar formats (VKBRIDGE_FAKE_MISSING=planarext)");
     }
+    /* always: fp16_hide (MK-20) decides per query whether 16-bit floats are offered */
+    vkb_errata_fp16_instance_install(t);
     if (!t->real.vkEnumerateDeviceExtensionProperties) return;
     /* always: the driver errata hide by GPU and driver version (vkb_errata_hidden_ext) */
     t->dt.vkEnumerateDeviceExtensionProperties = hide_EnumerateDeviceExtensionProperties;
     if (vkb_emu_hiding_exts()) VKB_ONCE(VKB_LOG_INFO, "device extensions hidden from clients: VKBRIDGE_FAKE_MISSING=%s VKBRIDGE_SERVER_HIDE_EXTS=%s",
              fake_list() ? fake_list() : "", hide_list() ? hide_list() : "");
+}
+
+/* ------------------------------------------------------------------ robustness2 without its robust access */
+
+/*
+ * The Mali-G715 on r54p3 (Pixel 8 / 8 Pro / 8a, Android 17; driver 0x0d803000) has VK_EXT_robustness2
+ * with nullDescriptor but neither robustBufferAccess2 nor robustImageAccess2. DXVK 3 requires
+ * robustBufferAccess2 (dxvk_device_info.cpp, the robustness2 entries of the feature list) and drops
+ * an adapter without it; with no adapter left its DXGI factory is never made, so every D3D9-12 game
+ * fails at CreateDXGIFactory (E_FAIL): NieR's "No Graphic Memory", Dead Space's
+ * "CreateDXGIFactory1(IDXGIFactory4) E_FAIL", Steam's d3ddriverquery64 exit code 1. vkd3d-proton
+ * requires both (device.c, "Robustness2 features not supported").
+ * The bridge reports them (VKB_EMU_ROBUST2_ACCESS) and, as for the full robustness2 emulation,
+ * turns on the robustness the GPU has instead: core robustBufferAccess for robustBufferAccess2,
+ * robustImageAccess (Vulkan 1.3 / VK_EXT_image_robustness) for robustImageAccess2. What differs:
+ * an out-of-bounds read may give an in-bounds value rather than zero, and the bounds are the
+ * descriptor's range rounded as robustBufferAccess allows. Null descriptors stay the driver's own.
+ */
+int vkb_emu_robust2_driver(const vkb_dispatch *dt, VkPhysicalDevice pd, VkBool32 *buf, VkBool32 *img, VkBool32 *null_desc)
+{
+    *buf = *img = *null_desc = VK_FALSE;
+    if (!dt->vkGetPhysicalDeviceFeatures2) return 0;
+    VkPhysicalDeviceRobustness2FeaturesEXT r2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &r2};
+    dt->vkGetPhysicalDeviceFeatures2(pd, &f2);
+    *buf = r2.robustBufferAccess2;
+    *img = r2.robustImageAccess2;
+    *null_desc = r2.nullDescriptor;
+    return 1;
+}
+
+/* The app's robustness2 features in a device request (NULL: none) */
+static VkPhysicalDeviceRobustness2FeaturesEXT *robust2_request(const VkDeviceCreateInfo *ci)
+{
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) return (VkPhysicalDeviceRobustness2FeaturesEXT *)b;
+    return NULL;
+}
+
+int vkb_emu_robust2_image_stand_in(vkb_srv_table *inst, VkPhysicalDevice pd, uint32_t emu, const VkDeviceCreateInfo *ci)
+{
+    if (!(emu & VKB_EMU_ROBUST2_ACCESS)) return 0;
+    const VkPhysicalDeviceRobustness2FeaturesEXT *r = robust2_request(ci);
+    if (!r || !r->robustImageAccess2) return 0;
+    VkBool32 b, i, n;
+    return vkb_emu_robust2_driver(&inst->real, pd, &b, &i, &n) && !i;
+}
+
+/*
+ * VKBRIDGE_FAKE_MISSING=robust2access (host tests): that driver's robustness2 imitated. The feature
+ * query answers robustBufferAccess2 and robustImageAccess2 false, and a device that asks for
+ * either is refused with VK_ERROR_FEATURE_NOT_PRESENT, as a driver may.
+ */
+static struct {
+    PFN_vkGetInstanceProcAddr gipa;
+    PFN_vkGetPhysicalDeviceFeatures2 f2, f2khr;
+    PFN_vkCreateDevice create;
+} r2imit;
+
+static void r2imit_clear(void *next)
+{
+    for (VkBaseOutStructure *b = next; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
+            VkPhysicalDeviceRobustness2FeaturesEXT *r = (VkPhysicalDeviceRobustness2FeaturesEXT *)b;
+            r->robustBufferAccess2 = r->robustImageAccess2 = VK_FALSE;
+        }
+}
+
+static VKAPI_ATTR void VKAPI_CALL r2imit_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
+{
+    r2imit.f2(pd, f);
+    r2imit_clear(f->pNext);
+}
+
+static VKAPI_ATTR void VKAPI_CALL r2imit_GetPhysicalDeviceFeatures2KHR(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
+{
+    r2imit.f2khr(pd, f);
+    r2imit_clear(f->pNext);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL r2imit_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                          VkDevice *out)
+{
+    const VkPhysicalDeviceRobustness2FeaturesEXT *r = robust2_request(ci);
+    if (r && (r->robustBufferAccess2 || r->robustImageAccess2)) {
+        VKB_WARN("imitated robustness2: device refused (robustBufferAccess2 %u, robustImageAccess2 %u asked; the driver has neither)",
+                 r->robustBufferAccess2, r->robustImageAccess2);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    return r2imit.create(pd, ci, a, out);
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL r2imit_GetInstanceProcAddr(VkInstance inst, const char *n)
+{
+    PFN_vkVoidFunction f = r2imit.gipa(inst, n);
+    if (!f || !inst) return f;
+    if (!strcmp(n, "vkGetPhysicalDeviceFeatures2")) {
+        r2imit.f2 = (PFN_vkGetPhysicalDeviceFeatures2)f;
+        return (PFN_vkVoidFunction)r2imit_GetPhysicalDeviceFeatures2;
+    }
+    if (!strcmp(n, "vkGetPhysicalDeviceFeatures2KHR")) {
+        r2imit.f2khr = (PFN_vkGetPhysicalDeviceFeatures2)f;
+        return (PFN_vkVoidFunction)r2imit_GetPhysicalDeviceFeatures2KHR;
+    }
+    if (!strcmp(n, "vkCreateDevice")) {
+        r2imit.create = (PFN_vkCreateDevice)f;
+        return (PFN_vkVoidFunction)r2imit_CreateDevice;
+    }
+    return f;
+}
+
+PFN_vkGetInstanceProcAddr vkb_emu_imitate_gipa(PFN_vkGetInstanceProcAddr gipa)
+{
+    if (!vkb_emu_faked("robust2access")) return gipa;
+    r2imit.gipa = gipa;
+    VKB_INFO("imitating the Mali-G715 r54p3's robustness2: nullDescriptor only (VKBRIDGE_FAKE_MISSING=robust2access)");
+    return r2imit_GetInstanceProcAddr;
+}
+
+/* The driver offers VK_EXT_vertex_input_dynamic_state (VKBRIDGE_FAKE_MISSING=vidyn: as if not). */
+static int driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd)
+{
+    const char *fake = fake_list();
+    if (fake && token(fake, "vidyn")) return 0;
+    uint32_t n = 0;
+    d->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
+    VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));
+    if (!e) return 1;
+    d->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
+    int found = 0;
+    for (uint32_t i = 0; i < n && !found; i++) found = !strcmp(e[i].extensionName, "VK_EXT_vertex_input_dynamic_state");
+    free(e);
+    return found;
+}
+
+/* Whether this instance's clients get VKB_EMU_BGR10_VTX (the GPU needing it is the caller's check):
+ * where the driver offers VK_EXT_vertex_input_dynamic_state, only Zink, from which it is hidden. */
+int vkb_emu_bgr10_for(const vkb_srv_table *inst, VkPhysicalDevice pd)
+{
+    if (!inst) return 0;
+    if (inst->zink) return 1;
+    return !driver_vi_dyn(&inst->real, pd);
 }
 
 uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *missing)
@@ -217,7 +369,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
     VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));
     idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
-    int divisor = 0, depth_clip = 0, maint5 = 0, robust2 = 0, maint6 = 0, lson_khr = 0, lson_ext = 0, push = 0;
+    int divisor = 0, depth_clip = 0, maint5 = 0, robust2 = 0, maint6 = 0, lson_khr = 0, lson_ext = 0, push = 0, dynrend = 0, rp2 = 0;
     for (uint32_t i = 0; i < n; i++) {
         if (!strcmp(e[i].extensionName, "VK_EXT_vertex_attribute_divisor") ||
             !strcmp(e[i].extensionName, "VK_KHR_vertex_attribute_divisor"))
@@ -229,6 +381,8 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (!strcmp(e[i].extensionName, "VK_KHR_push_descriptor")) push = 1;
         if (!strcmp(e[i].extensionName, "VK_KHR_load_store_op_none")) lson_khr = 1;
         if (!strcmp(e[i].extensionName, "VK_EXT_load_store_op_none")) lson_ext = 1;
+        if (!strcmp(e[i].extensionName, "VK_KHR_dynamic_rendering")) dynrend = 1;
+        if (!strcmp(e[i].extensionName, "VK_KHR_create_renderpass2")) rp2 = 1;
     }
     free(e);
     /* VKBRIDGE_FAKE_MISSING=bc,divisor,clip,cull,depthclip pretends the GPU lacks them (host tests);
@@ -249,6 +403,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (token(fake, "maint6")) maint6 = 0;
         if (token(fake, "push")) push = 0;
         if (token(fake, "loadstorenone")) lson_khr = 0;
+        if (token(fake, "dynrend")) dynrend = 0;
     }
     uint32_t emu = 0;
     VkPhysicalDeviceProperties props;
@@ -279,6 +434,22 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
      * (robustBufferAccess2, robustImageAccess2, nullDescriptor) without enforcing it, and DXVK
      * games run - out-of-bounds reads and null descriptors are then up to the driver. */
     if (!robust2 && f.robustBufferAccess && !env_off("VKBRIDGE_EMU_ROBUSTNESS2")) emu |= VKB_EMU_ROBUSTNESS2;
+    /* The driver's robustness2 without robustBufferAccess2 / robustImageAccess2 (Mali-G715 r54p3):
+     * those two reported, the driver's null descriptors kept (vkb_emu_robust2_driver). */
+    int r2_partial = 0;
+    if (robust2 && props.apiVersion >= VK_API_VERSION_1_1) {
+        VkBool32 rb, ri, rn;
+        if (vkb_emu_robust2_driver(idt, pd, &rb, &ri, &rn) && (!rb || !ri)) {
+            r2_partial = 1;
+            int on = rn && f.robustBufferAccess && !env_off("VKBRIDGE_EMU_ROBUST2ACCESS");
+            if (on) emu |= VKB_EMU_ROBUST2_ACCESS;
+            VKB_ONCE(VKB_LOG_INFO, "robustness2: the driver's has robustBufferAccess2 %u, robustImageAccess2 %u, nullDescriptor %u; %s", rb, ri,
+                     rn, on ? "the missing ones reported, the GPU's own robustness on in their place (DXVK 3 and vkd3d-proton require them)"
+                     : !rn ? "not reported (no nullDescriptor either)"
+                     : !f.robustBufferAccess ? "not reported (no robustBufferAccess to stand in)"
+                     : "not reported (VKBRIDGE_EMU_ROBUST2ACCESS=0): DXVK 3 and vkd3d-proton will not use this GPU");
+        }
+    }
     /* dma-buf export of images (gamescope's nested backend needs it): emulated with dma-heap pages
      * where the driver imports dma-bufs into images but exports none (Mali). */
     if (!env_off("VKBRIDGE_EMU_DMABUF_EXPORT") && vkb_mem_dmaheap_available()) {
@@ -315,6 +486,44 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (!maint6 && (props.apiVersion < VK_API_VERSION_1_4 || (fake && token(fake, "maint6"))) && !env_off("VKBRIDGE_EMU_MAINT6"))
         emu |= VKB_EMU_MAINT6;
     if (!lson_khr && lson_ext) emu |= VKB_EMU_LOADSTORE_NONE;
+    /* Zink (Mesa 25 and later: Steam's UI, every OpenGL game) refuses a device without dynamic
+     * rendering; Mali's Vulkan 1.1 drivers (r32p1) lack it. Renderings become render passes
+     * (server_emu_dynrend.c), made with vkCreateRenderPass2 (core in 1.2, an extension before). */
+    int dynrend_missing = !dynrend && (props.apiVersion < VK_API_VERSION_1_3 || (fake && token(fake, "dynrend")));
+    if (dynrend_missing && (rp2 || props.apiVersion >= VK_API_VERSION_1_2) && !env_off("VKBRIDGE_EMU_DYNREND")) emu |= VKB_EMU_DYN_RENDER;
+    /* Zink offers OpenGL 3.3 only with GL_ARB_vertex_type_2_10_10_10_rev, which wants every packed
+     * 10-10-10-2 vertex format. Mali (G720 r44p1, G68, G57, G925 ...) lacks the BGRA signed one,
+     * A2R10G10B10_SNORM_PACK32, and has A2B10G10R10_SNORM: Zink stopped at OpenGL 3.2, and LÖVE 12 and
+     * Godot 3 games would not start ("does not support any of the supported OpenGL versions", issue #5).
+     * Fetched as the RGBA format, with red and blue swapped where the vertex shader reads it
+     * (server_emu_shader.c). A format set at record time (VK_EXT_vertex_input_dynamic_state, r48 and
+     * later; below r48 the errata hide it) cannot reach the shader: on such a driver the extension is
+     * hidden from Zink, which then takes its formats at pipeline creation, and every other client
+     * keeps the extension and goes without the emulation (vkb_emu_bgr10_for). */
+    /* (r32p1 lacks the BGRA USCALED and SSCALED ones too) */
+    int bgr10_missing = 0;
+    static const VkFormat bgr10[] = {VK_FORMAT_A2R10G10B10_SNORM_PACK32, VK_FORMAT_A2R10G10B10_USCALED_PACK32,
+                                     VK_FORMAT_A2R10G10B10_SSCALED_PACK32};
+    for (size_t i = 0; i < sizeof(bgr10) / sizeof(bgr10[0]); i++) {
+        VkFormatProperties bgr, rgb;
+        idt->vkGetPhysicalDeviceFormatProperties(pd, bgr10[i], &bgr);
+        idt->vkGetPhysicalDeviceFormatProperties(pd, vkb_bgr10_rgba(bgr10[i]), &rgb);
+        if (fake && token(fake, "bgr10vtx")) bgr.bufferFeatures &= ~(VkFormatFeatureFlags)VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+        bgr10_missing |= !(bgr.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) && (rgb.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+    }
+    if (bgr10_missing && !env_off("VKBRIDGE_EMU_BGR10VTX")) emu |= VKB_EMU_BGR10_VTX; /* per client: vkb_emu_bgr10_for */
+    /* B10G11R11_UFLOAT vertex fetch: Mali before r49 (G720/G615 r44, G610/G710 r32, G57/G68 r38) lacks it,
+     * and Zink offers OpenGL 4.4 only with GL_ARB_vertex_type_10f_11f_11f_rev. Fetched as R32_UINT and
+     * unpacked in the vertex shader (server_emu_shader.c), with the same per-client rule as above. */
+    int uf11_missing = 0;
+    {
+        VkFormatProperties uf, u32;
+        idt->vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &uf);
+        idt->vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_R32_UINT, &u32);
+        if (fake && token(fake, "uf11vtx")) uf.bufferFeatures &= ~(VkFormatFeatureFlags)VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+        uf11_missing = !(uf.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) && (u32.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+    }
+    if (uf11_missing && !env_off("VKBRIDGE_EMU_UF11VTX")) emu |= VKB_EMU_UF11_VTX;
     /* vkd3d-proton (every D3D12 game) refuses a device without push descriptors (Vulkan 1.4 has them). */
     if (!push && (props.apiVersion < VK_API_VERSION_1_4 || (fake && token(fake, "push"))) && !env_off("VKBRIDGE_EMU_PUSH")) emu |= VKB_EMU_PUSH_DESC;
     /* vkd3d-proton 3 refuses a device whose storage texel buffers need more than texel alignment
@@ -351,12 +560,16 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (!depth_clip) miss |= VKB_EMU_DEPTH_CLIP;
     if (emu & VKB_EMU_MAINT5) miss |= VKB_EMU_MAINT5;
     if (!robust2) miss |= VKB_EMU_ROBUSTNESS2;
+    if (r2_partial) miss |= VKB_EMU_ROBUST2_ACCESS;
     if (!f.dualSrcBlend) miss |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid) miss |= VKB_EMU_FILL_MODE;
     if (!f.multiViewport) miss |= VKB_EMU_MULTI_VIEWPORT;
     if (!f.multiDrawIndirect) miss |= VKB_EMU_MULTI_DRAW;
     if (emu & VKB_EMU_MAINT6) miss |= VKB_EMU_MAINT6;
     if (emu & VKB_EMU_PUSH_DESC) miss |= VKB_EMU_PUSH_DESC;
+    if (dynrend_missing) miss |= VKB_EMU_DYN_RENDER;
+    if (bgr10_missing) miss |= VKB_EMU_BGR10_VTX;
+    if (uf11_missing) miss |= VKB_EMU_UF11_VTX;
     if (!texel_single) miss |= VKB_EMU_TEXEL_ALIGN;
     if (desc_short) miss |= VKB_EMU_DESC_LIMITS;
     *missing = miss;
@@ -440,12 +653,30 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
     if (emu & VKB_EMU_DEPTH_CLIP) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
     if (emu & VKB_EMU_MAINT5) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES);
     if (emu & VKB_EMU_MAINT6) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES);
+    if (emu & VKB_EMU_DYN_RENDER) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES);
     if (emu & VKB_EMU_ROBUSTNESS2) {
         chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
         /* What robustness the GPU has stays on; robustBufferAccess2 asks for at least that. */
         VkPhysicalDeviceFeatures *rf = find_features(ci);
         const char *nr = vkb_srv_env("VKBRIDGE_NO_FORCED_ROBUSTNESS");
         if (rf && !(nr && *nr && strcmp(nr, "0"))) rf->robustBufferAccess = VK_TRUE;
+    }
+    VkPhysicalDeviceRobustness2FeaturesEXT *r2 = (emu & VKB_EMU_ROBUST2_ACCESS) ? robust2_request(ci) : NULL;
+    if (r2) {
+        /* What the driver lacks is taken off; robustBufferAccess2 asks for at least core robust
+         * buffer access (robustImageAccess2's stand-in: server_instance.c). */
+        VkBool32 hb, hi, hn;
+        vkb_emu_robust2_driver(&inst->real, pd, &hb, &hi, &hn);
+        int wb = r2->robustBufferAccess2 && !hb, wi = r2->robustImageAccess2 && !hi;
+        if (wb) r2->robustBufferAccess2 = VK_FALSE;
+        if (wi) r2->robustImageAccess2 = VK_FALSE;
+        VkPhysicalDeviceFeatures *rf = find_features(ci);
+        const char *nr = vkb_srv_env("VKBRIDGE_NO_FORCED_ROBUSTNESS");
+        int forced = wb && rf && !(nr && *nr && strcmp(nr, "0"));
+        if (forced) rf->robustBufferAccess = VK_TRUE;
+        if (wb || wi)
+            VKB_INFO("vkCreateDevice: robustness2's%s%s taken off (the driver lacks them; VKB_EMU_ROBUST2_ACCESS)%s",
+                     wb ? " robustBufferAccess2" : "", wi ? " robustImageAccess2" : "", forced ? "; robustBufferAccess on" : "");
     }
 }
 

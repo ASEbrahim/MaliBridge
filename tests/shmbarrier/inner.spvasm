@@ -1,0 +1,56 @@
+; shm_barrier: a write and a read inside one if (no control barrier allowed there: a memory barrier), then a top-level read (a control barrier).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %lid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %lid BuiltIn LocalInvocationIndex
+               OpDecorate %Buf Block
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_4 = OpConstant %uint 4
+    %uint_16 = OpConstant %uint 16
+    %uint_63 = OpConstant %uint 63
+    %uint_64 = OpConstant %uint 64
+        %arr = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %arr
+       %pBuf = OpTypePointer StorageBuffer %Buf
+        %pSB = OpTypePointer StorageBuffer %uint
+        %buf = OpVariable %pBuf StorageBuffer
+        %pIn = OpTypePointer Input %uint
+        %lid = OpVariable %pIn Input
+       %sarr = OpTypeArray %uint %uint_64
+       %pWGa = OpTypePointer Workgroup %sarr
+        %pWG = OpTypePointer Workgroup %uint
+         %sh = OpVariable %pWGa Workgroup
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %i = OpLoad %uint %lid
+          %c = OpULessThan %bool %i %uint_16
+               OpSelectionMerge %m None
+               OpBranchConditional %c %t %m
+          %t = OpLabel
+          %p = OpAccessChain %pWG %sh %i
+               OpStore %p %i
+          %j = OpBitwiseXor %uint %i %uint_1
+          %q = OpAccessChain %pWG %sh %j
+          %v = OpLoad %uint %q
+          %o = OpAccessChain %pSB %buf %uint_0 %i
+               OpStore %o %v
+               OpBranch %m
+          %m = OpLabel
+          %k = OpIAdd %uint %i %uint_4
+         %k2 = OpBitwiseAnd %uint %k %uint_63
+          %r = OpAccessChain %pWG %sh %k2
+          %w = OpLoad %uint %r
+         %o2 = OpAccessChain %pSB %buf %uint_0 %k
+               OpStore %o2 %w
+               OpReturn
+               OpFunctionEnd

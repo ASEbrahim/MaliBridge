@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * procaddr_check: what vkGetInstanceProcAddr and vkGetDeviceProcAddr give for extension commands,
  * and that calling what they give is safe. Lee Gao's finding (Droid-Deck/DroidDeck#165): on a Mali

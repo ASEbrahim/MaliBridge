@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Loader interface, instances, physical devices, devices and queues.
  */
@@ -77,6 +78,16 @@ int vkb_physdev_has_ext(VkPhysicalDevice p, const char *list)
     return any_listed(list, pd_has, pd);
 }
 
+/* Core commands the server gives a device below their version. Zink (Mesa 26.2) binds vertex
+ * buffers with vkCmdBindVertexBuffers2 on every device, also below Vulkan 1.3 and without
+ * VK_EXT_extended_dynamic_state (strides NULL then); with no such command it calls a null pointer
+ * at its first draw. Where the server emulates dynamic rendering (Mali's Vulkan 1.1 drivers, for
+ * Zink) it has that one as vkCmdBindVertexBuffers when the driver lacks it (server_emu_dynrend.c). */
+static int beyond_version(const vkb_device *dev, const char *name)
+{
+    return dev->pd && (dev->pd->info.emu & VKB_EMU_DYN_RENDER) && !strcmp(name, "vkCmdBindVertexBuffers2");
+}
+
 PFN_vkVoidFunction vkb_lookup_proc(const char *name, int level_max, vkb_device *dev, vkb_instance *inst)
 {
     (void)inst;
@@ -87,7 +98,7 @@ PFN_vkVoidFunction vkb_lookup_proc(const char *name, int level_max, vkb_device *
         if (p->level != VKB_LEVEL_DEVICE) return NULL;
         if (dev && p->ext && !any_listed(p->ext, dev_has, dev)) return NULL;
         /* Core commands newer than the device's Vulkan version do not exist for it. */
-        if (dev && p->core && p->core > dev->api_version) return NULL;
+        if (dev && p->core && p->core > dev->api_version && !beyond_version(dev, name)) return NULL;
     }
     return p->fn;
 }

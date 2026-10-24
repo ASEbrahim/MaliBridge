@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Polygon mode LINE and POINT (wireframe, D3D's FILL_WIREFRAME / D3DFILL_POINT) on a GPU without
  * fillModeNonSolid (Mali-G720 on r44). DXVK 3 will not start without the feature, so it is

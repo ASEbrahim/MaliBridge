@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * The MK-03 pass (server/spirv_bitwise.c) over a corpus of SPIR-V modules:
  *   bitwise_corpus [-a] [-q] outdir file.spv... | @list (one path a line)

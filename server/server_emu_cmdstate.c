@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * What an app has bound in a command buffer, for emulations that record commands of their own
  * into it (the BCn decoder's dispatches) and must leave the app's state as it was: the compute
@@ -48,6 +49,7 @@ typedef struct cb_state {
     void *gfx;            /* graphics-side state (divisor emulation) */
     void *bcn;            /* the BC decoder's scratch buffers (server_emu_bcn.c) */
     void *poly;           /* polygon-mode emulation (server_emu_polygon.c) */
+    void *dynrend;        /* the framebuffers of emulated renderings (server_emu_dynrend.c) */
     uint32_t begin_flags; /* VkCommandBufferUsageFlags of the last begin */
     int secondary;        /* allocated at VK_COMMAND_BUFFER_LEVEL_SECONDARY */
     /* Descriptor sets emulations record with (no push descriptors), alive until the next begin. */
@@ -156,6 +158,14 @@ void *vkb_emu_cb_poly(vkb_emu_device *e, VkCommandBuffer cb, size_t size)
     return c->poly;
 }
 
+/* The dynamic rendering emulation's framebuffer list of cb, made when there is none. */
+void *vkb_emu_cb_dynrend(vkb_emu_device *e, VkCommandBuffer cb, size_t size)
+{
+    cb_state *c = get(e, cb);
+    if (!c->dynrend) c->dynrend = calloc(1, size);
+    return c->dynrend;
+}
+
 /* What the app made cb with and began it with: its pool (VK_NULL_HANDLE when unseen), its level. */
 VkCommandPool vkb_emu_cb_origin(vkb_emu_device *e, VkCommandBuffer cb, int *secondary, uint32_t *begin_flags)
 {
@@ -179,6 +189,7 @@ static void reset(vkb_emu_device *e, cb_state *c)
     vkb_emu_gfx_reset(c->gfx);
     vkb_emu_bcn_cb_release(e, c->bcn);
     vkb_emu_polygon_cb_reset(e, c->cb, c->pool, &c->poly);
+    vkb_emu_dynrend_cb_reset(e, c->dynrend);
 }
 
 static void destroy(vkb_emu_device *e, cb_state *c)
@@ -192,6 +203,7 @@ static void destroy(vkb_emu_device *e, cb_state *c)
     vkb_emu_gfx_free(c->gfx);
     free(c->bcn);
     vkb_emu_polygon_cb_free(e, c->poly);
+    vkb_emu_dynrend_cb_free(e, c->dynrend);
     free(c);
 }
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * BC1-BC7 textures on a GPU without them (textureCompressionBC missing; DXVK and vkd3d-proton
  * refuse such a device). The image the app creates in a BC format is created decoded instead
@@ -40,9 +41,9 @@
 #include <time.h>
 
 /* FAM_BC1_16: BC1 UNORM decoded to 16 bits (vkb_bc_packed_format), a decoder variant, not a family;
- * TX_*: the transcoders (TX_BC1 + family). */
+ * TX_*: the transcoders (TX_BC1 + family); TX6_* / TX8_*: into ASTC 6x6 / 8x8 (VKBRIDGE_BC_ASTC_BLOCK). */
 enum { FAM_BC1, FAM_BC2, FAM_BC3, FAM_BC4, FAM_BC5, FAM_BC6H, FAM_BC7, FAM_BC1_16, TX_BC1, TX_BC2, TX_BC3, TX_BC4, TX_BC5,
-       TX_BC6H, TX_BC7, FAM_COUNT };
+       TX_BC6H, TX_BC7, TX6_BC2, TX6_BC3, TX6_BC7, TX8_BC2, TX8_BC3, TX8_BC7, FAM_COUNT };
 #define BC_INDEX(f) ((f) - VK_FORMAT_BC1_RGB_UNORM_BLOCK)
 
 /* Scratch: chunks of 1-16 MiB; one command buffer holds up to CB_MAX before it reuses its own
@@ -89,6 +90,7 @@ typedef struct bcn_state {
     VkPhysicalDeviceMemoryProperties mp;
     int packed_ok[2];        /* R5G6B5, A1R5G5B5 can hold BC1 UNORM */
     VkFormat tx[16];         /* per BC format (BC_INDEX): what it is transcoded to, UNDEFINED: decoded */
+    uint32_t astc_n;         /* VKBRIDGE_BC_ASTC_BLOCK: 4, 6 or 8 (BC2 / BC3 / BC7's ASTC target) */
     uint32_t quality;        /* the transcoders' search (bc_decode.comp's BC_QUALITY): 0 fast, 1 default, 2 high,
                               * QUALITY_AUTO: fast for large mip levels, default for the rest (level_quality) */
     pthread_mutex_t lock;
@@ -108,6 +110,7 @@ typedef struct pc_t {
     uint32_t src_word, row_blocks, layer_blocks, flags;
     uint32_t dst_word, pad;
     uint32_t extent[2];
+    uint32_t nx[4]; /* ASTC 6x6 / 8x8 transcoders only (bc_decode.comp ENC_ASTCN) */
 } pc_t;
 
 static void prebuild(vkb_emu_device *e, int fam);
@@ -140,8 +143,13 @@ static uint32_t family_flags(const vkb_emu_image *img)
  * BC1's 4 bits a texel), BC2 / BC3 / BC7 -> ASTC 4x4 (8 bits like them, and better than ETC2
  * RGBA8 at BC7's colours), BC4 -> EAC R11, BC5 -> EAC RG11 (BC4/BC5's sizes, 11-bit), BC6H (UFLOAT
  * and SFLOAT) -> ASTC 4x4 HDR (8 bits, half floats; no negative values, which SFLOAT loses). */
-static VkFormat tx_target(VkFormat f)
+static VkFormat tx_target(VkFormat f, uint32_t n)
 {
+    int srgb = f == VK_FORMAT_BC2_SRGB_BLOCK || f == VK_FORMAT_BC3_SRGB_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
+    int astc = (f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC3_SRGB_BLOCK) || f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
+    if ((n == 6 || n == 8) && astc)
+        return n == 6 ? (srgb ? VK_FORMAT_ASTC_6x6_SRGB_BLOCK : VK_FORMAT_ASTC_6x6_UNORM_BLOCK)
+                      : (srgb ? VK_FORMAT_ASTC_8x8_SRGB_BLOCK : VK_FORMAT_ASTC_8x8_UNORM_BLOCK);
     switch (f) {
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
@@ -168,6 +176,8 @@ static int tx_class(VkFormat t)
     case VK_FORMAT_EAC_R11_UNORM_BLOCK: case VK_FORMAT_EAC_R11_SNORM_BLOCK: return 4;
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK: case VK_FORMAT_EAC_R11G11_SNORM_BLOCK: return 5;
     case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK: return 6;
+    case VK_FORMAT_ASTC_6x6_UNORM_BLOCK: case VK_FORMAT_ASTC_6x6_SRGB_BLOCK: return 7;
+    case VK_FORMAT_ASTC_8x8_UNORM_BLOCK: case VK_FORMAT_ASTC_8x8_SRGB_BLOCK: return 8;
     default: return 0;
     }
 }
@@ -191,6 +201,33 @@ static uint32_t transcode_quality(void)
     if (!strcmp(v, "high")) return 2;
     VKB_WARN("BC emulation: VKBRIDGE_BC_TRANSCODE_QUALITY=%s unknown (auto, fast, default, high): auto", v);
     return QUALITY_AUTO;
+}
+
+/* VKBRIDGE_BC_ASTC_BLOCK: the ASTC block BC2 / BC3 / BC7 are transcoded to - 4x4 (the default: 8
+ * bits a texel, as BC2 / BC3 / BC7), 6x6 (3.56 bits) or 8x8 (2 bits): 2.25 or 4 times less memory
+ * for those textures, at a cost in detail (bcn_check measures it). BC1 stays ETC2 (its cut-out
+ * alpha lost too much in 8x8 blocks: 20 dB), BC4 / BC5 EAC, BC6H ASTC 4x4 HDR. ASTC 6x6 and 8x8
+ * are in every GPU's ASTC LDR (textureCompressionASTC_LDR names all block sizes); the format's
+ * features are checked like the others'. */
+static uint32_t astc_block(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_BC_ASTC_BLOCK"); /* <cache dir>/env and presets too */
+    if (!v || !*v) return 4;
+    uint32_t n = !strcmp(v, "6x6") ? 6 : !strcmp(v, "8x8") ? 8 : !strcmp(v, "4x4") ? 4 : 0;
+    if (!n) {
+        VKB_WARN("BC emulation: VKBRIDGE_BC_ASTC_BLOCK=%s unknown (4x4, 6x6, 8x8): 4x4", v);
+        return 4;
+    }
+    return n;
+}
+
+/* The transcoder of a BC family into a target format. */
+static int tx_family(int fam, VkFormat target)
+{
+    uint32_t n = vkb_tx_block_dim(target);
+    if (n == 4) return TX_BC1 + fam;
+    int base = n == 6 ? TX6_BC2 : TX8_BC2;
+    return fam == FAM_BC2 ? base : fam == FAM_BC3 ? base + 1 : base + 2;
 }
 
 /* auto: mip levels of AUTO_FAST_TEXELS texels or more (1024x1024, 2048x512, ...) are encoded fast,
@@ -313,6 +350,10 @@ static VkFormat sibling(VkFormat f)
     case VK_FORMAT_EAC_R11_SNORM_BLOCK: return VK_FORMAT_EAC_R11_UNORM_BLOCK;
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK: return VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
     case VK_FORMAT_EAC_R11G11_SNORM_BLOCK: return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_6x6_UNORM_BLOCK: return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
+    case VK_FORMAT_ASTC_6x6_SRGB_BLOCK: return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_8x8_UNORM_BLOCK: return VK_FORMAT_ASTC_8x8_SRGB_BLOCK;
+    case VK_FORMAT_ASTC_8x8_SRGB_BLOCK: return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
     default: return f;
     }
 }
@@ -400,7 +441,7 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci)
             if (k == n && n < sizeof(list) / sizeof(list[0])) list[n++] = f;
         }
     }
-    if (e->bcn) prebuild(e, tx ? TX_BC1 + family(client) : packed ? FAM_BC1_16 : family(client));
+    if (e->bcn) prebuild(e, tx ? tx_family(family(client), tx) : packed ? FAM_BC1_16 : family(client));
     ci->format = view;
     ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
     if (n == 1) ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -433,7 +474,8 @@ VkFormat vkb_emu_bcn_view_format(vkb_emu_device *e, VkImage image, VkFormat requ
     /* A 16-bit image has no other view formats (packed_format); a transcoded one only those of its
      * class (tx_format). */
     if (vkb_is_bc(requested) && bc && vkb_tx_block_bytes(r->format)) {
-        VkFormat t = tx_target(requested);
+        const bcn_state *s = e->bcn;
+        VkFormat t = s ? s->tx[BC_INDEX(requested)] : VK_FORMAT_UNDEFINED;
         return tx_class(t) == tx_class(r->format) ? t : r->format;
     }
     if (vkb_is_bc(requested)) return bc && vkb_bc_is_packed(r->format) ? r->format : vkb_bc_view_format(requested);
@@ -596,29 +638,63 @@ void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch)
 
 static const uint32_t *const fam_code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
                                                     spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
-                                                    spv_bc7_astc};
+                                                    spv_bc7_astc, spv_bc2_astc6, spv_bc3_astc6, spv_bc7_astc6, spv_bc2_astc8,
+                                                    spv_bc3_astc8, spv_bc7_astc8};
 static const size_t fam_size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), sizeof(spv_bc3), sizeof(spv_bc4), sizeof(spv_bc5),
                                            sizeof(spv_bc6h), sizeof(spv_bc7), sizeof(spv_bc1_16), sizeof(spv_bc1_etc2),
                                            sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac),
-                                           sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc)};
+                                           sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc), sizeof(spv_bc2_astc6), sizeof(spv_bc3_astc6),
+                                           sizeof(spv_bc7_astc6), sizeof(spv_bc2_astc8), sizeof(spv_bc3_astc8), sizeof(spv_bc7_astc8)};
 
 /* Builds the decoder or transcoder for fam at quality q, through the device's persistent pipeline
  * cache (server_pcache.c): Mali takes hundreds of ms over some transcoders, and without the cache
  * every process paid that again. */
+/* The transcoders' search, BC_QUALITY (specialization constant 0, default 1), written into a copy of
+ * the code as that constant's default instead of passed as a specialization: Mali compilers have
+ * taken specializations wrong (the spec_select probe: DXVK's guard folded at the defaults), and on
+ * the Dimensity 9500's G1-Ultra (r54p1) every texture of 1024x1024 or more - the ones auto quality
+ * gives the fast search, BC_QUALITY 0 - came out as blocks of noise while smaller ones were right
+ * (Library of Ruina, Lobotomy Corporation; DroidDeck#218). With the value as the default the driver
+ * has nothing to specialize. NULL: no constant 0 found (code returned unchanged then). */
+static uint32_t *bake_quality(const uint32_t *code, size_t size, uint32_t q)
+{
+    size_t n = size / 4;
+    uint32_t id = 0;
+    for (size_t i = 5; i < n && !id;) {
+        uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
+        if (!len) return NULL;
+        if (op == 71 /* OpDecorate */ && len >= 4 && code[i + 2] == 1 /* SpecId */ && code[i + 3] == 0) id = code[i + 1];
+        i += len;
+    }
+    for (size_t i = 5; id && i < n;) {
+        uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
+        if (!len) break;
+        if (op == 50 /* OpSpecConstant */ && len == 4 && code[i + 2] == id) {
+            uint32_t *w = malloc(size);
+            if (!w) return NULL;
+            memcpy(w, code, size);
+            w[i + 3] = q;
+            return w;
+        }
+        i += len;
+    }
+    return NULL;
+}
+
 static VkPipeline build(vkb_emu_device *e, int fam, uint32_t q, int bg)
 {
     const vkb_dispatch *r = &e->dev->real;
     VkDevice d = e->dev->device;
-    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fam_size[fam], fam_code[fam]};
+    uint32_t *baked = fam >= TX_BC1 && q != 1 && fam_code[fam] ? bake_quality(fam_code[fam], fam_size[fam], q) : NULL;
+    if (fam >= TX_BC1 && q != 1 && !baked) VKB_WARN("BC emulation: transcoder %d has no BC_QUALITY constant to set; built at its default", fam);
+    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fam_size[fam], baked ? baked : fam_code[fam]};
     VkShaderModule m;
-    if (!fam_code[fam] || r->vkCreateShaderModule(d, &mci, NULL, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkResult mr = fam_code[fam] ? r->vkCreateShaderModule(d, &mci, NULL, &m) : VK_ERROR_INITIALIZATION_FAILED;
+    free(baked);
+    if (mr != VK_SUCCESS) return VK_NULL_HANDLE;
     VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    /* the transcoders' search: BC_QUALITY, specialization constant 0 (left at its default of 1
-     * when that is asked for) */
-    const VkSpecializationMapEntry me = {0, 0, sizeof(uint32_t)};
-    const VkSpecializationInfo si = {1, &me, sizeof(uint32_t), &q};
     pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
-                                                  VK_SHADER_STAGE_COMPUTE_BIT, m, "main", q != 1 ? &si : NULL};
+                                                  VK_SHADER_STAGE_COMPUTE_BIT, m, "main", NULL};
     pci.layout = ((bcn_state *)e->bcn)->layout;
     VkPipeline p;
     struct timespec t0, t1;
@@ -687,7 +763,7 @@ static void prebuild(vkb_emu_device *e, int fam)
     if (!s->warm_all) {
         __atomic_store_n(&s->warm_all, 1, __ATOMIC_RELEASE);
         for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++)
-            if (s->tx[BC_INDEX(f)]) queue_family(e, TX_BC1 + family(f), 0);
+            if (s->tx[BC_INDEX(f)]) queue_family(e, tx_family(family(f), s->tx[BC_INDEX(f)]), 0);
     }
     pthread_mutex_unlock(&s->plock);
 }
@@ -810,6 +886,7 @@ typedef struct upload {
     vkb_emu_image *img;
     VkImageLayout layout;
     uint32_t ob, block_bytes;  /* bytes of a block in the scratch (decoded or transcoded), in the source */
+    uint32_t n_dim;          /* texels a side of an output block: 4, or 6 / 8 for ASTC 6x6 / 8x8 */
     VkDeviceSize left;       /* scratch the rest of the upload needs (sizes new chunks) */
     VkBuffer *bufs;          /* decoded, waiting to be copied into the image */
     VkBufferImageCopy *copies;
@@ -895,6 +972,8 @@ static int slot(upload *u, VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
     }
 }
 
+static void queue_copy(upload *u, VkBuffer buf, const VkBufferImageCopy *c);
+
 /* Decodes slices [slice0, slice0 + nslices) x block rows [row0, row0 + nrows) of a region into
  * scratch and queues its copy into the image. */
 static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices, uint32_t row0, uint32_t nrows)
@@ -937,20 +1016,25 @@ static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices,
     r->vkCmdPushConstants(u->cb, s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     r->vkCmdDispatch(u->cb, (bw + 7) / 8, (nrows + 7) / 8, nslices);
 
-    /* The copy, within the mip level (a region may name whole blocks past a small mip's edge). */
-    const vkb_emu_image *img = u->img;
-    uint32_t mip = g->sub.mipLevel;
-    uint32_t mw = img->extent.width >> mip, mh = img->extent.height >> mip;
-    if (!mw) mw = 1;
-    if (!mh) mh = 1;
     VkBufferImageCopy c = {off, bw * 4, nrows * 4, g->sub, {g->ioff.x, g->ioff.y + (int32_t)y0, g->ioff.z}, {g->iext.width, h, 1}};
-    if (img->type == VK_IMAGE_TYPE_3D) {
+    if (u->img->type == VK_IMAGE_TYPE_3D) {
         c.imageOffset.z += (int32_t)slice0;
         c.imageExtent.depth = nslices;
     } else {
         c.imageSubresource.baseArrayLayer += slice0;
         c.imageSubresource.layerCount = nslices;
     }
+    queue_copy(u, buf, &c);
+}
+
+/* Queues a copy of decoded (transcoded) blocks into the image, cut to the mip level (a region may
+ * name whole blocks past a small mip's edge). */
+static void queue_copy(upload *u, VkBuffer buf, const VkBufferImageCopy *cin)
+{
+    VkBufferImageCopy c = *cin;
+    uint32_t mw = u->img->extent.width >> c.imageSubresource.mipLevel, mh = u->img->extent.height >> c.imageSubresource.mipLevel;
+    if (!mw) mw = 1;
+    if (!mh) mh = 1;
     if ((uint32_t)c.imageOffset.x >= mw || (uint32_t)c.imageOffset.y >= mh) return;
     if (c.imageOffset.x + c.imageExtent.width > mw) c.imageExtent.width = mw - (uint32_t)c.imageOffset.x;
     if (c.imageOffset.y + c.imageExtent.height > mh) c.imageExtent.height = mh - (uint32_t)c.imageOffset.y;
@@ -967,8 +1051,86 @@ static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices,
     u->copies[u->n++] = c;
 }
 
+/* ASTC 6x6 / 8x8 output: a region is encoded in whole ASTC blocks from the block-aligned corner at
+ * or before its start (shift: how far before), so its blocks per row and rows of blocks. */
+static void n_blocks(const upload *u, const region *g, uint32_t *bw, uint32_t *bh, uint32_t *sx, uint32_t *sy)
+{
+    uint32_t n = u->n_dim;
+    *sx = (uint32_t)g->ioff.x % n, *sy = (uint32_t)g->ioff.y % n;
+    *bw = (*sx + g->iext.width + n - 1) / n, *bh = (*sy + g->iext.height + n - 1) / n;
+}
+
+/* ASTC 6x6 / 8x8: rows [row0, row0 + nrows) of a region's ASTC blocks (n_blocks) in slices
+ * [slice0, slice0 + nslices), each encoded from the BC blocks under it (bc_decode.comp ENC_ASTCN),
+ * and the copy of them queued. A region that does not start on an ASTC block's edge (a sub-region
+ * update) is encoded from the corner before it, with its own texels repeated over what lies outside
+ * it: the texels around it that share its edge blocks are re-encoded from its edge (logged once). */
+static void piece_n(upload *u, const region *g, uint32_t slice0, uint32_t nslices, uint32_t row0, uint32_t nrows)
+{
+    bcn_state *s = u->e->bcn;
+    const vkb_dispatch *r = &u->e->dev->real;
+    uint32_t n = u->n_dim, bw, bh, sx, sy;
+    n_blocks(u, g, &bw, &bh, &sx, &sy);
+    uint32_t w_tex = g->row_length ? g->row_length : g->iext.width;
+    uint32_t h_tex = g->image_height ? g->image_height : g->iext.height;
+    uint32_t row_blocks = (w_tex + 3) / 4, layer_blocks = row_blocks * ((h_tex + 3) / 4), bcw = (g->iext.width + 3) / 4;
+    uint32_t y0 = row0 * n, h = sy + g->iext.height - y0 < nrows * n ? sy + g->iext.height - y0 : nrows * n;
+    /* the region's texel rows this piece reads, and their BC block rows */
+    uint32_t v0 = y0 > sy ? y0 - sy : 0, v1 = y0 + h - 1 > sy ? y0 + h - 1 - sy : 0;
+    if (v1 >= g->iext.height) v1 = g->iext.height - 1;
+    uint32_t r0 = v0 / 4, r1 = v1 / 4;
+    VkDeviceSize bytes = (VkDeviceSize)bw * nrows * u->ob * nslices;
+    VkBuffer buf;
+    VkDeviceSize off;
+    if (!slot(u, bytes, &buf, &off)) return;
+    u->left = u->left > bytes ? u->left - bytes : 0;
+    VkDeviceSize first = g->offset + ((VkDeviceSize)slice0 * layer_blocks + (VkDeviceSize)r0 * row_blocks) * u->block_bytes;
+    VkDeviceSize aligned = first & ~(s->ssbo_align - 1);
+    VkDeviceSize range = first - aligned +
+                         ((VkDeviceSize)(nslices - 1) * layer_blocks + (VkDeviceSize)(r1 - r0) * row_blocks + bcw) * u->block_bytes;
+    VkDescriptorBufferInfo sbi = {u->src, aligned, range}, dbi = {buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[2] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &sbi, NULL},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &dbi, NULL}};
+    if (s->push) {
+        r->vkCmdPushDescriptorSet(u->cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout, 0, 2, w);
+    } else {
+        VkDescriptorSet set = vkb_emu_cb_scratch_set(u->e, u->cb, s->dsl);
+        if (!set) {
+            VKB_ONCE(VKB_LOG_ERROR, "BC emulation: no descriptor set for the decoder (logged once)");
+            return;
+        }
+        w[0].dstSet = w[1].dstSet = set;
+        r->vkUpdateDescriptorSets(u->e->dev->device, 2, w, 0, NULL);
+        r->vkCmdBindDescriptorSets(u->cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout, 0, 1, &set, 0, NULL);
+    }
+    pc_t pc = {(uint32_t)((first - aligned) / 4), row_blocks, layer_blocks, family_flags(u->img), (uint32_t)(off / 4), 0,
+               {sx + g->iext.width, h}, {sx | (sy << 4) | (r0 << 8), y0, g->iext.width, g->iext.height}};
+    r->vkCmdPushConstants(u->cb, s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    r->vkCmdDispatch(u->cb, (bw + 7) / 8, (nrows + 7) / 8, nslices);
+    if (sx || sy || ((g->ioff.x + g->iext.width) % n && g->ioff.x + g->iext.width < (u->img->extent.width >> g->sub.mipLevel)) ||
+        ((g->ioff.y + g->iext.height) % n && g->ioff.y + g->iext.height < (u->img->extent.height >> g->sub.mipLevel)))
+        VKB_ONCE(VKB_LOG_INFO, "BC emulation: an upload not on ASTC %ux%u block edges (at %d,%d, %ux%u): the texels around it in its edge "
+                 "blocks are re-encoded from its own (logged once)", n, n, g->ioff.x, g->ioff.y, g->iext.width, g->iext.height);
+    VkBufferImageCopy c = {off, bw * n, nrows * n, g->sub, {g->ioff.x - (int32_t)sx, g->ioff.y - (int32_t)sy + (int32_t)y0, g->ioff.z},
+                           {bw * n, nrows * n, 1}};
+    if (u->img->type == VK_IMAGE_TYPE_3D) {
+        c.imageOffset.z += (int32_t)slice0;
+        c.imageExtent.depth = nslices;
+    } else {
+        c.imageSubresource.baseArrayLayer += slice0;
+        c.imageSubresource.layerCount = nslices;
+    }
+    queue_copy(u, buf, &c);
+}
+
 static VkDeviceSize region_bytes(const upload *u, const region *g, uint32_t slices)
 {
+    if (u->n_dim != 4) {
+        uint32_t bw, bh, sx, sy;
+        n_blocks(u, g, &bw, &bh, &sx, &sy);
+        return (VkDeviceSize)bw * bh * u->ob * slices;
+    }
     return (VkDeviceSize)((g->iext.width + 3) / 4) * ((g->iext.height + 3) / 4) * u->ob * slices;
 }
 
@@ -977,14 +1139,14 @@ static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_
 {
     bcn_state *s = e->bcn;
     int fam = family(img->client_format);
-    fam = vkb_tx_block_bytes(img->format) ? TX_BC1 + fam : vkb_bc_is_packed(img->format) ? FAM_BC1_16 : fam;
+    fam = vkb_tx_block_bytes(img->format) ? tx_family(fam, img->format) : vkb_bc_is_packed(img->format) ? FAM_BC1_16 : fam;
     /* in auto per region (level_quality): the first region's, before anything is recorded (or the
      * other quality while this one is still being built) */
     uint32_t q0 = fam >= TX_BC1 ? level_quality(s, img, n ? regs[0].sub.mipLevel : 0) : 1;
     VkPipeline pipe = pipeline(e, fam, q0), bound = VK_NULL_HANDLE;
     if (!pipe) return;
     upload u = {e, cb, vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)), src, img, layout, out_block_bytes(img),
-                vkb_bc_block_bytes(img->client_format)};
+                vkb_bc_block_bytes(img->client_format), vkb_tx_block_dim(img->format)};
     if (!u.sc) return;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     for (uint32_t i = 0; i < n; i++) u.left += region_bytes(&u, &regs[i], is3d ? regs[i].iext.depth : regs[i].sub.layerCount);
@@ -1009,6 +1171,21 @@ static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_
         if (pipe != bound) {
             e->dev->real.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
             bound = pipe;
+        }
+        if (u.n_dim != 4) {
+            /* ASTC 6x6 / 8x8: whole slices, or bands of ASTC block rows */
+            uint32_t nbw, nbh, sx, sy;
+            n_blocks(&u, g, &nbw, &nbh, &sx, &sy);
+            VkDeviceSize sb = (VkDeviceSize)nbw * nbh * u.ob, rb = (VkDeviceSize)nbw * u.ob;
+            if (sb <= lim) {
+                uint32_t per = (uint32_t)(lim / sb);
+                for (uint32_t z = 0; z < slices; z += per) piece_n(&u, g, z, slices - z < per ? slices - z : per, 0, nbh);
+            } else {
+                uint32_t per = rb <= lim ? (uint32_t)(lim / rb) : 1;
+                for (uint32_t z = 0; z < slices; z++)
+                    for (uint32_t y = 0; y < nbh; y += per) piece_n(&u, g, z, 1, y, nbh - y < per ? nbh - y : per);
+            }
+            continue;
         }
         VkDeviceSize slice_bytes = region_bytes(&u, g, 1), row_bytes = slice_bytes / bh;
         if (slice_bytes <= lim) {
@@ -1092,7 +1269,7 @@ static int copy_kind(const vkb_emu_image *s, const vkb_emu_image *d)
     if (!s || !d) return -1;
     uint32_t st = vkb_tx_block_bytes(s->format), dt = vkb_tx_block_bytes(d->format);
     if (st || dt) {
-        if (st == dt) return 0;
+        if (st == dt && vkb_tx_block_dim(s->format) == vkb_tx_block_dim(d->format)) return 0;
         VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy between BC images held as formats %d and %d is skipped (logged once)", s->format, d->format);
         return -2;
     }
@@ -1101,6 +1278,26 @@ static int copy_kind(const vkb_emu_image *s, const vkb_emu_image *d)
     if (s->format == d->format) return 0;
     if ((sp || s->format == VK_FORMAT_R8G8B8A8_UNORM) && (dp || d->format == VK_FORMAT_R8G8B8A8_UNORM)) return 1;
     return -1;
+}
+
+/* A copy between two ASTC 6x6 / 8x8 images must start on block edges and end on one or at the
+ * level's edge; the app's regions are on BC's 4-texel edges, so one that is not on these is
+ * skipped (logged once). Empty regions (clamp_region) are skipped too. */
+static int on_blocks(const vkb_emu_image *s, const vkb_emu_image *d, const VkImageSubresourceLayers *ss, const VkImageSubresourceLayers *ds,
+                     const VkOffset3D *so, const VkOffset3D *dof, const VkExtent3D *ext)
+{
+    if (!ext->width || !ext->height || !ext->depth) return 0;
+    uint32_t n = vkb_tx_block_dim(s->format);
+    if (n == 4) return 1;
+    uint32_t sw = s->extent.width >> ss->mipLevel, sh = s->extent.height >> ss->mipLevel;
+    uint32_t dw = d->extent.width >> ds->mipLevel, dh = d->extent.height >> ds->mipLevel;
+    int ok = !(so->x % n) && !(so->y % n) && !(dof->x % n) && !(dof->y % n) &&
+             (!(ext->width % n) || (so->x + ext->width >= (sw ? sw : 1) && dof->x + ext->width >= (dw ? dw : 1))) &&
+             (!(ext->height % n) || (so->y + ext->height >= (sh ? sh : 1) && dof->y + ext->height >= (dh ? dh : 1)));
+    if (!ok)
+        VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy between images held as ASTC %ux%u off its block edges (%d,%d -> %d,%d, %ux%u) is "
+                 "skipped (logged once)", n, n, so->x, so->y, dof->x, dof->y, ext->width, ext->height);
+    return ok;
 }
 
 static int blit_region(const vkb_emu_image *s, const VkImageSubresourceLayers *ss, const VkImageSubresourceLayers *ds,
@@ -1219,8 +1416,13 @@ int vkb_emu_copy_image(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkIma
         return 1;
     }
     VkImageCopy *c = (VkImageCopy *)regions;
-    for (uint32_t i = 0; i < n; i++)
+    uint32_t k0 = 0;
+    for (uint32_t i = 0; i < n; i++) {
         clamp_region(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent);
+        if (on_blocks(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent)) c[k0++] = c[i];
+    }
+    n = k0;
+    if (!n) return 1;
     if (!kind) {
         e->dev->real.vkCmdCopyImage(cb, src, sl, dst, dl, n, regions);
         return 1;
@@ -1254,8 +1456,13 @@ int vkb_emu_copy_image2(vkb_emu_device *e, VkCommandBuffer cb, const VkCopyImage
         return 1;
     }
     VkImageCopy2 *c = (VkImageCopy2 *)info->pRegions;
-    for (uint32_t i = 0; i < info->regionCount; i++)
+    uint32_t k0 = 0;
+    for (uint32_t i = 0; i < info->regionCount; i++) {
         clamp_region(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent);
+        if (on_blocks(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent)) c[k0++] = c[i];
+    }
+    ((VkCopyImageInfo2 *)info)->regionCount = k0;
+    if (!k0) return 1;
     if (!kind) {
         e->dev->real.vkCmdCopyImage2(cb, info);
         return 1;
@@ -1307,21 +1514,23 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     VkPhysicalDeviceFeatures pf;
     dev->real.vkGetPhysicalDeviceFeatures(dev->physical, &pf);
     int hdr = vkb_emu_bcn_astc_hdr(&dev->real, dev->physical, dev->api_version) != 0;
+    s->astc_n = astc_block();
     const VkFormatFeatureFlags txneed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    char msg[256];
-    int len = 0;
-    msg[0] = 0;
+    char msg[256], off[96];
+    int len = 0, olen = 0;
+    msg[0] = off[0] = 0;
     for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
-        VkFormat t = tx_target(f);
+        VkFormat t = tx_target(f, s->astc_n);
         if (!t || !vkb_emu_bcn_transcode_wanted()) continue;
         int cls = tx_class(t);
-        if (cls == 6 ? !hdr : cls == 3 ? !pf.textureCompressionASTC_LDR : !pf.textureCompressionETC2) continue;
+        if (cls == 6 ? !hdr : cls == 3 || cls >= 7 ? !pf.textureCompressionASTC_LDR : !pf.textureCompressionETC2) continue;
         /* the startup probe could not build this target's transcoder on the driver (server_probe.c) */
-        uint32_t blocked = cls <= 2 ? VKB_PROBE_FLAG_TX_ETC2 : cls == 3 ? VKB_PROBE_FLAG_TX_ASTC : cls == 6 ? VKB_PROBE_FLAG_TX_ASTC_HDR
-                                                                                                          : VKB_PROBE_FLAG_TX_EAC;
+        uint32_t blocked = cls <= 2 ? VKB_PROBE_FLAG_TX_ETC2 : cls == 3 || cls >= 7 ? VKB_PROBE_FLAG_TX_ASTC
+                                                         : cls == 6 ? VKB_PROBE_FLAG_TX_ASTC_HDR : VKB_PROBE_FLAG_TX_EAC;
+        if (family(f) == FAM_BC7) blocked = VKB_PROBE_FLAG_TX_BC7;
         if (vkb_probe_flag(blocked)) {
-            VKB_ONCE(VKB_LOG_WARN, "BC emulation: formats whose transcoder the startup probe could not build are decoded instead");
+            if (olen < (int)sizeof(off) - 8) olen += snprintf(off + olen, sizeof(off) - (size_t)olen, " %d", f);
             continue;
         }
         VkFormatProperties fp;
@@ -1332,9 +1541,13 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
         int blit = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
         if (len < (int)sizeof(msg) - 24) len += snprintf(msg + len, sizeof(msg) - (size_t)len, " %d->%d%s", f, t, blit ? "" : " (no blit)");
     }
+    if (olen)
+        VKB_ONCE(VKB_LOG_WARN, "BC emulation: formats%s decoded, not transcoded: the startup probe could not build their transcoder "
+                 "(its line in the device profile says why; VKBRIDGE_PROBE=force runs it again)", off);
     s->quality = transcode_quality();
     static const char *const qname[4] = {", fast", "", ", high quality", ", auto quality (fast for levels of 1024x1024 texels or more)"};
-    if (len) VKB_INFO("BC emulation: transcoding (BC format -> format):%s%s", msg, qname[s->quality]);
+    if (len) VKB_INFO("BC emulation: transcoding (BC format -> format):%s%s%s", msg, qname[s->quality],
+                      s->astc_n == 6 ? ", ASTC 6x6 (VKBRIDGE_BC_ASTC_BLOCK)" : s->astc_n == 8 ? ", ASTC 8x8 (VKBRIDGE_BC_ASTC_BLOCK)" : "");
     else VKB_INFO("BC emulation: no transcoding (%s)", vkb_emu_bcn_transcode_wanted() ? "the GPU samples neither ETC2 nor ASTC" : "VKBRIDGE_BC_TRANSCODE=0");
     VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
@@ -1391,7 +1604,7 @@ static const struct {
 } probe_tx[] = {{TX_BC1, "BC1->ETC2", VKB_PROBE_FLAG_TX_ETC2},    {TX_BC2, "BC2->ASTC", VKB_PROBE_FLAG_TX_ASTC},
                 {TX_BC3, "BC3->ASTC", VKB_PROBE_FLAG_TX_ASTC},    {TX_BC4, "BC4->EAC", VKB_PROBE_FLAG_TX_EAC},
                 {TX_BC5, "BC5->EAC", VKB_PROBE_FLAG_TX_EAC},      {TX_BC6H, "BC6H->ASTC-HDR", VKB_PROBE_FLAG_TX_ASTC_HDR},
-                {TX_BC7, "BC7->ASTC", VKB_PROBE_FLAG_TX_ASTC}};
+                {TX_BC7, "BC7->ASTC", VKB_PROBE_FLAG_TX_BC7}};
 
 int vkb_emu_bcn_transcoders(void) { return (int)(sizeof(probe_tx) / sizeof(probe_tx[0])); }
 

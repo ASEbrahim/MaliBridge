@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * cached_check: cached readback as an app sees it (server_memory.c, VKBRIDGE_CACHED_READBACK=apps):
  * a HOST_VISIBLE | HOST_CACHED memory type without HOST_COHERENT, used the way the spec says for

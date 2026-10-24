@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * A layer-only pass-through geometry shader folded into the vertex shader (spirv_gsfold.c).
  */

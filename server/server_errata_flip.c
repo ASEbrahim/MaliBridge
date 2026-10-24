@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * viewport_flip (MK-02, wgpu #10057: Mali-G715 r54p2 ignores a negative viewport height - the
  * maintenance1 y-flip DXVK and vkd3d-proton always use - so every frame comes out upside down).

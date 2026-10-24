@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Clip/cull distance (and geometry/tessellation point size) built-ins turned into ordinary
  * Location variables, for a driver without shaderClipDistance/shaderCullDistance (Mali-G720,

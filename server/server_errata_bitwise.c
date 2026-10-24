@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * bitwise_scalar (MK-03, Arm erratum 3843237, r18p0-r53p0): an integer vector bitwise op (or
  * shift) whose operand is a lane swizzle or a vector built lane by lane is miscompiled. The fix

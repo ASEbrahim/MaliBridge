@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * clampzero_check: MK-32 (min/max/clamp with a constant zero limit on a value selected at run
  * time from constants, Arm erratum 3779215, Mali r38p1-r49p0 and r50p0-r51p0). A compute shader

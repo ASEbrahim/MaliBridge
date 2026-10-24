@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * clip_check: runs the server's clip/cull distance demotion (spirv_clip.c) on SPIR-V files the way
  * a Mali device gets it - geometry/tessellation shaders first through the per-vertex fold

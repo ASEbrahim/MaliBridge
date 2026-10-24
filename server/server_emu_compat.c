@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * What DXVK 3 requires and Mali-G720 (r44p1) does not have, made up for so that DirectX games
  * start at all (Cuphead, 2026-10-11: "Skipping: Device does not support required feature

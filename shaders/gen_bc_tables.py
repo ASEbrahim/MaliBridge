@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 ASEbrahim and MaliBridge contributors
 """
 Generates bc_tables.glsl from bcdec.h (third_party/bcdec, MIT/Unlicense): the BC6H per-mode bit
 layouts (as a table instead of 14 hand-written cases) and the BC6H/BC7 partition and anchor tables.

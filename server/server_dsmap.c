@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Descriptor sets named by the client. Where the client keeps a pool's books it knows an
  * allocation will succeed, so it names the sets itself (VKB_DS_TAG | n) and sends the allocation

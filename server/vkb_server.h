@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MaliBridge - server side (bionic on the device, glibc for host tests).
  *
@@ -84,6 +85,8 @@ struct vkb_emu_device;
 typedef struct vkb_srv_table {
     uint32_t id;
     int is_device;
+    int zink;                                /* instance: its engine is Mesa's Zink (VKB_EMU_BGR10_VTX) */
+    int promote_ui;                          /* instance: gamescope's - Vulkan promotion even where untested (server_promote.c) */
     vkb_srv_proc *proc;
     VkInstance instance;
     VkDevice device;
@@ -104,6 +107,7 @@ typedef struct vkb_srv_table {
     struct vkb_errata_dev *errata;           /* server_errata.c */
     uint32_t mem_types_seen;                 /* memory types this device has allocated in (logged once each) */
     struct vkb_report_dev *report;           /* server_report.c */
+    struct vkb_async *async;                 /* server_async.c */
 } vkb_srv_table;
 
 /* server_main.c */
@@ -120,6 +124,11 @@ void vkb_log_summary(void);
 extern __thread VkCommandBuffer vkb_srv_replay_cb;
 extern __thread uint32_t vkb_srv_replay_n;
 extern __thread const char *vkb_srv_replay_ring[VKB_REPLAY_RING];
+/* What the call this thread is making was asked to do, for the crash line (empty: nothing noted).
+ * Cleared at each request. vkb_srv_note_pipeline_layout fills it before a pipeline layout reaches
+ * the driver (a G710 r32p1 driver crashed inside vkCreatePipelineLayout with nothing more to go on). */
+extern __thread char vkb_srv_crash_detail[512];
+void vkb_srv_note_pipeline_layout(const VkPipelineLayoutCreateInfo *ci);
 
 /* server_guard.c */
 void vkb_guard_device_init(vkb_srv_table *t);
@@ -140,9 +149,10 @@ double vkb_guard_timeout_s(int mode, const char **why);
 #define VKB_PROBE_FLAG_SPIRV_FIX 0x4u   /* server_spvfix.c on whatever the vendor */
 #define VKB_PROBE_FLAG_TX_ETC2 0x8u     /* BC transcoders that did not build: those formats decoded */
 #define VKB_PROBE_FLAG_TX_EAC 0x10u
-#define VKB_PROBE_FLAG_TX_ASTC 0x20u
+#define VKB_PROBE_FLAG_TX_ASTC 0x20u     /* BC2 / BC3 -> ASTC */
 #define VKB_PROBE_FLAG_TX_ASTC_HDR 0x40u
-#define VKB_PROBE_FLAG_TX_ALL 0x78u
+#define VKB_PROBE_FLAG_TX_BC7 0x8000u    /* BC7 -> ASTC: its own (the biggest; BC2 and BC3 build where it does not) */
+#define VKB_PROBE_FLAG_TX_ALL 0x8078u
 /* The MK probes (one per Mali driver erratum it can tell): the bug's own pattern was seen. Their
  * results reach the errata decisions (server_errata.c) through vkb_errata_set_probe_source. */
 #define VKB_PROBE_FLAG_MK_WAIT 0x80u        /* wait_eintr: a wait failed or ended early after a signal (MK-01) */
@@ -153,7 +163,8 @@ double vkb_guard_timeout_s(int mode, const char **why);
 #define VKB_PROBE_FLAG_MK_VB_SINGLE 0x1000u /* vb_strides: single-binding calls wrong too - the split cannot fix it (option B) */
 #define VKB_PROBE_FLAG_MK_CHURN 0x2000u     /* rendering_churn: a re-made view rendered with stale state (MK-06) */
 #define VKB_PROBE_FLAG_MK_VIEW3D 0x4000u    /* view3d_layers: a 3D image's REMAINING slices view wrong (MK-07) */
-#define VKB_PROBE_FLAG_MK_ALL 0x7f80u
+#define VKB_PROBE_FLAG_MK_FP16 0x8000u      /* fp16_math: 16-bit float arithmetic gave wrong results (MK-20) */
+#define VKB_PROBE_FLAG_MK_ALL 0xff80u
 int vkb_probe_flag(uint32_t f);
 void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd);
 void vkb_probe_start_background(void); /* what did not fit the start's budget */
@@ -182,6 +193,27 @@ void vkb_report_device_destroy(vkb_srv_table *t);
 void vkb_report_features(const VkPhysicalDeviceFeatures *want, const VkPhysicalDeviceFeatures *have, char *out, size_t cap);
 const char *vkb_srv_env_list(char *out, size_t cap); /* <cache dir>/env as applied (server_pcache.c) */
 void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, VkResult r, const char *slow_stages);
+/* Pipelines the driver built with creation feedback, and how many of them it found in the pipeline cache (server_guard.c). */
+void vkb_report_cache_hits(vkb_srv_table *t, uint64_t built, uint64_t hits);
+
+/* server_async.c: graphics pipelines compiled in the background (VKBRIDGE_ASYNC_COMPILE) */
+void vkb_async_device_init(vkb_srv_table *t);
+void vkb_async_device_destroy(vkb_srv_table *t); /* first: its workers call every layer beneath */
+
+/* server_promote.c: Vulkan 1.2 / 1.3 offered on a driver below them, from its extensions
+ * (VKBRIDGE_PROMOTE_API; VKBRIDGE_FAKE_API=1.x takes the host driver as that version) */
+void vkb_promote_decide(const vkb_dispatch *idt, VkPhysicalDevice pd); /* the self-test, per GPU */
+void vkb_promote_instance_install(vkb_srv_table *t);
+/* vkCreateDevice: core feature structures the driver lacks turned into the extensions', those
+ * extensions enabled; returns the extension list (*n updated; may be a new array in a) */
+const char **vkb_promote_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci, const char **exts,
+                                            uint32_t *n, vkb_arena *a);
+PFN_vkGetDeviceProcAddr vkb_promote_gdpa(PFN_vkGetDeviceProcAddr real); /* VKBRIDGE_FAKE_API: core names a 1.1 driver lacks */
+void vkb_promote_device_init(vkb_srv_table *t);    /* before t->dt is made: SPIR-V lowered beneath every layer */
+void vkb_promote_device_destroy(vkb_srv_table *t);
+/* The version offered and the driver's for a GPU, and what the next version lacks; 0: not known */
+int vkb_promote_describe(const uint8_t uuid[VK_UUID_SIZE], uint32_t *offered, uint32_t *drv, const char **missing);
+void vkb_promote_write_apps_file(void);           /* <cache dir>/apps-vulkan, after the self-test */
 
 /* server_spvfix.c */
 void vkb_spvfix_device_init(vkb_srv_table *t);
@@ -209,6 +241,9 @@ enum {
     VKB_ERRATUM_CLAMP_ZERO,      /* MK-32 min/max/clamp with a zero limit on a constant-selected value */
     VKB_ERRATUM_CULL_NONTRI,     /* MK-16 vkCmdSetCullMode culls points and lines */
     VKB_ERRATUM_DEDICATED_IMPORT, /* MK-39 a dedicated-allocation struct on an import fails or crashes */
+    VKB_ERRATUM_FP16_HIDE,       /* MK-20 16-bit float arithmetic wrong (Mali-G715 r54) */
+    VKB_ERRATUM_STENCIL_LAYOUT,  /* MK-11 a separate stencil layout in a render pass ignored */
+    VKB_ERRATUM_VB_BAKE,         /* MK-05 option B: dynamic strides wrong in single-binding calls too */
     VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };
@@ -248,6 +283,12 @@ void vkb_errata_probe_end(void *h);
 uint64_t vkb_spv_app_hash(const uint32_t *code, size_t size);
 int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta); /* r<major>p<minor> in s */
 const char *vkb_errata_hidden_ext(const vkb_srv_table *inst, VkPhysicalDevice pd); /* an erratum's hidden device extension */
+/* fp16_hide (MK-20, server_errata_fp16.c): 1 when 16-bit float arithmetic and storage are hidden
+ * from the clients of this physical device (inst: its instance's table) - the erratum's decision
+ * as vkCreateDevice makes it, VKBRIDGE_NO_FP16 included; why (may be NULL) gets the reason */
+int vkb_errata_fp16_hidden(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
+void vkb_errata_fp16_instance_install(vkb_srv_table *inst); /* the feature and property queries */
+void vkb_errata_fp16_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci); /* strips what an app enables anyway */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);
@@ -321,6 +362,9 @@ const char *vkb_preset_text(const vkb_srv_proc *p, char *out, size_t cap); /* "K
 const char *vkb_preset_note(const vkb_srv_proc *p, char *out, size_t cap);
 uint32_t vkb_preset_client_knobs(void);  /* vkb_server_pd_info.client_knobs for this thread's client */
 void vkb_preset_client_values(vkb_server_pd_info *info); /* its .heap_max_mb and .spoof_gpu, the same way */
+uint64_t vkb_memtotal_mb(void); /* RAM in MB (MemTotal; VKBRIDGE_FAKE_MEMTOTAL_MB for tests), 0: unknown */
+uint64_t vkb_memavail_kb(void); /* MemAvailable in KB (VKBRIDGE_FAKE_MEMAVAIL_MB for tests), 0: unknown */
+uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb); /* the safe-mode heap cap for 8 GB devices, 0: none */
 
 /* server_instance.c */
 void vkb_selftest_all(void);
@@ -363,6 +407,9 @@ const VkMemoryGetFdInfoKHR *vkb_opaque_get_fd_info(vkb_srv_table *t, const VkMem
 
 /* emulation (server_emu*.c) */
 uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *missing);
+int vkb_emu_robust2_driver(const vkb_dispatch *dt, VkPhysicalDevice pd, VkBool32 *buf, VkBool32 *img, VkBool32 *null_desc);
+int vkb_emu_robust2_image_stand_in(vkb_srv_table *inst, VkPhysicalDevice pd, uint32_t emu, const VkDeviceCreateInfo *ci);
+PFN_vkGetInstanceProcAddr vkb_emu_imitate_gipa(PFN_vkGetInstanceProcAddr gipa);
 /* BC6H -> ASTC 4x4 HDR: whether the device gets textureCompressionASTC_HDR for it (transcoding wanted,
  * the GPU has the feature; api: the instance's version): 0 no, 1 as Vulkan 1.3 core, 2 through
  * VK_EXT_texture_compression_astc_hdr (which vkCreateDevice then enables). VKBRIDGE_FAKE_MISSING=

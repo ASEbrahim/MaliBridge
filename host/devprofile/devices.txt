@@ -1,0 +1,14 @@
+# The GPUs the testers have (vulkan.gpuinfo.org report ids; fetch_devices.sh): name, report, GPU name
+pixel8pro-g715-r54p3     47969 Mali-G715
+xring-o3-g2ultra-r56p0   51676 Mali-G2-Ultra-NX MC16
+d9500-g1ultra-r54p1      51905 Mali-G1-Ultra MC12
+g710-r32p1-vk11          51864 Mali-G710 MC10
+g68-a16-r38p1            48721 Mali-G68
+g68-tabs9fe-r38p1        48561 Mali-G68
+g57-r32p1-vk11           42840 Mali-G57 MC2
+g57-r38p1                46906 Mali-G57 MC2
+g57-r54p1                46348 Mali-G57 MC2
+g610-r32p1-vk11          52258 Mali-G610 MC6
+g615-edge60-r44p1        52483 Mali-G615 MC2
+g720-tabs10-r44p1        50778 Mali-G720-Immortalis MC12
+g925-tabs11-r49p1        51053 Mali-G925-Immortalis MC12

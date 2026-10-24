@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * clip_pipeline: builds a graphics pipeline vs [+ gs] + fs from SPIR-V files, draws a quad over a
  * 16x16 RGBA8 target whose shaders set gl_ClipDistance[0] = x (corpus/clip_*.spvasm), and checks

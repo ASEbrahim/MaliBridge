@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * bitwise_check: MK-03 (integer vector bitwise ops on a swizzle, Mali r18p0-r53p0). A compute
  * shader (shaders/bitwise.comp, glslc -O0 so the shuffles and composites reach the driver) works

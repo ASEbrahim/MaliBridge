@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * MK-02 (viewport_flip): a driver that ignores a negative viewport height (Mali-G715 r54p2) is
  * given positive heights instead, and the last pre-rasterization stage negates gl_Position.y.

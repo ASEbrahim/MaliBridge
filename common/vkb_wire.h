@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Wire primitives shared by the bridge's client ICD (glibc) and server (bionic).
  * The protocol is described in vkb_proto.h and README.md.
@@ -19,6 +20,8 @@ typedef struct vkb_arena_block vkb_arena_block;
 typedef struct vkb_arena {
     vkb_arena_block *head;
     size_t used_total;
+    vkb_arena_block *spare; /* default-size blocks a reset kept for the next requests */
+    unsigned nspare;
 } vkb_arena;
 void *vkb_arena_alloc(vkb_arena *a, size_t n);
 void vkb_arena_reset(vkb_arena *a);

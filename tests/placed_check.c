@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * placed_check: VK_EXT_map_memory_placed as Wine uses it for 32-bit programs (Celeste, x86 .NET/FNA,
  * crashed on a mapping that "does not fit 32-bit pointer"). Reserves an address range, maps an

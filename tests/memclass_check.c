@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * memclass_check: every kind of resource an app makes has a memory type, as an app looks for one
  * (the first type in its memoryTypeBits with the flags it wants). On the XRing O3 (Mali-G2-Ultra,

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Evidence: with <pipeline cache dir>/trace present, the first commands of each device that touch
  * images (copies, blits, clears, dispatches, image barriers) and its submissions go to the log, with

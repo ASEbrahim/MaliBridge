@@ -1,0 +1,50 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// fp16_math (MK-20; ncnn#7054: wrong fp16 results on the Mali-G715's r54 drivers): 16-bit float
+// arithmetic on inputs from push constants (so nothing folds; built with -O0), each result
+// converted to 32 bits for the buffer (no 16-bit storage needed). Every input, partial result and
+// result is exact in 16 bits, so a right driver gives the exact values server_probe.c expects.
+// Lanes go to b.v[0..17], then a marker.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer B { float v[]; } b;
+// a = (1.5, 2.25, -0.125, 0.25), c = (2^-14, 1/3, 65280, -2.75), n = 16
+layout(push_constant) uniform P { vec4 a; vec4 c; int n; } pc;
+void main() {
+    f16vec4 a = f16vec4(pc.a);
+    // fma: fused, separate, and a dot product
+    b.v[0] = float(fma(a.x, a.y, a.z));
+    b.v[1] = float(a.x * a.y + a.z);
+    b.v[2] = float(dot(a, a.yxwz));
+    // range: the smallest normal and the top of the range; lane 4 goes through a denormal
+    // (2^-16), which a driver may flush to zero
+    float16_t lo = float16_t(pc.c.x), hi = float16_t(pc.c.z);
+    b.v[3] = float(lo * (a.x + a.x));
+    b.v[4] = float(lo * a.w * float16_t(16.0));
+    b.v[5] = float(hi * a.w);
+    b.v[6] = float(hi * (a.x - float16_t(1.0)) + hi * float16_t(0.5));
+    // conversions: from 32-bit float, to and from integers, a vector
+    b.v[7] = float(float16_t(pc.c.y));
+    b.v[8] = float(int(float16_t(pc.c.w)));
+    b.v[9] = float(float16_t(uint(pc.n) * 128u + 1u));
+    b.v[10] = vec2(f16vec2(pc.c.yw)).y;
+    // relaxed precision: 32-bit floats a driver may compute in 16 bits
+    mediump float x = pc.a.x, y = pc.a.y, z = pc.a.z, w = pc.a.w;
+    b.v[11] = x * y + z;
+    mediump float r = 0.0;
+    for (int i = 0; i < pc.n; i++) r += float(i) * w;
+    b.v[12] = r;
+    // chain: a 16-bit accumulation over a loop, scalar and vector
+    float16_t s = float16_t(0.0);
+    f16vec4 acc = f16vec4(0.0);
+    for (int i = 0; i < pc.n; i++) {
+        float16_t fi = float16_t(i);
+        s = fma(fi, a.w, s);
+        acc += a * fi;
+    }
+    b.v[13] = float(s);
+    b.v[14] = float(acc.x);
+    b.v[15] = float(acc.y);
+    b.v[16] = float(acc.z);
+    b.v[17] = float(acc.w);
+    b.v[18] = 12345.0;
+}

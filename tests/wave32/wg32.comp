@@ -1,0 +1,28 @@
+#version 450
+// wave32 corpus and differential check: a 32-invocation workgroup (one virtual subgroup), so
+// votes and reductions are uniform across it and an if and a loop on them count as uniform: the
+// subgroup operations inside them are emulated too. glslc -O0.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_quad : require
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint g = gl_WorkGroupID.x * 32u + gl_LocalInvocationIndex;
+    uint x = (g * 2654435761u) >> 24;
+    uint acc = 0u;
+    if (subgroupAny(x > 200u)) acc = subgroupAdd(x);
+    uint k = 0u;
+    while (subgroupAny(k < (x & 7u))) {
+        acc += subgroupMax(k + x);
+        k++;
+    }
+    o[g] = acc ^ (k << 24);
+}

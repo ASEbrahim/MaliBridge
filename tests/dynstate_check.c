@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * dynstate_check: dynamic state set before a vkCmdBindPipeline must hold after it (MK-04, Arm errata
  * 3809538 / 3893905 / 3893903: Mali drivers lose it, or let a static pipeline pick it up). Every

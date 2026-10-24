@@ -1,0 +1,16 @@
+#version 450
+// promote_check's SPIR-V 1.5 / 1.6 module (promote_comp15.inc, promote_comp16.inc): a runtime
+// descriptor array and a subgroup broadcast from a lane that is dynamically uniform but not a
+// constant (SPIR-V 1.5's subgroupBroadcastDynamicId).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_nonuniform_qualifier : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Out { uint v[]; } outs[];
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    uint lane = (gl_WorkGroupID.x + 1u) % gl_SubgroupSize;
+    outs[gl_WorkGroupID.x].v[i] = subgroupBroadcast(i * 3u, lane);
+    if (i == 0u) outs[gl_WorkGroupID.x].v[64] = gl_SubgroupSize;
+}

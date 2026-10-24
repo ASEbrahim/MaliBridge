@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * A geometry shader that only passes triangles through and sets the layer, folded into the vertex
  * shader. Unreal Engine 4 renders volume textures (the colour-grading LUT among them) with such a

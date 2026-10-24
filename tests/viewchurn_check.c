@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * viewchurn_check: image views made, rendered to with dynamic rendering and destroyed, over and
  * over - the pattern that Mali drivers r49p1-r51 get wrong when a destroyed view's handle value

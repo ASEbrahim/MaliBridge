@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * droiddeck-vkbridge-smoke: a self-checking Vulkan test, run at session start (Mali bridge on)
  * and on the host against the bridge. Every check compares real bytes; output goes to stdout

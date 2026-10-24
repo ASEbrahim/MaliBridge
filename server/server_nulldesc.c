@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Null descriptors for GPUs without VK_EXT_robustness2 (Mali r44).
  *
@@ -8,8 +9,15 @@
  * null read at 0x28 inside its vkUpdateDescriptorSetWithTemplate, as Steam started). Here the
  * nulls become small dummy resources: a 1x1 image view, a buffer, a texel buffer view. The buffer
  * (and the texel view on it) is zero-filled where it can be mapped, so null buffer reads return
- * zeros as the extension promises; reads of the image view return whatever it holds (zeros once
- * cleared, not guaranteed). Nothing crashes. Zero-filling the stand-in buffer follows the Mali
+ * zeros as the extension promises. Image stand-ins are cleared to zero, and moved to GENERAL, by a
+ * small command buffer submitted ahead of the first queue submission after they are made, and
+ * waited for there (a fence) before that submission goes on: every queue's later submissions
+ * then find them cleared, not only the one the clear went on (before, their contents were left
+ * undefined: RE2 under vkd3d-proton rendered without lighting and flashed textures under DXVK).
+ * Storage descriptors (null UAVs) get stand-ins of their own, a sink buffer and sink images: a
+ * shader's writes through a null UAV land there and never reach what null SRVs and CBVs read. A
+ * read through a null UAV returns what was written into the sink, not 0 as robustness2 says (the
+ * sink is shared by all of them); null SRVs and CBVs do read 0. Nothing crashes. Zero-filling the stand-in buffer follows the Mali
  * compatibility layer of David Cimo and The412Banner (DroidDeck, GPL-3.0) and Lee Gao's
  * compat_layer (MIT).
  *
@@ -39,6 +47,7 @@
 #include "vkb_server.h"
 #include "server_emu.h"
 #include "spirv_edit.h"
+#include "nd_map.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -67,19 +76,14 @@ typedef struct nd_image {
     VkDeviceMemory mem;
     VkImageView view;
     int tried;
+    int cleared; /* cleared to zero and in GENERAL (or being, in a submitted command buffer) */
+    uint32_t layers;
 } nd_image;
 
-/* Small hash maps of handles: modules, pipeline layouts and set layouts to what is known of
- * them (malloc'd), descriptor sets to their layouts. */
-typedef struct nd_ent {
-    uint64_t key, val;
-    struct nd_ent *next;
-} nd_ent;
+#define MAX_QUEUE_FAMILIES 16
 
-typedef struct nd_map {
-    nd_ent **b;
-    uint32_t mask, count;
-} nd_map;
+/* Handle maps (nd_map.h): modules, pipeline layouts and set layouts to what is known of them
+ * (malloc'd), descriptor sets to their layouts. */
 
 /* A module's image bindings and the kind each wants; a set layout's bindings and theirs. */
 typedef struct nd_use {
@@ -127,12 +131,26 @@ typedef struct vkb_nulldesc {
     unsigned long shaped, mixed;
     nd_template *templates;
     int made, failed;
-    nd_image shape[KINDS]; /* KIND(2D, float) is the default stand-in, made with the buffer */
-    VkDeviceMemory buffer_mem;
-    VkImageView view;      /* the default stand-in's view */
-    VkBuffer buffer;
-    VkBufferView texel;
+    nd_image shape[2][KINDS]; /* [storage]; KIND(2D, float) is the default stand-in, made with the buffers */
+    VkDeviceMemory buffer_mem, sink_mem;
+    VkImageView view[2];      /* the default stand-ins' views */
+    VkBuffer buffer, sink;    /* read-only nulls (and vertex buffers); storage nulls */
+    VkBufferView texel, sink_texel;
     unsigned long replaced;
+    /* the clear of new stand-ins, ahead of the next queue submission */
+    int pending;              /* atomic: stand-ins not cleared yet */
+    int buffers_unzeroed;     /* a buffer could not be zeroed through a mapping: fill it too */
+    PFN_vkGetDeviceQueue get_queue;
+    PFN_vkGetDeviceQueue2 get_queue2;
+    PFN_vkQueueSubmit submit;
+    PFN_vkQueueSubmit2 submit2;
+    nd_map queues;            /* queue -> family + 1 */
+    VkQueueFamilyProperties fam[MAX_QUEUE_FAMILIES];
+    uint32_t nfam;
+    uint32_t fam_idx[MAX_QUEUE_FAMILIES]; /* 0..nfam-1: the stand-ins are CONCURRENT on all when nfam > 1 */
+    VkCommandPool pool[MAX_QUEUE_FAMILIES];
+    unsigned long clears;
+    unsigned clear_misses;    /* submissions on queues that could not clear (unknown, transfer only) */
 } vkb_nulldesc;
 
 static vkb_nulldesc *cur(void)
@@ -193,6 +211,16 @@ static void free_image(vkb_srv_table *t, nd_image *s)
     s->mem = VK_NULL_HANDLE;
 }
 
+/* The stand-ins are used from every queue family the app has: CONCURRENT on all of them when
+ * there are several (EXCLUSIVE ones would need an ownership transfer the app does not know of). */
+static void set_sharing(const vkb_nulldesc *n, VkSharingMode *mode, uint32_t *count_, const uint32_t **idx)
+{
+    if (n->nfam < 2) return;
+    *mode = VK_SHARING_MODE_CONCURRENT;
+    *count_ = n->nfam;
+    *idx = n->fam_idx;
+}
+
 /* A 1x1 (cubes: 6 faces) sampled and storage image of a kind, and its view; 0 when it could not
  * be made. Cube arrays need imageCubeArray, which a shader declaring one needs too. */
 static int make_image(vkb_nulldesc *n, uint8_t kind, nd_image *s)
@@ -209,8 +237,9 @@ static int make_image(vkb_nulldesc *n, uint8_t kind, nd_image *s)
     uint32_t layers = cube ? 6 : 1;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, it, fmt, {1, 1, 1},
                              1, layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
                              VK_IMAGE_LAYOUT_UNDEFINED};
+    set_sharing(n, &ici.sharingMode, &ici.queueFamilyIndexCount, &ici.pQueueFamilyIndices);
     VkMemoryRequirements req;
     uint32_t type;
     if (r->vkCreateImage(d, &ici, NULL, &s->image) != VK_SUCCESS) goto fail;
@@ -221,11 +250,42 @@ static int make_image(vkb_nulldesc *n, uint8_t kind, nd_image *s)
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, s->image, vt, fmt, {0},
                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
     if (r->vkCreateImageView(d, &vci, NULL, &s->view) != VK_SUCCESS) goto fail;
+    s->layers = layers;
+    s->cleared = 0;
+    __atomic_store_n(&n->pending, 1, __ATOMIC_RELEASE);
     return 1;
 fail:
     s->view = VK_NULL_HANDLE; /* not made: nothing to destroy */
     free_image(t, s);
     return 0;
+}
+
+/* A zero-filled 4 KB buffer for null buffer descriptors and an R32_UINT texel view on it (none
+ * when the driver refuses it: texel nulls then stay). 0 when the buffer could not be made. */
+static int make_buffer(vkb_nulldesc *n, VkBuffer *buf, VkDeviceMemory *mem, VkBufferView *texel, int *zeroed)
+{
+    vkb_srv_table *t = n->t;
+    VkDevice d = t->device;
+    const vkb_dispatch *r = &t->real;
+    VkMemoryRequirements req;
+    uint32_t type;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 4096,
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    set_sharing(n, &bci.sharingMode, &bci.queueFamilyIndexCount, &bci.pQueueFamilyIndices);
+    if (r->vkCreateBuffer(d, &bci, NULL, buf) != VK_SUCCESS) return 0;
+    r->vkGetBufferMemoryRequirements(d, *buf, &req);
+    if ((type = mem_type(t, req.memoryTypeBits, 1)) == UINT32_MAX) return 0;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = type;
+    if (r->vkAllocateMemory(d, &ai, NULL, mem) != VK_SUCCESS || r->vkBindBufferMemory(d, *buf, *mem, 0) != VK_SUCCESS) return 0;
+    *zeroed = zero_fill(t, *mem, type, req.size);
+    VkBufferViewCreateInfo bv = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, *buf, VK_FORMAT_R32_UINT, 0, VK_WHOLE_SIZE};
+    if (r->vkCreateBufferView(d, &bv, NULL, texel) != VK_SUCCESS) *texel = VK_NULL_HANDLE;
+    return 1;
 }
 
 /* The dummies, made on first need (under the lock). 0 when they could not be. */
@@ -234,32 +294,19 @@ static int make_dummies(vkb_nulldesc *n)
     if (n->made) return !n->failed;
     n->made = 1;
     vkb_srv_table *t = n->t;
-    VkDevice d = t->device;
-    const vkb_dispatch *r = &t->real;
-    VkMemoryRequirements req;
-    uint32_t type;
-    nd_image *def = &n->shape[KIND(VK_IMAGE_VIEW_TYPE_2D, CLS_FLOAT) - 1];
-    def->tried = 1;
-    if (!make_image(n, KIND(VK_IMAGE_VIEW_TYPE_2D, CLS_FLOAT), def)) goto fail;
-    n->view = def->view;
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 4096,
-                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
-    if (r->vkCreateBuffer(d, &bci, NULL, &n->buffer) != VK_SUCCESS) goto fail;
-    r->vkGetBufferMemoryRequirements(d, n->buffer, &req);
-    if ((type = mem_type(t, req.memoryTypeBits, 1)) == UINT32_MAX) goto fail;
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = type;
-    if (r->vkAllocateMemory(d, &ai, NULL, &n->buffer_mem) != VK_SUCCESS || r->vkBindBufferMemory(d, n->buffer, n->buffer_mem, 0) != VK_SUCCESS)
+    for (int st = 0; st < 2; st++) {
+        nd_image *def = &n->shape[st][KIND(VK_IMAGE_VIEW_TYPE_2D, CLS_FLOAT) - 1];
+        def->tried = 1;
+        if (!make_image(n, KIND(VK_IMAGE_VIEW_TYPE_2D, CLS_FLOAT), def)) goto fail;
+        n->view[st] = def->view;
+    }
+    int z0 = 0, z1 = 0;
+    if (!make_buffer(n, &n->buffer, &n->buffer_mem, &n->texel, &z0) || !make_buffer(n, &n->sink, &n->sink_mem, &n->sink_texel, &z1))
         goto fail;
-    int zeroed = zero_fill(t, n->buffer_mem, type, req.size);
-    VkBufferViewCreateInfo bv = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, n->buffer, VK_FORMAT_R32_UINT, 0, VK_WHOLE_SIZE};
-    if (r->vkCreateBufferView(d, &bv, NULL, &n->texel) != VK_SUCCESS) n->texel = VK_NULL_HANDLE; /* texel nulls stay */
-    VKB_INFO("device %u: null descriptors emulated (dummy image view, buffer%s%s)", t->id, n->texel ? ", texel buffer view" : "",
-             zeroed ? "; buffer zero-filled" : "; buffer not mappable, contents undefined");
+    n->buffers_unzeroed = !z0 || !z1;
+    if (n->buffers_unzeroed) __atomic_store_n(&n->pending, 1, __ATOMIC_RELEASE);
+    VKB_INFO("device %u: null descriptors emulated (dummy image views, buffers%s; %s; storage nulls have their own)", t->id,
+             n->texel ? ", texel buffer views" : "", n->buffers_unzeroed ? "buffers zeroed on the GPU" : "buffers zero-filled");
     return 1;
 fail:
     n->failed = 1;
@@ -269,89 +316,19 @@ fail:
 
 /* The stand-in view of a kind, made on first need (under the lock, dummies made); the default
  * one when the kind is not known or its image could not be made. */
-static VkImageView standin(vkb_nulldesc *n, uint8_t kind)
+static VkImageView standin(vkb_nulldesc *n, uint8_t kind, int storage)
 {
-    if (!kind || kind == KIND_MIXED) return n->view;
-    nd_image *s = &n->shape[kind - 1];
+    if (!kind || kind == KIND_MIXED) return n->view[storage];
+    nd_image *s = &n->shape[storage][kind - 1];
     if (!s->tried) {
         s->tried = 1;
         const char *vt = view_name[(kind - 1) / CLASSES], *cls = class_name[(kind - 1) % CLASSES];
-        if (make_image(n, kind, s)) VKB_INFO("device %u: null descriptor stand-in made: %s, %s", n->t->id, vt, cls);
+        if (make_image(n, kind, s)) VKB_INFO("device %u: null descriptor stand-in made: %s, %s%s", n->t->id, vt, cls, storage ? " (storage)" : "");
         else VKB_WARN("device %u: null descriptor stand-in %s, %s could not be made; the 2D one is used", n->t->id, vt, cls);
     }
-    if (!s->view) return n->view;
+    if (!s->view) return n->view[storage];
     n->shaped++;
     return s->view;
-}
-
-/* ------------------------------------------------------------------ handle maps */
-
-static unsigned slot(const nd_map *m, uint64_t key)
-{
-    key *= 0x9e3779b97f4a7c15ull;
-    return (unsigned)(key >> 40) & m->mask;
-}
-
-static nd_ent *map_find(const nd_map *m, uint64_t key)
-{
-    if (!m->b) return NULL;
-    nd_ent *e = m->b[slot(m, key)];
-    while (e && e->key != key) e = e->next;
-    return e;
-}
-
-/* The entry of key, made (val 0) when missing; NULL out of memory. */
-static nd_ent *map_get(nd_map *m, uint64_t key, uint32_t buckets)
-{
-    if (!m->b) {
-        if (!(m->b = calloc(buckets, sizeof(*m->b)))) return NULL;
-        m->mask = buckets - 1;
-    }
-    nd_ent *e = map_find(m, key);
-    if (e) return e;
-    if (!(e = calloc(1, sizeof(*e)))) return NULL;
-    e->key = key;
-    unsigned s = slot(m, key);
-    e->next = m->b[s];
-    m->b[s] = e;
-    m->count++;
-    return e;
-}
-
-/* Removes key; returns its value (0 when missing). */
-static uint64_t map_take(nd_map *m, uint64_t key)
-{
-    if (!m->b) return 0;
-    for (nd_ent **pp = &m->b[slot(m, key)]; *pp; pp = &(*pp)->next)
-        if ((*pp)->key == key) {
-            nd_ent *e = *pp;
-            uint64_t v = e->val;
-            *pp = e->next;
-            free(e);
-            m->count--;
-            return v;
-        }
-    return 0;
-}
-
-/* Empties the map; vals are freed when they are pointers. */
-static void map_clear(nd_map *m, int vals)
-{
-    for (uint32_t i = 0; m->b && i <= m->mask; i++)
-        while (m->b[i]) {
-            nd_ent *e = m->b[i];
-            m->b[i] = e->next;
-            if (vals) free((void *)(uintptr_t)e->val);
-            free(e);
-        }
-    m->count = 0;
-}
-
-static void map_free(nd_map *m, int vals)
-{
-    map_clear(m, vals);
-    free(m->b);
-    m->b = NULL;
 }
 
 /* ------------------------------------------------------------------ SPIR-V */
@@ -554,6 +531,7 @@ static VkResult VKAPI_CALL nd_CreatePipelineLayout(VkDevice device, const VkPipe
                                                    VkPipelineLayout *out)
 {
     vkb_nulldesc *n = cur();
+    vkb_srv_note_pipeline_layout(ci);
     VkResult r = n->create_layout(device, ci, a, out);
     if (r != VK_SUCCESS) return r;
     nd_layout *l = malloc(sizeof(*l) + ci->setLayoutCount * sizeof(l->set[0]));
@@ -652,22 +630,23 @@ static int fix_one(vkb_nulldesc *n, VkDescriptorType ty, uint8_t kind, void *p)
     if (image_type(ty)) {
         VkDescriptorImageInfo *ii = p;
         if (ii->imageView) return 0;
-        ii->imageView = standin(n, kind);
+        ii->imageView = standin(n, kind, ty == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         ii->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         return 1;
     }
     if (buffer_type(ty)) {
         VkDescriptorBufferInfo *bi = p;
         if (bi->buffer) return 0;
-        bi->buffer = n->buffer;
+        bi->buffer = ty == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || ty == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ? n->sink : n->buffer;
         bi->offset = 0;
         bi->range = VK_WHOLE_SIZE;
         return 1;
     }
-    if (texel_type(ty) && n->texel) {
+    VkBufferView tv = ty == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ? n->sink_texel : n->texel;
+    if (texel_type(ty) && tv) {
         VkBufferView *bv = p;
         if (*bv) return 0;
-        *bv = n->texel;
+        *bv = tv;
         return 1;
     }
     return 0;
@@ -883,6 +862,156 @@ static void VKAPI_CALL nd_CmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t fir
     n->bind_vb2(cb, first, count_, bufs, offs, sizes, strides);
 }
 
+/* ------------------------------------------------------------------ clearing the stand-ins */
+
+static void note_queue(vkb_nulldesc *n, VkQueue q, uint32_t family)
+{
+    if (!q) return;
+    pthread_mutex_lock(&n->lock);
+    nd_ent *e = map_get(&n->queues, (uint64_t)(uintptr_t)q, 64);
+    if (e) e->val = (uint64_t)family + 1;
+    pthread_mutex_unlock(&n->lock);
+}
+
+static void VKAPI_CALL nd_GetDeviceQueue(VkDevice device, uint32_t family, uint32_t index, VkQueue *q)
+{
+    vkb_nulldesc *n = cur();
+    n->get_queue(device, family, index, q);
+    note_queue(n, *q, family);
+}
+
+static void VKAPI_CALL nd_GetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2 *info, VkQueue *q)
+{
+    vkb_nulldesc *n = cur();
+    n->get_queue2(device, info, q);
+    note_queue(n, *q, info->queueFamilyIndex);
+}
+
+/* Records and submits, on q ahead of the app's submission, the clear of every stand-in not cleared
+ * yet: UNDEFINED -> TRANSFER_DST, zero, -> GENERAL, and a barrier that makes the writes available;
+ * then waits for it on a fence, so that a submission on any queue after this one finds them
+ * cleared (another thread's submission waits on the lock meanwhile). It goes down the chain like
+ * the app's own (n->submit: the hang watchdog sees it as a submission of its own). Under the lock.
+ * 1 when nothing is left to clear, 0 when q cannot clear (the next submission elsewhere will). */
+static int clear_pending(vkb_nulldesc *n, VkQueue q)
+{
+    vkb_srv_table *t = n->t;
+    VkDevice d = t->device;
+    const vkb_dispatch *r = &t->real;
+    nd_ent *e = map_find(&n->queues, (uint64_t)(uintptr_t)q);
+    if (!e || !e->val) return 0;
+    uint32_t fam = (uint32_t)(e->val - 1);
+    if (fam >= n->nfam || fam >= MAX_QUEUE_FAMILIES || !(n->fam[fam].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)))
+        return 0; /* a transfer-only queue cannot clear colour images: the next submission elsewhere will */
+    if (!n->pool[fam]) {
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, fam};
+        if (r->vkCreateCommandPool(d, &pci, NULL, &n->pool[fam]) != VK_SUCCESS) {
+            n->pool[fam] = VK_NULL_HANDLE;
+            return 0;
+        }
+    }
+    /* what a barrier may name on this family (VUID-vkCmdPipelineBarrier-dstAccessMask-02816) */
+    VkAccessFlags reads = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+    if (n->fam[fam].queueFlags & VK_QUEUE_GRAPHICS_BIT) reads |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, n->pool[fam], VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (r->vkAllocateCommandBuffers(d, &cai, &cb) != VK_SUCCESS) return 0;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+    r->vkBeginCommandBuffer(cb, &bi);
+    unsigned images = 0;
+    for (int st = 0; st < 2; st++)
+        for (int i = 0; i < KINDS; i++) {
+            nd_image *s = &n->shape[st][i];
+            if (!s->image || s->cleared) continue;
+            VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, s->layers};
+            VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+                                      VK_QUEUE_FAMILY_IGNORED, s->image, range};
+            r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+            VkClearColorValue zero = {{0}};
+            r->vkCmdClearColorImage(cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+            s->cleared = 1;
+            images++;
+        }
+    if (n->buffers_unzeroed) {
+        r->vkCmdFillBuffer(cb, n->buffer, 0, VK_WHOLE_SIZE, 0);
+        r->vkCmdFillBuffer(cb, n->sink, 0, VK_WHOLE_SIZE, 0);
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, reads};
+        r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        n->buffers_unzeroed = 0;
+    }
+    r->vkEndCommandBuffer(cb);
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0};
+    VkFence fence = VK_NULL_HANDLE;
+    VkResult res = r->vkCreateFence(d, &fci, NULL, &fence);
+    if (res == VK_SUCCESS && n->submit) {
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+        res = n->submit(q, 1, &si, fence);
+    } else if (res == VK_SUCCESS) {
+        VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, cb, 0};
+        VkSubmitInfo2 si2 = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, 0, NULL, 1, &cbi, 0, NULL};
+        res = n->submit2(q, 1, &si2, fence);
+    }
+    if (res == VK_SUCCESS) {
+        res = r->vkWaitForFences(d, 1, &fence, VK_TRUE, 5000000000ull);
+        if (res == VK_TIMEOUT) {
+            /* still running: the fence and command buffer stay (the pool frees the latter) */
+            VKB_WARN("device %u: the clear of the null descriptor stand-ins did not finish in 5 s; going on without waiting", t->id);
+            return 1;
+        }
+    }
+    if (fence) r->vkDestroyFence(d, fence, NULL);
+    if (res == VK_SUCCESS) r->vkFreeCommandBuffers(d, n->pool[fam], 1, &cb);
+    if (res != VK_SUCCESS) {
+        VKB_WARN("device %u: clearing the null descriptor stand-ins failed (%d)", t->id, res);
+        return 1; /* not again: the stand-ins keep what they hold */
+    }
+    if (!n->clears++ || images)
+        VKB_INFO("device %u: %u null descriptor stand-in image(s) cleared to zero ahead of a submission (family %u)", t->id, images, fam);
+    return 1;
+}
+
+/* Past this many submissions on queues that cannot clear, the clear is given up (said once): every
+ * submission would otherwise take the lock the descriptor updates use, for good. */
+#define CLEAR_MISSES_MAX 256
+
+static void clear_before_submit(vkb_nulldesc *n, VkQueue q)
+{
+    if (!n || !__atomic_load_n(&n->pending, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&n->lock);
+    if (__atomic_load_n(&n->pending, __ATOMIC_ACQUIRE)) {
+        if (clear_pending(n, q)) {
+            n->clear_misses = 0;
+            __atomic_store_n(&n->pending, 0, __ATOMIC_RELEASE);
+        } else if (++n->clear_misses >= CLEAR_MISSES_MAX) {
+            if (n->clear_misses == CLEAR_MISSES_MAX)
+                VKB_WARN("device %u: null descriptor stand-ins not cleared: %u submissions, none on a graphics or compute queue this layer "
+                         "saw made; their contents stay undefined", n->t->id, n->clear_misses);
+            __atomic_store_n(&n->pending, 0, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&n->lock);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL nd_QueueSubmit(VkQueue q, uint32_t count_, const VkSubmitInfo *s, VkFence f)
+{
+    vkb_nulldesc *n = cur();
+    clear_before_submit(n, q);
+    return n->submit(q, count_, s, f);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL nd_QueueSubmit2(VkQueue q, uint32_t count_, const VkSubmitInfo2 *s, VkFence f)
+{
+    vkb_nulldesc *n = cur();
+    clear_before_submit(n, q);
+    return n->submit2(q, count_, s, f);
+}
+
 void vkb_nulldesc_device_init(vkb_srv_table *t)
 {
     if (!t->emu || !(t->emu->flags & VKB_EMU_ROBUSTNESS2) || vkb_srv_env("VKBRIDGE_NO_NULLDESC")) return;
@@ -938,6 +1067,19 @@ void vkb_nulldesc_device_init(vkb_srv_table *t)
     } else {
         VKB_INFO("device %u: null images all get the 2D stand-in%s", t->id, two_d ? " (VKBRIDGE_NULLDESC_2D)" : "");
     }
+    /* the clear of the stand-ins rides on the app's submissions */
+    t->real.vkGetPhysicalDeviceQueueFamilyProperties(t->physical, &n->nfam, NULL);
+    if (n->nfam > MAX_QUEUE_FAMILIES) n->nfam = MAX_QUEUE_FAMILIES;
+    t->real.vkGetPhysicalDeviceQueueFamilyProperties(t->physical, &n->nfam, n->fam);
+    for (uint32_t i = 0; i < n->nfam; i++) n->fam_idx[i] = i;
+    n->get_queue = dt->vkGetDeviceQueue;
+    n->get_queue2 = dt->vkGetDeviceQueue2;
+    n->submit = dt->vkQueueSubmit;
+    n->submit2 = dt->vkQueueSubmit2;
+    if (n->get_queue) dt->vkGetDeviceQueue = nd_GetDeviceQueue;
+    if (n->get_queue2) dt->vkGetDeviceQueue2 = nd_GetDeviceQueue2;
+    if (n->submit) dt->vkQueueSubmit = nd_QueueSubmit;
+    if (n->submit2) dt->vkQueueSubmit2 = nd_QueueSubmit2;
     t->nulldesc = n;
 }
 
@@ -969,10 +1111,23 @@ void vkb_nulldesc_device_destroy(vkb_srv_table *t)
     }
     const vkb_dispatch *r = &t->real;
     VkDevice d = t->device;
+    if (dt->vkGetDeviceQueue == nd_GetDeviceQueue) dt->vkGetDeviceQueue = n->get_queue;
+    if (dt->vkGetDeviceQueue2 == nd_GetDeviceQueue2) dt->vkGetDeviceQueue2 = n->get_queue2;
+    if (dt->vkQueueSubmit == nd_QueueSubmit) dt->vkQueueSubmit = n->submit;
+    if (dt->vkQueueSubmit2 == nd_QueueSubmit2) dt->vkQueueSubmit2 = n->submit2;
+    /* every clear was waited for when it was submitted (or timed out: then the app's own wait
+     * for idle before vkDestroyDevice covers it) */
+    for (uint32_t i = 0; i < MAX_QUEUE_FAMILIES; i++)
+        if (n->pool[i]) r->vkDestroyCommandPool(d, n->pool[i], NULL);
     if (n->texel) r->vkDestroyBufferView(d, n->texel, NULL);
     if (n->buffer) r->vkDestroyBuffer(d, n->buffer, NULL);
     if (n->buffer_mem) r->vkFreeMemory(d, n->buffer_mem, NULL);
-    for (int i = 0; i < KINDS; i++) free_image(t, &n->shape[i]);
+    if (n->sink_texel) r->vkDestroyBufferView(d, n->sink_texel, NULL);
+    if (n->sink) r->vkDestroyBuffer(d, n->sink, NULL);
+    if (n->sink_mem) r->vkFreeMemory(d, n->sink_mem, NULL);
+    for (int st = 0; st < 2; st++)
+        for (int i = 0; i < KINDS; i++) free_image(t, &n->shape[st][i]);
+    if (n->clears) VKB_INFO("device %u: null descriptor stand-ins cleared to zero in %lu submission(s)", t->id, n->clears);
     if (n->replaced)
         VKB_INFO("device %u: %lu null descriptors replaced, %lu images by stand-ins of their binding's shape; %lu bindings where pipelines "
                  "disagree on the shape", t->id, n->replaced, n->shaped, n->mixed);
@@ -980,6 +1135,7 @@ void vkb_nulldesc_device_destroy(vkb_srv_table *t)
     map_free(&n->layouts, 1);
     map_free(&n->hints, 1);
     map_free(&n->sets, 0);
+    map_free(&n->queues, 0);
     while (n->templates) {
         nd_template *x = n->templates;
         n->templates = x->next;

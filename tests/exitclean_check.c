@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * exitclean_check: processes that exit without destroying anything while another keeps importing.
  * On a Tab S10+ (v0.5.1 rc1) two steamwebhelper processes exited without destroying their devices

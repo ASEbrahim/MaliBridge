@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * shl_barrier: an optimization barrier after every left shift by a constant, for Mali's (and
  * Adreno's) shader compiler. A shift by a constant is folded by the compiler into the address

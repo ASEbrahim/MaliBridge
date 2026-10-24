@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * The MK-02 pass (server/spirv_flip.c) over a corpus of SPIR-V modules:
  *   flip_corpus [-q] outdir file.spv... | @list (one path a line)

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * mali_xproc_probe - can a SECOND process map the Mali driver's own CPU mapping of Vulkan memory?
  *

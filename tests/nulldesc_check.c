@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * nulldesc_check: null image descriptors (robustness2's nullDescriptor) of every view type and
  * numeric class a shader can declare - cube, 3D, uint 2D, sint 2D array, cube array, 1D, an r32ui
@@ -7,7 +8,9 @@
  * (Mali r44; on the host VKBRIDGE_FAKE_MISSING=robustness2) the server puts stand-in views in
  * their place (server_nulldesc.c); a stand-in must have the shape the shader declares. The
  * dispatch reports every binding's size: a real null descriptor gives 0 in every dimension, a
- * stand-in 1 in every dimension (cube arrays count cubes, so a 2D stand-in reads as 0 cubes).
+ * stand-in 1 in every dimension (cube arrays count cubes, so a 2D stand-in reads as 0 cubes),
+ * and what each reads: 0 either way (a stand-in is cleared to zero before the first submission).
+ * Then a write through the null storage image: the sampled nulls still read 0 after it.
  *
  *   cc -O2 -Wall -Ithird_party/Vulkan-Headers-1.4.341/include -Icommon -Icommon/gen -Itests \
  *      -o host/out/nulldesc_check tests/nulldesc_check.c -ldl          (from the repository root)
@@ -243,6 +246,39 @@ static const uint32_t spv_nd_comp[] = {
     0x000000eb,0x000000ea,0x00060041,0x0000001e,0x000000ec,0x00000018,
     0x00000010,0x000000e7,0x0003003e,0x000000ec,0x000000eb,0x000100fd,
     0x00010038
+};
+
+/* Written by hand (SPIR-V 1.0), the same as:
+ *   layout(local_size_x = 1) in;
+ *   layout(set = 0, binding = 6, r32ui) uniform uimage2D su;
+ *   void main() { imageStore(su, ivec2(0), uvec4(0xdeadbeef)); } */
+static const uint32_t spv_nd_write[] = {
+    0x07230203, 0x00010000, 0x00000000, 17, 0,
+    0x00020011, 1,                                   /* OpCapability Shader */
+    0x0003000e, 0, 1,                                /* OpMemoryModel Logical GLSL450 */
+    0x0005000f, 5, 1, 0x6e69616d, 0x00000000,        /* OpEntryPoint GLCompute %1 "main" */
+    0x00060010, 1, 17, 1, 1, 1,                      /* OpExecutionMode %1 LocalSize 1 1 1 */
+    0x00040047, 2, 34, 0,                            /* OpDecorate %2 DescriptorSet 0 */
+    0x00040047, 2, 33, 6,                            /* OpDecorate %2 Binding 6 */
+    0x00020013, 3,                                   /* %3 = OpTypeVoid */
+    0x00030021, 4, 3,                                /* %4 = OpTypeFunction %3 */
+    0x00040015, 5, 32, 0,                            /* %5 = OpTypeInt 32 0 */
+    0x00040015, 6, 32, 1,                            /* %6 = OpTypeInt 32 1 */
+    0x00040017, 7, 6, 2,                             /* %7 = OpTypeVector %6 2 */
+    0x00040017, 8, 5, 4,                             /* %8 = OpTypeVector %5 4 */
+    0x00090019, 9, 5, 1, 0, 0, 0, 2, 33,             /* %9 = OpTypeImage %5 2D 0 0 0 2 R32ui */
+    0x00040020, 10, 0, 9,                            /* %10 = OpTypePointer UniformConstant %9 */
+    0x0004003b, 10, 2, 0,                            /* %2 = OpVariable %10 UniformConstant */
+    0x0004002b, 6, 11, 0,                            /* %11 = OpConstant %6 0 */
+    0x0005002c, 7, 12, 11, 11,                       /* %12 = OpConstantComposite %7 %11 %11 */
+    0x0004002b, 5, 13, 0xdeadbeef,                   /* %13 = OpConstant %5 0xdeadbeef */
+    0x0007002c, 8, 14, 13, 13, 13, 13,               /* %14 = OpConstantComposite %8 %13 %13 %13 %13 */
+    0x00050036, 3, 1, 0, 4,                          /* %1 = OpFunction %3 None %4 */
+    0x000200f8, 15,                                  /* %15 = OpLabel */
+    0x0004003d, 9, 16, 2,                            /* %16 = OpLoad %9 %2 */
+    0x00040063, 16, 12, 14,                          /* OpImageWrite %16 %12 %14 */
+    0x000100fd,                                      /* OpReturn */
+    0x00010038,                                      /* OpFunctionEnd */
 };
 
 #define NB 8 /* image bindings in set 0 */
@@ -514,6 +550,67 @@ int main(void)
             break;
         }
         check_sizes(o, how[k]);
+        /* What they read: 0 from a null descriptor, and from a stand-in too (cleared before the
+         * first submission; before that it was whatever the memory held). */
+        char d[200] = "", what[96];
+        int bad = 0;
+        for (int i = 19; i <= 26; i++) {
+            size_t l = strlen(d);
+            snprintf(d + l, sizeof(d) - l, "%s%08x", l ? " " : "", o[i]);
+            bad |= o[i] != 0;
+        }
+        snprintf(what, sizeof(what), "null images read 0, %s", how[k]);
+        check(!bad, what, d);
+    }
+
+    /* A write through the null storage image (binding 6), then the reads again in the next
+     * submission. A null descriptor drops the write; a stand-in takes it into a sink of its own
+     * (server_nulldesc.c), so the sampled nulls, stand-ins or not, still read 0. The storage image
+     * itself reads 0 when it is a real null; a stand-in's sink gives back what was written into
+     * it (robustness2 says 0), which is said but not counted. */
+    VkShaderModule wsm;
+    VkPipeline wpipe;
+    smci.codeSize = sizeof(spv_nd_write);
+    smci.pCode = spv_nd_write;
+    cpci.layout = pl;
+    ok = !vkCreateShaderModule(dev, &smci, NULL, &wsm) && (cpci.stage.module = wsm) &&
+         !vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &wpipe);
+    check(ok, "pipeline writing through a null storage image", NULL);
+    for (int k = 0; ok && k < 2; k++) {
+        memset(o, 0xee, 128);
+        vkBeginCommandBuffer(cb, &cbi);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k ? pipe : wpipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 2, S, 0, NULL);
+        vkCmdDispatch(cb, 1, 1, 1);
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &mb, 0, NULL, 0, NULL);
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+        VkResult r = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        if (r == VK_SUCCESS) r = vkQueueWaitIdle(queue);
+        if (r != VK_SUCCESS) {
+            char d[64];
+            snprintf(d, sizeof(d), "%s: %d", k ? "read" : "write", r);
+            check(0, "write through a null storage image", d);
+            break;
+        }
+    }
+    if (ok) {
+        char d[200] = "";
+        int bad = 0;
+        for (int i = 19; i <= 24; i++) {
+            size_t l = strlen(d);
+            snprintf(d + l, sizeof(d) - l, "%s%08x", l ? " " : "", o[i]);
+            bad |= o[i] != 0;
+        }
+        int standin = o[14] == 1 && o[15] == 1;
+        size_t l = strlen(d);
+        snprintf(d + l, sizeof(d) - l, "; the storage image %s reads %08x%s", standin ? "(a stand-in)" : "(null)", o[25],
+                 standin && o[25] ? ", its sink's" : "");
+        bad |= !standin && o[25] != 0;
+        check(!bad, "null images read 0 after a write through a null storage image", d);
     }
 
     vkDestroyDevice(dev, NULL);

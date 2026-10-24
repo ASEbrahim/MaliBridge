@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Emulation wrappers installed into a device's dispatch table, like a Vulkan layer: the generated
  * handlers call c->dt, which for an emulating device points here first. The device is found
@@ -69,6 +70,7 @@ static void untrack_image(vkb_emu_device *e, VkImage img)
     pthread_mutex_unlock(&e->lock);
     if (r) {
         image_unaccount(r);
+        vkb_texcap_destroyed(r);
         vkb_emu_image_release(e, r);
         free(r);
     }
@@ -220,6 +222,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_GetDeviceImageMemoryRequirements(VkDevice 
 {
     vkb_emu_device *e = vkb_emu_cur();
     VkImageCreateInfo ci = *pInfo->pCreateInfo;
+    vkb_texcap_create_info(e, &ci);
     vkb_emu_image_create_info(e, &ci);
     vkb_opaque_image(e, &ci);
     VkDeviceImageMemoryRequirements info = *pInfo;
@@ -232,6 +235,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_GetDeviceImageSparseMemoryRequirements(VkD
 {
     vkb_emu_device *e = vkb_emu_cur();
     VkImageCreateInfo ci = *pInfo->pCreateInfo;
+    vkb_texcap_create_info(e, &ci);
     vkb_emu_image_create_info(e, &ci);
     VkDeviceImageMemoryRequirements info = *pInfo;
     info.pCreateInfo = &ci;
@@ -292,7 +296,8 @@ static uint32_t decoded_texel_bytes(VkFormat f)
     }
 }
 
-static void image_account(vkb_emu_device *e, VkDevice device, VkImage img, const VkImageCreateInfo *ci, VkFormat client_format)
+static void image_account(vkb_emu_device *e, VkDevice device, VkImage img, const VkImageCreateInfo *ci, const VkImageCreateInfo *app,
+                          VkFormat client_format)
 {
     vkb_emu_image *r = ci->flags & VK_IMAGE_CREATE_DISJOINT_BIT ? NULL : vkb_emu_find_image(e, img); /* disjoint: per plane */
     if (!r) return;
@@ -301,11 +306,17 @@ static void image_account(vkb_emu_device *e, VkDevice device, VkImage img, const
     int64_t src = 0, ideal = 0;
     if (client_format != ci->format && vkb_is_bc(client_format)) {
         int64_t block = vkb_bc_block_bytes(client_format), texel = decoded_texel_bytes(ci->format), tx = vkb_tx_block_bytes(ci->format);
+        /* the BC data as the app made the image (all its levels), and what the driver holds of it */
+        for (uint32_t m = 0; m < app->mipLevels; m++) {
+            uint32_t w = app->extent.width >> m, h = app->extent.height >> m, d = app->extent.depth >> m;
+            w = w ? w : 1, h = h ? h : 1, d = d ? d : 1;
+            src += (int64_t)((w + 3) / 4) * ((h + 3) / 4) * d * block;
+        }
         for (uint32_t m = 0; m < ci->mipLevels; m++) {
             uint32_t w = ci->extent.width >> m, h = ci->extent.height >> m, d = ci->extent.depth >> m;
             w = w ? w : 1, h = h ? h : 1, d = d ? d : 1;
-            src += (int64_t)((w + 3) / 4) * ((h + 3) / 4) * d * block;
-            ideal += tx ? (int64_t)((w + 3) / 4) * ((h + 3) / 4) * d * tx : (int64_t)w * h * d * texel; /* transcoded: its blocks */
+            uint32_t n = vkb_tx_block_dim(ci->format);
+            ideal += tx ? (int64_t)((w + n - 1) / n) * ((h + n - 1) / n) * d * tx : (int64_t)w * h * d * texel; /* transcoded: its blocks */
         }
         src *= ci->arrayLayers, ideal *= ci->arrayLayers;
     } else {
@@ -422,6 +433,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     vkb_emu_device *e = vkb_emu_cur();
     VkImageCreateInfo *ci = (VkImageCreateInfo *)pCreateInfo;
     VkFormat client_format = ci->format;
+    VkImageCreateInfo app = *ci;
+    uint32_t drop = vkb_texcap_create_info(e, ci);
     vkb_emu_image_create_info(e, ci);
     int opaque = vkb_opaque_image(e, ci);
     VkResult r = driver_create_image(device, ci, pAllocator, pImage);
@@ -434,7 +447,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     if (r != VK_SUCCESS && dmabuf_plain_retry(ci)) r = driver_create_image(device, ci, pAllocator, pImage);
     if (r == VK_SUCCESS) {
         vkb_emu_track_image(e, *pImage, ci, client_format);
-        image_account(e, device, *pImage, ci, client_format);
+        if (drop) vkb_texcap_created(e, vkb_emu_find_image(e, *pImage), drop, &app.extent, app.mipLevels);
+        image_account(e, device, *pImage, ci, &app, client_format);
         for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
             if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
                 (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
@@ -510,6 +524,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateGraphicsPipelines(VkDevice devic
         /* Before compat flattens a non-solid polygon mode: what the line/point variant needs. */
         vkb_emu_polygon_pipeline(e, ci, (poly_info *)(polys + i * psz));
         vkb_emu_compat_pipeline(e, device, ci, mods, &nmods, 64);
+        /* Last of the shader rewrites: it builds on what the others made of the vertex stage. */
+        vkb_emu_shader_bgr10(e, device, ci, mods, &nmods, 64);
+        vkb_emu_shader_uf11(e, device, ci, mods, &nmods, 64);
         if (e->flags & VKB_EMU_MAINT5) {
             VkPipelineCreateFlags2CreateInfo *f2 = vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO);
             if (f2) ci->flags = (VkPipelineCreateFlags)f2->flags;
@@ -539,6 +556,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateGraphicsPipelines(VkDevice devic
         vkb_emu_polygon_created(e, device, cache, &infos[i], p, (poly_info *)(polys + i * psz));
     }
     for (uint32_t i = 0; i < nmods; i++) vkb_emu_real()->vkDestroyShaderModule(device, mods[i], NULL);
+    vkb_emu_shader_call_end();
     free(divs);
     free(polys);
     return r;
@@ -561,6 +579,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateComputePipelines(VkDevice device
     }
     VkResult r = vkb_emu_real()->vkCreateComputePipelines(device, cache, n, infos, pAllocator, pPipelines);
     for (uint32_t i = 0; i < nmods; i++) vkb_emu_real()->vkDestroyShaderModule(device, mods[i], NULL);
+    vkb_emu_shader_call_end();
     return r;
 }
 
@@ -624,6 +643,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdCopyImage(VkCommandBuffer cb, VkImage s
         fix_layers(e, src, (VkImageSubresourceLayers *)&regions[i].srcSubresource);
         fix_layers(e, dst, (VkImageSubresourceLayers *)&regions[i].dstSubresource);
     }
+    if (!(n = vkb_texcap_image_copy(e, src, dst, (VkImageCopy *)regions, n))) return;
     if (vkb_emu_copy_image(e, cb, src, sl, dst, dl, n, regions)) return;
     vkb_emu_real()->vkCmdCopyImage(cb, src, sl, dst, dl, n, regions);
 }
@@ -635,6 +655,8 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdCopyImage2(VkCommandBuffer cb, const Vk
         fix_layers(e, info->srcImage, (VkImageSubresourceLayers *)&info->pRegions[i].srcSubresource);
         fix_layers(e, info->dstImage, (VkImageSubresourceLayers *)&info->pRegions[i].dstSubresource);
     }
+    VkCopyImageInfo2 *w = (VkCopyImageInfo2 *)info;
+    if (!(w->regionCount = vkb_texcap_image_copy2(e, info->srcImage, info->dstImage, (VkImageCopy2 *)info->pRegions, info->regionCount))) return;
     if (vkb_emu_copy_image2(e, cb, info)) return;
     vkb_emu_real()->vkCmdCopyImage2(cb, info);
 }
@@ -647,6 +669,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdBlitImage(VkCommandBuffer cb, VkImage s
         fix_layers(e, src, (VkImageSubresourceLayers *)&regions[i].srcSubresource);
         fix_layers(e, dst, (VkImageSubresourceLayers *)&regions[i].dstSubresource);
     }
+    if (!(n = vkb_texcap_blit(e, src, dst, (VkImageBlit *)regions, n))) return;
     vkb_emu_real()->vkCmdBlitImage(cb, src, sl, dst, dl, n, regions, filter);
 }
 
@@ -657,6 +680,8 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdBlitImage2(VkCommandBuffer cb, const Vk
         fix_layers(e, info->srcImage, (VkImageSubresourceLayers *)&info->pRegions[i].srcSubresource);
         fix_layers(e, info->dstImage, (VkImageSubresourceLayers *)&info->pRegions[i].dstSubresource);
     }
+    VkBlitImageInfo2 *w = (VkBlitImageInfo2 *)info;
+    if (!(w->regionCount = vkb_texcap_blit2(e, info->srcImage, info->dstImage, (VkImageBlit2 *)info->pRegions, info->regionCount))) return;
     vkb_emu_real()->vkCmdBlitImage2(cb, info);
 }
 
@@ -668,6 +693,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdResolveImage(VkCommandBuffer cb, VkImag
         fix_layers(e, src, (VkImageSubresourceLayers *)&regions[i].srcSubresource);
         fix_layers(e, dst, (VkImageSubresourceLayers *)&regions[i].dstSubresource);
     }
+    if (!(n = vkb_texcap_resolve(e, dst, (VkImageResolve *)regions, n))) return;
     vkb_emu_real()->vkCmdResolveImage(cb, src, sl, dst, dl, n, regions);
 }
 
@@ -678,6 +704,8 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdResolveImage2(VkCommandBuffer cb, const
         fix_layers(e, info->srcImage, (VkImageSubresourceLayers *)&info->pRegions[i].srcSubresource);
         fix_layers(e, info->dstImage, (VkImageSubresourceLayers *)&info->pRegions[i].dstSubresource);
     }
+    VkResolveImageInfo2 *w = (VkResolveImageInfo2 *)info;
+    if (!(w->regionCount = vkb_texcap_resolve2(e, info->dstImage, (VkImageResolve2 *)info->pRegions, info->regionCount))) return;
     vkb_emu_real()->vkCmdResolveImage2(cb, info);
 }
 
@@ -686,6 +714,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdCopyBufferToImage(VkCommandBuffer cb, V
 {
     vkb_emu_device *e = vkb_emu_cur();
     for (uint32_t i = 0; i < n; i++) fix_layers(e, dst, (VkImageSubresourceLayers *)&regions[i].imageSubresource);
+    if (!(n = vkb_texcap_buffer_image(e, dst, 0, (VkBufferImageCopy *)regions, n))) return;
     if (vkb_emu_copy_buffer_to_image(e, cb, src, dst, dl, n, regions)) return;
     vkb_emu_real()->vkCmdCopyBufferToImage(cb, src, dst, dl, n, regions);
 }
@@ -695,6 +724,8 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdCopyBufferToImage2(VkCommandBuffer cb, 
     vkb_emu_device *e = vkb_emu_cur();
     for (uint32_t i = 0; i < info->regionCount; i++)
         fix_layers(e, info->dstImage, (VkImageSubresourceLayers *)&info->pRegions[i].imageSubresource);
+    VkCopyBufferToImageInfo2 *w = (VkCopyBufferToImageInfo2 *)info;
+    if (!(w->regionCount = vkb_texcap_buffer_image2(e, info->dstImage, 0, (VkBufferImageCopy2 *)info->pRegions, info->regionCount))) return;
     if (vkb_emu_copy_buffer_to_image2(e, cb, info)) return;
     vkb_emu_real()->vkCmdCopyBufferToImage2(cb, info);
 }
@@ -705,6 +736,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdCopyImageToBuffer(VkCommandBuffer cb, V
     vkb_emu_device *e = vkb_emu_cur();
     for (uint32_t i = 0; i < n; i++) fix_layers(e, src, (VkImageSubresourceLayers *)&regions[i].imageSubresource);
     if (vkb_emu_bcn_blocks_readback(e, src)) return;
+    if (!(n = vkb_texcap_buffer_image(e, src, 1, (VkBufferImageCopy *)regions, n))) return;
     vkb_emu_real()->vkCmdCopyImageToBuffer(cb, src, sl, dst, n, regions);
 }
 
@@ -714,6 +746,8 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdCopyImageToBuffer2(VkCommandBuffer cb, 
     for (uint32_t i = 0; i < info->regionCount; i++)
         fix_layers(e, info->srcImage, (VkImageSubresourceLayers *)&info->pRegions[i].imageSubresource);
     if (vkb_emu_bcn_blocks_readback(e, info->srcImage)) return;
+    VkCopyImageToBufferInfo2 *w = (VkCopyImageToBufferInfo2 *)info;
+    if (!(w->regionCount = vkb_texcap_buffer_image2(e, info->srcImage, 1, (VkBufferImageCopy2 *)info->pRegions, info->regionCount))) return;
     vkb_emu_real()->vkCmdCopyImageToBuffer2(cb, info);
 }
 
@@ -780,12 +814,22 @@ void vkb_emu_install(vkb_srv_table *dev)
     vkb_emu_polygon_install(dev); /* over compat: its split indirect draws come through it */
     vkb_emu_desc_install(dev); /* beneath push descriptors: their layouts and templates come through it */
     vkb_emu_push_install(dev);
+    vkb_emu_dynrend_install(dev); /* over the pipeline and command buffer wrappers: they see render passes */
+    vkb_texcap_install(dev); /* over the BC views and the shader store: it renumbers levels before them */
+    if (e->texcap) {
+        /* blits from a capped texture and resolves into one (not only under maintenance5) */
+        dt->vkCmdBlitImage = emu_CmdBlitImage;
+        dt->vkCmdResolveImage = emu_CmdResolveImage;
+        if (dev->real.vkCmdBlitImage2) dt->vkCmdBlitImage2 = emu_CmdBlitImage2;
+        if (dev->real.vkCmdResolveImage2) dt->vkCmdResolveImage2 = emu_CmdResolveImage2;
+    }
     VKB_INFO("device %u: emulation 0x%x installed", dev->id, e->flags);
 }
 
 void vkb_emu_uninstall(vkb_srv_table *dev)
 {
     vkb_emu_device *e = dev->emu;
+    vkb_texcap_uninstall(dev);
     vkb_emu_push_uninstall(dev);
     vkb_emu_desc_uninstall(dev);
     vkb_emu_polygon_uninstall(dev);
@@ -796,6 +840,7 @@ void vkb_emu_uninstall(vkb_srv_table *dev)
             vkb_emu_image *r = e->images[i];
             e->images[i] = r->next;
             image_unaccount(r);
+            vkb_texcap_destroyed(r);
             vkb_emu_image_release(e, r);
             free(r);
         }
@@ -806,6 +851,7 @@ void vkb_emu_uninstall(vkb_srv_table *dev)
             free(r);
         }
     }
+    vkb_emu_dynrend_uninstall(dev); /* after the command buffers' records, which hold its framebuffers */
 }
 
 /* ------------------------------------------------------------------ depth clip enable */

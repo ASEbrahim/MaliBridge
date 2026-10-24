@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * d3d11_flicker.exe [frames] [draws]: every frame of a game-like D3D11 workload checked. Per frame
  * a 256-cell grid is drawn into an offscreen target, one draw per cell, each with a

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Experiment: images made without the driver's framebuffer compression (AFBC on Mali), through
  * VK_EXT_image_compression_control. VKBRIDGE_NO_COMPRESSION=all: every image; =alias: images made

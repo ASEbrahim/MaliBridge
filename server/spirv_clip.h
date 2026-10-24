@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 ASEbrahim and MaliBridge contributors */
 #ifndef VKB_SPIRV_CLIP_H
 #define VKB_SPIRV_CLIP_H
 

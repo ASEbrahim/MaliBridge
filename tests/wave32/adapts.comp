@@ -1,0 +1,19 @@
+#version 450
+// wave32 corpus: compares gl_SubgroupSize, as shaders made for any size do: left as it is.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_quad : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    uint s = gl_SubgroupSize == 32u ? subgroupAdd(o[i]) : 0u;
+    o[i] = s;
+}

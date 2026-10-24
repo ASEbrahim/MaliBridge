@@ -1,0 +1,16 @@
+#version 450
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#pragma use_vulkan_memory_model
+#extension GL_KHR_memory_scope_semantics : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430) buffer Ptr { uint v[]; };
+layout(set = 0, binding = 0) buffer Bytes { uint8_t b[]; } bufs[];
+layout(push_constant) uniform PC { Ptr p; uint idx; } pc;
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    pc.p.v[i] = uint(bufs[nonuniformEXT(pc.idx + i % 2u)].b[i]) + 1u;
+}

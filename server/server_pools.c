@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Elastic descriptor pools. Desktop drivers commonly allocate past a pool's maxSets and sizes, and
  * games developed on them rely on it; Mali (r44) refuses with VK_ERROR_OUT_OF_POOL_MEMORY, which
