@@ -467,6 +467,20 @@ add_custom_target(ci-test
         cullmode_check
         divisor_check
         polygon_check
+        texcap_check
+        promote_check
+        shmbarrier_check
+        wave32_check
+        stencillayout_check
+        dynrend_check
+        robust2_check
+        fp16_check
+        asyncpipe_check
+        xfb_check
+        downgrade_corpus
+        shmbarrier_corpus
+        wave32_corpus
+        effects_corpus
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     USES_TERMINAL
     VERBATIM
