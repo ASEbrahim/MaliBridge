@@ -191,6 +191,16 @@ set(CHECK_TESTS
     memclass_check
     procaddr_check
     exitclean_check
+    texcap_check
+    asyncpipe_check
+    robust2_check
+    fp16_check
+    promote_check
+    shmbarrier_check
+    stencillayout_check
+    dynrend_check
+    wave32_check
+    xfb_check
 )
 foreach(t IN LISTS CHECK_TESTS)
     add_executable(${t}
@@ -232,6 +242,26 @@ target_sources(polygon_check PRIVATE
     "${VKB}/tests/polygon_frag.inc"
 )
 target_sources(clampzero_check PRIVATE "${VKB}/tests/clampzero_comp.inc")
+target_sources(texcap_check PRIVATE "${VKB}/tests/texcap_comp.inc")
+target_sources(asyncpipe_check PRIVATE
+    "${VKB}/tests/cullmode_vert.inc"
+    "${VKB}/tests/dynstate_frag.inc"
+)
+target_sources(dynrend_check PRIVATE
+    "${VKB}/tests/polygon_vert.inc"
+    "${VKB}/tests/polygon_frag.inc"
+)
+target_sources(promote_check PRIVATE
+    "${VKB}/tests/promote_comp15.inc"
+    "${VKB}/tests/promote_comp16.inc"
+)
+target_sources(shmbarrier_check PRIVATE "${VKB}/tests/shmbarrier_comp.inc")
+target_sources(wave32_check PRIVATE "${VKB}/tests/wave32_comp.inc")
+target_sources(xfb_check PRIVATE
+    "${VKB}/tests/xfb_xfb_vert.inc"
+    "${VKB}/tests/xfb_plain_vert.inc"
+    "${VKB}/tests/xfb_so_geom.inc"
+)
 target_sources(viewport_check PRIVATE
     "${VKB}/tests/viewport_vert.inc"
     "${VKB}/tests/viewport_vert_mv.inc"
@@ -295,6 +325,49 @@ add_executable(shlbarrier_corpus
 target_link_libraries(shlbarrier_corpus PRIVATE vkb_host_warn)
 vkb_host_output(shlbarrier_corpus)
 
+# The version promotion's SPIR-V lowering alone, over a corpus (host/promote_test.sh)
+add_executable(downgrade_corpus
+    "${VKB}/tests/downgrade_corpus.c"
+    "${SRV}/spirv_downgrade.c"
+    "${SRV}/spirv_edit.c"
+)
+target_link_libraries(downgrade_corpus PRIVATE vkb_host_warn)
+vkb_host_output(downgrade_corpus)
+
+# The shm_barrier SPIR-V pass alone, over a corpus (host/shmbarrier_test.sh)
+add_executable(shmbarrier_corpus
+    "${VKB}/tests/shmbarrier_corpus.c"
+    "${SRV}/spirv_shmbarrier.c"
+    "${SRV}/spirv_uniform.c"
+    "${SRV}/spirv_lockstep.c"
+)
+target_link_libraries(shmbarrier_corpus PRIVATE vkb_host_warn)
+vkb_host_output(shmbarrier_corpus)
+
+# The wave32 SPIR-V pass alone, over a corpus (host/wave32_test.sh)
+add_executable(wave32_corpus
+    "${VKB}/tests/wave32_corpus.c"
+    "${SRV}/spirv_wave32.c"
+    "${SRV}/spirv_uniform.c"
+)
+target_link_libraries(wave32_corpus PRIVATE vkb_host_warn)
+vkb_host_output(wave32_corpus)
+
+# The asynchronous compile's shader scan alone (host/asyncpipe_test.sh)
+add_executable(effects_corpus
+    "${VKB}/tests/effects_corpus.c"
+    "${SRV}/spirv_effects.c"
+    "${VKB}/tests/bitwise_comp.inc"
+    "${VKB}/tests/clampzero_comp.inc"
+    "${VKB}/tests/dynstate_frag.inc"
+    "${VKB}/tests/cullmode_vert.inc"
+    "${VKB}/tests/divisor_vert.inc"
+    "${VKB}/tests/divisor_frag.inc"
+)
+target_include_directories(effects_corpus PRIVATE "${SRV}" "${VKB}/tests")
+target_link_libraries(effects_corpus PRIVATE vkb_host_warn)
+vkb_host_output(effects_corpus)
+
 # `make -C host test` runs the whole regression suite; so does `cmake --build <dir> --target test`.
 add_custom_target(test
     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/run_tests.sh" "${OUT}"
@@ -309,6 +382,10 @@ add_custom_target(test
         bitwise_corpus
         clampzero_corpus
         shlbarrier_corpus
+        downgrade_corpus
+        shmbarrier_corpus
+        wave32_corpus
+        effects_corpus
     USES_TERMINAL
     VERBATIM
 )
