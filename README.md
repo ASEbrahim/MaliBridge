@@ -71,6 +71,8 @@ Logs from your device help a lot (see [If something goes wrong](INSTALL.md#if-so
 
 The [install guide](INSTALL.md) has every step, the settings to check, and which games to try first.
 
+**Support MaliBridge.** If it helps you, you can support it on [Ko-fi](https://ko-fi.com/asebrahim). Patreon is coming soon.
+
 <a id="status"></a>
 ## Games that run
 
