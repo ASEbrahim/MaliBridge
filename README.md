@@ -71,7 +71,7 @@ Logs from your device help a lot (see [If something goes wrong](INSTALL.md#if-so
 
 The [install guide](INSTALL.md) has every step, the settings to check, and which games to try first.
 
-**Support MaliBridge.** If it helps you, you can support it on [Ko-fi](https://ko-fi.com/asebrahim). Patreon is coming soon.
+**Support MaliBridge.** If it helps you, you can support it on [Ko-fi](https://ko-fi.com/asebrahim). Patreon is coming soon. Come say hi on [Discord](https://discord.gg/nJUvtYJA9C).
 
 <a id="status"></a>
 ## Games that run
@@ -248,6 +248,7 @@ little (the table above); safe mode is meant for GPUs I haven't tested.
   model and what happened. [Install guide: If something goes wrong](INSTALL.md#if-something-goes-wrong)
   has the details.
 - **Questions** (storage, which Proton, PanVK, anti-cheat): see the [FAQ](INSTALL.md#faq).
+- **Chat with other players and me** on [Discord](https://discord.gg/nJUvtYJA9C).
 
 ## What's next
 
