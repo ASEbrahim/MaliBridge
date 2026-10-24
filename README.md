@@ -31,18 +31,23 @@ which chip you have? It's under Settings → About phone (or About tablet), or i
 | Google Pixel 8 / 8 Pro | Tensor G3 / Mali-G715 | r54 | Player reports: games run (Cuphead, Hades, Balatro, Dishonored) |
 | vivo X200 | Dimensity 9400 / Immortalis-G925 MC12 | | Player report: games run (Euro Truck Simulator 2, CarX Drift Racing Online) |
 | OPPO Find X9 Pro and others | Dimensity 9500 / Mali-G1-Ultra MC12 | r54p1 | Player reports: games run since v0.5.2 (Balatro, Slay the Spire) |
-| OnePlus (Dimensity 9000) | Mali-G710 | r32p1 (Vulkan 1.1) | Player report: Half-Life 2 and RimWorld start with DXVK 1.10.3 picked by hand; the automatic pick is being fixed |
+| OnePlus Ace 2V (Dimensity 9000) | Mali-G710 | r32p1 (Vulkan 1.1) | Player report: Half-Life 2 starts and RimWorld plays for 1-2 hours with DXVK 1.10.3 |
 | POCO X6 Pro | Dimensity 8300-Ultra / Mali-G615 MC6 | | Player report: lighter games run (GTA San Andreas, Burnout Paradise) |
 | realme Neo7 | Dimensity 9300+ / Immortalis-G720 MC12 | r44p1 | Player report: Stardew Valley runs; Balatro runs with its text missing |
 | Dimensity 8350 phone | Mali-G615 | | Player report: Rivals of Aether about 55 fps |
+| Xiaomi Pad 9 Pro Max | XRing O3 | | Player report: Human Fall Flat works, Portal 2 40-50 fps at 1080p |
+| Xiaomi 17T Pro | Dimensity 9500 / Mali-G1-Ultra MC12 | r54p1 | Player report: Hollow Knight, Silksong, Hades, Celeste and Portal run |
+| Xiaomi 14T Pro | Dimensity 9300+ / Immortalis-G720 MC12 | r44p1 | Player report: Steam, controller and downloads work; Alan Wake 20-50 fps on Low |
+| POCO X8 Pro | Dimensity 8500 / Mali-G720 MC8 | r49p1 | Player reports: Indiana Jones and the Emperor's Tomb about 30 fps; Hob plays with some freezes |
+| Redmi Note 12S | Helio G96 / Mali-G57 MC2 | | Player report: first G57 report; Steam works first try, lighter games run |
 
 **Help wanted: not tested yet.** Reports from these would help the most:
 
 | Chip | GPU | Example devices |
 |---|---|---|
-| Dimensity 9300 / 9300+ (other devices) | Immortalis-G720 MC12 | Xiaomi 14T Pro, vivo X100 Pro |
+| Dimensity 9300 / 9300+ (other devices) | Immortalis-G720 MC12 | vivo X100 Pro |
 | Dimensity 9400 / 9400+ (other devices) | Immortalis-G925 MC12 | OPPO Find X8 |
-| Dimensity 8400 / 8500 | Mali-G720 MC7 / MC8 | POCO X7 Pro, POCO X8 Pro |
+| Dimensity 8400 | Mali-G720 MC7 | POCO X7 Pro |
 | Dimensity 9000 / 9200 | Mali-G710 / Immortalis-G715 | OnePlus Ace 2V |
 | Dimensity 7300, 8100, 8200, Helio G99 and similar | Mali-G615 / G610 / G57 | many mid-range phones (smaller GPUs: expect light games only) |
 | Exynos 1280 / 1380 / 2100 | Mali-G68 / G78 | Galaxy A53, A54, S21 |
@@ -141,7 +146,7 @@ readings, not my measurements.
 | Euro Truck Simulator 2 | vivo X200 (G925) | about 20 fps in play (Medium, 1600x720), smooth menus |
 | CarX Drift Racing Online | vivo X200 (G925) | 9-20 fps in play on the lowest settings, with stutter |
 | Half-Life 2 | OnePlus, Dimensity 9000 (G710) | starts with DXVK 1.10.3 picked by hand |
-| RimWorld | OnePlus, Dimensity 9000 (G710) | menu and world generation work; crashes during character creation |
+| RimWorld | OnePlus Ace 2V (G710) | plays for 1-2 hours with DXVK 1.10.3 |
 | GTA San Andreas | POCO X6 Pro (G615) | about 30 fps |
 | Prince of Persia: Warrior Within | POCO X6 Pro (G615) | about 30 fps |
 | Burnout Paradise | POCO X6 Pro (G615) | 20-30 fps |
@@ -153,6 +158,18 @@ readings, not my measurements.
 | Stardew Valley | realme Neo7 (G720) | about 59 fps |
 | Balatro | realme Neo7 (G720) | 55-72 fps, but its text is missing |
 | Rivals of Aether | Dimensity 8350 phone (G615) | about 55 fps |
+| Hollow Knight | Xiaomi 17T Pro (Dimensity 9500) | 60-80 fps; texture artifacts fixed in v0.5.3 |
+| Hollow Knight: Silksong | Xiaomi 17T Pro (Dimensity 9500) | 60-75 fps in game; texture artifacts fixed in v0.5.3 |
+| Hades | Xiaomi 17T Pro (Dimensity 9500) | 100-120 fps in DX mode, 45-55 in Vulkan |
+| Celeste | Xiaomi 17T Pro (Dimensity 9500) | stable 60 fps |
+| Portal | Xiaomi 17T Pro (Dimensity 9500) | 50-115 fps |
+| Portal 2 | Xiaomi Pad 9 Pro Max (XRing O3) | 40-50 fps at 1080p |
+| Human Fall Flat | Xiaomi Pad 9 Pro Max (XRing O3) | works |
+| Alan Wake | Xiaomi 14T Pro (G720) | 20-50 fps on Low |
+| Zombie Blocks 2 | Redmi Note 12S (G57) | about 30 fps on Low |
+| Death Road to Canada | Redmi Note 12S (G57) | 30-60 fps |
+| Left 4 Dead | Redmi Note 12S (G57) | 15-40 fps |
+| Hob | POCO X8 Pro (G720 MC8) | playable, with some freezes being looked into |
 | Indiana Jones and the Emperor's Tomb | POCO X8 Pro (G720 MC8) | about 30 fps in play with the Stability FEX preset; the Performance presets stop it with an "invalid camera matrix" error |
 
 ## Known issues
@@ -232,6 +249,7 @@ little (the table above); safe mode is meant for GPUs I haven't tested.
 
 ## What's next
 
+- Better performance across the board, and frame generation that adds smoothness without adding lag.
 - Smoother first visits to new areas (shader compiling in the background).
 - The games limited by the CPU (The Forest, ASTRONEER, Outer Wilds) and faster file access in
   DroidDeck's sandbox, which should also fix Just Cause 2.
