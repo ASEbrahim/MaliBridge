@@ -96,6 +96,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateImageView(VkDevice device, const Vk
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreatePipelineCache(VkDevice device, const VkPipelineCacheCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPipelineCache* pPipelineCache);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPipelineLayout* pPipelineLayout);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkRenderPass* pRenderPass);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSampler* pSampler);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkShaderModule* pShaderModule);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator);
@@ -192,8 +193,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkAllocateMemory(VkDevice device, const VkM
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo)
 {
     // server_emu_cmdstate.c (emu_BeginCommandBuffer)
+    // server_emu_dynrend.c (d_BeginCommandBuffer)
     // server_errata_cmd.c (l_BeginCommandBuffer)
     // server_errata_flip.c (fl_BeginCommandBuffer)
+    // server_errata_vbbake.c (bk_BeginCommandBuffer)
+    // server_errata_vbbake.c (im_BeginCommandBuffer)
     // server_gpuprof.c (gp_BeginCommandBuffer)
     // server_hang.c (hg_BeginCommandBuffer)
     auto ctx = get_scoped_ctx(commandBuffer);
@@ -216,6 +220,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkBindImageMemory2(VkDevice device, uint32_
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin, VkSubpassContents contents)
 {
+    // server_errata_ds.c (i_CmdBeginRenderPass)
     // server_gpuprof.c (gp_CmdBeginRenderPass)
     // server_hang.c (hg_CmdBeginRenderPass)
     auto ctx = get_scoped_ctx(commandBuffer);
@@ -224,6 +229,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBeginRenderPass(VkCommandBuffer commandBuf
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin, const VkSubpassBeginInfo* pSubpassBeginInfo)
 {
+    // server_errata_ds.c (i_CmdBeginRenderPass2)
     // server_gpuprof.c (gp_CmdBeginRenderPass2)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdBeginRenderPass2(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
@@ -231,6 +237,8 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBeginRenderPass2(VkCommandBuffer commandBu
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
 {
+    // server_emu_dynrend.c (d_CmdBeginRendering)
+    // server_errata_ds.c (f_CmdBeginRendering)
     // server_errata_views.c (v_CmdBeginRendering)
     // server_gpuprof.c (gp_CmdBeginRendering)
     // server_hang.c (hg_CmdBeginRendering)
@@ -270,6 +278,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBindPipeline(VkCommandBuffer commandBuffer
     // server_errata_cmd.c (f_CmdBindPipeline)
     // server_errata_cmd.c (i_CmdBindPipeline)
     // server_errata_flip.c (fl_CmdBindPipeline)
+    // server_errata_vbbake.c (bk_CmdBindPipeline)
     // server_gpuprof.c (gp_CmdBindPipeline)
     // server_hang.c (hg_CmdBindPipeline)
     auto ctx = get_scoped_ctx(commandBuffer);
@@ -281,6 +290,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBindVertexBuffers(VkCommandBuffer commandB
     // server_emu_divisor.c (emu_CmdBindVertexBuffers)
     // server_errata_cmd.c (f_CmdBindVertexBuffers)
     // server_errata_cmd.c (i_CmdBindVertexBuffers)
+    // server_errata_vbbake.c (im_CmdBindVertexBuffers)
     // server_nulldesc.c (nd_CmdBindVertexBuffers)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdBindVertexBuffers(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets);
@@ -289,11 +299,14 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBindVertexBuffers(VkCommandBuffer commandB
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBuffer* pBuffers, const VkDeviceSize* pOffsets, const VkDeviceSize* pSizes, const VkDeviceSize* pStrides)
 {
     // server_emu_divisor.c (emu_CmdBindVertexBuffers2)
+    // server_emu_dynrend.c (d_CmdBindVertexBuffers2)
     // server_emu_layer.c (emu_CmdBindVertexBuffers2)
     // server_emu_layer.c (imi_CmdBindVertexBuffers2)
     // server_errata_cmd.c (f_CmdBindVertexBuffers2)
     // server_errata_cmd.c (f_CmdBindVertexBuffers2Split)
     // server_errata_cmd.c (i_CmdBindVertexBuffers2)
+    // server_errata_vbbake.c (bk_CmdBindVertexBuffers2)
+    // server_errata_vbbake.c (im_CmdBindVertexBuffers2)
     // server_nulldesc.c (nd_CmdBindVertexBuffers2)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdBindVertexBuffers2(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
@@ -329,6 +342,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdClearColorImage(VkCommandBuffer commandBuf
 {
     // server_gpuprof.c (gp_vkCmdClearColorImage)
     // server_hang.c (hg_clear_color)
+    // server_texcap.c (tc_CmdClearColorImage)
     // server_trace.c (tr_CmdClearColorImage)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdClearColorImage(commandBuffer, image, imageLayout, pColor, rangeCount, pRanges);
@@ -435,6 +449,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDraw(VkCommandBuffer commandBuffer, uint32
     // server_emu_divisor.c (emu_CmdDraw)
     // server_errata_cmd.c (ci_CmdDraw)
     // server_errata_flip.c (fl_CmdDraw)
+    // server_errata_vbbake.c (bk_vkCmdDraw)
     // server_gpuprof.c (gp_CmdDraw)
     // server_hang.c (hg_CmdDraw)
     auto ctx = get_scoped_ctx(commandBuffer);
@@ -446,6 +461,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndexed(VkCommandBuffer commandBuffer,
     // server_emu_divisor.c (emu_CmdDrawIndexed)
     // server_errata_cmd.c (ci_CmdDrawIndexed)
     // server_errata_flip.c (fl_CmdDrawIndexed)
+    // server_errata_vbbake.c (bk_vkCmdDrawIndexed)
     // server_gpuprof.c (gp_CmdDrawIndexed)
     // server_hang.c (hg_CmdDrawIndexed)
     auto ctx = get_scoped_ctx(commandBuffer);
@@ -458,6 +474,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndexedIndirect(VkCommandBuffer comman
     // server_emu_divisor.c (emu_CmdDrawIndexedIndirect)
     // server_errata_cmd.c (ci_CmdDrawIndexedIndirect)
     // server_errata_flip.c (fl_CmdDrawIndexedIndirect)
+    // server_errata_vbbake.c (bk_vkCmdDrawIndexedIndirect)
     // server_gpuprof.c (gp_CmdDrawIndexedIndirect)
     // server_hang.c (hg_draw_indexed_indirect)
     auto ctx = get_scoped_ctx(commandBuffer);
@@ -468,6 +485,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndexedIndirectCount(VkCommandBuffer c
 {
     // server_emu_divisor.c (emu_CmdDrawIndexedIndirectCount)
     // server_errata_flip.c (fl_CmdDrawIndexedIndirectCount)
+    // server_errata_vbbake.c (bk_vkCmdDrawIndexedIndirectCount)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdDrawIndexedIndirectCount(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
 }
@@ -478,6 +496,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndirect(VkCommandBuffer commandBuffer
     // server_emu_divisor.c (emu_CmdDrawIndirect)
     // server_errata_cmd.c (ci_CmdDrawIndirect)
     // server_errata_flip.c (fl_CmdDrawIndirect)
+    // server_errata_vbbake.c (bk_vkCmdDrawIndirect)
     // server_gpuprof.c (gp_CmdDrawIndirect)
     // server_hang.c (hg_draw_indirect)
     auto ctx = get_scoped_ctx(commandBuffer);
@@ -487,6 +506,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndirect(VkCommandBuffer commandBuffer
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instanceCount, uint32_t firstInstance, VkBuffer counterBuffer, VkDeviceSize counterBufferOffset, uint32_t counterOffset, uint32_t vertexStride)
 {
     // server_errata_flip.c (fl_CmdDrawIndirectByteCountEXT)
+    // server_errata_vbbake.c (bk_vkCmdDrawIndirectByteCountEXT)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdDrawIndirectByteCountEXT(commandBuffer, instanceCount, firstInstance, counterBuffer, counterBufferOffset, counterOffset, vertexStride);
 }
@@ -495,6 +515,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndirectCount(VkCommandBuffer commandB
 {
     // server_emu_divisor.c (emu_CmdDrawIndirectCount)
     // server_errata_flip.c (fl_CmdDrawIndirectCount)
+    // server_errata_vbbake.c (bk_vkCmdDrawIndirectCount)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdDrawIndirectCount(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
 }
@@ -502,6 +523,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawIndirectCount(VkCommandBuffer commandB
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount, const VkMultiDrawInfoEXT* pVertexInfo, uint32_t instanceCount, uint32_t firstInstance, uint32_t stride)
 {
     // server_errata_flip.c (fl_CmdDrawMultiEXT)
+    // server_errata_vbbake.c (bk_vkCmdDrawMultiEXT)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdDrawMultiEXT(commandBuffer, drawCount, pVertexInfo, instanceCount, firstInstance, stride);
 }
@@ -509,12 +531,14 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawMultiEXT(VkCommandBuffer commandBuffer
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount, const VkMultiDrawIndexedInfoEXT* pIndexInfo, uint32_t instanceCount, uint32_t firstInstance, uint32_t stride, const int32_t* pVertexOffset)
 {
     // server_errata_flip.c (fl_CmdDrawMultiIndexedEXT)
+    // server_errata_vbbake.c (bk_vkCmdDrawMultiIndexedEXT)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdDrawMultiIndexedEXT(commandBuffer, drawCount, pIndexInfo, instanceCount, firstInstance, stride, pVertexOffset);
 }
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdEndRenderPass(VkCommandBuffer commandBuffer)
 {
+    // server_errata_ds.c (i_CmdEndRenderPass)
     // server_gpuprof.c (gp_CmdEndRenderPass)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdEndRenderPass(commandBuffer);
@@ -522,6 +546,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdEndRenderPass(VkCommandBuffer commandBuffe
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
 {
+    // server_errata_ds.c (i_CmdEndRenderPass2)
     // server_gpuprof.c (gp_CmdEndRenderPass2)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdEndRenderPass2(commandBuffer, pSubpassEndInfo);
@@ -529,6 +554,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdEndRenderPass2(VkCommandBuffer commandBuff
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdEndRendering(VkCommandBuffer commandBuffer)
 {
+    // server_emu_dynrend.c (d_CmdEndRendering)
     // server_gpuprof.c (gp_CmdEndRendering)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdEndRendering(commandBuffer);
@@ -538,6 +564,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdExecuteCommands(VkCommandBuffer commandBuf
 {
     // server_errata_cmd.c (cu_CmdExecuteCommands)
     // server_errata_cmd.c (f_CmdExecuteCommands)
+    // server_errata_vbbake.c (bk_CmdExecuteCommands)
     // server_gpuprof.c (gp_CmdExecuteCommands)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
@@ -555,6 +582,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdPipelineBarrier(VkCommandBuffer commandBuf
 {
     // server_gpuprof.c (gp_vkCmdPipelineBarrier)
     // server_hang.c (hg_barrier)
+    // server_texcap.c (tc_CmdPipelineBarrier)
     // server_trace.c (tr_CmdPipelineBarrier)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
@@ -564,6 +592,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdPipelineBarrier2(VkCommandBuffer commandBu
 {
     // server_gpuprof.c (gp_vkCmdPipelineBarrier2)
     // server_hang.c (hg_barrier2)
+    // server_texcap.c (tc_CmdPipelineBarrier2)
     // server_trace.c (tr_CmdPipelineBarrier2)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdPipelineBarrier2(commandBuffer, pDependencyInfo);
@@ -790,6 +819,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdUpdateBuffer(VkCommandBuffer commandBuffer
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent* pEvents, VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers)
 {
     // server_hang.c (hg_wait_events)
+    // server_texcap.c (tc_CmdWaitEvents)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, dstStageMask, memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
 }
@@ -797,6 +827,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdWaitEvents(VkCommandBuffer commandBuffer, 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent* pEvents, const VkDependencyInfo* pDependencyInfos)
 {
     // server_hang.c (hg_wait_events2)
+    // server_texcap.c (tc_CmdWaitEvents2)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdWaitEvents2(commandBuffer, eventCount, pEvents, pDependencyInfos);
 }
@@ -829,6 +860,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateComputePipelines(VkDevice device, V
     // server_hang.c (hg_CreateComputePipelines)
     // server_nulldesc.c (nd_CreateComputePipelines)
     // server_pcache.c (pc_CreateComputePipelines)
+    // server_promote.c (lw_CreateComputePipelines)
     // server_spvfix.c (fx_CreateComputePipelines)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkCreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
@@ -863,6 +895,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateDescriptorUpdateTemplate(VkDevice d
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount, const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines)
 {
+    // server_emu_dynrend.c (d_CreateGraphicsPipelines)
     // server_emu_layer.c (emu_CreateGraphicsPipelines)
     // server_errata_bitwise.c (bw_CreateGraphicsPipelines)
     // server_errata_bitwise.c (bwi_CreateGraphicsPipelines)
@@ -871,11 +904,13 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateGraphicsPipelines(VkDevice device, 
     // server_errata_cmd.c (l_CreateGraphicsPipelines)
     // server_errata_flip.c (fl_CreateGraphicsPipelines)
     // server_errata_flip.c (fli_CreateGraphicsPipelines)
+    // server_errata_vbbake.c (bk_CreateGraphicsPipelines)
     // server_gpuprof.c (gp_CreateGraphicsPipelines)
     // server_guard.c (gd_CreateGraphicsPipelines)
     // server_hang.c (hg_CreateGraphicsPipelines)
     // server_nulldesc.c (nd_CreateGraphicsPipelines)
     // server_pcache.c (pc_CreateGraphicsPipelines)
+    // server_promote.c (lw_CreateGraphicsPipelines)
     // server_quirks.c (q_CreateGraphicsPipelines)
     // server_spvfix.c (fx_CreateGraphicsPipelines)
     auto ctx = get_scoped_ctx(device);
@@ -884,6 +919,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateGraphicsPipelines(VkDevice device, 
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImage* pImage)
 {
+    // server_emu_dynrend.c (d_CreateImage)
     // server_emu_layer.c (emu_CreateImage)
     // server_errata_mem.c (l_CreateImage)
     // server_errata_views.c (v_CreateImage)
@@ -897,11 +933,13 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateImage(VkDevice device, const VkImag
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImageView* pView)
 {
     // server_emu_bcn.c (emu_CreateImageView)
+    // server_emu_dynrend.c (d_CreateImageView)
     // server_errata.c (ex_CreateImageView)
     // server_errata.c (ex_imi_CreateImageView)
     // server_errata_views.c (v_CreateImageView)
     // server_gpuprof.c (gp_CreateImageView)
     // server_hang.c (hg_CreateImageView)
+    // server_texcap.c (tc_CreateImageView)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkCreateImageView(device, pCreateInfo, pAllocator, pView);
 }
@@ -921,6 +959,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreatePipelineLayout(VkDevice device, con
     return ctx->t->dt.vkCreatePipelineLayout(device, pCreateInfo, pAllocator, pPipelineLayout);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkRenderPass* pRenderPass)
+{
+    // server_errata_ds.c (f_CreateRenderPass2)
+    // server_errata_ds.c (i_CreateRenderPass2)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkCreateRenderPass2(device, pCreateInfo, pAllocator, pRenderPass);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSampler* pSampler)
 {
     // server_hang.c (hg_CreateSampler)
@@ -937,12 +983,16 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateShaderModule(VkDevice device, const
     // server_errata_clampzero.c (cz_CreateShaderModule)
     // server_errata_clampzero.c (czi_CreateShaderModule)
     // server_errata_flip.c (fl_CreateShaderModule)
+    // server_errata_fp16.c (imi_CreateShaderModule)
+    // server_errata_vbbake.c (bk_CreateShaderModule)
     // server_gpuprof.c (gp_CreateShaderModule)
     // server_guard.c (gd_CreateShaderModule)
     // server_hang.c (hg_CreateShaderModule)
     // server_nulldesc.c (nd_CreateShaderModule)
+    // server_promote.c (lw_CreateShaderModule)
     // server_quirks.c (q_CreateShaderModule)
     // server_spvfix.c (fx_CreateShaderModule)
+    // server_texcap.c (tc_CreateShaderModule)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
 }
@@ -1000,6 +1050,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDescriptorUpdateTemplate(VkDevice devi
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator)
 {
+    // server_emu_dynrend.c (d_DestroyImage)
     // server_emu_layer.c (emu_DestroyImage)
     // server_errata_mem.c (l_DestroyImage)
     // server_errata_views.c (v_DestroyImage)
@@ -1011,6 +1062,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyImage(VkDevice device, VkImage image, 
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator)
 {
+    // server_emu_dynrend.c (d_DestroyImageView)
     // server_errata_views.c (v_DestroyImageView)
     // server_gpuprof.c (gp_DestroyImageView)
     // server_hang.c (hg_DestroyImageView)
@@ -1023,6 +1075,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyPipeline(VkDevice device, VkPipeline p
     // server_emu_divisor.c (emu_DestroyPipeline)
     // server_errata_cmd.c (l_DestroyPipeline)
     // server_errata_flip.c (fl_DestroyPipeline)
+    // server_errata_vbbake.c (bk_DestroyPipeline)
     // server_hang.c (hg_DestroyPipeline)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroyPipeline(device, pipeline, pAllocator);
@@ -1039,6 +1092,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyPipelineLayout(VkDevice device, VkPipe
 {
     // server_emu_push.c (p_DestroyPipelineLayout)
     // server_errata_flip.c (fl_DestroyPipelineLayout)
+    // server_errata_vbbake.c (bk_DestroyPipelineLayout)
     // server_nulldesc.c (nd_DestroyPipelineLayout)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroyPipelineLayout(device, pipelineLayout, pAllocator);
@@ -1046,7 +1100,9 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyPipelineLayout(VkDevice device, VkPipe
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyRenderPass(VkDevice device, VkRenderPass renderPass, const VkAllocationCallbacks* pAllocator)
 {
+    // server_errata_ds.c (i_DestroyRenderPass)
     // server_errata_flip.c (fl_DestroyRenderPass)
+    // server_errata_vbbake.c (bk_DestroyRenderPass)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroyRenderPass(device, renderPass, pAllocator);
 }
@@ -1063,6 +1119,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyShaderModule(VkDevice device, VkShader
 {
     // server_emu_shader.c (emu_DestroyShaderModule)
     // server_errata_flip.c (fl_DestroyShaderModule)
+    // server_errata_vbbake.c (bk_DestroyShaderModule)
     // server_hang.c (hg_DestroyShaderModule)
     // server_nulldesc.c (nd_DestroyShaderModule)
     auto ctx = get_scoped_ctx(device);
@@ -1213,6 +1270,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetRenderingAreaGranularity(VkDevice device, 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence)
 {
     // server_hang.c (hg_QueueSubmit)
+    // server_nulldesc.c (nd_QueueSubmit)
     // server_report.c (rp_QueueSubmit)
     // server_trace.c (tr_QueueSubmit)
     auto ctx = get_scoped_ctx(queue);
@@ -1222,6 +1280,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submi
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence)
 {
     // server_hang.c (hg_QueueSubmit2)
+    // server_nulldesc.c (nd_QueueSubmit2)
     // server_report.c (rp_QueueSubmit2)
     // server_trace.c (tr_QueueSubmit2)
     auto ctx = get_scoped_ctx(queue);
@@ -1425,6 +1484,8 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkCreateImageView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateImageView);
     if (strcmp(pName, "vkCreatePipelineCache") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreatePipelineCache);
     if (strcmp(pName, "vkCreatePipelineLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreatePipelineLayout);
+    if (strcmp(pName, "vkCreateRenderPass2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateRenderPass2);
+    if (strcmp(pName, "vkCreateRenderPass2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateRenderPass2);
     if (strcmp(pName, "vkCreateSampler") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateSampler);
     if (strcmp(pName, "vkCreateShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateShaderModule);
     if (strcmp(pName, "vkDestroyBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyBuffer);
