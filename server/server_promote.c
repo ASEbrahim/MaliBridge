@@ -1013,6 +1013,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     const promo_gpu *g = gpu_of(t, pd);
     if (!g || !g->active) {
         t->real.vkGetPhysicalDeviceFeatures2(pd, f);
+        vkb_emu_report_features2(pd, f);
         return;
     }
     ext_list el;
@@ -1021,6 +1022,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     if (!x) {
         free(el.e);
         t->real.vkGetPhysicalDeviceFeatures2(pd, f);
+        vkb_emu_report_features2(pd, f);
         return;
     }
     x->drv = g->drv_api;
@@ -1034,6 +1036,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     }
     free(x);
     free(el.e);
+    vkb_emu_report_features2(pd, f);
 }
 
 void vkb_promote_instance_install(vkb_srv_table *t)

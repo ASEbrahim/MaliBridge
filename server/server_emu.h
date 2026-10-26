@@ -227,6 +227,7 @@ void vkb_emu_a1_layer(const char *comm); /* the layer: the a1 gate only for Stea
 int vkb_steam_own_process(const char *comm); /* server_apicap.c: gamescope, Xwayland, steamwebhelper, steam */
 int vkb_emu_hiding_exts(void);
 void vkb_emu_instance_install(vkb_srv_table *t); /* clients see the device extensions without the hidden ones */
+void vkb_emu_report_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f); /* emulated features in a client's query */
 void vkb_emu_compat_uninstall(vkb_srv_table *dev);
 /* OPAQUE_FD on dma-bufs (server_opaque.c) */
 int vkb_opaque_wanted(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t emu);
