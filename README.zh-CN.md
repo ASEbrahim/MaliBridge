@@ -28,7 +28,7 @@
 <i>在 Galaxy Tab S11 Ultra 上用 v0.5.4 实际游玩的画面。</i></p>
 
 <p align="center"><a href="https://youtu.be/nikeajHpf5s"><img src="docs/img/ds3-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩《黑暗之魂3》，古达 Boss 战" width="720"></a><br>
-<i>用较早的版本录制，以 2 倍速播放。</i><br>
+<i>用 v0.5.1 录制，以 2 倍速播放。</i><br>
 <a href="https://youtu.be/nikeajHpf5s">在 YouTube 观看</a> · <a href="https://www.reddit.com/r/GalaxyTab/comments/1xea3as/">Reddit 帖子</a> · <a href="https://www.youtube.com/@malibridge">更多视频</a> · <a href="https://space.bilibili.com/3747573858831484">哔哩哔哩</a></p>
 
 > [!IMPORTANT]

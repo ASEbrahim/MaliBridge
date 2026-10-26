@@ -27,7 +27,7 @@ It runs on the device's own driver, with no custom GPU driver to install.</p>
 <i>In game on a Galaxy Tab S11 Ultra with v0.5.4.</i></p>
 
 <p align="center"><a href="https://youtu.be/nikeajHpf5s"><img src="docs/img/ds3-video.jpg" alt="Video: Dark Souls III on a Galaxy Tab S11 Ultra, the Iudex Gundyr fight" width="720"></a><br>
-<i>Recorded with an earlier version and played at 2x speed.</i><br>
+<i>Recorded with v0.5.1 and played at 2x speed.</i><br>
 <a href="https://youtu.be/nikeajHpf5s">Watch on YouTube</a> · <a href="https://www.reddit.com/r/GalaxyTab/comments/1xea3as/">Reddit post</a> · <a href="https://www.youtube.com/@malibridge">More videos</a> · <a href="https://space.bilibili.com/3747573858831484">Bilibili</a></p>
 
 > [!IMPORTANT]
