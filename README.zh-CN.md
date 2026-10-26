@@ -44,8 +44,8 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 **修复**
 - **天玑 9500**（Mali-G1-Ultra）上《空洞骑士》《丝之歌》《哈迪斯》等游戏的**绿色方块和偏红贴图**应该已经消失。
 - **三星 Exynos（Xclipse）手机上有声音但画面全黑**：现在应该能显示游戏画面了。
-- **较旧的 Mali GPU**（G57、G68 等，例如 Galaxy A16 和 F15）上 **Steam 黑屏**已修复。如果再次出现，把 **Steam menus** 设为 *software*。
-- **Steam 卡在 “Starting display and audio”**（Retroid Pocket 4 Pro、华为 nova 7 等）：现在应该可以启动了。
+- **较旧的 Mali GPU**（G57、G68 等，例如 Galaxy A16 和 F15）上 **Steam 黑屏**应该已经修复。如果再次出现，把 **Steam menus** 设为 *software*。
+- **Steam 卡在 “Starting display and audio”**（Retroid Pocket 4 Pro 等）：现在应该可以启动了。
 - **Balatro 等 OpenGL 游戏中文字缺失**的问题已修复。
 - **手机内存不足时崩溃更少**，游戏之后再启动时卡顿也更少。
 - 会话被安卓在后台暂停很久之后，结束时**游戏画面不再丢失**。
@@ -426,6 +426,8 @@ MaliBridge 采用 GPL-3.0-or-later 许可，并在第 7 节附加了两条条款
 
 <details>
 <summary>名称、DroidDeck 与致谢</summary>
+
+**致谢：** 感谢 Mondyro 找到天玑 9500 的贴图问题（[#24](https://github.com/ASEbrahim/MaliBridge/issues/24)）。
 
 **关于名称。** 欢迎在许可范围内 fork，但 “MaliBridge” 这个名字只指本项目；请给你的 fork 起一个自己的名字。
 

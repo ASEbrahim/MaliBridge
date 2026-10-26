@@ -47,8 +47,8 @@ across the tables below. It is free.
 **Fixes**
 - **Green squares and red-tinted textures on the Dimensity 9500** (Hollow Knight, Silksong, Hades and others) should be gone.
 - **Black picture with sound on Samsung Exynos (Xclipse)** phones: games should show now.
-- **Black Steam screen on older Mali GPUs** (G57, G68 and similar, like the Galaxy A16 and F15) is fixed. If it ever comes back, set **Steam menus** to *software*.
-- **Steam stuck at "Starting display and audio"** (Retroid Pocket 4 Pro, Huawei Nova 7 and others) should start now.
+- **Black Steam screen on older Mali GPUs** (G57, G68 and similar, like the Galaxy A16 and F15) should be fixed. If it ever comes back, set **Steam menus** to *software*.
+- **Steam stuck at "Starting display and audio"** (Retroid Pocket 4 Pro and others) should start now.
 - **Missing text in Balatro** and other OpenGL games is fixed.
 - **Fewer crashes when the phone runs low on memory**, and less stutter on later launches of a game.
 - **Games keep their picture** at the end of a session that Android had paused in the background for a long time.
@@ -477,7 +477,7 @@ runs the Steam client and PC games on Android. It is not part of the official Dr
 - Code from Lee Gao's [SPIRV-Tools fork](https://github.com/leegao/SPIRV-Tools), Apache-2.0.
 
 **Thanks** for ideas, findings and testing that shaped MaliBridge (no code copied unless listed
-above): Lee Gao ([compat_layer](https://github.com/leegao/compat_layer), bionic-vulkan-wrapper,
+above): Mondyro (the Dimensity 9500 texture fix, [#24](https://github.com/ASEbrahim/MaliBridge/issues/24)), Lee Gao ([compat_layer](https://github.com/leegao/compat_layer), bionic-vulkan-wrapper,
 winlator-internals), Julius Pinsker (bionic-vulkan-wrapper), David Cimo
 ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali), GPL-3.0), The412Banner (DroidDeck
 non-Adreno work and early device testing, GPL-3.0), taowen
