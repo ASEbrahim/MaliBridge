@@ -336,6 +336,7 @@ void vkb_caps_patch_features(const vkb_pd_caps *caps, VkPhysicalDeviceFeatures *
     set_feature(caps, VKB_EMU_FILL_MODE, &f->fillModeNonSolid);
     set_feature(caps, VKB_EMU_MULTI_VIEWPORT, &f->multiViewport);
     set_feature(caps, VKB_EMU_MULTI_DRAW, &f->multiDrawIndirect);
+    set_feature(caps, VKB_EMU_DEPTH_CLAMP, &f->depthClamp);
 }
 
 void vkb_caps_patch_features_chain(const vkb_pd_caps *caps, VkBaseOutStructure *b,

@@ -508,6 +508,30 @@ void vkb_emu_linearstorage_instance_init(vkb_srv_table *t)
     VKB_ONCE(VKB_LOG_INFO, "imitating r18p0's refusal of LINEAR images with storage usage (VKBRIDGE_FAKE_MISSING=linearstorage)");
 }
 
+/* depthClamp (VKB_EMU_DEPTH_CLAMP) is reported here as well as by the client (client/emu.c), so a
+ * guest whose client library predates the flag sees it too. */
+static PFN_vkGetPhysicalDeviceFeatures clamp_next1;
+static PFN_vkGetPhysicalDeviceFeatures2 clamp_next2;
+
+static int clamp_on(VkPhysicalDevice pd)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    const vkb_pd_knowledge *k = t ? vkb_pd_lookup(&t->real, pd) : NULL;
+    return k && (k->info.emu & VKB_EMU_DEPTH_CLAMP);
+}
+
+static VKAPI_ATTR void VKAPI_CALL clamp_GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f)
+{
+    clamp_next1(pd, f);
+    if (clamp_on(pd)) f->depthClamp = VK_TRUE;
+}
+
+static VKAPI_ATTR void VKAPI_CALL clamp_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
+{
+    clamp_next2(pd, f);
+    if (clamp_on(pd)) f->features.depthClamp = VK_TRUE;
+}
+
 void vkb_emu_instance_install(vkb_srv_table *t)
 {
     if (vkb_emu_faked("dmabufmod") && t->dt.vkGetPhysicalDeviceImageFormatProperties2 &&
@@ -515,6 +539,14 @@ void vkb_emu_instance_install(vkb_srv_table *t)
         dmabufmod_next2 = t->dt.vkGetPhysicalDeviceImageFormatProperties2;
         t->dt.vkGetPhysicalDeviceImageFormatProperties2 = dmabufmod_GetPhysicalDeviceImageFormatProperties2;
         VKB_ONCE(VKB_LOG_INFO, "imitating r32p1's refusal of DRM-modifier dma-buf storage / mutable images (VKBRIDGE_FAKE_MISSING=dmabufmod)");
+    }
+    if (t->dt.vkGetPhysicalDeviceFeatures) {
+        clamp_next1 = t->dt.vkGetPhysicalDeviceFeatures;
+        t->dt.vkGetPhysicalDeviceFeatures = clamp_GetPhysicalDeviceFeatures;
+    }
+    if (t->dt.vkGetPhysicalDeviceFeatures2) {
+        clamp_next2 = t->dt.vkGetPhysicalDeviceFeatures2;
+        t->dt.vkGetPhysicalDeviceFeatures2 = clamp_GetPhysicalDeviceFeatures2;
     }
     if (vkb_emu_faked("planarext")) {
         if (t->dt.vkGetPhysicalDeviceImageFormatProperties) {
@@ -799,6 +831,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (token(fake, "robustness2")) robust2 = 0;
         if (token(fake, "dualsrc")) f.dualSrcBlend = VK_FALSE;
         if (token(fake, "fillmode")) f.fillModeNonSolid = VK_FALSE;
+        if (token(fake, "depthclamp")) f.depthClamp = VK_FALSE;
         if (token(fake, "multiviewport")) f.multiViewport = VK_FALSE;
         if (token(fake, "multidraw")) f.multiDrawIndirect = VK_FALSE;
         if (token(fake, "maint6")) maint6 = 0;
@@ -889,6 +922,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     /* What DXVK 3 requires and the GPU lacks (server_emu_compat.c). Vulkan 1.4 has maintenance6. */
     if (!f.dualSrcBlend && !env_off("VKBRIDGE_EMU_DUALSRC")) emu |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid && !env_off("VKBRIDGE_EMU_FILLMODE")) emu |= VKB_EMU_FILL_MODE;
+    if (!f.depthClamp && !env_off("VKBRIDGE_EMU_DEPTHCLAMP")) emu |= VKB_EMU_DEPTH_CLAMP;
     if (!f.multiViewport && !env_off("VKBRIDGE_EMU_MULTIVIEWPORT")) emu |= VKB_EMU_MULTI_VIEWPORT;
     /* DXVK refuses a device without multiDrawIndirect; Mali-G57 on r32p1/r38p1 has none (Lee Gao's
      * compat_layer README). Indirect draws are split into single ones (server_emu_compat.c). */
@@ -992,6 +1026,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (r2_partial) miss |= VKB_EMU_ROBUST2_ACCESS;
     if (!f.dualSrcBlend) miss |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid) miss |= VKB_EMU_FILL_MODE;
+    if (!f.depthClamp) miss |= VKB_EMU_DEPTH_CLAMP;
     if (!f.multiViewport) miss |= VKB_EMU_MULTI_VIEWPORT;
     if (!f.multiDrawIndirect) miss |= VKB_EMU_MULTI_DRAW;
     if (emu & VKB_EMU_MAINT6) miss |= VKB_EMU_MAINT6;

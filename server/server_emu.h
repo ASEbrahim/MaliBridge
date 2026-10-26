@@ -12,7 +12,8 @@
                              VKB_EMU_MAINT6 | VKB_EMU_LOADSTORE_NONE | VKB_EMU_PUSH_DESC | VKB_EMU_TEXEL_ALIGN | \
                              VKB_EMU_DESC_LIMITS | VKB_EMU_OPAQUE_FD | VKB_EMU_MULTI_DRAW | VKB_EMU_ROBUST2_ACCESS | \
                              VKB_EMU_DYN_RENDER | VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX | VKB_EMU_TIMELINE | \
-                             VKB_EMU_DMABUF_AHB | VKB_EMU_IMAGELESS | VKB_EMU_MEM_BUDGET)
+                             VKB_EMU_DMABUF_AHB | VKB_EMU_IMAGELESS | VKB_EMU_MEM_BUDGET | \
+                             VKB_EMU_DEPTH_CLAMP)
 
 #define VKB_EMU_BUCKETS 1024
 
