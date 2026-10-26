@@ -48,7 +48,6 @@ across the tables below. It is free.
 - **Green squares and red-tinted textures on the Dimensity 9500** (Hollow Knight, Silksong, Hades and others) should be gone.
 - **Black picture with sound on Samsung Exynos (Xclipse)** phones: games should show now.
 - **Black Steam screen on older Mali GPUs** (G57, G68 and similar, like the Galaxy A16 and F15) should be fixed. If it ever comes back, set **Steam menus** to *software*.
-- **Steam stuck at "Starting display and audio"** (Retroid Pocket 4 Pro and others) should start now.
 - **Missing text in Balatro** and other OpenGL games is fixed.
 - **Fewer crashes when the phone runs low on memory**, and less stutter on later launches of a game.
 - **Games keep their picture** at the end of a session that Android had paused in the background for a long time.
