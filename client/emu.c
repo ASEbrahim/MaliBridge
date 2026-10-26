@@ -141,6 +141,7 @@ void vkb_emu_patch_features(vkb_physdev *pd, VkPhysicalDeviceFeatures *f)
     set_feature(pd, VKB_EMU_FILL_MODE, &f->fillModeNonSolid);
     set_feature(pd, VKB_EMU_MULTI_VIEWPORT, &f->multiViewport);
     set_feature(pd, VKB_EMU_MULTI_DRAW, &f->multiDrawIndirect);
+    set_feature(pd, VKB_EMU_DEPTH_CLAMP, &f->depthClamp);
 }
 
 void vkb_emu_patch_features_chain(vkb_physdev *pd, VkBaseOutStructure *b)

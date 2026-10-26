@@ -68,6 +68,8 @@ static inline VkFormat vkb_bgr10_rgba(VkFormat f)
                                             * (Zink's GL_ARB_vertex_type_10f_11f_11f_rev: OpenGL 4.4 and up) */
 #define VKB_EMU_ROBUST2_ACCESS (1u << 19)  /* robustBufferAccess2/robustImageAccess2 reported where the driver's robustness2
                                             * has nullDescriptor only (Mali-G715 r54p3); core robustness on instead (DXVK 3) */
+#define VKB_EMU_DEPTH_CLAMP    (1u << 23)  /* depthClamp: a clamping pipeline clips instead (DXVK 1.10 needs it for every D3D11
+                                            * feature level; Mali-G76 r26p0 lacks it) */
 
 /* vkbQueryServer reply (per physical device). */
 typedef struct vkb_server_pd_info {
