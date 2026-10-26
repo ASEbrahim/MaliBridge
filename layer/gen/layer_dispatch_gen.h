@@ -562,6 +562,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdEndRendering(VkCommandBuffer commandBuffer
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount, const VkCommandBuffer* pCommandBuffers)
 {
+    // server_conn.c (cf_CmdExecuteCommands)
     // server_errata_cmd.c (cu_CmdExecuteCommands)
     // server_errata_cmd.c (f_CmdExecuteCommands)
     // server_errata_vbbake.c (bk_CmdExecuteCommands)
@@ -786,6 +787,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetStencilWriteMask(VkCommandBuffer comman
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetVertexInputEXT(VkCommandBuffer commandBuffer, uint32_t vertexBindingDescriptionCount, const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions, uint32_t vertexAttributeDescriptionCount, const VkVertexInputAttributeDescription2EXT* pVertexAttributeDescriptions)
 {
     // server_emu_divisor.c (emu_CmdSetVertexInputEXT)
+    // server_vidyn.c (vi_CmdSetVertexInputEXT)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetVertexInputEXT(commandBuffer, vertexBindingDescriptionCount, pVertexBindingDescriptions, vertexAttributeDescriptionCount, pVertexAttributeDescriptions);
 }
@@ -861,6 +863,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateComputePipelines(VkDevice device, V
     // server_nulldesc.c (nd_CreateComputePipelines)
     // server_pcache.c (pc_CreateComputePipelines)
     // server_promote.c (lw_CreateComputePipelines)
+    // server_spvfix.c (fake_CreateComputePipelines)
     // server_spvfix.c (fx_CreateComputePipelines)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkCreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
@@ -955,6 +958,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreatePipelineLayout(VkDevice device, con
 {
     // server_emu_push.c (p_CreatePipelineLayout)
     // server_nulldesc.c (nd_CreatePipelineLayout)
+    // server_spvfix.c (fx_CreatePipelineLayout)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkCreatePipelineLayout(device, pCreateInfo, pAllocator, pPipelineLayout);
 }
@@ -1035,6 +1039,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDescriptorSetLayout(VkDevice device, V
 {
     // server_emu_desc.c (d_DestroyDescriptorSetLayout)
     // server_nulldesc.c (nd_DestroyDescriptorSetLayout)
+    // server_spvfix.c (fx_DestroyDescriptorSetLayout)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroyDescriptorSetLayout(device, descriptorSetLayout, pAllocator);
 }
@@ -1094,6 +1099,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyPipelineLayout(VkDevice device, VkPipe
     // server_errata_flip.c (fl_DestroyPipelineLayout)
     // server_errata_vbbake.c (bk_DestroyPipelineLayout)
     // server_nulldesc.c (nd_DestroyPipelineLayout)
+    // server_spvfix.c (fx_DestroyPipelineLayout)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroyPipelineLayout(device, pipelineLayout, pAllocator);
 }
@@ -1269,6 +1275,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetRenderingAreaGranularity(VkDevice device, 
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence)
 {
+    // server_conn.c (cf_QueueSubmit)
     // server_hang.c (hg_QueueSubmit)
     // server_nulldesc.c (nd_QueueSubmit)
     // server_report.c (rp_QueueSubmit)
@@ -1279,6 +1286,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submi
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence)
 {
+    // server_conn.c (cf_QueueSubmit2)
     // server_hang.c (hg_QueueSubmit2)
     // server_nulldesc.c (nd_QueueSubmit2)
     // server_report.c (rp_QueueSubmit2)

@@ -137,7 +137,8 @@ run_mode() {
       MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink timeout 60 python3 -I ../tests/gl/glbgr10.py >out/t-bgr10.log 2>&1
       timeout 60 vulkaninfo 2>/dev/null | grep -c "VK_EXT_vertex_input_dynamic_state" >out/t-bgr10-vulkaninfo.log
       grep -q "^RESULT ok" out/t-bgr10.log && grep -q "red and blue swapped back in the vertex shader" "$VKB_SERVER_LOG" &&
-        grep -q "hidden from Zink" "$VKB_SERVER_LOG" && [ "$(cat out/t-bgr10-vulkaninfo.log)" -ge 1 ]
+        { grep -q "hidden from Zink" "$VKB_SERVER_LOG" || grep -q "vertex fetch emulated" "$VKB_SERVER_LOG"; } &&
+        [ "$(cat out/t-bgr10-vulkaninfo.log)" -ge 1 ]
       result $? "BGRA 10-10-10-2 vertex fetch through Zink ($(grep -o 'RESULT.*' out/t-bgr10.log | cut -c1-60)); vulkaninfo still lists vertex input dynamic state"
       unset VKB_MISSING_ADD
     fi
