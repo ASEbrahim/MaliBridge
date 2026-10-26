@@ -244,10 +244,17 @@ static VKAPI_ATTR void VKAPI_CALL clamp_GetPhysicalDeviceFeatures(VkPhysicalDevi
     if (clamp_on(pd)) f->depthClamp = VK_TRUE;
 }
 
+/* Also the end of the version promotion's own vkGetPhysicalDeviceFeatures2 (server_promote.c), which
+ * asks the driver directly. */
+void vkb_emu_report_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
+{
+    if (clamp_on(pd)) f->features.depthClamp = VK_TRUE;
+}
+
 static VKAPI_ATTR void VKAPI_CALL clamp_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
 {
     clamp_next2(pd, f);
-    if (clamp_on(pd)) f->features.depthClamp = VK_TRUE;
+    vkb_emu_report_features2(pd, f);
 }
 
 void vkb_emu_instance_install(vkb_srv_table *t)
