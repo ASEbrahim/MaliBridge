@@ -22,7 +22,7 @@
  * while the background part still runs. So while a probe runs, <profile>.beat holds its name and
  * how long it has run (not counting time the process was stopped), rewritten every 200 ms, and a
  * mark of how the process ended where it could write one; the next start reads it:
- *   stop mark (SIGTERM/SIGINT/SIGHUP, the app gone)      interrupted: run again, nothing decided
+ *   stop mark (SIGTERM/SIGINT, the app gone)             interrupted: run again, nothing decided
  *   crash mark (a fatal signal outside the probe's guard, died (on another thread: interrupted)
  *     on the probe's thread)
  *   no mark, still inside past its limit + 2 s           died (the watchdog could not interrupt it)
@@ -838,6 +838,8 @@ static void p_dma_heaps(pctx *c)
     }
     closedir(d);
     say(c, "; the bridge's dma-heap: %s", vkb_mem_dmaheap_available() ? "available" : "NOT available");
+    if (!vkb_mem_dmaheap_available() && *vkb_mem_ahb_export_result())
+        say(c, " (dma-buf export from AHardwareBuffers: %s)", vkb_mem_ahb_export_result());
     /* needed where the driver exports no dma-bufs (the export emulation, the dmaheap strategy) */
     if (!ok && c->dmabuf) say(c, " (not needed: the driver has dma-buf memory)");
     outcome(c, ok ? PS_PASS : c->dmabuf ? PS_SKIP : PS_FAIL);
@@ -856,7 +858,8 @@ static void p_dmabuf_export(pctx *c)
     VkExternalMemoryFeatureFlags ef = r == VK_SUCCESS ? ep.externalMemoryProperties.externalMemoryFeatures : 0;
     say(c, "query (optimal RGBA8): %d, features 0x%x", r, ef);
     if (!(ef & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
-        say(c, "; not claimed exportable%s", (c->emu & VKB_EMU_DMABUF_EXPORT) ? " (emulated)" : "");
+        say(c, "; not claimed exportable%s%s", (c->emu & VKB_EMU_DMABUF_EXPORT) ? " (emulated, pages from the " : "",
+            (c->emu & VKB_EMU_DMABUF_EXPORT) ? vkb_mem_export_backing() == 2 ? "AHardwareBuffer)" : "dma-heap)" : "");
         outcome(c, PS_SKIP);
         return;
     }
@@ -1580,7 +1583,7 @@ static void p_spec_select(pctx *c)
     say(c, "selected %u %u %u %u (want 11 22 33 44; zeros: folded at the defaults)", o[0], o[1], o[2], o[3]);
     int ok = o[0] == 11 && o[1] == 22 && o[2] == 33 && o[3] == 44;
     if (!ok) {
-        say(c, " - the SPIR-V fix (server_spvfix.c) %s", c->props.vendorID == 0x13B5 ? "is on for ARM" : "is turned on");
+        say(c, " - the SPIR-V fix (server_spvfix.c) %s", vkb_driver_is_arm(&c->props, 0) ? "is on for Arm's driver" : "is turned on");
         c->want_flags |= VKB_PROBE_FLAG_SPIRV_FIX;
     }
     outcome(c, ok ? PS_PASS : PS_FAIL);
@@ -3280,7 +3283,7 @@ static uint32_t emu_possible(const pctx *c)
     uint32_t m = VKB_EMU_IMPLEMENTED;
     if (!c->feat.depthClamp) m &= ~VKB_EMU_DEPTH_CLIP;
     if (!vkb_emu_bcn_supported(c->idt, c->pd)) m &= ~VKB_EMU_BCN;
-    if (!vkb_mem_dmaheap_available()) m &= ~VKB_EMU_DMABUF_EXPORT;
+    if (!vkb_mem_export_backing()) m &= ~VKB_EMU_DMABUF_EXPORT;
     return m;
 }
 

@@ -1143,17 +1143,18 @@ for c in wire_cmds:
         cw('}')
         cw()
     elif c in ASYNC_RESULT and not outs:
-        cw('if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;')
-        cw('if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;')
+        # A lost device is logged the first time each call returns it (client/conn.c vkb_first_error).
+        cw(f'if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("{c}");')
+        cw(f'if (!vkb_call_exec(&call_)) return vkb_device_lost("{c}");')
         cw('VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);')
         cw('vkb_call_end(&call_);')
-        cw('return r_;')
+        cw(f'return vkb_note_lost("{c}", r_);')
         cw('}')
         cw()
     else:
         cw('if (!vkb_call_exec(&call_)) {')
         if ret == 'VkResult':
-            cw('return VK_ERROR_DEVICE_LOST;')
+            cw(f'return vkb_device_lost("{c}");')
         elif ret == 'void':
             cw('return;')
         else:
@@ -1205,7 +1206,9 @@ for c in wire_cmds:
                     cw(f'if ({p.name}) vkb_dec_raw_into(d, {p.name}, sizeof(*{p.name})); else d->err = 1;')
                 cw('}')
         cw('vkb_call_end(&call_);')
-        if ret != 'void':
+        if ret == 'VkResult':
+            cw(f'return vkb_note_lost("{c}", r_);')
+        elif ret != 'void':
             cw('return r_;')
         cw('}')
         cw()

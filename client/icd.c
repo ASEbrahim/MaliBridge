@@ -605,45 +605,48 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceQueue2(VkDevice device, const VkDev
 
 /* ------------------------------------------------------------------ queues and sync */
 
+/* An error from a submit or a wait is logged the first time (vkb_first_error): it is what a game
+ * stops on, often with nothing else in either log. */
+
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence)
 {
-    return vkb_wire_vkQueueSubmit(queue, submitCount, pSubmits, fence);
+    return vkb_note_error("vkQueueSubmit", vkb_wire_vkQueueSubmit(queue, submitCount, pSubmits, fence));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2 *pSubmits, VkFence fence)
 {
-    return vkb_wire_vkQueueSubmit2(queue, submitCount, pSubmits, fence);
+    return vkb_note_error("vkQueueSubmit2", vkb_wire_vkQueueSubmit2(queue, submitCount, pSubmits, fence));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueWaitIdle(VkQueue queue)
 {
-    return vkb_wire_vkQueueWaitIdle(queue);
+    return vkb_note_error("vkQueueWaitIdle", vkb_wire_vkQueueWaitIdle(queue));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkDeviceWaitIdle(VkDevice device)
 {
-    return vkb_wire_vkDeviceWaitIdle(device);
+    return vkb_note_error("vkDeviceWaitIdle", vkb_wire_vkDeviceWaitIdle(device));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences, VkBool32 waitAll,
                                                       uint64_t timeout)
 {
-    return vkb_wire_vkWaitForFences(device, fenceCount, pFences, waitAll, timeout);
+    return vkb_note_error("vkWaitForFences", vkb_wire_vkWaitForFences(device, fenceCount, pFences, waitAll, timeout));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetFenceStatus(VkDevice device, VkFence fence)
 {
-    return vkb_wire_vkGetFenceStatus(device, fence);
+    return vkb_note_error("vkGetFenceStatus", vkb_wire_vkGetFenceStatus(device, fence));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo *pWaitInfo, uint64_t timeout)
 {
-    return vkb_wire_vkWaitSemaphores(device, pWaitInfo, timeout);
+    return vkb_note_error("vkWaitSemaphores", vkb_wire_vkWaitSemaphores(device, pWaitInfo, timeout));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore, uint64_t *pValue)
 {
-    return vkb_wire_vkGetSemaphoreCounterValue(device, semaphore, pValue);
+    return vkb_note_error("vkGetSemaphoreCounterValue", vkb_wire_vkGetSemaphoreCounterValue(device, semaphore, pValue));
 }
 
 /* DXVK polls each pending query until the GPU is done with it: ~15,000 round trips a second in

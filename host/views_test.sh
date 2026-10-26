@@ -7,7 +7,7 @@
 #     3  the bug imitated, fix on: all pass, nothing reaches the imitation;
 #     4  fix off, no imitation: all pass (the desktop driver resolves REMAINING itself);
 #   view_quarantine (MK-06), viewchurn_check:
-#     5  the bug imitated, r44p1 (off): handle values come back on other images and are wrong;
+#     5  the bug imitated, r44p1 in performance mode (off; safe mode has it on everywhere): handle values come back on other images and are wrong;
 #     6  the bug imitated, r49p1 beta (on by the version gate): all right, views held back;
 #     7  10000 iterations and 10000 with images made and destroyed: the quarantine stays at its
 #        caps (4096 views, 1024 images), the server's RSS does not grow from the first run to the
@@ -76,11 +76,11 @@ run VKBRIDGE_ERRATA=-view_counts -- view3d_check
 step $? "fix off, no imitation (the desktop driver's own REMAINING): $res"
 
 # view_quarantine (MK-06)
-run VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA_IMITATE=view_quarantine -- viewchurn_check 500
+run VKBRIDGE_MODE=performance VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA_IMITATE=view_quarantine -- viewchurn_check 500
 [ $rc != 0 ] && ! echo "$new" | grep -q "errata: view_quarantine ON" && echo "$new" | grep -q "a view handle value came back on another image"
-step $? "the bug imitated, r44p1 (off): $res; $(lg '[0-9]* stale hit(s) imitated')"
+step $? "the bug imitated, r44p1 in performance mode (off): $res; $(lg '[0-9]* stale hit(s) imitated')"
 run VKBRIDGE_FAKE_DRIVER_VERSION=v1.r49p1-03bet0 VKBRIDGE_ERRATA_IMITATE=view_quarantine -- viewchurn_check 500
-[ $rc = 0 ] && echo "$new" | grep -q "errata: view_quarantine ON (r49p1 in r49p1-r49p2" && echo "$new" | grep -q "; 0 stale hit(s) imitated" &&
+[ $rc = 0 ] && echo "$new" | grep -qE "errata: view_quarantine ON \((r49p1 in r49p1-r49p2|always; safe mode)" && echo "$new" | grep -q "; 0 stale hit(s) imitated" &&
   echo "$new" | grep -q "view_quarantine: 500 view(s) held back"
 step $? "the bug imitated, r49p1 beta (on): $res; $(lg 'view_quarantine: [0-9]* view(s) held back')"
 run VKBRIDGE_FAKE_DRIVER_VERSION=r49p1 VKBRIDGE_ERRATA_IMITATE=view_quarantine -- viewchurn_check 10000
@@ -105,7 +105,7 @@ step $? "VKBRIDGE_VIEW_QUARANTINE=64: at most $held views held (of 64), $defer i
 for t in vkbridge-smoke recycle_check nulldesc_check view3d_check; do
   run VKBRIDGE_ERRATA=+view_quarantine -- $t
   # (a device with the same decisions as an earlier one logs only "same as device N ...: on ...")
-  [ $rc = 0 ] && echo "$new" | grep -qE "errata: view_quarantine ON \(VKBRIDGE_ERRATA=\+view_quarantine[;)]|errata: device [0-9]+: same as device [0-9]+ \([a-z]+ mode\): on ([a-z_]+,)*view_quarantine(,|\$)"
+  [ $rc = 0 ] && echo "$new" | grep -qE "errata: view_quarantine ON \((VKBRIDGE_ERRATA=\+view_quarantine|always; safe mode)[;)]|errata: device [0-9]+: same as device [0-9]+ \([a-z]+ mode\): on ([a-z_]+,)*view_quarantine(,|\$)"
   step $? "$t with +view_quarantine: $res"
 done
 

@@ -10,6 +10,18 @@
  *   begin_check refused   (with VKBRIDGE_SYNC=1 VKBRIDGE_TEST_BEGIN_NOCOUNT=1: the begin info
  *                         encoded without its count, as a bridge copy of 2026-10-10 did) every
  *                         vkEndCommandBuffer fails; nothing is submitted
+ *   begin_check dropped   (the server with VKBRIDGE_TEST_BEGIN_FAIL=4 or VKBRIDGE_TEST_END_FAIL=4: the
+ *                         driver fails round 1's primary) round 1's primary is submitted anyway, as an
+ *                         app does whose end returned VK_SUCCESS early (asynchronous ends); with
+ *                         VKBRIDGE_SYNC=1 its end fails. In both modes the submit succeeds, the fence
+ *                         is signalled (no timeout, no device lost) and the buffer keeps round 0's
+ *                         values: the server left that command buffer out. Round 2 passes in full
+ *   begin_check dropped-secondary   (VKBRIDGE_TEST_BEGIN_FAIL=3 or VKBRIDGE_TEST_END_FAIL=3: round 1's
+ *                         secondary) the primary runs without it: its half has round 1's value, the
+ *                         secondary's half round 0's; round 2 passes in full
+ *   begin_check recover   (VKBRIDGE_SYNC=1, VKBRIDGE_TEST_BEGIN_FAIL=4 or VKBRIDGE_TEST_END_FAIL=4)
+ *                         round 1's primary fails to end, is recorded again and that one runs: every
+ *                         round passes
  * One line per step, "OK: ..." / "FAILED: ..." last. The server log says the rest
  * (begin_encoding_test.sh).
  */
@@ -18,6 +30,7 @@
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -43,7 +56,9 @@ static void check(int ok, const char *what, int r)
 
 int main(int argc, char **argv)
 {
-    int refused = argc > 1 && !strcmp(argv[1], "refused");
+    const char *mode = argc > 1 ? argv[1] : "ok";
+    int refused = !strcmp(mode, "refused"), dropped = !strncmp(mode, "dropped", 7), dropped_sec = !strcmp(mode, "dropped-secondary");
+    int recover = !strcmp(mode, "recover"), sync = getenv("VKBRIDGE_SYNC") != NULL;
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
         printf("FAILED: loader: %s\n", dlerror());
@@ -137,30 +152,49 @@ int main(int argc, char **argv)
         vkCmdFillBuffer(sec, buf, size / 2, size / 2, 0x5ec0a7d0u + (uint32_t)round);
         r_sec = vkEndCommandBuffer(sec);
         VkCommandBufferBeginInfo pbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
-        vkBeginCommandBuffer(prim, &pbi);
-        vkCmdFillBuffer(prim, buf, 0, size / 2, 0x0b1a5e00u + (uint32_t)round);
-        vkCmdExecuteCommands(prim, 1, &sec);
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
-        vkCmdPipelineBarrier(prim, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-        r_prim = vkEndCommandBuffer(prim);
+        for (int again = 0; again < 2; again++) {
+            vkBeginCommandBuffer(prim, &pbi);
+            vkCmdFillBuffer(prim, buf, 0, size / 2, 0x0b1a5e00u + (uint32_t)round);
+            vkCmdExecuteCommands(prim, 1, &sec);
+            vkCmdPipelineBarrier(prim, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            r_prim = vkEndCommandBuffer(prim);
+            if (!(recover && round == 1 && !again)) break;
+            check(r_prim == VK_ERROR_OUT_OF_DEVICE_MEMORY, "primary: the driver's failure reaches vkEndCommandBuffer", r_prim);
+        }
         if (refused) {
             check(r_sec != VK_SUCCESS, "secondary with inheritance info: vkEndCommandBuffer fails", r_sec);
             check(r_prim != VK_SUCCESS, "primary: vkEndCommandBuffer fails", r_prim);
             continue;
         }
-        check(r_sec == VK_SUCCESS, "secondary with inheritance info: vkEndCommandBuffer", r_sec);
-        check(r_prim == VK_SUCCESS, "primary: vkEndCommandBuffer", r_prim);
+        int failed_round = dropped && round == 1;
+        if (failed_round) {
+            /* The command buffer the driver did not record: its end as the mode says, the other one's
+             * as usual. */
+            VkResult want = sync ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
+            check((dropped_sec ? r_sec : r_prim) == want, dropped_sec ? "secondary: vkEndCommandBuffer as the mode says" : "primary: vkEndCommandBuffer as the mode says",
+                  dropped_sec ? r_sec : r_prim);
+            check((dropped_sec ? r_prim : r_sec) == VK_SUCCESS, dropped_sec ? "primary: vkEndCommandBuffer" : "secondary: vkEndCommandBuffer",
+                  dropped_sec ? r_prim : r_sec);
+        } else {
+            check(r_sec == VK_SUCCESS, "secondary with inheritance info: vkEndCommandBuffer", r_sec);
+            check(r_prim == VK_SUCCESS, "primary: vkEndCommandBuffer", r_prim);
+        }
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence f;
         vkCreateFence(dev, &fci, NULL, &f);
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &prim, 0, NULL};
         VkResult r = vkQueueSubmit(queue, 1, &si, f);
         if (r == VK_SUCCESS) r = vkWaitForFences(dev, 1, &f, VK_TRUE, 5000000000ull);
-        check(r == VK_SUCCESS, "submit and wait", r);
+        check(r == VK_SUCCESS, failed_round ? "submit and wait: the fence signalled, not a timeout nor a device lost" : "submit and wait", r);
         vkDestroyFence(dev, f, NULL);
         const uint32_t *w = ptr;
-        int filled = w[0] == 0x0b1a5e00u + (uint32_t)round && w[size / 4 - 1] == 0x5ec0a7d0u + (uint32_t)round;
-        check(filled, "both halves filled", (int)round);
+        /* Left out: what it would have written keeps the round before's value. */
+        uint32_t want_prim = 0x0b1a5e00u + (uint32_t)(failed_round && !dropped_sec ? round - 1 : round);
+        uint32_t want_sec = 0x5ec0a7d0u + (uint32_t)(failed_round ? round - 1 : round);
+        int filled = w[0] == want_prim && w[size / 4 - 1] == want_sec;
+        check(filled, failed_round ? (dropped_sec ? "the primary ran without the secondary" : "the primary left out, nothing of it ran") : "both halves filled",
+              (int)round);
     }
     vkDeviceWaitIdle(dev);
     vkDestroyCommandPool(dev, pool, NULL);
@@ -168,7 +202,7 @@ int main(int argc, char **argv)
     vkFreeMemory(dev, mem, NULL);
     vkDestroyDevice(dev, NULL);
     vkDestroyInstance(inst, NULL);
-    if (failures) printf("FAILED: %d of %d checks (%s)\n", failures, checks, refused ? "refused" : "ok");
-    else printf("OK: %d checks (%s)\n", checks, refused ? "refused" : "ok");
+    if (failures) printf("FAILED: %d of %d checks (%s)\n", failures, checks, mode);
+    else printf("OK: %d checks (%s)\n", checks, mode);
     return failures ? 1 : 0;
 }

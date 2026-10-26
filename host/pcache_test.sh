@@ -18,13 +18,15 @@
 #  10  the limit for one program (VKBRIDGE_PCACHE_MAX_MB): a cache growing past it is said once
 #      and its file keeps what it had (no failed saves); a file over a lower limit is said and not
 #      loaded;
-#  11  that limit by default: RAM/64 within 64-128 MB, never over the total limit nor a quarter of
-#      the memory free (at least 32 MB);
+#  11  that limit by default: RAM/64 within 64-128 MB, never over the total limit; the memory
+#      free does not lower it;
 #  12  short of memory, a save does not merge with another process's file (said once);
 #  13  files are read into the heap unless big and on local storage (a mapped page that cannot be
 #      read is a SIGBUS in the driver): VKBRIDGE_PCACHE_MMAP=all maps a small one on local storage,
 #      not on a stand-in for FUSE (VKBRIDGE_PCACHE_FAKE_FS), not by default; one that cannot be
-#      read starts empty, said, and the server keeps running.
+#      read starts empty, said, and the server keeps running;
+#  14  short of memory at the start (under twice the file's size free), the file is not loaded,
+#      said, and the game's saves leave it as it was; with memory again it loads in full.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}  # VKB_OUT=out-tsan for the ThreadSanitizer build
@@ -187,7 +189,7 @@ step $? "a file over a lower limit: said, not loaded"
 # 11 the default by RAM (VKBRIDGE_FAKE_MEMTOTAL_MB), under a smaller total limit, and by the memory
 #    free (VKBRIDGE_FAKE_MEMAVAIL_MB; plenty unless given, so the PC's own state does not count)
 lim11=
-for ram in 12000:128 6000:93 1024:64 12000,100:100 12000/200:50 12000/80:32; do
+for ram in 12000:128 6000:93 1024:64 12000,100:100 12000/200:128 12000/80:128; do
   r=${ram%%:*}; want=${ram#*:}; tot=; av=100000
   case $r in */*) av=${r#*/}; r=${r%/*};; esac
   case $r in *,*) tot=${r#*,}; r=${r%,*};; esac
@@ -238,6 +240,25 @@ u13=$(load13 4273 VKBRIDGE_PCACHE_MMAP=all)
     ! echo "$d13" | grep -q "mapped" && echo "$d13" | grep -q "KB loaded" &&
     echo "$u13" | grep -q "^alive" && grep -q "steam4273.vkpc could not be read (Is a directory): starting without it" $work/server13-4273.log
 step $? "mapped only where it may ($fs13: all=${m13##*, }; fuse: $(echo "$f13" | grep -c mapped) mapped; default: $(echo "$d13" | grep -c mapped) mapped); an unreadable file starts empty"
+
+# 14 a file saved with plenty free, then a start with 5 KB "free" (a few new pipelines, saved at
+#    the end), then plenty again
+l14=$work/server14
+srv10 $l14-a.log VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4274 "$out/pcache_check" --first 0 --count 40 >$work/14a.log 2>&1
+end10
+a14=$(size10 steam4274); i14a=$(stat -c %i "$work"/c10/*-steam4274.vkpc | head -1)
+srv10 $l14-b.log VKBRIDGE_FAKE_MEMAVAIL_MB=0.005 VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4274 "$out/pcache_check" --first 3000 --count 5 >$work/14b.log 2>&1
+end10
+b14=$(size10 steam4274); i14b=$(stat -c %i "$work"/c10/*-steam4274.vkpc | head -1)  # a save writes aside and renames over: a new inode
+srv10 $l14-c.log VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4274 "$out/pcache_check" --first 0 --count 1 >$work/14c.log 2>&1
+end10
+c14=$(grep -o "steam4274.vkpc ([0-9]* KB loaded" $l14-c.log | grep -o "[0-9]* KB" | head -1)
+[ "$a14" -gt 0 ] && [ "$b14" = "$a14" ] && [ -n "$i14a" ] && [ "$i14b" = "$i14a" ] && grep -q "steam4274.vkpc ([0-9]* KB) not loaded this time" $l14-b.log &&
+    grep -q "steam4274.vkpc not saved: the file was not loaded" $l14-b.log && [ "$c14" = "$((a14 >> 10)) KB" ]
+step $? "short of memory at the start: $a14 bytes not loaded, $b14 bytes after that run, then $c14 loaded (file $([ "$i14b" = "$i14a" ] && echo untouched || echo rewritten))"
 
 grep -E "process [0-9]+ is|pipeline cache|taken in|removed|several|cache directory" "$log" > "$out/t-pcache-server.log"
 if [ $fails = 0 ]; then echo "OK: persistent pipeline cache"; else echo "FAILED: $fails step(s) (server log in $out/t-pcache-server.log)"; exit 1; fi

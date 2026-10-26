@@ -696,6 +696,25 @@ static VkResult ds_refill(VkDevice device, ds_pool *p, const ds_layout *l, ds_ca
 #define VKB_DS_TAG 0xDDDD000000000000ull /* server_dsmap.c: not a pointer, tagged or not */
 #define DS_NAMED_MAX 1024
 
+/* A set no pool like this one can hold (more of a type than the pool has, or a type it has none
+ * of): the server grows a pool by others of the same size (server_pools.c), so no growth helps. */
+static int ds_oversize(const ds_pool *p, const VkDescriptorSetAllocateInfo *ai)
+{
+    if (ai->descriptorSetCount > p->max_sets * 8) return 1;
+    for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
+        const ds_layout *l = layout_find(ai->pSetLayouts[i]);
+        if (!l || !l->known) continue;
+        for (int t = 0; t < DS_TYPES; t++)
+            if (l->count[t] > p->size[t]) return 1;
+    }
+    return 0;
+}
+
+/* Set by ds_allocate on this thread: the refusal was a pool full after its growth, the normal
+ * "pool full" DXVK and vkd3d-proton answer by moving on to another pool. Not a failure. */
+static __thread int ds_full_answer;
+uint32_t vkb_stat_pool_full; /* VKBRIDGE_STATS */
+
 static VkResult ds_alloc_named(VkDevice device, ds_pool *p, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out)
 {
     static uint64_t next_name;
@@ -710,6 +729,7 @@ static VkResult ds_alloc_named(VkDevice device, ds_pool *p, const VkDescriptorSe
     if (n > p->sets_left) return VK_ERROR_OUT_OF_POOL_MEMORY;
     for (int t = 0; t < DS_TYPES; t++)
         if (need[t] > p->left[t]) return VK_ERROR_OUT_OF_POOL_MEMORY;
+    if (ds_oversize(p, ai)) return VK_ERROR_OUT_OF_POOL_MEMORY; /* the books add pools' worth; the server's pools stay this size */
     vkb_device *dev = vkb_dev(device);
     vkb_call c;
     vkb_call_begin(&c, VKB_CMD_vkbAllocDescSets, dev->obj.table);
@@ -723,7 +743,7 @@ static VkResult ds_alloc_named(VkDevice device, ds_pool *p, const VkDescriptorSe
     }
     if (!vkb_call_exec_async(&c)) {
         for (uint32_t i = 0; i < n; i++) out[i] = VK_NULL_HANDLE;
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkAllocateDescriptorSets");
     }
     p->sets_left -= n;
     for (int t = 0; t < DS_TYPES; t++) p->left[t] -= (uint32_t)need[t];
@@ -745,8 +765,8 @@ static void ds_report_failure(const VkDescriptorSetAllocateInfo *ai, VkResult r)
     int len = snprintf(line, sizeof(line), "vkAllocateDescriptorSets refused (%d): %u set(s), pNext %s; pool %s", r, ai->descriptorSetCount,
                        ai->pNext ? "set" : "none", p ? "" : "unknown");
     if (p) {
-        len += snprintf(line + len, sizeof(line) - (size_t)len, "maxSets %u left %u books %d batch %u, left/size:", p->max_sets,
-                        p->sets_left, p->books, p->max_batch);
+        len += snprintf(line + len, sizeof(line) - (size_t)len, "maxSets %u left %u books %d batch %u grown %u (pools' worth %u), left/size:",
+                        p->max_sets, p->sets_left, p->books, p->max_batch, p->grown, p->grown + 1);
         for (int t = 0; t < DS_TYPES && len < (int)sizeof(line) - 24; t++)
             if (p->size[t]) len += snprintf(line + len, sizeof(line) - (size_t)len, " t%d %u/%u", t, p->left[t], p->size[t]);
     }
@@ -761,8 +781,15 @@ static void ds_report_failure(const VkDescriptorSetAllocateInfo *ai, VkResult r)
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out)
 {
+    ds_full_answer = 0;
     VkResult r = ds_allocate(device, ai, out);
-    if (r != VK_SUCCESS) {
+    if (r != VK_SUCCESS && ds_full_answer) {
+        static int said;
+        if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+            VKB_INFO("descriptor pool full after growing to 8 pools' worth: handed back to the app, which moves on to another "
+                     "pool (normal for DXVK and vkd3d-proton; counted in VKBRIDGE_STATS, not said again)");
+        __atomic_add_fetch(&vkb_stat_pool_full, 1, __ATOMIC_RELAXED);
+    } else if (r != VK_SUCCESS) {
         __atomic_add_fetch(&vkb_stat_refused, 1, __ATOMIC_RELAXED);
         ds_report_failure(ai, r);
     }
@@ -787,13 +814,14 @@ static VkResult ds_allocate(VkDevice device, const VkDescriptorSetAllocateInfo *
          * 8192). Then "full" goes back to the app: DXVK retires a full pool and resets it once the
          * GPU is done; never full, it kept allocating from one pool, never reset it, outgrew the
          * server's 64 overflow pools and its sets came out null (Deep Rock Galactic hung loading). */
-        while (nr == VK_ERROR_OUT_OF_POOL_MEMORY && p->grown < 7) {
+        int oversize = nr == VK_ERROR_OUT_OF_POOL_MEMORY && ds_oversize(p, ai);
+        while (nr == VK_ERROR_OUT_OF_POOL_MEMORY && !oversize && p->grown < 7) {
             p->grown++;
             p->sets_left += p->max_sets;
             for (int t = 0; t < DS_TYPES; t++) p->left[t] += p->size[t];
             nr = ds_alloc_named(device, p, ai, out);
-            if (nr == VK_ERROR_OUT_OF_POOL_MEMORY && p->grown == 1) break; /* bigger than a whole pool */
         }
+        ds_full_answer = nr == VK_ERROR_OUT_OF_POOL_MEMORY && !oversize;
         if (nr != VK_ERROR_UNKNOWN) {
             pthread_mutex_unlock(&ds_lock);
             return nr;

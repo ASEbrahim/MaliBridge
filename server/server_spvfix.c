@@ -14,10 +14,16 @@
  * pCode, or a VkShaderModuleCreateInfo chained to a pipeline stage), so nothing is copied.
  * On for ARM GPUs; VKBRIDGE_SPIRV_FIX=1/0 forces it (host tests).
  *
- * Also here, for the same GPUs: Mali (r44) fails to build a compute pipeline whose layout holds
- * immutable YCbCr samplers (VK_ERROR_INITIALIZATION_FAILED), and gamescope's compositing layout
- * has 16 of them. In compute bindings they are replaced by one plain linear sampler: RGB content
- * composites as before; only NV12 surfaces (video) lose their YCbCr conversion.
+ * Also here, for the same GPUs and Samsung's Xclipse: Mali (r44) fails to build a compute pipeline
+ * whose layout holds immutable YCbCr samplers (VK_ERROR_INITIALIZATION_FAILED), and gamescope's
+ * compositing layout has 16 of them; the Xclipse 960 fails the same pipelines with
+ * VK_ERROR_UNKNOWN (135 of gamescope's 144, every game black with sound, MaliBridge#20). In compute
+ * bindings they are replaced by one plain linear sampler: RGB content composites as before; only
+ * NV12 surfaces (video) lose their YCbCr conversion. VKBRIDGE_YCBCR_SWAP=1/0 forces it. On every
+ * GPU the samplers that stay are counted per layout, so the first compute pipeline the driver
+ * refuses is logged with the number its layout holds (vkb_spvfix_compute_failed, from the crash
+ * guard, which sees every pipeline's result already). VKBRIDGE_FAKE_MISSING=ycbcrcompute (host
+ * tests) imitates the refusal beneath every layer (vkb_spvfix_fake_init).
  *
  * And: geometry and tessellation shaders get their loose per-vertex built-ins folded into
  * gl_PerVertex blocks (spirv_pervertex.c); loose ones crash Mali's compiler (tablet run 8, Steam's
@@ -44,6 +50,7 @@
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
+#include "server_emu.h"
 #include "server_errata.h"
 #include "spirv_pervertex.h"
 #include "spirv_shlbarrier.h"
@@ -89,6 +96,16 @@ typedef struct vkb_spvfix {
     VkSampler ycbcr[64]; /* samplers created with a YCbCr conversion */
     unsigned nycbcr;
     VkSampler plain;     /* their stand-in in compute layouts */
+    int ycbcr_swap;      /* VKBRIDGE_YCBCR_SWAP: the stand-in used (else the samplers are only counted) */
+    PFN_vkDestroyDescriptorSetLayout destroy_dsl;
+    PFN_vkCreatePipelineLayout create_pl;
+    PFN_vkDestroyPipelineLayout destroy_pl;
+    struct ycbcr_layout {
+        uint64_t layout;
+        unsigned n;
+    } dsl_y[64], pl_y[64]; /* set and pipeline layouts that reached the driver with YCbCr compute samplers, how many */
+    unsigned ndsl_y, npl_y;
+    int told_fail;         /* the first refused compute pipeline logged */
     int fixes;           /* VKBRIDGE_SPIRV_FIX: the composites, per-vertex blocks, YCbCr samplers */
     int shl;             /* VKBRIDGE_SHL_BARRIER: barriers after constant left shifts */
     unsigned long shl_modules, shl_barriers, shl_seen;
@@ -572,7 +589,7 @@ static VkResult VKAPI_CALL fx_CreateSampler(VkDevice device, const VkSamplerCrea
         if (b->sType == VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO) {
             pthread_mutex_lock(&f->lock);
             if (f->nycbcr < sizeof(f->ycbcr) / sizeof(f->ycbcr[0])) f->ycbcr[f->nycbcr++] = *out;
-            if (!f->plain) {
+            if (!f->plain && f->ycbcr_swap) {
                 VkSamplerCreateInfo pi = *ci;
                 pi.pNext = NULL;
                 if (f->create_sampler(device, &pi, NULL, &f->plain) != VK_SUCCESS) f->plain = VK_NULL_HANDLE;
@@ -599,27 +616,174 @@ static int is_ycbcr(vkb_spvfix *f, VkSampler s)
     return 0;
 }
 
+/* A layout's count in one of the lists; 0 when not there. Under f->lock. */
+static unsigned y_find(const struct ycbcr_layout *l, unsigned n, uint64_t h)
+{
+    for (unsigned i = 0; i < n; i++)
+        if (l[i].layout == h) return l[i].n;
+    return 0;
+}
+
+static void y_add(struct ycbcr_layout *l, unsigned *n, unsigned cap, uint64_t h, unsigned count)
+{
+    for (unsigned i = 0; i < *n; i++)
+        if (l[i].layout == h) {
+            l[i].n = count;
+            return;
+        }
+    if (*n < cap) l[(*n)++] = (struct ycbcr_layout){h, count};
+}
+
+static void y_drop(struct ycbcr_layout *l, unsigned *n, uint64_t h)
+{
+    for (unsigned i = 0; i < *n; i++)
+        if (l[i].layout == h) {
+            l[i] = l[--*n];
+            return;
+        }
+}
+
 static VkResult VKAPI_CALL fx_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *ci,
                                                         const VkAllocationCallbacks *a, VkDescriptorSetLayout *out)
 {
     vkb_spvfix *f = cur();
     pthread_mutex_lock(&f->lock);
     int any = 0;
-    for (uint32_t i = 0; i < ci->bindingCount && f->nycbcr && f->plain; i++) {
+    unsigned kept = 0; /* YCbCr samplers left in compute bindings: what the driver gets */
+    for (uint32_t i = 0; i < ci->bindingCount && f->nycbcr; i++) {
         const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i];
         if (!(b->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) || !b->pImmutableSamplers) continue;
         for (uint32_t k = 0; k < b->descriptorCount; k++)
             if (is_ycbcr(f, b->pImmutableSamplers[k])) {
-                /* The binding array lives in the request's buffer: swapped in place. */
-                ((VkSampler *)b->pImmutableSamplers)[k] = f->plain;
-                any = 1;
+                if (f->ycbcr_swap && f->plain) {
+                    /* The binding array lives in the request's buffer: swapped in place. */
+                    ((VkSampler *)b->pImmutableSamplers)[k] = f->plain;
+                    any = 1;
+                } else {
+                    kept++;
+                }
             }
     }
     pthread_mutex_unlock(&f->lock);
     static int told;
     if (any && !__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED))
-        VKB_WARN("compute layout: immutable YCbCr samplers replaced (Mali cannot build such pipelines); NV12 surfaces lose YCbCr conversion");
-    return f->create_dsl(device, ci, a, out);
+        VKB_WARN("compute layout: immutable YCbCr samplers replaced (this GPU cannot build such pipelines); NV12 surfaces lose YCbCr "
+                 "conversion");
+    VkResult r = f->create_dsl(device, ci, a, out);
+    if (r == VK_SUCCESS && kept) {
+        pthread_mutex_lock(&f->lock);
+        y_add(f->dsl_y, &f->ndsl_y, 64, (uint64_t)(uintptr_t)*out, kept);
+        pthread_mutex_unlock(&f->lock);
+    }
+    return r;
+}
+
+static void VKAPI_CALL fx_DestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout l, const VkAllocationCallbacks *a)
+{
+    vkb_spvfix *f = cur();
+    if (__atomic_load_n(&f->ndsl_y, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&f->lock);
+        y_drop(f->dsl_y, &f->ndsl_y, (uint64_t)(uintptr_t)l);
+        pthread_mutex_unlock(&f->lock);
+    }
+    f->destroy_dsl(device, l, a);
+}
+
+static VkResult VKAPI_CALL fx_CreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                   VkPipelineLayout *out)
+{
+    vkb_spvfix *f = cur();
+    VkResult r = f->create_pl(device, ci, a, out);
+    if (r != VK_SUCCESS || !__atomic_load_n(&f->ndsl_y, __ATOMIC_RELAXED)) return r;
+    pthread_mutex_lock(&f->lock);
+    unsigned n = 0;
+    for (uint32_t i = 0; i < ci->setLayoutCount; i++) n += y_find(f->dsl_y, f->ndsl_y, (uint64_t)(uintptr_t)ci->pSetLayouts[i]);
+    if (n) y_add(f->pl_y, &f->npl_y, 64, (uint64_t)(uintptr_t)*out, n);
+    pthread_mutex_unlock(&f->lock);
+    return r;
+}
+
+static void VKAPI_CALL fx_DestroyPipelineLayout(VkDevice device, VkPipelineLayout l, const VkAllocationCallbacks *a)
+{
+    vkb_spvfix *f = cur();
+    if (__atomic_load_n(&f->npl_y, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&f->lock);
+        y_drop(f->pl_y, &f->npl_y, (uint64_t)(uintptr_t)l);
+        pthread_mutex_unlock(&f->lock);
+    }
+    f->destroy_pl(device, l, a);
+}
+
+/* The immutable YCbCr samplers a pipeline layout gave the driver in its compute bindings. */
+static unsigned layout_ycbcr(vkb_srv_table *t, VkPipelineLayout l)
+{
+    vkb_spvfix *f = t ? t->spvfix : NULL;
+    if (!f || !__atomic_load_n(&f->npl_y, __ATOMIC_RELAXED)) return 0;
+    pthread_mutex_lock(&f->lock);
+    unsigned n = y_find(f->pl_y, f->npl_y, (uint64_t)(uintptr_t)l);
+    pthread_mutex_unlock(&f->lock);
+    return n;
+}
+
+void vkb_spvfix_compute_failed(vkb_srv_table *t, uint32_t n, const VkComputePipelineCreateInfo *ci, VkResult r)
+{
+    vkb_spvfix *f = t ? t->spvfix : NULL;
+    if (!f || __atomic_exchange_n(&f->told_fail, 1, __ATOMIC_RELAXED)) return;
+    unsigned y = 0;
+    for (uint32_t i = 0; i < n && !y; i++) y = layout_ycbcr(t, ci[i].layout);
+    VKB_WARN("device %u: compute pipeline failed (%d): layout has %u immutable YCbCr sampler(s)%s (first failure; YCbCr compute "
+             "samplers %s)", t->id, r, y, n > 1 ? " (a batch)" : "", f->ycbcr_swap ? "swapped" : "kept");
+}
+
+/* VKBRIDGE_FAKE_MISSING=ycbcrcompute (host tests): a driver that cannot build a compute pipeline
+ * whose layout holds immutable YCbCr samplers, as the Xclipse 960 (VK_ERROR_UNKNOWN, after its
+ * compiler has run). Installed beneath every layer, before the crash guard, so the bridge's
+ * report and logs see it as a driver failure; the count is the one the layouts reached the
+ * driver with (after the swap). */
+static struct {
+    VkDevice device;
+    vkb_srv_table *t;
+    PFN_vkCreateComputePipelines next;
+} fake_y[16];
+
+static VkResult VKAPI_CALL fake_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
+                                                      const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                      VkPipeline *out)
+{
+    int s = 0;
+    for (int i = 0; i < 16; i++)
+        if (__atomic_load_n(&fake_y[i].device, __ATOMIC_ACQUIRE) == device) {
+            s = i;
+            break;
+        }
+    VkResult r = VK_SUCCESS;
+    for (uint32_t i = 0; i < n; i++) {
+        if (layout_ycbcr(fake_y[s].t, ci[i].layout)) {
+            out[i] = VK_NULL_HANDLE;
+            r = VK_ERROR_UNKNOWN;
+            continue;
+        }
+        VkResult ri = fake_y[s].next(device, cache, 1, &ci[i], a, &out[i]);
+        if (ri < 0) out[i] = VK_NULL_HANDLE;
+        if (ri != VK_SUCCESS && r == VK_SUCCESS) r = ri;
+    }
+    return r;
+}
+
+void vkb_spvfix_fake_init(vkb_srv_table *t)
+{
+    if (!vkb_emu_faked("ycbcrcompute") || !t->real.vkCreateComputePipelines) return;
+    for (int i = 0; i < 16; i++)
+        if (!fake_y[i].device || fake_y[i].device == t->device) {
+            fake_y[i].t = t;
+            fake_y[i].next = t->real.vkCreateComputePipelines;
+            __atomic_store_n(&fake_y[i].device, t->device, __ATOMIC_RELEASE);
+            if (t->dt.vkCreateComputePipelines == t->real.vkCreateComputePipelines) t->dt.vkCreateComputePipelines = fake_CreateComputePipelines;
+            t->real.vkCreateComputePipelines = fake_CreateComputePipelines;
+            VKB_INFO("device %u: imitating a driver that cannot build compute pipelines with immutable YCbCr samplers "
+                     "(VKBRIDGE_FAKE_MISSING=ycbcrcompute)", t->id);
+            return;
+        }
 }
 
 void vkb_spvfix_device_init(vkb_srv_table *t)
@@ -627,12 +791,14 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     VkPhysicalDeviceProperties p;
     t->real.vkGetPhysicalDeviceProperties(t->physical, &p);
     const char *env = vkb_srv_env("VKBRIDGE_SPIRV_FIX");
-    /* ARM, or a GPU the startup probe saw fold DXVK's guard at the defaults (server_probe.c) */
-    int on = env ? strcmp(env, "0") != 0 : p.vendorID == 0x13B5 || vkb_probe_flag(VKB_PROBE_FLAG_SPIRV_FIX);
-    /* shl_barrier: ARM GPUs (a no-op the compiler cannot fold; the cost is one ALU op per constant
+    /* Arm's driver (by driverID: not Mesa PanVK, also vendor 0x13B5; server_driverid.c), or a GPU the
+     * startup probe saw fold DXVK's guard at the defaults (server_probe.c) */
+    int arm = vkb_arm_driver(&t->real, t->physical, t->api_version);
+    int on = env ? strcmp(env, "0") != 0 : arm || vkb_probe_flag(VKB_PROBE_FLAG_SPIRV_FIX);
+    /* shl_barrier: Arm's driver (a no-op the compiler cannot fold; the cost is one ALU op per constant
      * shift and, once, the driver's pipeline cache entries of the modules it changes) */
     const char *shl_env = vkb_srv_env("VKBRIDGE_SHL_BARRIER");
-    int shl = shl_env && *shl_env ? strcmp(shl_env, "0") != 0 : p.vendorID == 0x13B5;
+    int shl = shl_env && *shl_env ? strcmp(shl_env, "0") != 0 : arm;
     /* shm_barrier: only when asked for (a per-game preset): it adds barriers, which cost time */
     const char *shm_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER");
     int shm = shm_env && *shm_env && strcmp(shm_env, "0") != 0 ? (strcmp(shm_env, "2") ? 1 : 2) : 0;
@@ -653,10 +819,22 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     const char *only_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_ONLY"), *skip_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_SKIP");
     const char *subst_env = vkb_srv_env("VKBRIDGE_SPIRV_SUBST");
     int subst = subst_env && *subst_env && strcmp(subst_env, "0") != 0;
-    if ((!on && !shl && !shm && !w32 && !subst) || !t->dt.vkCreateShaderModule) return;
+    /* Compute layouts with immutable YCbCr samplers (gamescope's composite shaders): Mali and
+     * Samsung's Xclipse do not build such pipelines (Xclipse 960: 135 of gamescope's 144 fail with
+     * VK_ERROR_UNKNOWN, every game black, MaliBridge#20). VKBRIDGE_YCBCR_SWAP=0/1 overrides. */
+    const char *yc_env = vkb_srv_env("VKBRIDGE_YCBCR_SWAP");
+    int ycs = yc_env && *yc_env ? strcmp(yc_env, "0") != 0 : on || p.vendorID == 0x144D;
+    int spv = on || shl || shm || w32 || subst;
+    /* Installed on every GPU: the sampler and layout hooks count YCbCr samplers for the failure
+     * line (they run when such objects are made, never per frame); the module and pipeline hooks
+     * only where a SPIR-V change is on (they keep copies of every module). */
+    if (!t->dt.vkCreateShaderModule || !t->dt.vkCreateSampler || !t->dt.vkDestroySampler || !t->dt.vkCreateDescriptorSetLayout ||
+        !t->dt.vkDestroyDescriptorSetLayout || !t->dt.vkCreatePipelineLayout || !t->dt.vkDestroyPipelineLayout)
+        return;
     vkb_spvfix *f = calloc(1, sizeof(*f));
     if (!f) return;
     f->fixes = on;
+    f->ycbcr_swap = ycs;
     f->shl = shl;
     f->shm = shm;
     f->shm_dump = shm_dump;
@@ -674,19 +852,27 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     f->create_module = dt->vkCreateShaderModule;
     f->create_gfx = dt->vkCreateGraphicsPipelines;
     f->create_compute = dt->vkCreateComputePipelines;
-    dt->vkCreateShaderModule = fx_CreateShaderModule;
-    dt->vkCreateGraphicsPipelines = fx_CreateGraphicsPipelines;
-    dt->vkCreateComputePipelines = fx_CreateComputePipelines;
+    if (spv) {
+        dt->vkCreateShaderModule = fx_CreateShaderModule;
+        dt->vkCreateGraphicsPipelines = fx_CreateGraphicsPipelines;
+        dt->vkCreateComputePipelines = fx_CreateComputePipelines;
+    }
     f->create_sampler = dt->vkCreateSampler;
     f->destroy_sampler = dt->vkDestroySampler;
     f->create_dsl = dt->vkCreateDescriptorSetLayout;
-    if (on) {
-        dt->vkCreateSampler = fx_CreateSampler;
-        dt->vkDestroySampler = fx_DestroySampler;
-        dt->vkCreateDescriptorSetLayout = fx_CreateDescriptorSetLayout;
-    }
+    f->destroy_dsl = dt->vkDestroyDescriptorSetLayout;
+    f->create_pl = dt->vkCreatePipelineLayout;
+    f->destroy_pl = dt->vkDestroyPipelineLayout;
+    dt->vkCreateSampler = fx_CreateSampler;
+    dt->vkDestroySampler = fx_DestroySampler;
+    dt->vkCreateDescriptorSetLayout = fx_CreateDescriptorSetLayout;
+    dt->vkDestroyDescriptorSetLayout = fx_DestroyDescriptorSetLayout;
+    dt->vkCreatePipelineLayout = fx_CreatePipelineLayout;
+    dt->vkDestroyPipelineLayout = fx_DestroyPipelineLayout;
     t->spvfix = f;
-    VKB_INFO("device %u: Mali SPIR-V fixes %s, shl_barrier %s%s%s", t->id, on ? "on" : "off", shl ? "on" : "off",
+    if (!spv && !ycs && !(yc_env && *yc_env)) return; /* only counting: nothing to say */
+    VKB_INFO("device %u: Mali SPIR-V fixes %s, YCbCr compute samplers %s%s, shl_barrier %s%s%s", t->id, on ? "on" : "off",
+             ycs ? "swapped" : "kept", yc_env && *yc_env ? " (VKBRIDGE_YCBCR_SWAP)" : "", shl ? "on" : "off",
              shl_env && *shl_env ? " (VKBRIDGE_SHL_BARRIER)" : "", shm == 2   ? ", shm_barrier on, level 2 (VKBRIDGE_SHARED_BARRIER)"
              : shm ? ", shm_barrier on (VKBRIDGE_SHARED_BARRIER)"
                    : "");
@@ -710,6 +896,9 @@ void vkb_spvfix_device_destroy(vkb_srv_table *t)
     t->dt.vkCreateSampler = f->create_sampler;
     t->dt.vkDestroySampler = f->destroy_sampler;
     t->dt.vkCreateDescriptorSetLayout = f->create_dsl;
+    t->dt.vkDestroyDescriptorSetLayout = f->destroy_dsl;
+    t->dt.vkCreatePipelineLayout = f->create_pl;
+    t->dt.vkDestroyPipelineLayout = f->destroy_pl;
     if (f->plain) t->real.vkDestroySampler(t->device, f->plain, NULL);
     if (f->patched) VKB_INFO("device %u: SPIR-V fix changed %lu composites", t->id, f->patched);
     if (f->shl)

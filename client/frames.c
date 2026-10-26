@@ -29,7 +29,7 @@
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int state = -1; /* -1 not looked at, 0 off, 1 on */
 static char path[640];
-static uint64_t presents, external;
+static uint64_t presents, external, all_presents; /* all_presents: counted with the statistics off too */
 static uint32_t swapchains;
 static double t_first, t_prev, t_write, sec_start, ft_max;
 static uint32_t ft[FT_BUCKETS], fps_s[6], sec_frames, hitch100, hitch1000;
@@ -105,6 +105,7 @@ static void write_line(void)
 
 void vkb_frames_present(void)
 {
+    __atomic_add_fetch(&all_presents, 1, __ATOMIC_RELAXED);
     double now = mono();
     pthread_mutex_lock(&lock);
     if (state < 0) setup();
@@ -157,3 +158,5 @@ static void count(uint32_t *sc, uint64_t *ext)
 void vkb_frames_swapchain(void) { count(&swapchains, NULL); }
 
 void vkb_frames_external(void) { count(NULL, &external); }
+
+uint64_t vkb_frames_presented(void) { return __atomic_load_n(&all_presents, __ATOMIC_RELAXED); }

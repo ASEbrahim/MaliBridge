@@ -66,7 +66,8 @@ p1=$(prof plain)
 [ $ok = 1 ] && grep -q '"probe_version": 3' "$p1" && grep -q '"name": "dyn_state", "status": "pass", .*"cases": "0x[1-9a-f]*", "failed": "0x0"' "$p1"
 step $? "every MK probe passes:$res"
 got=$(on_set)
-[ "$got" = wait_retry,dyn_reemit,vb_split,view_counts,cull_nontri ] && echo "$new" | grep -q "errata: dyn_reemit ON (always; safe mode; probe dyn_state passed) - MK-04" &&
+[ "$got" = wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri ] && echo "$new" | grep -q "errata: dyn_reemit ON (always; safe mode; probe dyn_state passed) - MK-04" &&
+  echo "$new" | grep -q "errata: view_quarantine ON (always; safe mode; probe rendering_churn passed, recorded only)" &&
   echo "$new" | grep -q "errata: wait_retry ON (always; safe mode; probe wait_eintr passed, recorded only)" &&
   echo "$new" | grep -q "errata: vb_split ON (always; safe mode; probe vb_strides passed, recorded only)" &&
   echo "$new" | grep -q "errata: view_counts ON (always; safe mode; probe view3d_layers passed, recorded only)"
@@ -123,9 +124,9 @@ imitate fp16_hide fp16_math 0x8000 "errata: fp16_hide ON (probe fp16_math failed
 imitate view_quarantine rendering_churn 0x2000 ""
 for _ in $(seq 100); do grep -q "^| view_quarantine" $work/view_quarantine/s/malibridge-report.md 2>/dev/null && break; sleep 0.1; done
 ! echo "$new" | grep -q "errata: view_quarantine ON" &&
-  grep -q "^| view_quarantine | MK-06 | rendering_churn (records) | \*\*fail (views)\*\* | off (not needed here) | off (not needed here) - in force |" \
+  grep -q "^| view_quarantine | MK-06 | rendering_churn (records) | \*\*fail (views)\*\* | \*\*ON\*\* (always; safe mode; probe rendering_churn failed, recorded only) | off (not needed here) - in force |" \
     $work/view_quarantine/s/malibridge-report.md
-step $? "  rendering_churn's failure recorded only: view_quarantine stays off off the driver's range ($(grep -m1 '^| view_quarantine' $work/view_quarantine/s/malibridge-report.md | cut -c1-100))"
+step $? "  rendering_churn's failure recorded only: view_quarantine stays off off the driver's range in performance mode (safe mode: always on) ($(grep -m1 '^| view_quarantine' $work/view_quarantine/s/malibridge-report.md | cut -c1-100))"
 grep -q "| dyn_reemit | MK-04 | dyn_state | \*\*fail (depth_write, cull, stencil_wmask" $work/dyn_reemit/s/malibridge-report.md 2>/dev/null ||
   { sleep 6; grep -q "| dyn_reemit | MK-04 | dyn_state | \*\*fail (depth_write, cull, stencil_wmask" $work/dyn_reemit/s/malibridge-report.md; }
 step $? "  the report names dyn_state's failed sub-cases ($(grep -m1 -o '| dyn_reemit | MK-04 | dyn_state | [^|]*' $work/dyn_reemit/s/malibridge-report.md))"

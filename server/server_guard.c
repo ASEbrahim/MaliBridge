@@ -1285,6 +1285,7 @@ static void account(VkDevice device, int compute, uint32_t n, const void *infos,
         stages_text(h, stg, nh, st, sizeof(st));
     }
     vkb_report_compile(g ? g->t : NULL, compute, n, ms, r, st);
+    if (compute && r < 0 && g) vkb_spvfix_compute_failed(g->t, n, infos, r); /* once per device */
 }
 
 /*

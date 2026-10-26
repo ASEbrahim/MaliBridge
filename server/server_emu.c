@@ -9,6 +9,7 @@
 #include "vkb_server.h"
 #include "server_emu.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -61,6 +62,7 @@ static const struct {
     {"robustness2", {"VK_EXT_robustness2", "VK_KHR_robustness2"}},
     {"loadstorenone", {"VK_KHR_load_store_op_none", NULL}},
     {"dynrend", {"VK_KHR_dynamic_rendering", NULL}},
+    {"vidyn", {"VK_EXT_vertex_input_dynamic_state", NULL}},
 };
 
 /* A driver extension the clients are not shown: named in VKBRIDGE_FAKE_MISSING (as itself or
@@ -133,16 +135,43 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
     }
     uint32_t kept = 0;
     const char *erratum = vkb_errata_hidden_ext(t, pd);
-    /* Zink on a driver that needs the BGRA 10-10-10-2 emulation: its vertex formats at pipeline
-     * creation, where the vertex shader can be fitted to them (vkb_emu_bgr10_for). */
     const vkb_srv_table *inst = t->is_device ? t->parent : t;
-    const vkb_pd_knowledge *k = inst && inst->zink ? vkb_pd_lookup(&t->real, pd) : NULL;
+    /* Zink gets VK_EXT_vertex_input_dynamic_state on every driver (server_vidyn.c): the driver's,
+     * or the server's in its place; and no graphics pipeline libraries where the server makes
+     * pipeline variants (a library's vertex input cannot be made static). */
+    int vidyn = vkb_vidyn_mode(inst, pd), no_gpl = vidyn && vkb_vidyn_variants(inst, pd);
+    /* With that off (VKBRIDGE_EMU_VIDYN=0), Zink on a driver that needs the packed vertex format
+     * emulations: its vertex formats at pipeline creation, where the vertex shader can be fitted to
+     * them (vkb_emu_bgr10_for). */
+    const vkb_pd_knowledge *k = inst && inst->zink && !vidyn ? vkb_pd_lookup(&t->real, pd) : NULL;
     int hide_vi_dyn = k && (k->info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX));
-    for (uint32_t i = 0; i < n; i++)
-        if (!vkb_emu_ext_hidden(all[i].extensionName) && !(erratum && !strcmp(all[i].extensionName, erratum)) &&
-            !calts_hidden(all[i].extensionName) && !(hide_vi_dyn && !strcmp(all[i].extensionName, "VK_EXT_vertex_input_dynamic_state")))
+    int have_vi_dyn = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *e = all[i].extensionName;
+        int is_vi = !strcmp(e, "VK_EXT_vertex_input_dynamic_state");
+        if (is_vi && vidyn == VKB_VIDYN_EMULATED) continue; /* the server's below */
+        if (is_vi && vidyn == VKB_VIDYN_NATIVE) {
+            all[kept++] = all[i], have_vi_dyn = 1;
+            continue;
+        }
+        if (!vkb_emu_ext_hidden(e) && !(erratum && !strcmp(e, erratum)) && !calts_hidden(e) && !(hide_vi_dyn && is_vi) &&
+            !(no_gpl && !strcmp(e, "VK_EXT_graphics_pipeline_library")))
             all[kept++] = all[i];
+    }
+    if (vidyn == VKB_VIDYN_EMULATED || (vidyn == VKB_VIDYN_NATIVE && !have_vi_dyn)) {
+        VkExtensionProperties *grown = realloc(all, (n + 1) * sizeof(*all));
+        if (grown) {
+            all = grown;
+            memset(&all[kept], 0, sizeof(all[kept]));
+            snprintf(all[kept].extensionName, sizeof(all[kept].extensionName), "VK_EXT_vertex_input_dynamic_state");
+            all[kept++].specVersion = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_SPEC_VERSION;
+        }
+    }
     if (hide_vi_dyn) VKB_ONCE(VKB_LOG_INFO, "emulation: VK_EXT_vertex_input_dynamic_state hidden from Zink (packed vertex fetch emulated)");
+    if (vidyn)
+        VKB_ONCE(VKB_LOG_INFO, "emulation: VK_EXT_vertex_input_dynamic_state offered to Zink: %s%s",
+                 vidyn == VKB_VIDYN_EMULATED ? "the server's (not in the driver)" : "the driver's",
+                 no_gpl ? "; graphics pipeline libraries hidden from it (pipeline variants)" : "");
     if (!props) {
         *count = kept;
         free(all);
@@ -337,7 +366,7 @@ PFN_vkGetInstanceProcAddr vkb_emu_imitate_gipa(PFN_vkGetInstanceProcAddr gipa)
 }
 
 /* The driver offers VK_EXT_vertex_input_dynamic_state (VKBRIDGE_FAKE_MISSING=vidyn: as if not). */
-static int driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd)
+int vkb_emu_driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd)
 {
     const char *fake = fake_list();
     if (fake && token(fake, "vidyn")) return 0;
@@ -353,12 +382,14 @@ static int driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd)
 }
 
 /* Whether this instance's clients get VKB_EMU_BGR10_VTX (the GPU needing it is the caller's check):
- * where the driver offers VK_EXT_vertex_input_dynamic_state, only Zink, from which it is hidden. */
+ * where the driver offers VK_EXT_vertex_input_dynamic_state, only Zink, for which the vertex input
+ * of vkCmdSetVertexInputEXT is made static in pipeline variants (server_vidyn.c), or from which the
+ * extension is hidden (VKBRIDGE_EMU_VIDYN=0). */
 int vkb_emu_bgr10_for(const vkb_srv_table *inst, VkPhysicalDevice pd)
 {
     if (!inst) return 0;
     if (inst->zink) return 1;
-    return !driver_vi_dyn(&inst->real, pd);
+    return !vkb_emu_driver_vi_dyn(&inst->real, pd);
 }
 
 uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *missing)
@@ -451,8 +482,9 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         }
     }
     /* dma-buf export of images (gamescope's nested backend needs it): emulated with dma-heap pages
-     * where the driver imports dma-bufs into images but exports none (Mali). */
-    if (!env_off("VKBRIDGE_EMU_DMABUF_EXPORT") && vkb_mem_dmaheap_available()) {
+     * where the driver imports dma-bufs into images but exports none (Mali); AHardwareBuffer pages
+     * where there is no dma-heap (vkb_mem_export_backing). */
+    if (!env_off("VKBRIDGE_EMU_DMABUF_EXPORT") && vkb_mem_export_backing()) {
         int can_export = 0, can_import = 0;
         if (idt->vkGetPhysicalDeviceImageFormatProperties2) {
             /* Asked as gamescope asks: a linear DRM modifier (Mali answers import questions only so). */
@@ -472,7 +504,10 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
             }
         }
         if (fake && token(fake, "dmabufexport")) can_export = 0;
-        if (!can_export && can_import) emu |= VKB_EMU_DMABUF_EXPORT;
+        if (!can_export && can_import) {
+            emu |= VKB_EMU_DMABUF_EXPORT;
+            VKB_ONCE(VKB_LOG_INFO, "dma-buf export: emulated, pages from the %s", vkb_mem_export_backing_name());
+        }
     }
     /* OPAQUE_FD external memory on dma-bufs (server_opaque.c): DXVK's D3D11 shared resources. */
     if (!env_off("VKBRIDGE_EMU_OPAQUEFD") && vkb_opaque_wanted(idt, pd, emu)) emu |= VKB_EMU_OPAQUE_FD;
@@ -497,9 +532,9 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
      * Godot 3 games would not start ("does not support any of the supported OpenGL versions", issue #5).
      * Fetched as the RGBA format, with red and blue swapped where the vertex shader reads it
      * (server_emu_shader.c). A format set at record time (VK_EXT_vertex_input_dynamic_state, r48 and
-     * later; below r48 the errata hide it) cannot reach the shader: on such a driver the extension is
-     * hidden from Zink, which then takes its formats at pipeline creation, and every other client
-     * keeps the extension and goes without the emulation (vkb_emu_bgr10_for). */
+     * later; below r48 the errata hide it) cannot reach the shader: for Zink such a vertex input is
+     * made static in a pipeline variant (server_vidyn.c), and every other client keeps the
+     * extension and goes without the emulation (vkb_emu_bgr10_for). */
     /* (r32p1 lacks the BGRA USCALED and SSCALED ones too) */
     int bgr10_missing = 0;
     static const VkFormat bgr10[] = {VK_FORMAT_A2R10G10B10_SNORM_PACK32, VK_FORMAT_A2R10G10B10_USCALED_PACK32,

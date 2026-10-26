@@ -10,6 +10,7 @@
  *   --ext-sync            ... made EXTERNALLY_SYNCHRONIZED, as Zink makes its per-program ones
  *   --hold S              wait S seconds before tearing down (periodic saves happen meanwhile)
  *   --no-destroy          end with _exit() and destroy nothing, as a killed game
+ *   --mem MB              also hold MB of device memory meanwhile (the report's GPU memory per process)
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -32,12 +33,13 @@ static double now_ms(void)
 
 int main(int argc, char **argv)
 {
-    int first = 0, count = 32, app_caches = 0, ext_sync = 0, hold = 0, no_destroy = 0;
+    int first = 0, count = 32, app_caches = 0, ext_sync = 0, hold = 0, no_destroy = 0, mem_mb = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--first") && i + 1 < argc) first = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--count") && i + 1 < argc) count = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--app-caches") && i + 1 < argc) app_caches = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hold") && i + 1 < argc) hold = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mem") && i + 1 < argc) mem_mb = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ext-sync")) ext_sync = 1;
         else if (!strcmp(argv[i], "--no-destroy")) no_destroy = 1;
     }
@@ -87,6 +89,8 @@ int main(int argc, char **argv)
     GD(vkDestroyPipeline);
     GD(vkCreatePipelineCache);
     GD(vkDestroyPipelineCache);
+    GD(vkAllocateMemory);
+    GD(vkFreeMemory);
 
     VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(spv_smoke_comp), spv_smoke_comp};
     VkShaderModule sm;
@@ -128,10 +132,19 @@ int main(int argc, char **argv)
         }
     }
     double ms = now_ms() - t0;
+    VkDeviceMemory held = VK_NULL_HANDLE;
+    if (mem_mb > 0) {
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, (VkDeviceSize)mem_mb << 20, 0};
+        if (vkAllocateMemory(dev, &mai, NULL, &held)) {
+            printf("FAIL: %d MB of device memory\n", mem_mb);
+            return 1;
+        }
+    }
     if (hold > 0) sleep((unsigned)hold);
     printf("OK: %d pipelines (%d..%d) in %.1f ms%s\n", count, first, first + count - 1, ms, no_destroy ? ", exiting without cleanup" : "");
     fflush(stdout);
     if (no_destroy) _exit(0);
+    if (held) vkFreeMemory(dev, held, NULL);
     for (int i = 0; i < count; i++) vkDestroyPipeline(dev, pipes[i], NULL);
     for (int i = 0; i < app_caches; i++) vkDestroyPipelineCache(dev, caches[i], NULL);
     vkDestroyPipelineLayout(dev, pl, NULL);

@@ -241,6 +241,7 @@ static int server_init(const char *vk_lib, const char *cache_dir)
     vkb_srv_env_reload(); /* <cache dir>/env: VKBRIDGE_FAKE_MISSING and the like reach the self-test */
     vkb_gipa = vkb_mem_imitate_gipa(vkb_gipa); /* host tests: another Mali's memory table (server_memory.c) */
     vkb_gipa = vkb_emu_imitate_gipa(vkb_gipa); /* host tests: the G715 r54p3's robustness2 (server_emu.c) */
+    vkb_gipa = vkb_driverid_imitate_gipa(vkb_gipa); /* host tests: PanVK or Arm's driver by driverID (server_driverid.c) */
     vkb_mode_refresh();   /* logged with its source; the probe decides for both modes */
     vkb_selftest_all();
     return 1;
@@ -411,7 +412,12 @@ int main(int argc, char **argv)
     catch_crash(SIGFPE);
     signal(SIGTERM, on_stop);
     signal(SIGINT, on_stop);
-    signal(SIGHUP, on_stop);
+    /* A hangup is not the session's end: the server has no terminal, and the app ends it itself
+     * once the session's programs are gone (SIGKILL) or by going away (parent_watch). A hangup
+     * reached the whole session at once - the server stopped with the session's programs, SIGHUP'd
+     * together after a long background pause (2026-10-25, status 129), and gamescope and Xwayland,
+     * still closing, got "device lost" from it. Ignored, the server stops last as the app orders. */
+    signal(SIGHUP, SIG_IGN);
     vkb_probe_crash_marks(1);
     /* The server is the app's child: when the app dies, so does the session's GPU. Not with
      * PR_SET_PDEATHSIG: that fires when the parent THREAD exits, and Android's ProcessBuilder forks

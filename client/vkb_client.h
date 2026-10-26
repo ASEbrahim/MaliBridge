@@ -176,6 +176,7 @@ void vkb_client_knobs_set(uint32_t w);
 int vkb_query_mirror_wanted(void);
 void vkb_stats_count(uint32_t cmd, int async, size_t bytes);
 extern uint32_t vkb_stat_refused; /* refused vkAllocateDescriptorSets, for VKBRIDGE_STATS */
+extern uint32_t vkb_stat_pool_full; /* pools handed back full after their growth (descriptor.c) */
 uint32_t vkb_table_of(const void *dispatchable);
 int vkb_connected(void);
 /* Per-thread transport cleanup for fork children. */
@@ -228,5 +229,28 @@ int vkb_memfd(const char *name, size_t size);
 void vkb_frames_present(void); /* frames.c: frame statistics for the server's session report */
 void vkb_frames_swapchain(void); /* frames.c: a swapchain made */
 void vkb_frames_external(void);  /* frames.c: memory the app exported or imported as an fd */
+uint64_t vkb_frames_presented(void); /* frames.c: presents so far in this process */
+
+/* conn.c: logs the first time each call returns each error. The test stays at the call site, so a
+ * call that succeeds costs one compare. */
+void vkb_first_error(const char *call, VkResult r);
+static inline VkResult vkb_note_error(const char *call, VkResult r)
+{
+    if (__builtin_expect(r < 0, 0)) vkb_first_error(call, r);
+    return r;
+}
+
+/* The generated wire calls (common/gen): a lost device is logged from every call that returns it. */
+static inline VkResult vkb_note_lost(const char *call, VkResult r)
+{
+    if (__builtin_expect(r == VK_ERROR_DEVICE_LOST, 0)) vkb_first_error(call, r);
+    return r;
+}
+
+static inline VkResult vkb_device_lost(const char *call)
+{
+    vkb_first_error(call, VK_ERROR_DEVICE_LOST);
+    return VK_ERROR_DEVICE_LOST;
+}
 
 #endif

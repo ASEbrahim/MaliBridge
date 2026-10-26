@@ -46,9 +46,12 @@
  * ~9 KB a pipeline) passed it within minutes on two tablets, HL2 did too, and from then on nothing
  * new was kept, so the same compile stutter came back at every launch.
  *
- * Now VKBRIDGE_PCACHE_MAX_MB, by default RAM/64 within 64-128 MB, never more than the total limit,
- * and never more than a quarter of the memory free when the device starts (MemAvailable, at least
- * 32 MB). The cache is one VkPipelineCache in the driver (a pipeline is created with one cache, so
+ * Now VKBRIDGE_PCACHE_MAX_MB, by default RAM/64 within 64-128 MB, never more than the total limit.
+ * The memory free at the device's start no longer lowers it: it used to (a quarter of MemAvailable,
+ * at least 32 MB), and one tight start left RE Village's 82 MB file unloaded and the next save
+ * replaced it with a few MB (Pixel 8 Pro, 2026-10). Now the memory free decides only whether the
+ * file is loaded this time (about twice its size free); when it is not, saves only merge into it,
+ * never write this run's smaller cache over it. The cache is one VkPipelineCache in the driver (a pipeline is created with one cache, so
  * all that should hit has to be in it, and the driver holds all of it in memory however the files
  * are cut), and a save that merges with what another process wrote holds about three of them in
  * the driver for a moment (ours, the file's, the merge, while vkGetPipelineCacheData copies it):
@@ -62,7 +65,6 @@
 #define PC_MAX_MB_MIN 64u
 #define PC_MAX_MB_MAX 128u
 #define PC_MAX_MB_UNKNOWN_RAM 64u
-#define PC_MAX_MB_LOW_MEM 32u /* the floor when the memory free sets the limit */
 #define PC_MAX_MB_SET_MAX (1u << 20) /* VKBRIDGE_PCACHE_MAX_MB above this is taken as this */
 /* A <file>.<pid>.<n>.tmp left by a killed save (its size reserved in full) goes at the next trim
  * once its process is gone, or after this long whatever its pid (pids are reused). */
@@ -110,11 +112,14 @@ typedef struct vkb_pcache {
     char path[512];
     int dirty;
     size_t saved_size;    /* size of `cache` at the last save (or load) */
+    size_t mem_size;      /* its size in the driver at the last save, over the limit too (vkb_pcache_stats) */
     pc_ident file;        /* the file as this cache last read or wrote it */
     int covers;           /* the file holds nothing `cache` lacks (it was written from it alone) */
     int full_warned;
     int over_warned;      /* warn_over said for this device */
     int nomerge_warned;   /* a merge skipped for want of memory, said */
+    int not_loaded;       /* the file was left unloaded for want of memory: saves only merge into it */
+    int keep_warned;      /* a save skipped to keep that file, said */
     uint64_t max;         /* the per-program limit in bytes (file_limit at the device's start) */
     int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
@@ -143,6 +148,7 @@ static pthread_mutex_t save_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned tmp_seq;
 static vkb_pcache *pc_list;
 static int pc_thread_started;
+static uint64_t pc_made; /* pipelines made through the caches (atomic; the server's memory line) */
 
 const char *vkb_pcache_dir(void) { return pc_dir; }
 
@@ -387,8 +393,6 @@ static uint64_t file_limit(void)
     } else {
         uint64_t ram = vkb_memtotal_mb(), mb = ram ? ram / 64 : PC_MAX_MB_UNKNOWN_RAM;
         mb = mb < PC_MAX_MB_MIN ? PC_MAX_MB_MIN : mb > PC_MAX_MB_MAX ? PC_MAX_MB_MAX : mb;
-        uint64_t avail = vkb_memavail_kb() >> 10;
-        if (avail && avail / 4 < mb) mb = avail / 4 < PC_MAX_MB_LOW_MEM ? PC_MAX_MB_LOW_MEM : avail / 4;
         bytes = mb << 20;
     }
     uint64_t total = total_limit();
@@ -722,7 +726,7 @@ static void warn_full(vkb_pcache *p, size_t size, int merged)
     p->full_warned = 1;
     char lim[32];
     VKB_WARN("device %u: pipeline cache %s would be %zu KB%s, over the %s limit for one program (VKBRIDGE_PCACHE_MAX_MB): the file "
-             "keeps what it has, pipelines compiled from now on are not kept",
+             "keeps what it has, pipelines compiled from now on are not saved (they stay in the driver's memory until the device goes)",
              p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max));
 }
 
@@ -774,6 +778,7 @@ static void save(vkb_pcache *p)
     __atomic_store_n(&p->dirty, 0, __ATOMIC_RELAXED); /* pipelines from now on make it dirty again */
     size_t own = 0;
     if (t->real.vkGetPipelineCacheData(t->device, p->cache, &own, NULL) != VK_SUCCESS || !own) return;
+    __atomic_store_n(&p->mem_size, own, __ATOMIC_RELAXED);
     if (own == p->saved_size) {
         /* Nothing new was compiled (merges of what it already had leave the size alone). */
         if (p->nwarm && p->file.valid) consume_warm(p);
@@ -800,6 +805,15 @@ static void save(vkb_pcache *p)
                          t->id, p->path, (unsigned long long)avail, (unsigned long long)need);
             }
         }
+    }
+    if (p->not_loaded && exists && !want_merge) {
+        /* Ours alone would replace a bigger file this run never loaded. */
+        if (!p->keep_warned) {
+            p->keep_warned = 1;
+            VKB_INFO("device %u: pipeline cache %s not saved: the file was not loaded (memory) and a merge does not fit now; it is kept as it is",
+                     t->id, p->path);
+        }
+        return;
     }
     if (want_merge) {
         /* Another process saved (or this one wrote a merge): ours goes on top of the file. */
@@ -911,6 +925,7 @@ static VkResult VKAPI_CALL pc_CreateGraphicsPipelines(VkDevice device, VkPipelin
                                                       VkPipeline *out)
 {
     vkb_pcache *p = cur();
+    __atomic_add_fetch(&pc_made, n, __ATOMIC_RELAXED);
     if (cache) {
         app_used(p, cache);
         return p->create_gfx(device, cache, n, ci, a, out);
@@ -927,6 +942,7 @@ static VkResult VKAPI_CALL pc_CreateComputePipelines(VkDevice device, VkPipeline
                                                      VkPipeline *out)
 {
     vkb_pcache *p = cur();
+    __atomic_add_fetch(&pc_made, n, __ATOMIC_RELAXED);
     if (cache) {
         app_used(p, cache);
         return p->create_compute(device, cache, n, ci, a, out);
@@ -1052,6 +1068,15 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         VKB_WARN("device %u: %s is not this GPU's pipeline cache; starting empty", t->id, from);
         unmap_file(&fm);
     }
+    uint64_t avail_kb = vkb_memavail_kb();
+    if (fm.data && from == p->path && avail_kb && avail_kb < ((uint64_t)fm.size * 2 >> 10)) {
+        /* The driver copies it into its heap: not when that is half of what is free. Kept for a
+         * later start; this run's pipelines go into it by merges when memory allows. */
+        VKB_WARN("device %u: pipeline cache %s (%zu KB) not loaded this time: %llu KB of memory free; the file is kept", t->id,
+                 p->path, fm.size >> 10, (unsigned long long)avail_kb);
+        unmap_file(&fm);
+        p->not_loaded = 1;
+    }
     const uint8_t *data = fm.data;
     size_t size = fm.size;
     VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, data ? size : 0, data};
@@ -1072,7 +1097,8 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         return;
     }
     p->saved_size = from == p->path ? size : 0;
-    p->covers = 1;
+    p->mem_size = size;
+    p->covers = !p->not_loaded;
     if (p->warm_role)
         VKB_INFO("device %u: pipeline cache %s (Steam's shader pre-caching: starts empty, adds to the file)", t->id, p->path);
     else
@@ -1142,11 +1168,21 @@ VkResult vkb_pcache_create_compute(vkb_srv_table *t, const VkComputePipelineCrea
 {
     vkb_pcache *p = t->pcache;
     if (!p) return t->real.vkCreateComputePipelines(t->device, VK_NULL_HANDLE, 1, ci, NULL, out);
+    __atomic_add_fetch(&pc_made, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
     pthread_rwlock_rdlock(&p->use);
     VkResult r = t->real.vkCreateComputePipelines(t->device, p->cache, 1, ci, NULL, out);
     pthread_rwlock_unlock(&p->use);
     return r;
+}
+
+void vkb_pcache_stats(uint64_t *pipelines, uint64_t *bytes)
+{
+    *pipelines = __atomic_load_n(&pc_made, __ATOMIC_RELAXED);
+    *bytes = 0;
+    pthread_mutex_lock(&pc_lock);
+    for (vkb_pcache *p = pc_list; p; p = p->next) *bytes += __atomic_load_n(&p->mem_size, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&pc_lock);
 }
 
 /* ------------------------------------------------------------------ the server's own compiles */

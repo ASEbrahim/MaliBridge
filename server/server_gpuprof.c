@@ -22,6 +22,8 @@
  * spans showed no bridge work of note (no uploads, 0.5 ms of the game's copies; the dispatches are
  * its ocean FFT), every attachment and decoded BC texture kept AFBC, and =2 named the costliest
  * draw a full-screen ray march (2.2 ms, screen-space reflections).
+ * VKBRIDGE_GPU_PROF=counters adds Mali's hardware counters (server_hwcnt.c: why the GPU is busy -
+ * which queue, which shader core unit, external memory), =counters-only reads those alone.
  * Off unless asked for.
  */
 #define _GNU_SOURCE
@@ -890,7 +892,12 @@ int vkb_gprof_wanted(void)
 void vkb_gprof_device_init(vkb_srv_table *t)
 {
     if (t->id >= 4096 || !vkb_gprof_wanted()) return;
-    by_pipe = !strcmp(vkb_srv_env("VKBRIDGE_GPU_PROF"), "2");
+    const char *mode = vkb_srv_env("VKBRIDGE_GPU_PROF");
+    by_pipe = !strcmp(mode, "2");
+    if (strstr(mode, "counters")) { /* Mali's hardware counters too (server_hwcnt.c), or alone */
+        vkb_hwcnt_start();
+        if (!strcmp(mode, "counters-only")) return;
+    }
     if (!t->real.vkCreateQueryPool || !t->real.vkGetQueryPoolResults || !t->real.vkCmdWriteTimestamp || !t->real.vkCmdResetQueryPool ||
         !t->real.vkBeginCommandBuffer || !t->real.vkEndCommandBuffer || !t->real.vkCreateImageView || !t->real.vkDestroyImageView ||
         !t->real.vkCmdDraw || !t->real.vkCmdDrawIndexed || !t->real.vkCmdDrawIndirect || !t->real.vkCmdDrawIndexedIndirect ||

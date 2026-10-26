@@ -1,0 +1,8 @@
+#version 450
+// ycbcr_compute_check.c: a compute shader reading a combined image sampler whose layout binding
+// holds an immutable YCbCr-conversion sampler, as gamescope's composite shaders do.
+// glslangValidator -V -x -o tests/ycbcr_comp.inc tests/shaders/ycbcr.comp
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 0, binding = 1) buffer Out { vec4 v; } o;
+void main() { o.v = textureLod(tex, vec2(0.5), 0.0); }

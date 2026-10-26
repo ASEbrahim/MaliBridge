@@ -73,7 +73,7 @@ typedef struct vkb_srv_mem {
     size_t host_len;
     void *mapped;            /* server-side vkMapMemory pointer (for flush/invalidate) */
     void *ahb;               /* AHardwareBuffer* (Android) */
-    int export_fd1;          /* VKB_EMU_DMABUF_EXPORT: the dma-heap fd + 1 handed out as the export (0: none) */
+    int export_fd1;          /* VKB_EMU_DMABUF_EXPORT: the dma-buf fd + 1 handed out as the export (0: none) */
     int sync_fd1;            /* cached readback: the shared dma-buf + 1, for DMA_BUF_IOCTL_SYNC (0: not cached) */
     uint8_t stat_cls, stat_ded; /* accounting (server_memory.c): strategy class, dedicated to an image (1) / buffer (2) */
     int stat_pid;
@@ -108,6 +108,8 @@ typedef struct vkb_srv_table {
     uint32_t mem_types_seen;                 /* memory types this device has allocated in (logged once each) */
     struct vkb_report_dev *report;           /* server_report.c */
     struct vkb_async *async;                 /* server_async.c */
+    struct vkb_vidyn *vidyn;                 /* server_vidyn.c */
+    PFN_vkGetPhysicalDeviceFeatures2 vidyn_f2; /* instance: the feature query beneath server_vidyn.c's */
 } vkb_srv_table;
 
 /* server_main.c */
@@ -195,6 +197,7 @@ const char *vkb_srv_env_list(char *out, size_t cap); /* <cache dir>/env as appli
 void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, VkResult r, const char *slow_stages);
 /* Pipelines the driver built with creation feedback, and how many of them it found in the pipeline cache (server_guard.c). */
 void vkb_report_cache_hits(vkb_srv_table *t, uint64_t built, uint64_t hits);
+int vkb_report_frames(uint64_t *presents, double *t_last); /* busiest live process's presents (frames line) */
 
 /* server_async.c: graphics pipelines compiled in the background (VKBRIDGE_ASYNC_COMPILE) */
 void vkb_async_device_init(vkb_srv_table *t);
@@ -218,10 +221,15 @@ void vkb_promote_write_apps_file(void);           /* <cache dir>/apps-vulkan, af
 /* server_spvfix.c */
 void vkb_spvfix_device_init(vkb_srv_table *t);
 void vkb_spvfix_device_destroy(vkb_srv_table *t);
+/* host tests: VKBRIDGE_FAKE_MISSING=ycbcrcompute, beneath every layer (before the crash guard) */
+void vkb_spvfix_fake_init(vkb_srv_table *t);
+/* a compute pipeline the driver refused: the first is logged with its layout's YCbCr samplers */
+void vkb_spvfix_compute_failed(vkb_srv_table *t, uint32_t n, const VkComputePipelineCreateInfo *ci, VkResult r);
 
 /* server_pools.c */
 void vkb_pools_device_init(vkb_srv_table *t);
 void vkb_pools_device_destroy(vkb_srv_table *t);
+uint64_t vkb_pools_overflow_live(void); /* overflow descriptor pools alive, every device */
 
 /* server_trace.c */
 void vkb_trace_device_init(vkb_srv_table *t);
@@ -283,6 +291,19 @@ void vkb_errata_probe_end(void *h);
 uint64_t vkb_spv_app_hash(const uint32_t *code, size_t size);
 int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta); /* r<major>p<minor> in s */
 const char *vkb_errata_hidden_ext(const vkb_srv_table *inst, VkPhysicalDevice pd); /* an erratum's hidden device extension */
+
+/* server_vidyn.c: VK_EXT_vertex_input_dynamic_state for Zink. The mode on a physical device: off
+ * (the client sees the driver's, or nothing), native (the driver's) or emulated (the server's). */
+enum { VKB_VIDYN_OFF = 0, VKB_VIDYN_NATIVE = 1, VKB_VIDYN_EMULATED = 2 };
+int vkb_vidyn_mode(const vkb_srv_table *inst, VkPhysicalDevice pd);
+int vkb_vidyn_variants(const vkb_srv_table *inst, VkPhysicalDevice pd); /* the layer makes pipeline variants there */
+void vkb_vidyn_instance_install(vkb_srv_table *t);
+/* vkCreateDevice: the extension and its feature off the driver's request where emulated; returns
+ * the layer's mode for the device (0: no layer) */
+int vkb_vidyn_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32_t emu, VkDeviceCreateInfo *ci, const char **exts,
+                                 uint32_t *n);
+void vkb_vidyn_device_init(vkb_srv_table *t, int mode);
+void vkb_vidyn_device_destroy(vkb_srv_table *t);
 /* fp16_hide (MK-20, server_errata_fp16.c): 1 when 16-bit float arithmetic and storage are hidden
  * from the clients of this physical device (inst: its instance's table) - the erratum's decision
  * as vkCreateDevice makes it, VKBRIDGE_NO_FP16 included; why (may be NULL) gets the reason */
@@ -297,6 +318,8 @@ void vkb_hang_device_destroy(vkb_srv_table *t);
 int vkb_gprof_wanted(void); /* VKBRIDGE_GPU_PROF */
 void vkb_gprof_device_init(vkb_srv_table *t);
 void vkb_gprof_device_destroy(vkb_srv_table *t);
+/* server_hwcnt.c: Mali hardware counters (VKBRIDGE_GPU_PROF=counters): a summary every 5 s */
+void vkb_hwcnt_start(void);
 void vkb_trace_device_destroy(vkb_srv_table *t);
 
 /* server_nulldesc.c */
@@ -331,6 +354,9 @@ const char *vkb_srv_env_override(const char *name);        /* <cache dir>/env's 
 const char *vkb_env_src_name(int src);                     /* "<cache dir>/env", "the environment", ... */
 void vkb_pcache_device_init(vkb_srv_table *t);
 void vkb_pcache_device_destroy(vkb_srv_table *t);
+/* Pipelines made through the persistent caches so far, and the caches' size in the driver at their
+ * last save (every device; 0 and 0 without them). */
+void vkb_pcache_stats(uint64_t *pipelines, uint64_t *bytes);
 /* a pipeline the server builds for itself, through the device's cache (VK_NULL_HANDLE without one) */
 VkResult vkb_pcache_create_compute(vkb_srv_table *t, const VkComputePipelineCreateInfo *ci, VkPipeline *out);
 /* a cache for the server's own compiles on a device without a table (the startup probe's) */
@@ -347,6 +373,8 @@ void vkb_table_unregister(vkb_srv_table *t);
 void vkb_srv_reply_status(vkb_srv_call *c, uint32_t status);
 /* The table of the call being executed on this thread (emulation wrappers use it). */
 vkb_srv_table *vkb_srv_current_table(void);
+void vkb_cbfail_device_init(vkb_srv_table *t); /* server_conn.c */
+void vkb_cbfail_device_destroy(vkb_srv_table *t);
 void vkb_srv_set_current_table(vkb_srv_table *t);
 void vkb_proc_cleanup(vkb_srv_proc *p);
 vkb_srv_proc *vkb_srv_current_proc(void); /* the client process this connection thread serves, or NULL */
@@ -376,6 +404,9 @@ extern int vkb_npds;
 /* server_memory.c */
 extern PFN_vkGetDeviceProcAddr vkb_mem_gdpa;
 int vkb_mem_dmaheap_available(void);
+int vkb_mem_export_backing(void); /* the dma-buf export emulation's pages: 1 dma-heap, 2 AHardwareBuffer (its check passed), 0 none */
+const char *vkb_mem_export_backing_name(void);
+const char *vkb_mem_ahb_export_result(void); /* the start's check of the AHardwareBuffer pages; "" where not checked */
 void vkb_mem_export_install(vkb_srv_table *t);
 void vkb_mem_instance_install(vkb_srv_table *t); /* VKBRIDGE_FAKE_MISSING=lazymem: Mali's memory types (host tests) */
 void vkb_mem_device_install(vkb_srv_table *t);   /* VKBRIDGE_FAKE_MISSING=dmabuftypes: Mali's dma-buf fd properties (host tests) */
@@ -396,6 +427,10 @@ uint8_t vkb_memstat_dedicated(const VkMemoryAllocateInfo *ai);
 void vkb_memstat_image(VkFormat bc, int64_t bytes, int64_t bc_src_bytes, int64_t bc_decoded_bytes); /* bc 0: not BC */
 void vkb_memstat_buffer(int64_t bytes);
 void vkb_memstat_query(int pid, int64_t *pid_bytes, int64_t *total, int64_t *images, int64_t *bc_images, int64_t *bc_src);
+/* 1 while the device's memory is low (MemAvailable under an eighth of RAM, until it is over a sixth
+ * again; VKBRIDGE_FAKE_MEMAVAIL_MB / _MEMTOTAL_MB for tests): what the server holds without need is
+ * let go. Watched every ~5 s by the accounting thread, VKBRIDGE_MEM_STATS=0 too. */
+int vkb_mem_low(void);
 
 /* OPAQUE_FD on dma-bufs (server_opaque.c) */
 void vkb_opaque_instance_install(vkb_srv_table *t);
@@ -404,6 +439,17 @@ VkResult vkb_opaque_alloc_retry(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb_
 int vkb_opaque_shared_info(vkb_srv_table *t, VkMemoryAllocateInfo *ai);
 void vkb_opaque_shared_done(vkb_srv_mem *m, int out_fd);
 const VkMemoryGetFdInfoKHR *vkb_opaque_get_fd_info(vkb_srv_table *t, const VkMemoryGetFdInfoKHR *gi, VkMemoryGetFdInfoKHR *tmp);
+
+/* server_driverid.c: Arm's own driver told from others with Arm's vendor ID (Mesa PanVK) by driverID.
+ * vkb_driver_id: the VkDriverId, 0 when the driver cannot say (asked once per physical device, kept
+ * for the process; inst_api: the instance's version). vkb_driver_is_arm: driverID ARM_PROPRIETARY,
+ * or without one vendor 0x13B5 (driver_id 0: what was asked before). */
+uint32_t vkb_driver_id(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api);
+int vkb_driver_is_arm(const VkPhysicalDeviceProperties *p, uint32_t driver_id);
+int vkb_arm_driver(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api);
+const char *vkb_driver_id_name(uint32_t id);
+void vkb_driver_log(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api); /* the self-test's line */
+PFN_vkGetInstanceProcAddr vkb_driverid_imitate_gipa(PFN_vkGetInstanceProcAddr gipa); /* VKBRIDGE_FAKE_DRIVER (host tests) */
 
 /* emulation (server_emu*.c) */
 uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *missing);

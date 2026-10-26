@@ -66,6 +66,60 @@ void vkb_log(int level, const char *fmt, ...)
     pthread_mutex_unlock(&log_lock);
 }
 
+/* The first time each call returns each error, one warning: games often stop on a failed submit,
+ * wait or present with a message of their own (Stray's DXGI_ERROR_DEVICE_RESET, #21) or none at
+ * all, and until now neither log said which call failed. The line names the call, the result, the
+ * frames presented so far and the CLOCK_MONOTONIC time (as in vkbridge-frames-<pid>.txt), so it
+ * can be placed against the server's log. Callers test the result first (vkb_note_error); this
+ * runs only on an error. */
+static const char *result_name(VkResult r)
+{
+    switch (r) {
+#define R(x) case x: return #x;
+    R(VK_TIMEOUT) R(VK_NOT_READY) R(VK_ERROR_OUT_OF_HOST_MEMORY) R(VK_ERROR_OUT_OF_DEVICE_MEMORY) R(VK_ERROR_INITIALIZATION_FAILED)
+    R(VK_ERROR_DEVICE_LOST) R(VK_ERROR_MEMORY_MAP_FAILED) R(VK_ERROR_LAYER_NOT_PRESENT) R(VK_ERROR_EXTENSION_NOT_PRESENT)
+    R(VK_ERROR_FEATURE_NOT_PRESENT) R(VK_ERROR_INCOMPATIBLE_DRIVER) R(VK_ERROR_TOO_MANY_OBJECTS) R(VK_ERROR_FORMAT_NOT_SUPPORTED)
+    R(VK_ERROR_FRAGMENTED_POOL) R(VK_ERROR_UNKNOWN) R(VK_ERROR_OUT_OF_POOL_MEMORY) R(VK_ERROR_INVALID_EXTERNAL_HANDLE)
+    R(VK_ERROR_FRAGMENTATION) R(VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS) R(VK_ERROR_SURFACE_LOST_KHR)
+    R(VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) R(VK_ERROR_OUT_OF_DATE_KHR) R(VK_ERROR_VALIDATION_FAILED_EXT)
+    R(VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+#undef R
+    default: return "an error";
+    }
+}
+
+#define FIRST_ERRORS 64
+static struct {
+    const char *call;
+    VkResult r;
+} first_errors[FIRST_ERRORS];
+static uint32_t first_error_count;
+static pthread_mutex_t first_error_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void vkb_first_error(const char *call, VkResult r)
+{
+    pthread_mutex_lock(&first_error_lock);
+    for (uint32_t i = 0; i < first_error_count; i++)
+        if (first_errors[i].r == r && !strcmp(first_errors[i].call, call)) {
+            pthread_mutex_unlock(&first_error_lock);
+            return;
+        }
+    uint32_t n = first_error_count;
+    if (n <= FIRST_ERRORS) first_error_count++;
+    if (n < FIRST_ERRORS) {
+        first_errors[n].call = call;
+        first_errors[n].r = r;
+    }
+    pthread_mutex_unlock(&first_error_lock);
+    if (n == FIRST_ERRORS) VKB_WARN("more Vulkan errors returned to the game; not logged");
+    if (n >= FIRST_ERRORS) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    VKB_WARN("%s returned %s (%d) to the game, the first time; %llu frames presented, t=%.3f%s", call, result_name(r), (int)r,
+             (unsigned long long)vkb_frames_presented(), ts.tv_sec + ts.tv_nsec / 1e9,
+             r == VK_ERROR_DEVICE_LOST ? " (games report this as a lost or reset device)" : "");
+}
+
 /* ------------------------------------------------------------------ connection */
 
 typedef struct vkb_conn {
@@ -756,7 +810,7 @@ static uint32_t stat_sync[VKB_CMD_COUNT], stat_async[VKB_CMD_COUNT];
 static uint64_t stat_bytes, stat_cmd_bytes[VKB_CMD_COUNT];
 static uint64_t stat_total_sync[VKB_CMD_COUNT], stat_total_async[VKB_CMD_COUNT], stat_total_bytes;
 uint32_t vkb_stat_refused; /* descriptor.c */
-static uint64_t stat_last;
+static uint64_t stat_last, stat_total_refused, stat_total_full; /* descriptor counts, the whole run */
 
 static void stats_exit(void)
 {
@@ -768,6 +822,11 @@ static void stats_exit(void)
     vkb_log(VKB_LOG_ERROR, "stats at exit: %llu round trips, %llu async, %llu KB encoded; %llu messages, %llu KB on the wire",
             (unsigned long long)s, (unsigned long long)a, (unsigned long long)(stat_total_bytes >> 10),
             (unsigned long long)stat_msgs_total, (unsigned long long)(stat_wire_total >> 10));
+    uint64_t refused = stat_total_refused + __atomic_exchange_n(&vkb_stat_refused, 0, __ATOMIC_RELAXED);
+    uint64_t full = stat_total_full + __atomic_exchange_n(&vkb_stat_pool_full, 0, __ATOMIC_RELAXED);
+    if (refused || full)
+        vkb_log(VKB_LOG_ERROR, "  descriptor set allocations refused: %llu; descriptor pools handed back full: %llu", (unsigned long long)refused,
+                (unsigned long long)full);
     for (uint32_t i = 0; i < VKB_CMD_COUNT; i++)
         if (stat_total_sync[i] + stat_total_async[i] >= 100)
             vkb_log(VKB_LOG_ERROR, "  %-40s %8llu sync %8llu async", vkb_cmd_names[i], (unsigned long long)stat_total_sync[i],
@@ -826,6 +885,9 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
             vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async", vkb_cmd_names[i], stat_sync[i], stat_async[i]);
     uint32_t refused = __atomic_exchange_n(&vkb_stat_refused, 0, __ATOMIC_RELAXED);
     if (refused) vkb_log(VKB_LOG_ERROR, "  descriptor set allocations refused: %u", refused);
+    uint32_t full = __atomic_exchange_n(&vkb_stat_pool_full, 0, __ATOMIC_RELAXED);
+    if (full) vkb_log(VKB_LOG_ERROR, "  descriptor pools handed back full: %u", full);
+    stat_total_refused += refused, stat_total_full += full;
     memset(stat_sync, 0, sizeof(stat_sync));
     memset(stat_async, 0, sizeof(stat_async));
     memset(stat_cmd_bytes, 0, sizeof(stat_cmd_bytes));

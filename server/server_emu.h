@@ -133,6 +133,7 @@ int vkb_emu_dumping(void);
 void vkb_emu_shader_drop_second_output(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
                                        uint32_t *nmods, uint32_t cap);
 int vkb_emu_bgr10_for(const vkb_srv_table *inst, VkPhysicalDevice pd); /* VKB_EMU_BGR10_VTX for this instance's clients */
+int vkb_emu_driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd); /* the driver has VK_EXT_vertex_input_dynamic_state */
 void vkb_emu_shader_call_end(void); /* frees the stages rewritten during this vkCreateGraphicsPipelines */
 void vkb_emu_shader_bgr10(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods, uint32_t *nmods,
                           uint32_t cap);

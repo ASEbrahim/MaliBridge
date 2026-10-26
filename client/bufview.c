@@ -197,7 +197,7 @@ static VkResult create_view(VkDevice device, const VkBufferViewCreateInfo *ci, c
     vkb_enc_VkBufferViewCreateInfo(&c.e, ci);
     vkb_enc_u8(&c.e, 1);
     vkb_enc_bytes(&c.e, &name, sizeof(name));
-    if (!vkb_call_exec_async(&c)) return VK_ERROR_DEVICE_LOST;
+    if (!vkb_call_exec_async(&c)) return vkb_device_lost("vkCreateBufferView");
     *out = name;
     return VK_SUCCESS;
 }

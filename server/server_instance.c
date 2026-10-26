@@ -206,10 +206,12 @@ void vkb_selftest_all(void)
         VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
         dt.vkGetPhysicalDeviceProperties2(pds[i], &p2);
         log_device(&dt, pds[i], &p2.properties);
+        vkb_driver_log(&dt, pds[i], api);
         vkb_pd_knowledge *k = &vkb_pds[vkb_npds++];
         memcpy(k->uuid, id.deviceUUID, VK_UUID_SIZE);
         snprintf(k->name, sizeof(k->name), "%s", p2.properties.deviceName);
         k->info.real_api_version = p2.properties.apiVersion;
+        k->info.driver_id = vkb_driver_id(&dt, pds[i], api);
         vkb_promote_decide(&dt, pds[i]);
         vkb_mem_selftest(k, inst, &dt, pds[i]);
         k->info.emu_available = vkb_emu_detect(&dt, pds[i], &k->info.missing);
@@ -259,6 +261,7 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         vkb_mem_instance_install(t);
         vkb_emu_instance_install(t);
         vkb_promote_instance_install(t);
+        vkb_vidyn_instance_install(t); /* over the promotion's feature query */
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);
@@ -487,6 +490,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     }
     /* Vulkan 1.2 / 1.3 on a driver below it: the extensions' structures and names (server_promote.c). */
     exts = vkb_promote_device_create_info(inst, pd, ci, exts, &n, c->d.arena);
+    int vidyn = vkb_vidyn_device_create_info(inst, pd, emu, ci, exts, &n); /* Zink's vertex input dynamic state (server_vidyn.c) */
     ci->enabledExtensionCount = n;
     ci->ppEnabledExtensionNames = exts;
     ci->enabledLayerCount = 0;
@@ -548,6 +552,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
         } else {
             vkb_mem_device_install(t); /* host: another driver's image requirements, beneath every layer */
+            vkb_spvfix_fake_init(t); /* host: a driver refusing compute pipelines with YCbCr samplers */
             vkb_guard_device_init(t); /* first: every layer's compiles reach the driver through it */
             vkb_nocomp_device_init(t, nocomp);
             vkb_hang_device_init(t);  /* next: sees the driver-level calls of every layer above it */
@@ -563,7 +568,9 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_trace_device_init(t);
             vkb_gprof_device_init(t); /* wraps what the client's calls reach, emulations included */
             vkb_bvmap_device_init(t); /* last: client-named buffer views are driver views beneath */
+            vkb_vidyn_device_init(t, vidyn); /* over every layer that makes pipelines: its variants go through them all */
             vkb_async_device_init(t); /* over every layer that sees pipelines: the client's may be stand-ins */
+            vkb_cbfail_device_init(t); /* submits leave out command buffers the driver would not begin (server_conn.c) */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);
             VKB_INFO("device %u created on %s (pid %d, %u extensions, memory sharing %s)", id, k ? k->name : "?",
@@ -591,7 +598,9 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     }
     vkb_table_unregister(t);
     vkb_async_device_destroy(t);
+    vkb_vidyn_device_destroy(t);
     vkb_emu_device_quiesce(t);
+    vkb_cbfail_device_destroy(t);
     vkb_bvmap_device_destroy(t);
     vkb_gprof_device_destroy(t);
     vkb_trace_device_destroy(t);

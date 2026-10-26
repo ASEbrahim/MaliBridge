@@ -68,10 +68,17 @@ typedef struct vkb_rq_cache {
  *   - resources of DED_KEEP_MIN bytes or more keep it (large render targets: few allocations, and
  *     a sub-allocator gains nothing from them).
  * The hint is only a hint: memory bound to a sub-allocated range is valid either way.
- * VKBRIDGE_DEDICATED_HINT=1 clears it, =0 passes the driver's answer through; default: 1 on Arm
- * (Mali) GPUs, 0 on others (their drivers' preference is not known to cost anything).
+ * VKBRIDGE_DEDICATED_HINT=1 clears it, =0 passes the driver's answer through; default: 1 on Arm's
+ * driver (Mali; not Mesa PanVK), 0 on others (their drivers' preference is not known to cost anything).
  */
 #define DED_KEEP_MIN ((VkDeviceSize)32 << 20)
+
+/* Arm's driver: driverID ARM_PROPRIETARY from the server's self-test; vendor 0x13B5 where it has
+ * none (an older server, a driver without VK_KHR_driver_properties). Mesa PanVK has Arm's vendor ID. */
+static int arm_driver(const vkb_physdev *pd)
+{
+    return pd->info.driver_id ? pd->info.driver_id == VK_DRIVER_ID_ARM_PROPRIETARY : pd->props.vendorID == 0x13B5;
+}
 
 void vkb_memory_init_device(vkb_device *d)
 {
@@ -81,7 +88,7 @@ void vkb_memory_init_device(vkb_device *d)
         vkb_map_init(&c->buffers);
         vkb_map_init(&c->ded_keep);
         const char *e = getenv("VKBRIDGE_DEDICATED_HINT");
-        c->ded_clear = e && *e ? atoi(e) != 0 : d->pd->props.vendorID == 0x13B5;
+        c->ded_clear = e && *e ? atoi(e) != 0 : arm_driver(d->pd);
         c->ded_imitate = getenv("VKBRIDGE_TEST_PREFER_DEDICATED") && atoi(getenv("VKBRIDGE_TEST_PREFER_DEDICATED")) == 1;
         VKB_INFO("dedicated allocation hint: %s (VKBRIDGE_DEDICATED_HINT=%s)%s",
                  c->ded_clear ? "prefersDedicatedAllocation cleared for ordinary buffers and images" : "the driver's answer passed through",
@@ -620,9 +627,9 @@ static VkResult alloc_memory(VkDevice device, const VkMemoryAllocateInfo *pAlloc
     if (memfd >= 0) close(memfd);
     if (!ok) {
         if (ptr) munmap(ptr, (size_t)ai.allocationSize);
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkAllocateMemory");
     }
-    VkResult r = (VkResult)vkb_dec_u32(&c.d);
+    VkResult r = vkb_note_lost("vkAllocateMemory", (VkResult)vkb_dec_u32(&c.d));
     VkDeviceMemory mem = (VkDeviceMemory)vkb_dec_u64(&c.d);
     int fd = vkb_dec_fd(&c.d);
     uint64_t size = vkb_dec_u64(&c.d);
@@ -823,10 +830,10 @@ static VkResult ranges_call(VkDevice device, uint32_t cmd, uint32_t n, const VkM
     vkb_enc_u64(&c.e, dev->obj.remote);
     vkb_enc_u32(&c.e, n);
     for (uint32_t i = 0; i < n; i++) vkb_enc_VkMappedMemoryRange(&c.e, &r[i]);
-    if (!vkb_call_exec(&c)) return VK_ERROR_DEVICE_LOST;
+    if (!vkb_call_exec(&c)) return vkb_device_lost(vkb_cmd_names[cmd]);
     VkResult res = (VkResult)vkb_dec_u32(&c.d);
     vkb_call_end(&c);
-    return res;
+    return vkb_note_lost(vkb_cmd_names[cmd], res);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkFlushMappedMemoryRanges(VkDevice device, uint32_t n, const VkMappedMemoryRange *r)

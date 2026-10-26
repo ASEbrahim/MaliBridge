@@ -11,7 +11,8 @@
  *   1  the startup probe's result for the erratum's probe, where it has one (server_probe.c,
  *      through vkb_errata_set_probe_source: fail where the probe saw the bug's own pattern, pass,
  *      or not run - a probe that crashed, hung or could not run decides nothing);
- *   2  the Mali driver version, decoded from driverVersion ((r << 22) | (p << 12)) and from the
+ *   2  the Mali driver version - Arm's own driver only (driverID ARM_PROPRIETARY; vendor 0x13B5 where
+ *      the driver has no driverID: server_driverid.c), not Mesa PanVK with Arm's vendor ID - decoded from driverVersion ((r << 22) | (p << 12)) and from the
  *      driverInfo build string ("v1.r44p1-01eac0", "v1.r49p1-03bet0" for a beta), against the
  *      erratum's affected ranges, some of them for one GPU family only (job manager GPUs, told by
  *      maxDrawIndirectCount <= 1, or command stream frontend ones) or one GPU;
@@ -108,7 +109,11 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_VB_SPLIT] = {"vb_split", "MK-05", "vb_strides", 0, G_ALWAYS, G_ALWAYS,
         {{V(0, 0), V(48, 0), FAM_ANY, NULL, "ANGLE: below r48; Arm: r42p0-r47p0"}}, vkb_errata_vb_install,
         vkb_errata_vb_imitate},
-    [VKB_ERRATUM_VIEW_QUARANTINE] = {"view_quarantine", "MK-06", "rendering_churn", 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE,
+    /* Safe mode: on every driver. Arm lists r49p1-r51p0, but Ori and the Will of the Wisps on a
+     * G720 r44p1 (14T Pro) flicked to a stale magenta picture after a quality change while ~30
+     * images a second were made and destroyed: the pattern of this erratum, on a driver outside
+     * the list. It costs held-back handles, not memory (the app's frees go through). */
+    [VKB_ERRATUM_VIEW_QUARANTINE] = {"view_quarantine", "MK-06", "rendering_churn", 0, G_ALWAYS, G_IN_RANGE,
         {{V(49, 1), V(49, 3), FAM_ANY, NULL, NULL}, {V(50, 0), V(51, 1), FAM_ANY, NULL, NULL}},
         vkb_errata_views_install, vkb_errata_views_install},
     [VKB_ERRATUM_VIEW_COUNTS] = {"view_counts", "MK-07", "view3d_layers", 0, G_ALWAYS, G_ALWAYS,
@@ -162,7 +167,8 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
 
 /* The driver, as the version gates see it */
 typedef struct {
-    int arm;           /* an Arm GPU (or a faked version) */
+    int arm;           /* Arm's driver (driverID ARM_PROPRIETARY, else vendor 0x13B5), or a faked version */
+    int arm_vendor;    /* vendor 0x13B5, whichever driver (Mesa PanVK too) */
     int known;         /* r and p decoded */
     uint32_t r, p;
     int beta;
@@ -240,12 +246,15 @@ int vkb_errata_parse_version(const char *s, uint32_t *r, uint32_t *p, int *beta)
     return 0;
 }
 
-/* The driver as the version gates see it, from its properties and driverInfo string */
-static void version_from(const VkPhysicalDeviceProperties *pr, const char *info, drv_version *d)
+/* The driver as the version gates see it, from its properties, driverID (0: not asked; what the
+ * self-test asked decides, server_driverid.c) and driverInfo string. Arm's driver only: another
+ * driver with Arm's vendor ID (Mesa PanVK) has a Mesa driverVersion that decodes into the ranges. */
+static void version_from(const VkPhysicalDeviceProperties *pr, const char *info, uint32_t driver_id, drv_version *d)
 {
     memset(d, 0, sizeof(*d));
     d->family = pr->limits.maxDrawIndirectCount <= 1 ? FAM_JM : FAM_CSF;
-    d->arm = pr->vendorID == ARM_VENDOR;
+    d->arm = vkb_driver_is_arm(pr, driver_id);
+    d->arm_vendor = pr->vendorID == ARM_VENDOR;
     snprintf(d->build, sizeof(d->build), "%s", info ? info : "");
 
     const char *fake = vkb_srv_env("VKBRIDGE_FAKE_DRIVER_VERSION");
@@ -286,7 +295,7 @@ static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_vers
         t->real.vkGetPhysicalDeviceProperties(pd, &p2.properties);
     }
     snprintf(name, name_cap, "%s", p2.properties.deviceName);
-    version_from(&p2.properties, dp.driverInfo, d);
+    version_from(&p2.properties, dp.driverInfo, dp.driverID ? dp.driverID : vkb_driver_id(&t->real, pd, t->api_version), d);
 }
 
 static const erratum_range *in_range(const erratum *e, const drv_version *d, const char *gpu, int perf)
@@ -453,7 +462,7 @@ static int decide_erratum(int i, const drv_version *d, const char *gpu, int perf
 int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driver_info, vkb_errata_row rows[VKB_ERRATA_COUNT])
 {
     drv_version d;
-    version_from(props, driver_info, &d);
+    version_from(props, driver_info, 0, &d);
     switches w;
     read_switches(&w);
     int n = 0;
@@ -565,7 +574,9 @@ void vkb_errata_device_init(vkb_srv_table *t)
     uint32_t imitate = imitated_set(1);
 
     char drv[400];
-    if (!d.arm)
+    if (!d.arm && d.arm_vendor)
+        snprintf(drv, sizeof(drv), "not Arm's driver (driverID %s)", vkb_driver_id_name(vkb_driver_id(&t->real, t->physical, t->api_version)));
+    else if (!d.arm)
         snprintf(drv, sizeof(drv), "not an Arm GPU");
     else if (!d.known)
         snprintf(drv, sizeof(drv), "Arm driver, version unknown (\"%s\")", d.build);

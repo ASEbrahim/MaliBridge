@@ -9,6 +9,7 @@
 #include "vkb_server.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +167,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 VKB_INFO("process %d exited without destroying device %u; cleaning up", p->pid, t->id);
                 vkb_async_device_destroy(t);
                 vkb_emu_device_quiesce(t);
+                vkb_cbfail_device_destroy(t);
                 if (t->real.vkDeviceWaitIdle) t->real.vkDeviceWaitIdle(t->device);
                 vkb_bvmap_device_destroy(t);
                 vkb_gprof_device_destroy(t);
@@ -283,6 +285,232 @@ static void order_done(vkb_srv_proc *p, uint64_t seq)
 
 /* ------------------------------------------------------------------ command buffer replay */
 
+/* Command buffers the driver would not record: their vkBeginCommandBuffer refused (out of memory:
+ * Cyberpunk 2077 on the XRing O3, 2026-10-22), their begin not decoded, or the driver's
+ * vkEndCommandBuffer failed. Their recorded commands are not replayed - recording into a command
+ * buffer that is not recording took the driver, and the server with every game in it, down - and a
+ * submit leaves them out, as does a primary's vkCmdExecuteCommands, so the submit's semaphores and
+ * fence are still signalled and the app sees a frame dropped rather than a lost session. A later
+ * recording of the same handle that begins and ends clears it; so do vkFreeCommandBuffers and the
+ * device's end. VKBRIDGE_TEST_BEGIN_FAIL=<n> / VKBRIDGE_TEST_END_FAIL=<n> fail the n-th begin / end
+ * as the driver did (host tests). */
+typedef struct failed_cb {
+    VkCommandBuffer cb;
+    uint32_t table; /* the device's table id: its end forgets them */
+} failed_cb;
+static failed_cb *failed_cbs;
+static uint32_t nfailed, failed_cap;
+static pthread_mutex_t failed_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void failed_set(VkCommandBuffer cb, int on)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    pthread_mutex_lock(&failed_lock);
+    uint32_t i = 0;
+    while (i < nfailed && failed_cbs[i].cb != cb) i++;
+    if (on && i == nfailed) {
+        if (nfailed == failed_cap) {
+            uint32_t cap = failed_cap ? failed_cap * 2 : 64;
+            failed_cb *n = realloc(failed_cbs, cap * sizeof(*n));
+            if (n) failed_cbs = n, failed_cap = cap;
+        }
+        if (nfailed < failed_cap) failed_cbs[nfailed].cb = cb, failed_cbs[nfailed].table = t ? t->id : 0, nfailed++;
+        else VKB_ERR("command buffer %p: no memory to note that the driver did not record it", (void *)cb);
+    }
+    if (!on && i < nfailed) failed_cbs[i] = failed_cbs[--nfailed];
+    pthread_mutex_unlock(&failed_lock);
+}
+
+static int failed_has(VkCommandBuffer cb)
+{
+    if (!__atomic_load_n(&nfailed, __ATOMIC_RELAXED)) return 0;
+    pthread_mutex_lock(&failed_lock);
+    int hit = 0;
+    for (uint32_t i = 0; i < nfailed && !hit; i++) hit = failed_cbs[i].cb == cb;
+    pthread_mutex_unlock(&failed_lock);
+    return hit;
+}
+
+static int test_fail(const char *var, int *n, int *seen)
+{
+    if (*n < 0) {
+        const char *v = getenv(var);
+        *n = v && *v ? atoi(v) : 0;
+    }
+    return *n > 0 && __atomic_add_fetch(seen, 1, __ATOMIC_RELAXED) == *n;
+}
+
+static int test_begin_fail(void)
+{
+    static int n = -1, seen;
+    return test_fail("VKBRIDGE_TEST_BEGIN_FAIL", &n, &seen);
+}
+
+static int test_end_fail(void)
+{
+    static int n = -1, seen;
+    return test_fail("VKBRIDGE_TEST_END_FAIL", &n, &seen);
+}
+
+/* The first few left-out command buffers are said, then every 1000th: a game that keeps
+ * submitting one would otherwise fill the log every frame. */
+static void left_out(const char *call, uint32_t dropped)
+{
+    static uint32_t times;
+    uint32_t k = __atomic_add_fetch(&times, 1, __ATOMIC_RELAXED);
+    if (k <= 5 || k % 1000 == 0)
+        VKB_WARN("%s: %u command buffer(s) the driver did not record left out (their work is lost; the session goes on; %u time(s) so far)",
+                 call, dropped, k);
+}
+
+static PFN_vkQueueSubmit next_submit[VKB_MAX_TABLES];
+static PFN_vkQueueSubmit2 next_submit2[VKB_MAX_TABLES];
+
+/* VKBRIDGE_TEST_SUBMIT_FAIL=<n>: the n-th vkQueueSubmit and the two after it return
+ * VK_ERROR_DEVICE_LOST without reaching the driver (host tests: the client logs only the first). */
+static int test_submit_fail(void)
+{
+    static int n = -1, seen;
+    if (n < 0) {
+        const char *v = getenv("VKBRIDGE_TEST_SUBMIT_FAIL");
+        n = v && *v ? atoi(v) : 0;
+    }
+    if (n <= 0) return 0;
+    int k = __atomic_add_fetch(&seen, 1, __ATOMIC_RELAXED);
+    if (k < n || k > n + 2) return 0;
+    VKB_WARN("VKBRIDGE_TEST_SUBMIT_FAIL: vkQueueSubmit fails with a lost device on purpose");
+    return 1;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL cf_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence fence)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    PFN_vkQueueSubmit next = t ? next_submit[t->id] : NULL;
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    if (test_submit_fail()) return VK_ERROR_DEVICE_LOST;
+    int any = 0;
+    for (uint32_t i = 0; i < n && !any; i++)
+        for (uint32_t k = 0; k < si[i].commandBufferCount && !any; k++) any = failed_has(si[i].pCommandBuffers[k]);
+    if (!any) return next(q, n, si, fence);
+    VkSubmitInfo *c = malloc(n * sizeof(*c));
+    VkCommandBuffer *cbs = NULL;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n; i++) total += si[i].commandBufferCount;
+    cbs = malloc((total ? total : 1) * sizeof(*cbs));
+    if (!c || !cbs) {
+        free(c), free(cbs);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    uint32_t o = 0, dropped = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        c[i] = si[i];
+        c[i].pCommandBuffers = cbs + o;
+        c[i].commandBufferCount = 0;
+        for (uint32_t k = 0; k < si[i].commandBufferCount; k++) {
+            if (failed_has(si[i].pCommandBuffers[k])) dropped++;
+            else cbs[o++] = si[i].pCommandBuffers[k], c[i].commandBufferCount++;
+        }
+    }
+    left_out("vkQueueSubmit", dropped);
+    VkResult r = next(q, n, c, fence);
+    free(c), free(cbs);
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL cf_QueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence fence)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    PFN_vkQueueSubmit2 next = t ? next_submit2[t->id] : NULL;
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    int any = 0;
+    for (uint32_t i = 0; i < n && !any; i++)
+        for (uint32_t k = 0; k < si[i].commandBufferInfoCount && !any; k++) any = failed_has(si[i].pCommandBufferInfos[k].commandBuffer);
+    if (!any) return next(q, n, si, fence);
+    VkSubmitInfo2 *c = malloc(n * sizeof(*c));
+    VkCommandBufferSubmitInfo *cbs = NULL;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n; i++) total += si[i].commandBufferInfoCount;
+    cbs = malloc((total ? total : 1) * sizeof(*cbs));
+    if (!c || !cbs) {
+        free(c), free(cbs);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    uint32_t o = 0, dropped = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        c[i] = si[i];
+        c[i].pCommandBufferInfos = cbs + o;
+        c[i].commandBufferInfoCount = 0;
+        for (uint32_t k = 0; k < si[i].commandBufferInfoCount; k++) {
+            if (failed_has(si[i].pCommandBufferInfos[k].commandBuffer)) dropped++;
+            else cbs[o++] = si[i].pCommandBufferInfos[k], c[i].commandBufferInfoCount++;
+        }
+    }
+    left_out("vkQueueSubmit2", dropped);
+    VkResult r = next(q, n, c, fence);
+    free(c), free(cbs);
+    return r;
+}
+
+static PFN_vkCmdExecuteCommands next_exec[VKB_MAX_TABLES];
+static PFN_vkFreeCommandBuffers next_free[VKB_MAX_TABLES];
+
+/* A secondary the driver did not record never reaches it inside a primary. */
+static VKAPI_ATTR void VKAPI_CALL cf_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *secs)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    PFN_vkCmdExecuteCommands next = t ? next_exec[t->id] : NULL;
+    if (!next) return;
+    int any = 0;
+    for (uint32_t i = 0; i < n && !any; i++) any = failed_has(secs[i]);
+    if (!any) {
+        next(cb, n, secs);
+        return;
+    }
+    VkCommandBuffer *keep = malloc(n * sizeof(*keep));
+    if (!keep) return;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (!failed_has(secs[i])) keep[k++] = secs[i];
+    left_out("vkCmdExecuteCommands", n - k);
+    if (k) next(cb, k, keep);
+    free(keep);
+}
+
+static VKAPI_ATTR void VKAPI_CALL cf_FreeCommandBuffers(VkDevice d, VkCommandPool pool, uint32_t n, const VkCommandBuffer *cbs)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    PFN_vkFreeCommandBuffers next = t ? next_free[t->id] : NULL;
+    if (__atomic_load_n(&nfailed, __ATOMIC_RELAXED))
+        for (uint32_t i = 0; i < n; i++)
+            if (cbs[i]) failed_set(cbs[i], 0);
+    if (next) next(d, pool, n, cbs);
+}
+
+/* Over every layer but the report's: what reaches the layers beneath never names such a command buffer */
+void vkb_cbfail_device_init(vkb_srv_table *t)
+{
+    if (!t || t->id >= VKB_MAX_TABLES) return;
+    next_submit[t->id] = t->dt.vkQueueSubmit;
+    next_submit2[t->id] = t->dt.vkQueueSubmit2;
+    next_exec[t->id] = t->dt.vkCmdExecuteCommands;
+    next_free[t->id] = t->dt.vkFreeCommandBuffers;
+    if (t->dt.vkQueueSubmit) t->dt.vkQueueSubmit = cf_QueueSubmit;
+    if (t->dt.vkQueueSubmit2) t->dt.vkQueueSubmit2 = cf_QueueSubmit2;
+    if (t->dt.vkCmdExecuteCommands) t->dt.vkCmdExecuteCommands = cf_CmdExecuteCommands;
+    if (t->dt.vkFreeCommandBuffers) t->dt.vkFreeCommandBuffers = cf_FreeCommandBuffers;
+}
+
+/* The device's command buffers are gone with it (their pools too: handles the driver may reuse). */
+void vkb_cbfail_device_destroy(vkb_srv_table *t)
+{
+    if (!t || !__atomic_load_n(&nfailed, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&failed_lock);
+    for (uint32_t i = 0; i < nfailed;)
+        if (failed_cbs[i].table == t->id) failed_cbs[i] = failed_cbs[--nfailed];
+        else i++;
+    pthread_mutex_unlock(&failed_lock);
+}
+
 static int is_stream_cmd(uint32_t id)
 {
     const char *n = vkb_cmd_names[id];
@@ -338,6 +566,7 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
                 /* The begin never reached the driver (its encoding did not decode): recording into
                  * a command buffer that was not begun would hand the driver one in the wrong state. */
                 VKB_ERR("command stream: command buffer %p not begun; its %zu bytes of commands are dropped", (void *)cb, len);
+                failed_set(cb, 1);
                 vkb_srv_replay_cb = VK_NULL_HANDLE;
                 vkb_enc_free(&scratch);
                 vkb_enc_u32(&c->r, (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -345,6 +574,22 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
             }
         }
         if (id == VKB_CMD_vkBeginCommandBuffer && scratch.len >= 4) memcpy(&begin_r, scratch.buf, 4);
+        if (id == VKB_CMD_vkBeginCommandBuffer && begin_r == VK_SUCCESS && test_begin_fail()) {
+            c->dt->vkEndCommandBuffer(cb); /* begun by the driver: the test's refusal leaves it ended */
+            begin_r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            VKB_WARN("VKBRIDGE_TEST_BEGIN_FAIL: vkBeginCommandBuffer refused on purpose");
+        }
+        if (id == VKB_CMD_vkBeginCommandBuffer && begin_r != VK_SUCCESS) {
+            /* The driver refused the begin: nothing more goes into this command buffer, no end,
+             * and submits leave it out until it is recorded again. */
+            VKB_ERR("command buffer %p: the driver would not begin it (%d); its %zu bytes of commands are dropped "
+                    "and submits leave it out", (void *)cb, begin_r, len);
+            failed_set(cb, 1);
+            vkb_srv_replay_cb = VK_NULL_HANDLE;
+            vkb_enc_free(&scratch);
+            vkb_enc_u32(&c->r, (uint32_t)begin_r);
+            return;
+        }
         pos += (n + 7) & ~(size_t)7;
         ncmds++;
     }
@@ -353,7 +598,14 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
     VkResult r = c->dt->vkEndCommandBuffer(cb);
     vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
     vkb_srv_replay_cb = VK_NULL_HANDLE;
+    if (r == VK_SUCCESS && test_end_fail()) {
+        r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        VKB_WARN("VKBRIDGE_TEST_END_FAIL: vkEndCommandBuffer failed on purpose");
+    }
     if (begin_r != VK_SUCCESS) r = begin_r;
+    if (r != VK_SUCCESS)
+        VKB_ERR("command buffer %p: the driver's vkEndCommandBuffer failed (%d); submits leave it out", (void *)cb, r);
+    failed_set(cb, r != VK_SUCCESS); /* recorded this time, or not */
     if (vkb_verbose) VKB_DBG("command buffer %p: %u commands, %zu bytes -> %d", (void *)cb, ncmds, len, r);
     vkb_enc_u32(&c->r, (uint32_t)r);
 }

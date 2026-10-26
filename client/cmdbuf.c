@@ -232,7 +232,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkEndCommandBuffer(VkCommandBuffer command
         vkb_call_end(&c);
     }
     stream_reset(cb);
-    return r;
+    return vkb_note_lost("vkEndCommandBuffer", r);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags)

@@ -8,6 +8,11 @@
  * retried in an overflow pool made like the app's; the app keeps its one handle. Resets and
  * destruction take the overflow pools along, and freed sets go back to the pool that holds them.
  * Installed beneath the set-name map (server_dsmap.c), so named and plain allocations both grow.
+ *
+ * Overflow pools are kept through resets for the next frame, so an app pool that once grew stays
+ * that big in the driver (DXVK's pools on the XRing O3 grew to 8 times their size, MaliBridge#16,
+ * in the same game whose server the system closed for lack of memory, #18). While memory is low
+ * (vkb_mem_low), a reset frees the overflow pools nothing was allocated from since the last one.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -23,6 +28,7 @@ typedef struct ep_pool {
     VkDescriptorPoolSize *sizes;
     VkDescriptorPool *extra;         /* overflow pools, in order */
     uint32_t nextra, cur;            /* allocations try extra[cur..] after the app's pool */
+    uint32_t used;                   /* extra[0..used) allocated from since the last reset */
     int can_free;
     struct ep_pool *next;
 } ep_pool;
@@ -46,6 +52,9 @@ typedef struct vkb_pools {
 } vkb_pools;
 
 static vkb_pools *states[4096];
+static uint64_t g_extra_live, g_extra_trimmed; /* overflow pools alive, freed at low-memory resets (atomic) */
+
+uint64_t vkb_pools_overflow_live(void) { return __atomic_load_n(&g_extra_live, __ATOMIC_RELAXED); }
 
 static vkb_pools *st(void)
 {
@@ -128,6 +137,7 @@ static VKAPI_ATTR void VKAPI_CALL ep_DestroyDescriptorPool(VkDevice device, VkDe
                 if (p->can_free) forget_sets_of(s, p->extra[i]);
                 s->destroy(device, p->extra[i], NULL);
             }
+            __atomic_sub_fetch(&g_extra_live, p->nextra, __ATOMIC_RELAXED);
             free(p->extra);
             free(p->sizes);
             free(p);
@@ -147,7 +157,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL ep_ResetDescriptorPool(VkDevice device, Vk
             if (p->can_free) forget_sets_of(s, p->extra[i]);
             s->reset(device, p->extra[i], 0);
         }
+        /* Memory low: the ones idle since the last reset go (a reset pool holds no set the GPU
+         * still uses, so neither do they); made again if the app needs them. */
+        uint32_t drop = vkb_mem_low() && p->nextra > p->used ? p->nextra - p->used : 0;
+        for (uint32_t i = p->used; drop && i < p->nextra; i++) s->destroy(device, p->extra[i], NULL);
+        if (drop) {
+            p->nextra = p->used;
+            __atomic_sub_fetch(&g_extra_live, drop, __ATOMIC_RELAXED);
+            uint64_t n = __atomic_add_fetch(&g_extra_trimmed, drop, __ATOMIC_RELAXED), was = n - drop;
+            if ((was ^ n) > was) /* the first time, then each time it passes a power of two */
+                VKB_INFO("descriptor pools: memory low, %llu idle overflow pools freed at resets so far (made again when needed)",
+                         (unsigned long long)n);
+        }
         p->cur = 0;
+        p->used = 0;
     }
     pthread_mutex_unlock(&s->lock);
     return s->reset(device, pool, flags);
@@ -176,12 +199,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL ep_AllocateDescriptorSets(VkDevice device,
             }
             p->extra = grown;
             p->extra[p->nextra++] = np;
+            __atomic_add_fetch(&g_extra_live, 1, __ATOMIC_RELAXED);
             if (!s->grown++)
                 VKB_INFO("descriptor pools: an allocation past what a pool was made for goes to an overflow pool (maxSets %u)", p->ci.maxSets);
         }
         a2.descriptorPool = p->extra[p->cur];
         r = s->allocate(device, &a2, out);
         if (r == VK_SUCCESS) {
+            if (p->cur + 1 > p->used) p->used = p->cur + 1;
             if (p->can_free)
                 for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
                     ep_set *e = malloc(sizeof(*e));
@@ -263,6 +288,7 @@ void vkb_pools_device_destroy(vkb_srv_table *t)
             ep_pool *p = s->pools[b];
             s->pools[b] = p->next;
             for (uint32_t i = 0; i < p->nextra; i++) t->real.vkDestroyDescriptorPool(t->device, p->extra[i], NULL);
+            __atomic_sub_fetch(&g_extra_live, p->nextra, __ATOMIC_RELAXED);
             free(p->extra);
             free(p->sizes);
             free(p);

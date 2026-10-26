@@ -28,6 +28,21 @@
 #include <string.h>
 #include <unistd.h>
 
+/* VKBRIDGE_CLIP_DISCARD=0 (a measurement switch): the clip distances still become ordinary
+ * varyings, but no fragment shader discards on them, so nothing is clipped. A discard in a fragment
+ * shader costs Mali its early depth/stencil update and Forward Pixel Kill; this shows what the
+ * emulation's discard costs a game whose every world shader writes ClipDistance (Dark Souls III). */
+static int clip_discard_wanted(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_CLIP_DISCARD");
+    if (v && !strcmp(v, "0")) {
+        VKB_ONCE(VKB_LOG_WARN, "emulation: clip distances not applied (VKBRIDGE_CLIP_DISCARD=0, a measurement switch)");
+        return 0;
+    }
+    return 1;
+}
+
+
 typedef struct shader_rec {
     VkShaderModule module;
     uint32_t *code;
@@ -311,7 +326,7 @@ void vkb_emu_shader_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipel
                 memcpy(prev, info.out, sizeof(prev));
                 clip = info.out[0];
                 first = 0;
-            } else if (clip && vkb_spv_clip_discard(&sm[k], base, clip, info.clip_in_var) == 0) {
+            } else if (clip && clip_discard_wanted() && vkb_spv_clip_discard(&sm[k], base, clip, info.clip_in_var) == 0) {
                 changed = 1;
             }
             if (changed) set_stage_module(device, st[k], &sm[k], mods, nmods, cap);
@@ -624,6 +639,26 @@ void vkb_emu_shader_drop_second_output(vkb_emu_device *e, VkDevice device, VkGra
  * the attribute fetched swapped. */
 #define SpvOpVectorShuffle 79
 
+/* Whether operand word k of in can name a variable: the packed-format rewrites below look for every
+ * use of an input variable by its id, and a literal equal to that id is none (OpTypeFloat 32 names
+ * no variable %32; a test's shader had its colour input there, and both rewrites gave up). Debug
+ * and decoration instructions, types and constants never name one; nor does OpExtInst's
+ * instruction number. */
+static int names_var(const spv_inst *in, uint32_t k)
+{
+    switch (in->op) {
+    case 3: case 4: case 5: case 6: case 7: case 8: case 10: case 11: case 14: case 16: case 17: /* debug, mode, capability */
+    case SpvOpDecorate: case 72: case 317: case 330: case 331:                                    /* decorations, OpNoLine, ... */
+        return 0;
+    default:
+        break;
+    }
+    if (in->op >= 19 && in->op <= 39) return 0; /* types */
+    if ((in->op >= 41 && in->op <= 46) || (in->op >= 48 && in->op <= 52)) return 0; /* constants, spec constants */
+    if (in->op == SpvOpExtInst && k == 3) return 0;
+    return 1;
+}
+
 void vkb_emu_shader_bgr10(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
                           uint32_t *nmods, uint32_t cap)
 {
@@ -686,7 +721,7 @@ void vkb_emu_shader_bgr10(vkb_emu_device *e, VkDevice device, VkGraphicsPipeline
                 }
             } else if (in->op != SpvOpDecorate && in->op != SpvOpName && in->op != SpvOpEntryPoint && in->op != SpvOpVariable) {
                 for (uint32_t k = 0; k + 1 < in->n; k++)
-                    if (in->w[k] == var && !(in->op == SpvOpLoad && k == 2)) bad = 1;
+                    if (in->w[k] == var && !(in->op == SpvOpLoad && k == 2) && names_var(in, k)) bad = 1;
             }
         }
     }
@@ -743,7 +778,7 @@ static int uf11_var_ok(const spv_mod *m, uint32_t var)
         if (in->op == SpvOpDecorate || in->op == SpvOpName || in->op == SpvOpEntryPoint || in->op == SpvOpVariable) continue;
         int access = in->op == SpvOpAccessChain || in->op == SpvOpInBoundsAccessChain;
         for (uint32_t k = 0; k + 1 < in->n; k++)
-            if (in->w[k] == var && !(in->op == SpvOpLoad && k == 2) && !(access && k == 2)) return 0;
+            if (in->w[k] == var && !(in->op == SpvOpLoad && k == 2) && !(access && k == 2) && names_var(in, k)) return 0;
     }
     return 1;
 }

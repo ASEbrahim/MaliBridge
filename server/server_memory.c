@@ -51,6 +51,7 @@
 #include <linux/dma-heap.h>
 #include <linux/dma-buf.h>
 #include <malloc.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __ANDROID__
@@ -101,6 +102,20 @@ static int ahb_load(void)
     state = (p_AHardwareBuffer_allocate && p_AHardwareBuffer_release && p_AHardwareBuffer_getNativeHandle) ? 1 : -1;
     if (state < 0) VKB_WARN("AHardwareBuffer functions unavailable");
     return state > 0;
+}
+
+/* The dma-buf behind a BLOB AHardwareBuffer's pages (the handle's own fd, not a dup), -1 if none.
+ * Mali's gralloc can put more than one fd in the handle (metadata beside the pages): the memory
+ * is the one at least as large as the allocation. */
+static int ahb_pages_fd(const vkb_native_handle *nh, uint64_t sz)
+{
+    int pick = -1;
+    for (int i = 0; nh && i < nh->numFds && pick < 0; i++) {
+        off_t end = lseek(nh->data[i], 0, SEEK_END);
+        if (end >= (off_t)sz) pick = nh->data[i];
+        if (nh->numFds > 1) VKB_INFO("ahb: handle fd %d of %d is %lld bytes", i + 1, nh->numFds, (long long)end);
+    }
+    return pick;
 }
 #endif
 
@@ -173,11 +188,27 @@ static unsigned mem_hash(VkDeviceMemory m)
  * menu, 5.8 GB at the end, all of it DXVK's 256 MiB device-local chunks (type 0, no frees) holding
  * BC-emulated images: 4.7 GB decoded from 0.97 GB of BC (BC3 sRGB 2.5 GB, BC1 sRGB 1.3 GB at 8x,
  * BC3 0.6 GB), the driver within 2% of the decoded texels. The heap (~2.2 GB) stayed flat.
+ *
+ * Titanfall 2 on a 12 GB XRing O3 (MaliBridge#18): the system closed the server within 3-5 minutes,
+ * 4 GB of RSS, 2.4 GB of images, and the heap from 0.8 to 1.9 GB in the last minute - which part of
+ * the heap the line could not say. So it also has the memory free and the swap free, the
+ * pipelines made since the last line and what the persistent pipeline caches hold in the driver
+ * (the driver's own allocations, its compiler's among them, count in the heap figure too), and the
+ * descriptor overflow pools (server_pools.c).
+ *
+ * Low memory (vkb_mem_low): MemAvailable under an eighth of RAM, until it is over a sixth again.
+ * Entering it is said with what the server holds (the last lines in the log of a server the system
+ * then closes); while it lasts, the allocator's free pages go back to the system every 30 s and
+ * descriptor pool resets free their idle overflow pools. Neither changes what the app has.
  */
 enum { CLS_PLAIN, CLS_HOSTPTR, CLS_DMABUF, CLS_AHB, CLS_DMAHEAP, CLS_EXPORT, CLS_N };
 static const char *const cls_name[CLS_N] = {"plain", "hostptr", "dmabuf", "ahb", "dmaheap", "export"};
 #define ST_TYPES 32
-#define ST_PIDS 8
+/* Processes whose memory is counted (the report's GPU memory per process). A Steam session keeps
+ * eight Vulkan processes holding memory before any game (gamescope, two Xwaylands, two steam, two
+ * steamwebhelper, mangoapp): with 8 slots a game found none and its report read 0 MB. As many as
+ * the report follows (RP_PROCS); a slot is taken again once its process holds nothing. */
+#define ST_PIDS 64
 #define ST_TOP 4
 typedef struct { int64_t bytes, n; } st_pair;
 typedef struct { int64_t n, src, dec, drv; } st_bc; /* per app BC format: compressed, decoded texels, driver's size */
@@ -282,13 +313,63 @@ static long status_kb(const char *buf, const char *key)
     return p ? strtol(p + strlen(key), NULL, 10) : 0;
 }
 
+static int mem_low_now; /* vkb_mem_low (atomic) */
+
+int vkb_mem_low(void) { return __atomic_load_n(&mem_low_now, __ATOMIC_RELAXED); }
+
+/* SwapFree in KB, 0 when unknown or none. */
+static uint64_t swapfree_kb(void)
+{
+    char buf[4096];
+    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t k = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    buf[k > 0 ? k : 0] = 0;
+    long v = status_kb(buf, "SwapFree:");
+    return v > 0 ? (uint64_t)v : 0;
+}
+
+/* The allocator's free pages back to the system (what the heap figure does not count). */
+static void heap_purge(void)
+{
+#ifdef __ANDROID__
+#ifdef M_PURGE_ALL
+    if (mallopt(M_PURGE_ALL, 0) == 1) return; /* Android 14 and later */
+#endif
+    mallopt(M_PURGE, 0);
+#else
+    malloc_trim(0);
+#endif
+}
+
 static void *st_thread(void *arg)
 {
-    (void)arg;
-    uint64_t last_sig = 0, last_allocs = 0, last_frees = 0;
+    const int lines = arg != NULL;
+    uint64_t last_sig = 0, last_allocs = 0, last_frees = 0, last_made = 0;
     int64_t last_ab = 0, last_fb = 0;
+    unsigned lows = 0;
+    time_t last_purge = 0;
     for (;;) {
         sleep(5);
+        uint64_t avail = vkb_memavail_kb(), total = vkb_memtotal_mb() << 10, swap = swapfree_kb();
+        int low = vkb_mem_low(), entered = 0;
+        if (avail && total) {
+            if (!low && avail < total / 8) low = entered = 1;
+            else if (low && avail > total / 6) low = 0;
+        }
+        if (low != vkb_mem_low()) {
+            __atomic_store_n(&mem_low_now, low, __ATOMIC_RELAXED);
+            if (!low) VKB_INFO("memory: %llu MB free of %llu MB again; idle descriptor pools are kept again", (unsigned long long)(avail >> 10),
+                               (unsigned long long)(total >> 10));
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (low && (entered || now.tv_sec - last_purge >= 30)) {
+            heap_purge();
+            last_purge = now.tv_sec;
+        }
+        if (!lines && !entered) continue;
         char sbuf[4096] = "";
         int sfd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
         if (sfd >= 0) {
@@ -304,9 +385,12 @@ static void *st_thread(void *arg)
             while (readdir(dd)) nfd++;
             closedir(dd);
         }
+        uint64_t made = 0, pc_bytes = 0, pools = vkb_pools_overflow_live();
+        vkb_pcache_stats(&made, &pc_bytes);
         pthread_mutex_lock(&st.lock);
-        uint64_t sig = (uint64_t)(rss >> 14) ^ (st.allocs * 0x9E3779B97F4A7C15ull) ^ (st.frees << 32) ^ (uint64_t)st.img.n * 31 ^ (uint64_t)st.buf.n;
-        if (sig == last_sig) {
+        uint64_t sig = (uint64_t)(rss >> 14) ^ (st.allocs * 0x9E3779B97F4A7C15ull) ^ (st.frees << 32) ^ (uint64_t)st.img.n * 31 ^ (uint64_t)st.buf.n ^
+                       made * 0xC2B2AE3D27D4EB4Full ^ (uint64_t)low << 63;
+        if (sig == last_sig && !entered) {
             pthread_mutex_unlock(&st.lock);
             continue;
         }
@@ -317,8 +401,10 @@ static void *st_thread(void *arg)
         int64_t live = 0, nlive = 0;
         for (int i = 0; i < CLS_N; i++) live += st.cls[i].bytes, nlive += st.cls[i].n;
         struct mallinfo mi = mallinfo();
-        ADD("mem: rss %ldM (anon %ldM file %ldM shmem %ldM) heap %lldM fds %d | live %lldM/%lld:", rss >> 10, anon >> 10, file >> 10,
-            shm >> 10, MB((int64_t)(size_t)mi.uordblks), nfd - 2, MB(live), (long long)nlive);
+        long long heap = MB((int64_t)(size_t)mi.uordblks);
+        ADD("mem: rss %ldM (anon %ldM file %ldM shmem %ldM) heap %lldM fds %d | free %lluM swap %lluM%s | live %lldM/%lld:", rss >> 10,
+            anon >> 10, file >> 10, shm >> 10, heap, nfd - 2, (unsigned long long)(avail >> 10), (unsigned long long)(swap >> 10),
+            low ? " (low)" : "", MB(live), (long long)nlive);
         for (int i = 0; i < CLS_N; i++)
             if (st.cls[i].n) ADD(" %s %lldM/%lld", cls_name[i], MB(st.cls[i].bytes), (long long)st.cls[i].n);
         ADD(" | types");
@@ -343,19 +429,29 @@ static void *st_thread(void *arg)
         ADD(" | pids");
         for (int i = 0; i < ST_PIDS; i++)
             if (st.pid[i].pid && st.pid[i].bytes > 0) ADD(" %d:%lldM", st.pid[i].pid, MB(st.pid[i].bytes));
+        ADD(" | pipelines +%llu (%llu), pipeline caches %lluK, desc overflow pools %llu", (unsigned long long)(made - last_made),
+            (unsigned long long)made, (unsigned long long)(pc_bytes >> 10), (unsigned long long)pools);
+        last_made = made;
+        int64_t gpu = live;
 #undef ADD
         pthread_mutex_unlock(&st.lock);
-        VKB_INFO("%s | bc scratch %lldM", line, MB(vkb_emu_bcn_scratch_live()));
+        if (lines) VKB_INFO("%s | bc scratch %lldM", line, MB(vkb_emu_bcn_scratch_live()));
+        if (entered && ++lows <= 4)
+            VKB_WARN("memory low: %llu MB free of %llu MB (swap free %llu MB); the server holds %ld MB (GPU memory %lld MB, heap %lld MB, "
+                     "pipeline caches %llu MB): free heap pages go back to the system and idle descriptor pools are freed; the system "
+                     "may close apps, and the bridge with the game%s",
+                     (unsigned long long)(avail >> 10), (unsigned long long)(total >> 10), (unsigned long long)(swap >> 10), rss >> 10, MB(gpu),
+                     heap, (unsigned long long)(pc_bytes >> 20), lows == 4 ? " (said 4 times, not again)" : "");
     }
     return NULL;
 }
 
+/* The thread watches for low memory with the lines off too. */
 static void st_start(void)
 {
     const char *e = getenv("VKBRIDGE_MEM_STATS");
-    if (e && *e == '0') return;
     pthread_t th;
-    if (pthread_create(&th, NULL, st_thread, NULL) == 0) pthread_detach(th);
+    if (pthread_create(&th, NULL, st_thread, e && *e == '0' ? NULL : (void *)1) == 0) pthread_detach(th);
 }
 
 void vkb_mem_track(vkb_srv_table *dev, vkb_srv_mem *m)
@@ -416,7 +512,9 @@ void vkb_mem_free_all(vkb_srv_table *dev)
 }
 
 /* The dma-heap the dmaheap strategy allocates from, opened once: system-uncached first (the GPU
- * and the client both write through it without cache maintenance), else the cached system heap. */
+ * and the client both write through it without cache maintenance), else the cached system heap.
+ * VKBRIDGE_FAKE_MISSING=dmaheap (device tests): none, as on the phones without /dev/dma_heap
+ * (Retroid Pocket 4 Pro, Kirin 985; MaliBridge#10). Read once per server start. */
 static int dmaheap_fd(void)
 {
     static int fd = -2;
@@ -426,7 +524,8 @@ static int dmaheap_fd(void)
         const char *names[] = {"/dev/dma_heap/system-uncached", "/dev/dma_heap/system"};
         if (getenv("VKBRIDGE_DMAHEAP_CACHED")) names[0] = "/dev/dma_heap/system";
         fd = -1;
-        for (int i = 0; i < 2 && fd < 0; i++) {
+        if (vkb_emu_faked("dmaheap")) VKB_INFO("dmaheap: none, as on a phone without /dev/dma_heap (VKBRIDGE_FAKE_MISSING=dmaheap)");
+        for (int i = 0; i < 2 && fd < 0 && !vkb_emu_faked("dmaheap"); i++) {
             fd = open(names[i], O_RDONLY | O_CLOEXEC);
             if (fd >= 0) VKB_INFO("dmaheap: allocating from %s", names[i]);
             else VKB_INFO("dmaheap: %s: %s", names[i], strerror(errno));
@@ -446,7 +545,7 @@ static int dmaheap_cached_fd(void)
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
     if (fd == -2) {
-        fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+        fd = vkb_emu_faked("dmaheap") ? (errno = ENOENT, -1) : open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
         if (fd >= 0) VKB_INFO("dmaheap: cached readback allocates from /dev/dma_heap/system");
         else VKB_INFO("dmaheap: /dev/dma_heap/system: %s (no cached readback)", strerror(errno));
     }
@@ -701,14 +800,7 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
             r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
             break;
         }
-        /* Mali's gralloc can put more than one fd in the handle (metadata beside the pages): the
-         * memory is the one at least as large as the allocation. */
-        int pick = -1;
-        for (int i = 0; i < nh->numFds && pick < 0; i++) {
-            off_t end = lseek(nh->data[i], 0, SEEK_END);
-            if (end >= (off_t)sz) pick = nh->data[i];
-            if (nh->numFds > 1) VKB_INFO("ahb: handle fd %d of %d is %lld bytes", i + 1, nh->numFds, (long long)end);
-        }
+        int pick = ahb_pages_fd(nh, sz);
         if (pick < 0) {
             VKB_INFO("ahb: no fd in the handle covers %llu bytes", (unsigned long long)sz);
             dt->vkFreeMemory(dev, m->mem, NULL);
@@ -750,7 +842,97 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
  * exportable. Emulated (VKB_EMU_DMABUF_EXPORT): an allocation that asks to export a dma-buf gets
  * pages from the dma-heap, imported into the driver; vkGetMemoryFdKHR hands out those pages. The
  * driver keeps choosing the image's layout; the importer learns it from the modifier as usual.
+ *
+ * Phones without /dev/dma_heap (Retroid Pocket 4 Pro's Dimensity 1100 and Huawei's Kirin 985,
+ * Mali-G77 r32p1/r34p0; MaliBridge#10: gamescope stopped at "no exportable modifier"): the pages
+ * come from a BLOB AHardwareBuffer instead, its dma-buf imported as any other. The buffer is kept
+ * with the memory (m->ahb) and released after it. Offered only once a real one has been allocated,
+ * imported and mapped at start (ahb_export_check): a gralloc that refuses any of it leaves the
+ * export unclaimed, as before, instead of promising gamescope modifiers it cannot have.
  */
+
+/* The AHardwareBuffer path, checked once at start by the memory self-test (ahb_export_check)
+ * before gamescope is told it can export: -1 not checked, 0 failed, 1 passed; the CPU usage that
+ * passed (the export emulation allocates with it); what the check saw, for the probe and the report. */
+static char ahb_export_text[360];
+#ifdef __ANDROID__
+static int ahb_export_ok = -1;
+static uint64_t ahb_export_cpu = 2ull | (2ull << 4);
+#endif
+
+/* Where the emulation's pages come from: 1 the dma-heap, 2 AHardwareBuffers (Android, where the
+ * start's check passed), 0 nowhere. */
+int vkb_mem_export_backing(void)
+{
+    if (vkb_mem_dmaheap_available()) return 1;
+#ifdef __ANDROID__
+    if (ahb_export_ok == 1 && ahb_load()) return 2;
+#endif
+    return 0;
+}
+
+const char *vkb_mem_ahb_export_result(void)
+{
+    return ahb_export_text;
+}
+
+const char *vkb_mem_export_backing_name(void)
+{
+    int b = vkb_mem_export_backing();
+    return b == 1 ? "dma-heap" : b == 2 ? "AHardwareBuffer" : "none";
+}
+
+/* A dma-buf of len bytes for the emulation (the caller owns the fd), -1 on failure. */
+static int export_pages(uint64_t len, vkb_srv_mem *m)
+{
+    int hfd = dmaheap_fd();
+    if (hfd >= 0) {
+        struct dma_heap_allocation_data hd = {len, 0, O_RDWR | O_CLOEXEC, 0};
+        if (ioctl(hfd, DMA_HEAP_IOCTL_ALLOC, &hd) < 0) {
+            VKB_ERR("export emulation: dma-heap allocation of %llu bytes failed: %s", (unsigned long long)len, strerror(errno));
+            return -1;
+        }
+        return (int)hd.fd;
+    }
+#ifdef __ANDROID__
+    if (!ahb_load() || len > 0xFFFFFFFFull) return -1;
+    /* Uncached for the CPU, as the system-uncached heap's pages: the importer reads them by the GPU,
+     * and a CPU read (the dump-exports evidence) needs no cache maintenance. Cached where the start's
+     * check found the gralloc refusing "rarely" (ahb_export_check). */
+    vkb_ahb_desc d = {(uint32_t)len, 1, 1, AHB_FORMAT_BLOB, ahb_export_cpu | AHB_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
+    struct AHardwareBuffer *ahb = NULL;
+    int ar = p_AHardwareBuffer_allocate(&d, &ahb);
+    if (ar != 0 || !ahb) {
+        VKB_ERR("export emulation: AHardwareBuffer_allocate(%llu bytes) failed: %d", (unsigned long long)len, ar);
+        return -1;
+    }
+    const vkb_native_handle *nh = p_AHardwareBuffer_getNativeHandle(ahb);
+    VKB_ONCE(VKB_LOG_INFO, "export emulation: first AHardwareBuffer: %llu bytes, format 0x%x, usage 0x%llx; %d fd(s), %d int(s) in its handle",
+             (unsigned long long)len, d.format, (unsigned long long)d.usage, nh ? nh->numFds : -1, nh ? nh->numInts : -1);
+    int pick = ahb_pages_fd(nh, len);
+    int fd = pick >= 0 ? fcntl(pick, F_DUPFD_CLOEXEC, 0) : -1;
+    if (fd < 0) {
+        VKB_ERR("export emulation: no dma-buf of %llu bytes in the AHardwareBuffer's handle", (unsigned long long)len);
+        p_AHardwareBuffer_release(ahb);
+        return -1;
+    }
+    m->ahb = ahb;
+    return fd;
+#else
+    (void)m;
+    return -1;
+#endif
+}
+
+/* Undoes export_pages after a failed import. */
+static void export_pages_drop(int fd, vkb_srv_mem *m)
+{
+    close(fd);
+#ifdef __ANDROID__
+    if (m->ahb) p_AHardwareBuffer_release(m->ahb);
+#endif
+    m->ahb = NULL;
+}
 static int wants_dmabuf_export(const VkMemoryAllocateInfo *ai)
 {
     for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
@@ -763,15 +945,9 @@ static int wants_dmabuf_export(const VkMemoryAllocateInfo *ai)
 static VkResult alloc_exportable(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb_srv_mem *m)
 {
     const vkb_dispatch *dt = &t->real;
-    int hfd = dmaheap_fd();
-    if (hfd < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     uint64_t len = (ai->allocationSize + 4095) & ~4095ull;
-    struct dma_heap_allocation_data hd = {len, 0, O_RDWR | O_CLOEXEC, 0};
-    if (ioctl(hfd, DMA_HEAP_IOCTL_ALLOC, &hd) < 0) {
-        VKB_ERR("export emulation: dma-heap allocation of %llu bytes failed: %s", (unsigned long long)len, strerror(errno));
-        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    }
-    int fd = (int)hd.fd;
+    int fd = export_pages(len, m);
+    if (fd < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
     if (!dt->vkGetMemoryFdPropertiesKHR ||
         dt->vkGetMemoryFdPropertiesKHR(t->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) != VK_SUCCESS)
@@ -800,7 +976,7 @@ static VkResult alloc_exportable(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb
     uint32_t bits = fp.memoryTypeBits & want & ordinary;
     if (!bits) {
         VKB_ERR("export emulation: no ordinary memory type takes both the dma-buf (0x%x) and the resource (0x%x)", fp.memoryTypeBits, want);
-        close(fd);
+        export_pages_drop(fd, m);
         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
     }
     if (!(bits & (1u << ai->memoryTypeIndex))) {
@@ -824,7 +1000,7 @@ static VkResult alloc_exportable(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb
     if (r != VK_SUCCESS) {
         VKB_ERR("export emulation: importing %llu bytes (type %u) failed: %d", (unsigned long long)len, info.memoryTypeIndex, r);
         if (imp_fd >= 0) close(imp_fd);
-        close(fd);
+        export_pages_drop(fd, m);
         return r;
     }
     m->export_fd1 = fd + 1;
@@ -841,7 +1017,8 @@ static VkResult alloc_exportable(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb
                  (unsigned long long)(uintptr_t)ded_img,
                  still_dedicated ? "" : " (imported without the dedicated struct)");
     }
-    VKB_DBG("export emulation: %llu bytes from the dma-heap, type %u", (unsigned long long)len, info.memoryTypeIndex);
+    VKB_DBG("export emulation: %llu bytes from the %s, type %u", (unsigned long long)len, m->ahb ? "AHardwareBuffer" : "dma-heap",
+            info.memoryTypeIndex);
     return VK_SUCCESS;
 }
 
@@ -1514,9 +1691,12 @@ static void fdt_install(vkb_srv_table *t)
     }
 }
 
-/* At the driver's level (t->real), before the layers above it take their copies of it. */
+/* At the driver's level (t->real), before the layers above it take their copies of it. The
+ * accounting thread starts with the first device too (not only at the first allocation): it
+ * watches for low memory, which descriptor pools ask about with no memory allocated. */
 void vkb_mem_device_install(vkb_srv_table *t)
 {
+    pthread_once(&st_once, st_start);
     fdt_install(t);
 }
 
@@ -1839,7 +2019,7 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             for (const VkBaseInStructure *b = ai.pNext; b && nl < 32; b = b->pNext) links[nl++] = b;
             int whole = nl < 32;
             r = alloc_exportable(t, &ai, m);
-            path = "export emulation (dma-heap)";
+            path = m->ahb ? "export emulation (AHardwareBuffer)" : "export emulation (dma-heap)";
             type = ai.memoryTypeIndex;
             /* Pages the dma-heap would not give, or the driver would not import: the memory is still
              * made, without a dma-buf (most allocations asking for export are never exported; one
@@ -2399,6 +2579,122 @@ static uint32_t probe_dl_types(selftest *st, uint32_t image_types, VkExternalMem
     return chosen;
 }
 
+#ifdef __ANDROID__
+/* One BLOB AHardwareBuffer as the export emulation makes them (64 KiB, CPU usage cpu), its dma-buf
+ * imported into a buffer on the self-test's device, mapped where a host-visible type takes it, a
+ * word written and read back: 1 when all of it works, else 0 and why. Only the symbols resolving
+ * said nothing about the phones this path is for (Android 10-12 grallocs, ION, kernel 4.14-4.19):
+ * BLOB with GPU_DATA_BUFFER may be refused, the pages may sit in another fd of the handle, the
+ * import may fail. VKBRIDGE_FAKE_MISSING=ahbexport (device tests): the allocation refused. */
+static int ahb_export_try(selftest *st, uint64_t cpu, char *why, size_t cap)
+{
+    const uint64_t len = 64u * 1024u;
+    vkb_ahb_desc d = {(uint32_t)len, 1, 1, AHB_FORMAT_BLOB, cpu | AHB_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
+    struct AHardwareBuffer *ahb = NULL;
+    int faked = vkb_emu_faked("ahbexport");
+    int ar = faked ? -12 : p_AHardwareBuffer_allocate(&d, &ahb);
+    if (ar != 0 || !ahb) {
+        snprintf(why, cap, "allocate refused (%d)%s", ar, faked ? " [VKBRIDGE_FAKE_MISSING=ahbexport]" : "");
+        return 0;
+    }
+    const vkb_native_handle *nh = p_AHardwareBuffer_getNativeHandle(ahb);
+    int ok = 0, fd = -1;
+    VkBuffer b = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    int pick = ahb_pages_fd(nh, len);
+    if (pick < 0 || (fd = fcntl(pick, F_DUPFD_CLOEXEC, 0)) < 0) {
+        snprintf(why, cap, "no fd of %llu bytes among the handle's %d", (unsigned long long)len, nh ? nh->numFds : -1);
+        goto out;
+    }
+    VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    VkResult r = st->dt.vkGetMemoryFdPropertiesKHR
+                     ? st->dt.vkGetMemoryFdPropertiesKHR(st->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp)
+                     : VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (r != VK_SUCCESS) {
+        snprintf(why, cap, "the driver will not describe its dma-buf (%d)", r);
+        goto out;
+    }
+    VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &eb, 0, len, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if ((r = st->dt.vkCreateBuffer(st->dev, &bci, NULL, &b)) != VK_SUCCESS) {
+        b = VK_NULL_HANDLE;
+        snprintf(why, cap, "a dma-buf buffer refused (%d)", r);
+        goto out;
+    }
+    VkMemoryRequirements mr;
+    st->dt.vkGetBufferMemoryRequirements(st->dev, b, &mr);
+    uint32_t bits = 0, type = UINT32_MAX;
+    for (uint32_t i = 0; i < st->mp.memoryTypeCount; i++)
+        if (!(st->mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT))) bits |= 1u << i;
+    bits &= fp.memoryTypeBits & mr.memoryTypeBits;
+    for (uint32_t i = 0; i < st->mp.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((bits & (1u << i)) && (st->mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) type = i;
+    if (type == UINT32_MAX && bits) type = (uint32_t)__builtin_ctz(bits);
+    if (type == UINT32_MAX || mr.size > len) {
+        snprintf(why, cap, "no memory type takes the dma-buf (0x%x) and a buffer (0x%x, %llu bytes)", fp.memoryTypeBits, mr.memoryTypeBits,
+                 (unsigned long long)mr.size);
+        goto out;
+    }
+    VkImportMemoryFdInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, len, type};
+    if ((r = st->dt.vkAllocateMemory(st->dev, &ai, NULL, &m)) != VK_SUCCESS) {
+        m = VK_NULL_HANDLE;
+        snprintf(why, cap, "the import refused (%d, type %u)", r, type);
+        goto out;
+    }
+    fd = -1; /* the driver's now */
+    if ((r = st->dt.vkBindBufferMemory(st->dev, b, m, 0)) != VK_SUCCESS) {
+        snprintf(why, cap, "binding the imported memory refused (%d)", r);
+        goto out;
+    }
+    if (!(st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        /* gamescope's images need the import, not a CPU mapping */
+        snprintf(why, cap, "%d fd(s) in the handle, imported into type %u (not host-visible: not mapped)", nh->numFds, type);
+        ok = 1;
+        goto out;
+    }
+    void *p = NULL;
+    if ((r = st->dt.vkMapMemory(st->dev, m, 0, VK_WHOLE_SIZE, 0, &p)) != VK_SUCCESS || !p) {
+        snprintf(why, cap, "mapping the imported memory refused (%d)", r);
+        goto out;
+    }
+    ((volatile uint32_t *)p)[100] = 0x5eed1234u;
+    uint32_t got = ((volatile uint32_t *)p)[100];
+    st->dt.vkUnmapMemory(st->dev, m);
+    ok = got == 0x5eed1234u;
+    snprintf(why, cap, "%d fd(s) in the handle, imported into type %u, mapped: %s", nh->numFds, type, ok ? "read back" : "read back WRONG");
+out:
+    if (b) st->dt.vkDestroyBuffer(st->dev, b, NULL);
+    if (m) st->dt.vkFreeMemory(st->dev, m, NULL);
+    if (fd >= 0) close(fd);
+    p_AHardwareBuffer_release(ahb);
+    return ok;
+}
+
+/* Where there is no dma-heap: the AHardwareBuffer path tried once with the export emulation's own
+ * CPU usage ("rarely", uncached), again with "often" (some grallocs refuse "rarely" for BLOB), and
+ * only a pass lets vkb_mem_export_backing offer it. */
+static void ahb_export_check(selftest *st)
+{
+    if (ahb_export_ok >= 0 || vkb_mem_dmaheap_available() || !ahb_load()) return;
+    char rarely[160], often[160];
+    if (ahb_export_try(st, 2ull | (2ull << 4), rarely, sizeof(rarely))) {
+        ahb_export_ok = 1;
+        snprintf(ahb_export_text, sizeof(ahb_export_text), "check passed: %s", rarely);
+    } else if (ahb_export_try(st, AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN, often, sizeof(often))) {
+        ahb_export_ok = 1;
+        ahb_export_cpu = AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN;
+        snprintf(ahb_export_text, sizeof(ahb_export_text), "check passed with CPU usage often: %s (rarely: %s)", often, rarely);
+    } else {
+        ahb_export_ok = 0;
+        snprintf(ahb_export_text, sizeof(ahb_export_text), "check FAILED: %s; with CPU usage often: %s", rarely, often);
+    }
+    if (ahb_export_ok) VKB_INFO("dma-buf export: no dma-heap; AHardwareBuffer pages %s", ahb_export_text);
+    else VKB_WARN("dma-buf export: no dma-heap, and the AHardwareBuffer %s - gamescope is offered no exportable images", ahb_export_text);
+}
+#endif
+
 void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd)
 {
     selftest st;
@@ -2479,6 +2775,15 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
             if (!dup && nx < 16) exts[nx++] = req[j];
         }
     }
+#ifdef __ANDROID__
+    /* the AHardwareBuffer export check imports a dma-buf whatever strategy is tried (ahb_export_check) */
+    if (!vkb_mem_dmaheap_available() && ahb_load())
+        for (uint32_t j = 0; j < 3; j++) {
+            int dup = 0;
+            for (uint32_t q = 0; q < nx; q++) dup |= !strcmp(exts[q], ext_dmabuf[j]);
+            if (!dup && nx < 16 && has_ext(ex, ne, ext_dmabuf[j])) exts[nx++] = ext_dmabuf[j];
+        }
+#endif
     free(ex);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, st.qf, 1, &prio};
@@ -2546,6 +2851,9 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
 #undef OUTCOME
     if (k->info.strategy == VKB_MEM_NONE)
         VKB_ERR("memory sharing: no method works on %s; Linux programs will get no host-visible memory", k->name);
+#ifdef __ANDROID__
+    ahb_export_check(&st);
+#endif
 
     st.dt.vkDestroyCommandPool(st.dev, st.pool, NULL);
     st.dt.vkDestroyDevice(st.dev, NULL);

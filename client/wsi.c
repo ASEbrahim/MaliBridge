@@ -835,8 +835,8 @@ static void wait_display_release(const vkb_swap_image *img)
         VKB_WARN("Wayland: the display held a gralloc image for more than 100 ms after its release; drawing into it anyway");
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore,
-                                                           VkFence fence, uint32_t *pImageIndex)
+static VkResult acquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence,
+                        uint32_t *pImageIndex)
 {
     vkb_swapchain *sc = chain(swapchain);
     if (sc->retired) return VK_ERROR_OUT_OF_DATE_KHR;
@@ -865,6 +865,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAcquireNextImageKHR(VkDevice device, VkS
             return r;
         }
     }
+}
+
+/* An error from an acquire or a present is logged the first time (vkb_first_error). */
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore,
+                                                           VkFence fence, uint32_t *pImageIndex)
+{
+    return vkb_note_error("vkAcquireNextImageKHR", acquire(device, swapchain, timeout, semaphore, fence, pImageIndex));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextImageInfoKHR *pInfo, uint32_t *pImageIndex)
@@ -972,7 +979,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
         if (r < 0 && (worst >= 0 || r == VK_ERROR_DEVICE_LOST)) worst = r;
         else if (worst == VK_SUCCESS && r == VK_SUBOPTIMAL_KHR) worst = r;
     }
-    return worst;
+    return vkb_note_error("vkQueuePresentKHR", worst);
 }
 
 /* ------------------------------------------------------------------ headless */

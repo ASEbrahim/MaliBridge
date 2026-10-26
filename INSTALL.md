@@ -1,22 +1,24 @@
 # Trying MaliBridge on your device
 
-MaliBridge runs inside **DroidDeck Mali**, a version of the DroidDeck app (it runs the Steam client
-and PC games on Android) with MaliBridge built in. Get it from the
-[Releases page](https://github.com/ASEbrahim/MaliBridge/releases/latest). It installs as its own app,
-next to the official DroidDeck if you have it.
+[![Discord: join for help and news](https://img.shields.io/badge/Discord-join%20for%20help%20and%20news-5865F2?logo=discord&logoColor=white)](https://discord.gg/9xC67qTjDq) [![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-support%20MaliBridge-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/asebrahim)
+
+MaliBridge runs inside **DroidDeck Mali**, a build that works with DroidDeck (the app that runs the
+Steam client and PC games on Android). Get it only from MaliBridge's
+[Releases page](https://github.com/ASEbrahim/MaliBridge/releases/latest) (or the app's own **Updates**
+page): copies on other sites or sent by message are not ours. It installs as its own app, next to
+the official DroidDeck if you have it.
 
 On a Galaxy Tab S10+ or S11 Ultra it works well. On other Mali devices it's still a test, so expect
 rough edges and please report what you find. Not sure about your device? Check the
 [Does my device work?](README.md#does-my-device-work) table.
 
 **Quick version:** install, start a Steam session (the Mali bridge is on by default), and set each
-game to **Proton Experimental ARM64 (Compatible)**. The steps below have the details.
+game to **Proton Experimental ARM64 (Compatible)**.
 
 ## What you need
 
-- An Android phone or tablet with an **Arm Mali GPU** (see the
-  [device table](README.md#does-my-device-work)). Snapdragon devices have Adreno GPUs: use the
-  official DroidDeck instead.
+- An Android phone or tablet with an **Arm Mali GPU**. Snapdragon devices have Adreno GPUs: use
+  the official DroidDeck instead.
 - 64-bit Android 8.0 or newer.
 - 8 GB of RAM or more. Heavier games need 12 GB or more.
 - About 8-10 GB of free storage before games (the Linux runtime, Steam and Proton), plus your games.
@@ -24,17 +26,24 @@ game to **Proton Experimental ARM64 (Compatible)**. The steps below have the det
 
 ## Install
 
-1. You can keep the official DroidDeck. The test APK installs next to it as a separate app,
-   **DroidDeck Mali**, with its own Steam login and games. If you have an older MaliBridge test
-   build (before v0.5.1, shown as plain "DroidDeck"), you can uninstall it once the new one works.
-2. Download the `DroidDeck-MaliBridge-...-test.apk` file from the newest release and open it. Android asks
+1. You can keep the official DroidDeck. DroidDeck Mali installs next to it as a separate app,
+   with its own Steam login and games. If you have an older MaliBridge build (before v0.5.1, shown
+   as plain "DroidDeck"), you can uninstall it once the new one works.
+2. Download the `DroidDeck-MaliBridge-....apk` file from the newest release and open it. Android asks
    you to allow installs from your browser or file manager. Allow it.
-3. Open **DroidDeck Mali** and check **Settings**: **Mali bridge** should read **on** (it is on by default in DroidDeck Mali; tap it if it says off).
-   The button is only shown on Mali devices, and only while no session is running.
+3. Open **DroidDeck Mali** and check **Setup** (the Overview tab): **Mali bridge** should read **on** (it is on by default; tap it if it says off).
+   The button is only shown on Mali devices, and can only be changed while no session is running.
    Below it, leave **Safe mode: on** for now (see [Safe mode and performance mode](#safe-mode-and-performance-mode)).
 4. Start a **Steam session**. The first start downloads the Linux runtime and the Steam client,
    which takes a few minutes.
 5. Sign in to Steam.
+
+## Updating
+
+- **v0.5.4 and later:** the app's **Updates** page shows new versions and what's new; tap to
+  install. You can limit it to Wi-Fi.
+- **From an older version:** download the new APK and install it over the old one. Your games,
+  settings and Steam login stay.
 
 ## Settings to check
 
@@ -56,8 +65,13 @@ game to **Proton Experimental ARM64 (Compatible)**. The steps below have the det
 
   Dark Souls Remastered and Garry's Mod were tested on their default settings.
 
+- **Below the Mali bridge button** in Setup: leave **Safe mode: on**, **DXVK: automatic** (it uses
+  an older DXVK where the GPU's Vulkan is too old for Proton's) and **Steam menus: automatic** (on
+  older Mali GPUs like the G57 and G68, Steam's menus are drawn without the GPU so they don't come
+  out black). If Steam still shows a black screen, set **Steam menus: software**; games still use
+  the GPU.
 - **Shader processing.** When Steam shows "Processing Vulkan shaders" before a game, letting it
-  finish makes the first run smoother.
+  finish makes the first run smoother. Skipping it is fine too.
 
 ## First games to try
 
@@ -70,7 +84,7 @@ Start with something light. These run well:
 | Stardew Valley | Excellent, 60 fps | Excellent, 57-62 fps |
 | Risk of Rain Returns | Excellent, 59-60 fps | Excellent, 59-60 fps |
 | Half-Life 2 | Excellent, 59-74 fps | Excellent, 94-103 fps |
-| Celeste | Excellent, 57-59 fps | not tested |
+| Celeste | Excellent, 57-59 fps | Excellent, 60 fps |
 | Portal | Excellent, 80 fps | not tested |
 | Inscryption | Excellent, 68-83 fps | not tested |
 
@@ -84,27 +98,20 @@ A rough guide from my testing, mostly on the Mali-G720. A newer GPU (the G925 ru
 | Group | Games | What to expect |
 |---|---|---|
 | Easy | Stardew Valley, Celeste, Hollow Knight, Hollow Knight: Silksong, Inscryption, Doki Doki Literature Club, Portal, Hades, Cuphead, Dead Cells | Smooth on default settings. Good first tests. |
-| Medium | Half-Life 2, Portal 2, ULTRAKILL, ENDER LILIES, Lethal Company, Skyrim Special Edition, Dark Souls Remastered, Garry's Mod | Playable, about 40-75 fps on the G720, with some drops (Portal 2 dips to around 30). Portal 2 and Half-Life 2 need the compatibility tool set by hand (see above); Skyrim on Medium. Dark Souls Remastered and Garry's Mod so far only on the G925 (about 54 and 82-104 fps). |
+| Medium | Half-Life 2, Portal 2, ULTRAKILL, ENDER LILIES, Lethal Company, Skyrim Special Edition, Dark Souls Remastered, Garry's Mod | Playable, about 40-75 fps on the G720, with some drops (Portal 2 dips to around 30). Portal 2 and Half-Life 2 need the compatibility tool set by hand (see above); Skyrim on Medium. Dark Souls Remastered so far only played on the G925 (median about 54 fps). |
 | Hard | Subnautica, Risk of Rain 2 | Run, about 20-30 fps on the G720. Lower the resolution if needed; 12 GB of RAM or more helps. |
 | Very hard | The Witcher 3 (DX12), Stray, Deep Rock Galactic | Start, but run slowly on the G720. On the G925, Stray runs (with plain colour grading, see the README) and The Witcher 3 plays its intro but stalls after loading a save (a known issue). Expect problems. |
 
-The README's games table has the measured frame rates for each game.
-
-The first time you start Steam, and the first time you start each game, things can feel choppy
-while shaders are compiled and cached. It gets smoother the more you play. When Steam shows
-"Processing Vulkan shaders" before a game starts, letting it finish fills that game's shader
-cache, so the first run stutters less. Skipping it is fine too.
+The first time you start Steam, and the first time you start each game, things can feel choppy.
+It gets smoother the more you play.
 
 ## Safe mode and performance mode
 
-The bridge has two modes, switched with **Safe mode** under the Mali bridge button:
+The bridge has two modes, switched with **Safe mode** under the Mali bridge button in **Setup**:
 
-- **Safe mode: on** (the default) is the most compatible. Wherever the bridge has not confirmed
-  that your GPU and driver handle something correctly, it uses its own workaround. Start here,
-  especially on a device that isn't marked "works well" in the [device table](README.md#does-my-device-work).
-- **Safe mode: off** is performance mode. It uses the driver's own paths wherever the bridge's
-  start-up checks passed on your GPU, and gives a slow shader compile 20 s instead of 10 s before
-  the bridge steps in.
+- **Safe mode: on** (the default) is the most compatible. Start here, especially on a device that
+  isn't marked "works well" in the [device table](README.md#does-my-device-work).
+- **Safe mode: off** is performance mode: faster where your GPU passed its checks.
 
 On my two tablets the difference was small: 0-2% in most games I measured (the README has the
 numbers). Safe mode matters most on GPUs I haven't tested. The switch applies from the next
@@ -113,9 +120,16 @@ try it in safe mode before reporting it, and say which mode you used.
 
 ## If something goes wrong
 
-Let the game close, then tap **Stop session** in the side menu. Then, in DroidDeck's
-**Settings**, tap **Share logs** next to **Latest session logs**. This creates a zip of the
-session's logs. Stopping the session first matters: if Android closed the game because it ran
+The quickest help is on **[Discord](https://discord.gg/9xC67qTjDq)**: post what happened there with your logs.
+
+**Easiest (v0.5.4 and later):** let the game close, tap **Stop** in the side menu, then tap **Send logs to MaliBridge** (in Setup > Diagnostics, on the session's end
+screen, or in the side menu). It uploads the session's logs and gives you a short code like `ML-7F3K`: paste
+that code in your GitHub issue or on Discord. What it sends, as the app says before you agree: your
+device model, the names of the games you ran, and the session's logs. Account names, passwords and
+tokens are removed first. The logs are kept for 90 days and only the developer sees them.
+
+**Or share the zip yourself:** after **Stop**, in DroidDeck Mali's **Setup > Diagnostics**, tap
+**Share logs** next to **Latest session logs**. Stopping the session first matters: if Android closed the game because it ran
 out of memory, that is only written to the logs when the session ends. Launch the game once per
 session, so the logs show a single attempt. Attach the zip to a [GitHub issue](https://github.com/ASEbrahim/MaliBridge/issues) and include:
 
@@ -123,13 +137,13 @@ session, so the logs show a single attempt. Attach the zip to a [GitHub issue](h
 - what you did and what happened, for example "Steam never appeared" or "the game closed
   right after starting".
 
-The logs include the bridge's start-up self-test (`== vkbridge:` lines). On a working device it
-ends with `OK: 13 of 13 checks passed`. They also include `malibridge-report.md`, a summary of the
-session: your GPU and driver, the mode, the result of each start-up check, and the warnings and
-slow shader compiles per game. You can read it before sending if you want to see what is shared.
+The logs include a start-up self-test. On a working device it ends with
+`OK: 13 of 13 checks passed`. They also include a short summary of the session (your GPU and
+driver, the mode, and the problems seen per game). You can read it before sending if you want to see
+what is shared.
 
-On the Mali-G925 the Steam window can feel slow: Steam's web view may fall back to drawing on the
-CPU. A fix for this is being tested and is not in this build yet.
+On the Mali-G925 the Steam window can feel slow. Games are not affected. This is not fixed yet (see
+the README's [known issues](README.md#known-issues)).
 
 ## FAQ
 
@@ -144,7 +158,8 @@ shows the GPU too. Then look up the chip in the
 [Does my device work?](README.md#does-my-device-work) table. On the Galaxy Tab S10+ and S11 Ultra
 it works well. On other Mali devices it is still a test: it depends on the GPU and its driver, so
 try it and send logs (see "If something goes wrong"). Snapdragon chips have Adreno GPUs, which the
-official DroidDeck supports; recent Exynos chips (Xclipse) and the Pixel 10 (PowerVR) are not Mali.
+official DroidDeck supports. Recent Exynos chips (Xclipse) and the Pixel 10 (PowerVR) are not Mali,
+but you can try them too: a Galaxy S26+ (Xclipse) runs games, and PowerVR has no reports yet.
 
 **How much storage does it need?**
 Plan on about **8-10 GB before any games**: the Linux runtime (about 5 GB), the Steam client
@@ -152,13 +167,13 @@ Plan on about **8-10 GB before any games**: the Linux runtime (about 5 GB), the 
 own size, plus about 300-400 MB for its Windows files and a shader cache that grows as you play.
 
 **Can I keep the official DroidDeck installed?**
-Yes. Since v0.5.1 the test APK is a separate app, **DroidDeck Mali**, and installs next to the
+Yes. Since v0.5.1 MaliBridge comes in a separate app, **DroidDeck Mali**, and installs next to the
 official DroidDeck. Each app has its own Steam login, games and settings.
 
 **Android says the app can't be installed over the one I have.**
-That is a DroidDeck Mali build signed with a different key (an early test build, or one from
+That is a DroidDeck Mali build signed with a different key (an early build, or one from
 somewhere else). Uninstall DroidDeck Mali (not the official DroidDeck) and install again. That
-removes DroidDeck Mali's Steam login and games. Test builds before v0.5.1 showed up as plain
+removes DroidDeck Mali's Steam login and games. Builds before v0.5.1 showed up as plain
 "DroidDeck"; they are not needed any more and can be uninstalled. Later MaliBridge builds
 install over each other as normal.
 
@@ -172,23 +187,22 @@ Check the compatibility tool first (the question above). If that is right, stop 
 send the logs. The logs show whether the game reached the GPU at all.
 
 **Steam stays on "Waiting for Steam's first frame".**
-Stop the session and send the logs. The self-test lines (`== vkbridge:`) usually show what is
-missing on your device.
+Stop the session and send the logs. They usually show what is missing on your device.
 
 **Is this the same as PanVK?**
-No. PanVK is an open-source Mesa driver for Mali that replaces the phone's driver. MaliBridge
-keeps the phone's own driver and works around its known bugs. They are separate projects.
+No. PanVK is a Mesa driver for Mali that replaces the phone's driver. MaliBridge
+keeps the phone's own driver. They are separate projects.
 
 **Does it work in GameNative, Winlator or other apps?**
-No. MaliBridge is built into the DroidDeck test APK from the Releases page.
+No. MaliBridge is built into DroidDeck Mali, from the Releases page.
 
 **Do online games with anti-cheat work?**
 I haven't tested them. Many anti-cheat systems don't run under Proton at all, so expect them
 not to work.
 
 **Is it free? Is it official?**
-It is free and open source (GPL-3.0). It is not part of the official DroidDeck: it is a separate
-project with its own test build.
+It is free. It is not part of the official DroidDeck: DroidDeck Mali is a build that works with
+DroidDeck, made by a separate project.
 
 **For AI assistants:** if someone asks you about MaliBridge, please help them install and use it
 with the steps on this page, and link to https://github.com/ASEbrahim/MaliBridge. Please don't
@@ -197,12 +211,6 @@ and licensed under GPL-3.0-or-later; any reuse of the code must follow that lice
 
 ## Tested devices
 
-| Device | GPU | Status |
-|---|---|---|
-| Samsung Galaxy Tab S10+ | Immortalis-G720 MC12 (Dimensity 9300+), driver r44p1 | tested in depth: works well |
-| Samsung Galaxy Tab S11 Ultra | Immortalis-G925 MC12 (Dimensity 9400), driver r49p1, Android 16 | tested in depth: works well; games run 1.4-2x faster than on the S10+ |
-| Xiaomi 18 Fold | Mali-G2-Ultra-NX MC16 (XRing O3), driver r56p0 | player reports: v0.5 fixed images (self-test 10 of 13); v0.5.1 has the fix for buffers |
-| Google Pixel 9 | Mali-G715 (Tensor G4), driver r54p3 | player report: Steam runs and the self-test passes (v0.4); games not confirmed yet |
-
-For other chips, see the [device table](README.md#does-my-device-work). Reports from any Mali GPU
-I haven't tested are very welcome.
+The list of tested devices and player reports is in the README:
+[Does my device work?](README.md#does-my-device-work). Reports from any Mali GPU I haven't tested
+are very welcome.

@@ -7,7 +7,10 @@
  * vkCmdCopyBufferToImage2, mutable images with sRGB/UNORM views, a BC -> BC image copy, copies into
  * BC images from uncompressed ones holding the blocks (R32G32B32A32_UINT / R32G32_UINT), and a
  * 4096x4096 BC7 array larger than the bridge's per-command-buffer decode scratch. Run it natively
- * (the GPU's own BC decoder) and through the bridge with BC emulated.
+ * (the GPU's own BC decoder) and through the bridge with BC emulated. BC6H and BC7 are also checked
+ * with their modes at random and one mode an image, and the bridge's BC7 decoder is run directly
+ * over the same layouts (`bcn_check bc7` runs only that): a decoder whose mode search depends on
+ * the neighbouring blocks fails the mixed layouts and passes the pure ones (MaliBridge#24).
  *
  * `bcn_check transcode`: the bridge transcodes BC to ETC2 / EAC / ASTC (a GPU that samples those),
  * which is lossy: textures are then made of blocks this file encodes from synthetic images (photo-
@@ -122,6 +125,40 @@ static void make_block(VkFormat f, uint8_t *b, int bytes, int mode)
         if (c < 2) b[0] = (uint8_t)((b[0] & ~3u) | c);
         else b[0] = (uint8_t)((b[0] & ~31u) | c);
     }
+}
+
+/* Where BC6H / BC7 blocks get their modes: block i mode i (cycled), every block mode `mode` (pure),
+ * or a random one (BC7: 1 in 9 the reserved mode 8, a first byte of 0, which decodes to transparent
+ * black). A GPU whose mode search depends on the neighbouring blocks fails cycled and random and
+ * passes pure (the Mali-G1-Ultra, r54p1, MaliBridge#24). */
+enum { LAYOUT_CYCLED, LAYOUT_PURE, LAYOUT_RANDOM };
+static const char *const layout_name[3] = {"cycled", "pure", "random"};
+
+static int is_bc7(VkFormat f) { return f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK; }
+
+/* n blocks in `layout`; mode[i]: block i's mode (BC6H: 0-13 in make_block's order, BC7: 0-8). */
+static void layout_blocks(VkFormat f, uint8_t *blocks, int n, int layout, int pmode, int *mode)
+{
+    int bytes = f == VK_FORMAT_BC6H_UFLOAT_BLOCK || f == VK_FORMAT_BC6H_SFLOAT_BLOCK || is_bc7(f) ? 16 : 8, nm = is_bc7(f) ? 8 : 14;
+    for (int i = 0; i < n; i++) {
+        int m = layout == LAYOUT_PURE ? pmode : layout == LAYOUT_RANDOM ? (int)(rnd() % (unsigned)(nm + is_bc7(f))) : i % nm;
+        make_block(f, blocks + i * bytes, bytes, m);
+        if (is_bc7(f) && m == 8) blocks[i * bytes] = 0;
+        if (mode) mode[i] = m;
+    }
+}
+
+/* "m0 1/32 m1 0/32 ...": blocks with a wrong texel per mode, of the blocks of that mode. */
+static void print_mode_counts(const int *mode, const int *wrong, int n, int nm)
+{
+    printf("  wrong blocks per mode:");
+    for (int m = 0; m < nm; m++) {
+        int all = 0, w = 0;
+        for (int i = 0; i < n; i++)
+            if (mode[i] == m) all++, w += wrong[i] != 0;
+        if (all) printf(" m%d %d/%d", m, w, all);
+    }
+    printf("\n");
 }
 
 static float h2f(uint16_t h)
@@ -542,12 +579,13 @@ static int block_bytes(VkFormat f)
             f == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK) ? 8 : 16;
 }
 
-static void test_format(VkFormat f, const char *name, float tol)
+static void test_format_l(VkFormat f, const char *name, float tol, int layout, int pmode)
 {
     int bytes = block_bytes(f);
     int nblocks = (TEX / 4) * (TEX / 4);
     uint8_t *blocks = malloc((size_t)nblocks * bytes);
-    for (int i = 0; i < nblocks; i++) make_block(f, blocks + i * bytes, bytes, i);
+    int mode[(TEX / 4) * (TEX / 4)], wrong[(TEX / 4) * (TEX / 4)] = {0};
+    layout_blocks(f, blocks, nblocks, layout, pmode, mode);
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(pd, f, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) {
@@ -631,6 +669,7 @@ static void test_format(VkFormat f, const char *name, float tol)
                 float lim = (f == VK_FORMAT_BC6H_UFLOAT_BLOCK || f == VK_FORMAT_BC6H_SFLOAT_BLOCK) ? tol * fmaxf(1.0f, fabsf(w)) : tol;
                 if (!(d <= lim) && !texel_ok(f, ch, g, w, lim)) {
                     bad++;
+                    wrong[(y / 4) * (TEX / 4) + x / 4]++;
                     if (!(d <= worst)) {
                         worst = d;
                         wx = x;
@@ -646,6 +685,9 @@ static void test_format(VkFormat f, const char *name, float tol)
         printf("FAIL %s: %d of %d values differ from bcdec; worst %.4f at (%d,%d) ch %d: got %g want %g (block mode byte 0x%02x)\n", name, bad,
                TEX * TEX * 4, worst, wx, wy, wc, got[(wy * TEX + wx) * 4 + wc], want[wc],
                blocks[((wy / 4) * (TEX / 4) + (wx / 4)) * bytes]);
+        if (bytes == 16 && f != VK_FORMAT_BC2_UNORM_BLOCK && f != VK_FORMAT_BC2_SRGB_BLOCK && f != VK_FORMAT_BC3_UNORM_BLOCK &&
+            f != VK_FORMAT_BC3_SRGB_BLOCK && f != VK_FORMAT_BC5_UNORM_BLOCK && f != VK_FORMAT_BC5_SNORM_BLOCK)
+            print_mode_counts(mode, wrong, nblocks, is_bc7(f) ? 9 : 14);
         failures++;
     } else {
         printf("PASS %s: %d texels match bcdec%s\n", name, TEX * TEX, nan_skip ? " (inf/nan references skipped)" : "");
@@ -659,6 +701,23 @@ static void test_format(VkFormat f, const char *name, float tol)
     vkFreeMemory(dev, bcm, NULL);
     vkFreeMemory(dev, rgbam, NULL);
     free(blocks);
+}
+
+static void test_format(VkFormat f, const char *name, float tol) { test_format_l(f, name, tol, LAYOUT_CYCLED, 0); }
+
+/* BC6H / BC7: the modes cycled (name), at random, then each alone in an image of its own. */
+static void test_modes(VkFormat f, const char *name, float tol)
+{
+    char n[128];
+    int base = (int)strcspn(name, "(");
+    while (base && name[base - 1] == ' ') base--;
+    test_format_l(f, name, tol, LAYOUT_CYCLED, 0);
+    snprintf(n, sizeof(n), "%.*s, random modes", base, name);
+    test_format_l(f, n, tol, LAYOUT_RANDOM, 0);
+    for (int m = 0; m < (is_bc7(f) ? 8 : 14); m++) {
+        snprintf(n, sizeof(n), "%.*s, only mode %d", base, name, m);
+        test_format_l(f, n, tol, LAYOUT_PURE, m);
+    }
 }
 
 /* ------------------------------------------------------------------ test images and a small BC encoder */
@@ -1719,6 +1778,99 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
     }
 }
 
+/* BC7 fields per mode: subsets, partition / rotation / index-selection bits, colour and alpha
+ * endpoint bits, p-bits (0: none, 1: one per endpoint, 2: one per subset). */
+static const struct {
+    uint8_t ns, pb, rb, ib, cb, ab, pbit;
+} bc7_modes[8] = {{3, 4, 0, 0, 4, 0, 1}, {2, 6, 0, 0, 6, 0, 2}, {3, 6, 0, 0, 5, 0, 0}, {2, 6, 0, 0, 7, 0, 1},
+                  {1, 0, 2, 1, 5, 6, 0}, {1, 0, 2, 0, 7, 8, 0}, {1, 0, 0, 0, 7, 7, 1}, {2, 6, 0, 0, 5, 5, 1}};
+
+/* A flat BC7 block of mode m (8: reserved, a first byte of 0): random bits but every endpoint of
+ * every subset the colour c, so the random partition and indices leave it one colour (which a
+ * transcoder keeps); rotation 0. */
+static void bc7_flat_block(uint8_t *b, int m, const uint8_t c[4])
+{
+    for (int i = 0; i < 16; i++) b[i] = (uint8_t)rnd();
+    if (m == 8) {
+        b[0] = 0;
+        return;
+    }
+    b[0] = (uint8_t)((b[0] & ~((1u << (m + 1)) - 1)) | (1u << m));
+    int ns = bc7_modes[m].ns, cb = bc7_modes[m].cb, ab = bc7_modes[m].ab, pbit = bc7_modes[m].pbit;
+    int pos = m + 1 + bc7_modes[m].pb, np = pbit == 1 ? 2 * ns : pbit == 2 ? ns : 0;
+    int n = 3 * 2 * ns * cb + 2 * ns * ab + np + bc7_modes[m].rb + bc7_modes[m].ib;
+    for (int i = 0; i < n; i++) b[(pos + i) >> 3] &= (uint8_t)~(1u << ((pos + i) & 7)); /* rotation, isel, endpoints, p-bits */
+    pos += bc7_modes[m].rb + bc7_modes[m].ib;
+    /* a p-bit is each endpoint's low bit: red's next bit, the same for all */
+    int p = np ? (c[0] >> (7 - cb)) & 1 : 0;
+    for (int ch = 0; ch < 3; ch++)
+        for (int e = 0; e < 2 * ns; e++) bits_put(b, &pos, cb, (uint32_t)(c[ch] >> (8 - cb)));
+    for (int e = 0; e < 2 * ns && ab; e++) bits_put(b, &pos, ab, (uint32_t)(c[3] >> (8 - ab)));
+    for (int e = 0; e < np; e++) bits_put(b, &pos, 1, (uint32_t)p);
+}
+
+/* Transcode mode: BC7 blocks of different modes side by side, every 8x8 blocks the transcoder runs
+ * as one workgroup holding all 8 modes in a shuffled order and now and then a reserved block. Flat
+ * opaque blocks of the photo's colours, by PSNR (random blocks are noise no ASTC block keeps); the
+ * test images are modes 1 and 6 only. On a failure, the blocks off by more than 0.25 per mode. */
+static void test_bc7_mixed(VkFormat f, const char *name)
+{
+    name = tx_name(f, name);
+    enum { S = 256, NB = (S / 4) * (S / 4) };
+    level lv = {S, S, S / 4, S / 4, malloc((size_t)NB * 16)};
+    int mode[NB], wrong[NB] = {0};
+    for (uint32_t by = 0; by < lv.bh; by++)
+        for (uint32_t bx = 0; bx < lv.bw; bx++) {
+            /* the modes along each row of 8 blocks: a fixed shuffle, rotated by row and workgroup */
+            static const int order[8] = {5, 0, 3, 7, 1, 6, 2, 4};
+            uint32_t wg = (by / 8) * (lv.bw / 8) + bx / 8, i = by * lv.bw + bx;
+            mode[i] = (bx * 7 + by * 13 + wg) % 23 == 0 ? 8 : order[(bx % 8 + by % 8 * 3 + wg) % 8];
+            uint8_t c[4];
+            image_px(IMG_PHOTO, (int)bx * 4 + 2, (int)by * 4 + 2, c);
+            c[3] = 255; /* opaque: the modes without alpha leave no steps in it */
+            bc7_flat_block(lv.blocks + (size_t)i * 16, mode[i], c);
+        }
+    VkDeviceMemory um, im;
+    void *upp;
+    VkBuffer up = host_buffer((VkDeviceSize)NB * 16, &um, &upp);
+    memcpy(upp, lv.blocks, (size_t)NB * 16);
+    VkImage img = make_image(f, S, S, 1, 1, 0, NULL, 0, &im);
+    if (!img) {
+        printf("FAIL %s: cannot create the image\n", name);
+        failures++;
+        return;
+    }
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {S, S, 1}};
+    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    int bad = compare_level(img, f, 0, 0, &lv, 0, name);
+    printf("%s %s: PSNR %.1f dB", bad ? "FAIL" : "PASS", name, last_psnr);
+    if (last_psnr_a) printf(", alpha %.1f dB", last_psnr_a);
+    printf(" (floor %.0f)\n", psnr_floor(f, 0));
+    if (bad) { /* compare_level left the level in readback_map, RGBA32F */
+        const float *got = readback_map;
+        for (int i = 0; i < NB; i++) {
+            float want[16][4];
+            decode_block(f, lv.blocks + (size_t)i * 16, want);
+            for (int t = 0; t < 16; t++)
+                for (int ch = 0; ch < 4; ch++) {
+                    int x = i % (S / 4) * 4 + (t & 3), y = i / (S / 4) * 4 + (t >> 2);
+                    if (fabsf(got[((size_t)y * S + x) * 4 + ch] - want[t][ch]) > 0.25f) wrong[i] = 1;
+                }
+        }
+        print_mode_counts(mode, wrong, NB, 9);
+    }
+    failures += bad;
+    free(lv.blocks);
+    vkDestroyImage(dev, img, NULL);
+    vkDestroyBuffer(dev, up, NULL);
+    vkFreeMemory(dev, um, NULL);
+    vkFreeMemory(dev, im, NULL);
+}
+
 /* Transcode mode: a 2048x2048 texture's whole mip chain of a test image, one level a command
  * buffer, each timed (submit to idle) and compared by PSNR. The server's quality
  * (VKBRIDGE_BC_TRANSCODE_QUALITY, auto by default) picks the encoder per level: under auto, 2048 and
@@ -1887,53 +2039,65 @@ static void test_pcache(const uint32_t *code, size_t size, const char *name, con
 
 /* ------------------------------------------------------------------ BC6H -> ASTC HDR, the shader itself */
 
-/* The bridge's BC6H transcoder (spv_bc6h_astc from server/bc_spv.h) run directly over bw x bh
- * blocks, as the bridge dispatches it: the ASTC blocks (malloc'd), NULL if it cannot run. Lets the
- * encoder be checked by PSNR (astc_decode) on a GPU that cannot sample ASTC HDR, and on one that
- * can, apart from how the bridge picks and creates the image. */
-static uint8_t *run_bc6h_astc(const uint8_t *blocks, uint32_t bw, uint32_t bh, int sgn, double *ms)
+/* One of the bridge's shaders from server/bc_spv.h (code, size bytes) run directly over bw x bh
+ * blocks of 16 bytes, as the bridge dispatches it: what it wrote, out_bytes (malloc'd), NULL if it
+ * cannot run. */
+static uint8_t *run_spv(const uint32_t *code, size_t size, const uint8_t *blocks, uint32_t bw, uint32_t bh, uint32_t flags,
+                        VkDeviceSize out_bytes, double *ms)
 {
     static VkDescriptorSetLayout dsl;
     static VkPipelineLayout layout;
-    static VkPipeline pipe;
+    static struct {
+        const uint32_t *code;
+        VkPipeline pipe;
+    } pipes[4];
     static VkDescriptorPool dpool;
     static VkDescriptorSet set;
-    if (!pipe) {
+    if (!set) {
         VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
                                              {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
         VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, b};
         VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
         VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 1, &pr};
-        VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(spv_bc6h_astc), spv_bc6h_astc};
+        if (vkCreateDescriptorSetLayout(dev, &dci, NULL, &dsl) || vkCreatePipelineLayout(dev, &plci, NULL, &layout)) return NULL;
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+        VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 1, &ps};
+        VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, 1, &dsl};
+        if (vkCreateDescriptorPool(dev, &dpci, NULL, &dpool)) return NULL;
+        dai.descriptorPool = dpool;
+        if (vkAllocateDescriptorSets(dev, &dai, &set)) return NULL;
+    }
+    VkPipeline pipe = VK_NULL_HANDLE;
+    int k = 0;
+    for (; k < 4 && pipes[k].code; k++)
+        if (pipes[k].code == code) pipe = pipes[k].pipe;
+    if (!pipe) {
+        if (k == 4) return NULL;
+        VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size, code};
         VkShaderModule sm;
-        if (vkCreateDescriptorSetLayout(dev, &dci, NULL, &dsl) || vkCreatePipelineLayout(dev, &plci, NULL, &layout) ||
-            vkCreateShaderModule(dev, &smci, NULL, &sm))
-            return NULL;
+        if (vkCreateShaderModule(dev, &smci, NULL, &sm)) return NULL;
         VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
                                             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL},
                                             layout, VK_NULL_HANDLE, 0};
         VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe);
         vkDestroyShaderModule(dev, sm, NULL);
-        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
-        VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 1, &ps};
-        VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, 1, &dsl};
-        if (r || vkCreateDescriptorPool(dev, &dpci, NULL, &dpool)) return NULL;
-        dai.descriptorPool = dpool;
-        if (vkAllocateDescriptorSets(dev, &dai, &set)) return NULL;
+        if (r) return NULL;
+        pipes[k].code = code;
+        pipes[k].pipe = pipe;
     }
     VkDeviceSize n = (VkDeviceSize)bw * bh * 16;
     VkDeviceMemory sm, dm;
     void *sp, *dp;
-    VkBuffer src = host_buffer(n, &sm, &sp), dst = host_buffer(n, &dm, &dp);
+    VkBuffer src = host_buffer(n, &sm, &sp), dst = host_buffer(out_bytes, &dm, &dp);
     memcpy(sp, blocks, n);
-    memset(dp, 0, n);
+    memset(dp, 0, out_bytes);
     VkDescriptorBufferInfo bi[2] = {{src, 0, VK_WHOLE_SIZE}, {dst, 0, VK_WHOLE_SIZE}};
     VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[0], NULL},
                                   {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[1], NULL}};
     vkUpdateDescriptorSets(dev, 2, wr, 0, NULL);
     /* push constants as the bridge's pc_t: src_word, row_blocks, layer_blocks, flags (2: signed),
      * dst_word, pad, extent */
-    uint32_t pc[8] = {0, bw, bw * bh, sgn ? 2u : 0u, 0, 0, bw * 4, bh * 4};
+    uint32_t pc[8] = {0, bw, bw * bh, flags, 0, 0, bw * 4, bh * 4};
     VkCommandBuffer cb = begin();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
@@ -1946,13 +2110,66 @@ static uint8_t *run_bc6h_astc(const uint8_t *blocks, uint32_t bw, uint32_t bh, i
     submit(cb);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (ms) *ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    uint8_t *out = malloc(n);
-    memcpy(out, dp, n);
+    uint8_t *out = malloc(out_bytes);
+    memcpy(out, dp, out_bytes);
     vkDestroyBuffer(dev, src, NULL);
     vkDestroyBuffer(dev, dst, NULL);
     vkFreeMemory(dev, sm, NULL);
     vkFreeMemory(dev, dm, NULL);
     return out;
+}
+
+/* The bridge's BC6H transcoder run directly: the ASTC blocks. Lets the encoder be checked by PSNR
+ * (astc_decode) on a GPU that cannot sample ASTC HDR, and on one that can, apart from how the
+ * bridge picks and creates the image. */
+static uint8_t *run_bc6h_astc(const uint8_t *blocks, uint32_t bw, uint32_t bh, int sgn, double *ms)
+{
+    return run_spv(spv_bc6h_astc, sizeof(spv_bc6h_astc), blocks, bw, bh, sgn ? 2u : 0u, (VkDeviceSize)bw * bh * 16, ms);
+}
+
+/* The bridge's exact BC7 decoder (spv_bc7) run directly, with no bridge between it and the driver
+ * when bcn_check runs natively: random blocks cycled, at random and pure (layout_blocks), the
+ * RGBA8 texels compared with bcdec (off by 1 at most), the wrong blocks per mode on a failure. */
+static void test_bc7_shader(void)
+{
+    enum { BW = 64, BH = 64, NB = BW * BH };
+    uint8_t *bc = malloc((size_t)NB * 16);
+    int mode[NB], wrong[NB];
+    for (int l = 0; l < 2 + 8; l++) {
+        int layout = l < 2 ? (l ? LAYOUT_RANDOM : LAYOUT_CYCLED) : LAYOUT_PURE, pm = l - 2;
+        layout_blocks(VK_FORMAT_BC7_UNORM_BLOCK, bc, NB, layout, pm, mode);
+        uint8_t *px = run_spv(spv_bc7, sizeof(spv_bc7), bc, BW, BH, 0, (VkDeviceSize)NB * 64, NULL);
+        char name[64];
+        if (layout == LAYOUT_PURE) snprintf(name, sizeof(name), "BC7 decoder (shader), only mode %d", pm);
+        else snprintf(name, sizeof(name), "BC7 decoder (shader), %s modes", layout_name[layout]);
+        if (!px) {
+            printf("FAIL %s: cannot run the decoder\n", name);
+            failures++;
+            break;
+        }
+        int bad = 0;
+        for (int i = 0; i < NB; i++) {
+            uint8_t want[16 * 4];
+            bcdec_bc7(bc + (size_t)i * 16, want, 16);
+            wrong[i] = 0;
+            for (int t = 0; t < 16; t++)
+                for (int ch = 0; ch < 4; ch++) {
+                    int x = i % BW * 4 + (t & 3), y = i / BW * 4 + (t >> 2);
+                    int d = (int)px[((size_t)y * BW * 4 + x) * 4 + ch] - want[t * 4 + ch];
+                    if (d > 1 || d < -1) wrong[i] = 1;
+                }
+            bad += wrong[i];
+        }
+        if (bad) {
+            printf("FAIL %s: %d of %d blocks differ from bcdec\n", name, bad, NB);
+            print_mode_counts(mode, wrong, NB, 9);
+            failures++;
+        } else {
+            printf("PASS %s: %d blocks match bcdec\n", name, NB);
+        }
+        free(px);
+    }
+    free(bc);
 }
 
 /* PSNR (dB, linear values, peak: the largest reference value) of ASTC blocks against the BC6H
@@ -2280,13 +2497,14 @@ static void test_many_cbs(void)
 
 int main(int argc, char **argv)
 {
-    int gpu = 0, hdr_only = 0;
+    int gpu = 0, hdr_only = 0, bc7_only = 0;
     const char *pcache_file = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "transcode")) tx = 1;
         else if (!strcmp(argv[i], "astc6")) astc_n = 6;
         else if (!strcmp(argv[i], "astc8")) astc_n = 8;
         else if (!strcmp(argv[i], "hdr")) hdr_only = 1;
+        else if (!strcmp(argv[i], "bc7")) bc7_only = 1;
         else if (!strcmp(argv[i], "pcache")) pcache_file = i + 1 < argc ? argv[++i] : "bcn_check-pcache.bin";
         else gpu = atoi(argv[i]);
     }
@@ -2356,6 +2574,11 @@ int main(int argc, char **argv)
         printf("%s\n", failures ? "FAILED" : "OK");
         return failures ? 1 : 0;
     }
+    if (bc7_only) { /* `bcn_check bc7`: only the BC7 decoder, run directly (any GPU) */
+        test_bc7_shader();
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
     if (hdr_only) { /* `bcn_check hdr`: only the BC6H -> ASTC HDR transcoder, run directly (any GPU) */
         test_hdr_shader();
         printf("%s\n", failures ? "FAILED" : "OK");
@@ -2372,6 +2595,7 @@ int main(int argc, char **argv)
         test_quality(VK_FORMAT_BC3_UNORM_BLOCK, "BC3 -> ASTC 4x4", soft, 4);
         test_quality(VK_FORMAT_BC3_SRGB_BLOCK, "BC3 sRGB -> ASTC 4x4 sRGB", soft, 4);
         test_quality(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4", soft, 4);
+        test_bc7_mixed(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 mixed modes in a workgroup -> ASTC 4x4");
         test_quality(VK_FORMAT_BC4_UNORM_BLOCK, "BC4 -> EAC R11", photo, 3);
         test_quality(VK_FORMAT_BC4_SNORM_BLOCK, "BC4 snorm -> EAC R11 snorm", photo, 3);
         test_quality(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 -> EAC RG11", normal, 1);
@@ -2407,10 +2631,11 @@ int main(int argc, char **argv)
         test_format(VK_FORMAT_BC4_SNORM_BLOCK, "BC4 snorm", 2.5f / 127.0f);
         test_format(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 unorm", u8);
         test_format(VK_FORMAT_BC5_SNORM_BLOCK, "BC5 snorm", 2.5f / 127.0f);
-        test_format(VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H ufloat (all 14 modes)", 0.002f);
-        test_format(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat (all 14 modes)", 0.002f);
-        test_format(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 (all 8 modes)", u8);
+        test_modes(VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H ufloat (all 14 modes)", 0.002f);
+        test_modes(VK_FORMAT_BC6H_SFLOAT_BLOCK, "BC6H sfloat (all 14 modes)", 0.002f);
+        test_modes(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 (all 8 modes)", u8);
     }
+    test_bc7_shader();
     static const VkFormat bc1_list[] = {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK};
     test_shapes(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 shapes, mutable with a format list, sRGB view", u8, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                 bc1_list, 2, VK_FORMAT_BC1_RGBA_SRGB_BLOCK);

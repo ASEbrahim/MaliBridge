@@ -64,7 +64,7 @@ run "$out/bitwise_check" --
 step $? "as it is, not an Arm GPU: off, untouched ($res)"
 # 2
 run "$out/bitwise_check" -- VKBRIDGE_SHL_BARRIER=1
-[ $rc = 0 ] && echo "$new" | grep -q "Mali SPIR-V fixes off, shl_barrier on (VKBRIDGE_SHL_BARRIER)" &&
+[ $rc = 0 ] && echo "$new" | grep -q "Mali SPIR-V fixes off, YCbCr compute samplers kept, shl_barrier on (VKBRIDGE_SHL_BARRIER)" &&
   echo "$new" | grep -q "shl_barrier: optimization barriers after constant left shifts" && total | grep -q ": 1 of 1 module(s) rewritten, [1-9]"
 step $? "VKBRIDGE_SHL_BARRIER=1: $res; $(total)"
 # 3

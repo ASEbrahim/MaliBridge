@@ -23,7 +23,7 @@ VkResult vkb_wire_vkAllocateCommandBuffers(VkDevice device, const VkCommandBuffe
         vkb_enc_u8(e, pCommandBuffers != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkAllocateCommandBuffers");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -40,7 +40,7 @@ VkResult vkb_wire_vkAllocateCommandBuffers(VkDevice device, const VkCommandBuffe
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkAllocateCommandBuffers", r_);
 }
 
 VkResult vkb_wire_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo* pAllocateInfo, VkDescriptorSet* pDescriptorSets)
@@ -60,7 +60,7 @@ VkResult vkb_wire_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSe
         vkb_enc_u8(e, pDescriptorSets != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkAllocateDescriptorSets");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -77,7 +77,7 @@ VkResult vkb_wire_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSe
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkAllocateDescriptorSets", r_);
 }
 
 VkResult vkb_wire_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo, const VkAllocationCallbacks* pAllocator, VkDeviceMemory* pMemory)
@@ -97,7 +97,7 @@ VkResult vkb_wire_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* 
     vkb_enc_u8(e, pMemory != NULL);
     if (pMemory) vkb_enc_bytes(e, pMemory, sizeof(*pMemory));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkAllocateMemory");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -107,7 +107,7 @@ VkResult vkb_wire_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* 
         if (pMemory) vkb_dec_raw_into(d, pMemory, sizeof(*pMemory)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkAllocateMemory", r_);
 }
 
 VkResult vkb_wire_vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo)
@@ -124,14 +124,14 @@ VkResult vkb_wire_vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCo
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkBeginCommandBuffer");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkBeginCommandBuffer", r_);
 }
 
 VkResult vkb_wire_vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset)
@@ -143,11 +143,11 @@ VkResult vkb_wire_vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceM
     vkb_enc_bytes(e, &buffer, sizeof(buffer));
     vkb_enc_bytes(e, &memory, sizeof(memory));
     vkb_enc_bytes(e, &memoryOffset, sizeof(memoryOffset));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkBindBufferMemory");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkBindBufferMemory");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkBindBufferMemory", r_);
 }
 
 VkResult vkb_wire_vkBindBufferMemory2(VkDevice device, uint32_t bindInfoCount, const VkBindBufferMemoryInfo* pBindInfos)
@@ -164,11 +164,11 @@ VkResult vkb_wire_vkBindBufferMemory2(VkDevice device, uint32_t bindInfoCount, c
     } else {
         vkb_enc_u8(e, 0);
     }
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkBindBufferMemory2");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkBindBufferMemory2");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkBindBufferMemory2", r_);
 }
 
 VkResult vkb_wire_vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset)
@@ -180,11 +180,11 @@ VkResult vkb_wire_vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemo
     vkb_enc_bytes(e, &image, sizeof(image));
     vkb_enc_bytes(e, &memory, sizeof(memory));
     vkb_enc_bytes(e, &memoryOffset, sizeof(memoryOffset));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkBindImageMemory");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkBindImageMemory");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkBindImageMemory", r_);
 }
 
 VkResult vkb_wire_vkBindImageMemory2(VkDevice device, uint32_t bindInfoCount, const VkBindImageMemoryInfo* pBindInfos)
@@ -201,11 +201,11 @@ VkResult vkb_wire_vkBindImageMemory2(VkDevice device, uint32_t bindInfoCount, co
     } else {
         vkb_enc_u8(e, 0);
     }
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkBindImageMemory2");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkBindImageMemory2");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkBindImageMemory2", r_);
 }
 
 VkResult vkb_wire_vkBindTensorMemoryARM(VkDevice device, uint32_t bindInfoCount, const VkBindTensorMemoryInfoARM* pBindInfos)
@@ -223,14 +223,14 @@ VkResult vkb_wire_vkBindTensorMemoryARM(VkDevice device, uint32_t bindInfoCount,
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkBindTensorMemoryARM");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkBindTensorMemoryARM", r_);
 }
 
 void vkb_wire_vkCmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer, const VkConditionalRenderingBeginInfoEXT* pConditionalRenderingBegin)
@@ -2144,7 +2144,7 @@ VkResult vkb_wire_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCre
     vkb_enc_u8(e, pBuffer != NULL);
     if (pBuffer) vkb_enc_bytes(e, pBuffer, sizeof(*pBuffer));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateBuffer");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2154,7 +2154,7 @@ VkResult vkb_wire_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCre
         if (pBuffer) vkb_dec_raw_into(d, pBuffer, sizeof(*pBuffer)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateBuffer", r_);
 }
 
 VkResult vkb_wire_vkCreateBufferView(VkDevice device, const VkBufferViewCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkBufferView* pView)
@@ -2174,7 +2174,7 @@ VkResult vkb_wire_vkCreateBufferView(VkDevice device, const VkBufferViewCreateIn
     vkb_enc_u8(e, pView != NULL);
     if (pView) vkb_enc_bytes(e, pView, sizeof(*pView));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateBufferView");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2184,7 +2184,7 @@ VkResult vkb_wire_vkCreateBufferView(VkDevice device, const VkBufferViewCreateIn
         if (pView) vkb_dec_raw_into(d, pView, sizeof(*pView)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateBufferView", r_);
 }
 
 VkResult vkb_wire_vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkCommandPool* pCommandPool)
@@ -2204,7 +2204,7 @@ VkResult vkb_wire_vkCreateCommandPool(VkDevice device, const VkCommandPoolCreate
     vkb_enc_u8(e, pCommandPool != NULL);
     if (pCommandPool) vkb_enc_bytes(e, pCommandPool, sizeof(*pCommandPool));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateCommandPool");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2214,7 +2214,7 @@ VkResult vkb_wire_vkCreateCommandPool(VkDevice device, const VkCommandPoolCreate
         if (pCommandPool) vkb_dec_raw_into(d, pCommandPool, sizeof(*pCommandPool)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateCommandPool", r_);
 }
 
 VkResult vkb_wire_vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount, const VkComputePipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines)
@@ -2237,7 +2237,7 @@ VkResult vkb_wire_vkCreateComputePipelines(VkDevice device, VkPipelineCache pipe
         vkb_enc_u8(e, pPipelines != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateComputePipelines");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2254,7 +2254,7 @@ VkResult vkb_wire_vkCreateComputePipelines(VkDevice device, VkPipelineCache pipe
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateComputePipelines", r_);
 }
 
 VkResult vkb_wire_vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDescriptorPool* pDescriptorPool)
@@ -2274,7 +2274,7 @@ VkResult vkb_wire_vkCreateDescriptorPool(VkDevice device, const VkDescriptorPool
     vkb_enc_u8(e, pDescriptorPool != NULL);
     if (pDescriptorPool) vkb_enc_bytes(e, pDescriptorPool, sizeof(*pDescriptorPool));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateDescriptorPool");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2284,7 +2284,7 @@ VkResult vkb_wire_vkCreateDescriptorPool(VkDevice device, const VkDescriptorPool
         if (pDescriptorPool) vkb_dec_raw_into(d, pDescriptorPool, sizeof(*pDescriptorPool)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateDescriptorPool", r_);
 }
 
 VkResult vkb_wire_vkCreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDescriptorSetLayout* pSetLayout)
@@ -2304,7 +2304,7 @@ VkResult vkb_wire_vkCreateDescriptorSetLayout(VkDevice device, const VkDescripto
     vkb_enc_u8(e, pSetLayout != NULL);
     if (pSetLayout) vkb_enc_bytes(e, pSetLayout, sizeof(*pSetLayout));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateDescriptorSetLayout");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2314,7 +2314,7 @@ VkResult vkb_wire_vkCreateDescriptorSetLayout(VkDevice device, const VkDescripto
         if (pSetLayout) vkb_dec_raw_into(d, pSetLayout, sizeof(*pSetLayout)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateDescriptorSetLayout", r_);
 }
 
 VkResult vkb_wire_vkCreateDescriptorUpdateTemplate(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDescriptorUpdateTemplate* pDescriptorUpdateTemplate)
@@ -2334,7 +2334,7 @@ VkResult vkb_wire_vkCreateDescriptorUpdateTemplate(VkDevice device, const VkDesc
     vkb_enc_u8(e, pDescriptorUpdateTemplate != NULL);
     if (pDescriptorUpdateTemplate) vkb_enc_bytes(e, pDescriptorUpdateTemplate, sizeof(*pDescriptorUpdateTemplate));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateDescriptorUpdateTemplate");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2344,7 +2344,7 @@ VkResult vkb_wire_vkCreateDescriptorUpdateTemplate(VkDevice device, const VkDesc
         if (pDescriptorUpdateTemplate) vkb_dec_raw_into(d, pDescriptorUpdateTemplate, sizeof(*pDescriptorUpdateTemplate)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateDescriptorUpdateTemplate", r_);
 }
 
 VkResult vkb_wire_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
@@ -2363,7 +2363,7 @@ VkResult vkb_wire_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
     (void)pAllocator;
     vkb_enc_u8(e, pDevice != NULL);
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateDevice");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2374,7 +2374,7 @@ VkResult vkb_wire_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         if (pDevice) *pDevice = h_;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateDevice", r_);
 }
 
 VkResult vkb_wire_vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkEvent* pEvent)
@@ -2394,7 +2394,7 @@ VkResult vkb_wire_vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreat
     vkb_enc_u8(e, pEvent != NULL);
     if (pEvent) vkb_enc_bytes(e, pEvent, sizeof(*pEvent));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateEvent");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2404,7 +2404,7 @@ VkResult vkb_wire_vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreat
         if (pEvent) vkb_dec_raw_into(d, pEvent, sizeof(*pEvent)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateEvent", r_);
 }
 
 VkResult vkb_wire_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFence* pFence)
@@ -2424,7 +2424,7 @@ VkResult vkb_wire_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreat
     vkb_enc_u8(e, pFence != NULL);
     if (pFence) vkb_enc_bytes(e, pFence, sizeof(*pFence));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateFence");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2434,7 +2434,7 @@ VkResult vkb_wire_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreat
         if (pFence) vkb_dec_raw_into(d, pFence, sizeof(*pFence)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateFence", r_);
 }
 
 VkResult vkb_wire_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFramebuffer* pFramebuffer)
@@ -2454,7 +2454,7 @@ VkResult vkb_wire_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreate
     vkb_enc_u8(e, pFramebuffer != NULL);
     if (pFramebuffer) vkb_enc_bytes(e, pFramebuffer, sizeof(*pFramebuffer));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateFramebuffer");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2464,7 +2464,7 @@ VkResult vkb_wire_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreate
         if (pFramebuffer) vkb_dec_raw_into(d, pFramebuffer, sizeof(*pFramebuffer)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateFramebuffer", r_);
 }
 
 VkResult vkb_wire_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount, const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines)
@@ -2487,7 +2487,7 @@ VkResult vkb_wire_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pip
         vkb_enc_u8(e, pPipelines != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateGraphicsPipelines");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2504,7 +2504,7 @@ VkResult vkb_wire_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pip
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateGraphicsPipelines", r_);
 }
 
 VkResult vkb_wire_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImage* pImage)
@@ -2524,7 +2524,7 @@ VkResult vkb_wire_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreat
     vkb_enc_u8(e, pImage != NULL);
     if (pImage) vkb_enc_bytes(e, pImage, sizeof(*pImage));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateImage");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2534,7 +2534,7 @@ VkResult vkb_wire_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreat
         if (pImage) vkb_dec_raw_into(d, pImage, sizeof(*pImage)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateImage", r_);
 }
 
 VkResult vkb_wire_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImageView* pView)
@@ -2554,7 +2554,7 @@ VkResult vkb_wire_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo
     vkb_enc_u8(e, pView != NULL);
     if (pView) vkb_enc_bytes(e, pView, sizeof(*pView));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateImageView");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2564,7 +2564,7 @@ VkResult vkb_wire_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo
         if (pView) vkb_dec_raw_into(d, pView, sizeof(*pView)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateImageView", r_);
 }
 
 VkResult vkb_wire_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance)
@@ -2582,7 +2582,7 @@ VkResult vkb_wire_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
     (void)pAllocator;
     vkb_enc_u8(e, pInstance != NULL);
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateInstance");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2593,7 +2593,7 @@ VkResult vkb_wire_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
         if (pInstance) *pInstance = h_;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateInstance", r_);
 }
 
 VkResult vkb_wire_vkCreatePipelineCache(VkDevice device, const VkPipelineCacheCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPipelineCache* pPipelineCache)
@@ -2613,7 +2613,7 @@ VkResult vkb_wire_vkCreatePipelineCache(VkDevice device, const VkPipelineCacheCr
     vkb_enc_u8(e, pPipelineCache != NULL);
     if (pPipelineCache) vkb_enc_bytes(e, pPipelineCache, sizeof(*pPipelineCache));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreatePipelineCache");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2623,7 +2623,7 @@ VkResult vkb_wire_vkCreatePipelineCache(VkDevice device, const VkPipelineCacheCr
         if (pPipelineCache) vkb_dec_raw_into(d, pPipelineCache, sizeof(*pPipelineCache)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreatePipelineCache", r_);
 }
 
 VkResult vkb_wire_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPipelineLayout* pPipelineLayout)
@@ -2643,7 +2643,7 @@ VkResult vkb_wire_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayout
     vkb_enc_u8(e, pPipelineLayout != NULL);
     if (pPipelineLayout) vkb_enc_bytes(e, pPipelineLayout, sizeof(*pPipelineLayout));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreatePipelineLayout");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2653,7 +2653,7 @@ VkResult vkb_wire_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayout
         if (pPipelineLayout) vkb_dec_raw_into(d, pPipelineLayout, sizeof(*pPipelineLayout)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreatePipelineLayout", r_);
 }
 
 VkResult vkb_wire_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkQueryPool* pQueryPool)
@@ -2673,7 +2673,7 @@ VkResult vkb_wire_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo
     vkb_enc_u8(e, pQueryPool != NULL);
     if (pQueryPool) vkb_enc_bytes(e, pQueryPool, sizeof(*pQueryPool));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateQueryPool");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2683,7 +2683,7 @@ VkResult vkb_wire_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo
         if (pQueryPool) vkb_dec_raw_into(d, pQueryPool, sizeof(*pQueryPool)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateQueryPool", r_);
 }
 
 VkResult vkb_wire_vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkRenderPass* pRenderPass)
@@ -2703,7 +2703,7 @@ VkResult vkb_wire_vkCreateRenderPass(VkDevice device, const VkRenderPassCreateIn
     vkb_enc_u8(e, pRenderPass != NULL);
     if (pRenderPass) vkb_enc_bytes(e, pRenderPass, sizeof(*pRenderPass));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateRenderPass");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2713,7 +2713,7 @@ VkResult vkb_wire_vkCreateRenderPass(VkDevice device, const VkRenderPassCreateIn
         if (pRenderPass) vkb_dec_raw_into(d, pRenderPass, sizeof(*pRenderPass)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateRenderPass", r_);
 }
 
 VkResult vkb_wire_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkRenderPass* pRenderPass)
@@ -2733,7 +2733,7 @@ VkResult vkb_wire_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateI
     vkb_enc_u8(e, pRenderPass != NULL);
     if (pRenderPass) vkb_enc_bytes(e, pRenderPass, sizeof(*pRenderPass));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateRenderPass2");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2743,7 +2743,7 @@ VkResult vkb_wire_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateI
         if (pRenderPass) vkb_dec_raw_into(d, pRenderPass, sizeof(*pRenderPass)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateRenderPass2", r_);
 }
 
 VkResult vkb_wire_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSampler* pSampler)
@@ -2763,7 +2763,7 @@ VkResult vkb_wire_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pC
     vkb_enc_u8(e, pSampler != NULL);
     if (pSampler) vkb_enc_bytes(e, pSampler, sizeof(*pSampler));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateSampler");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2773,7 +2773,7 @@ VkResult vkb_wire_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pC
         if (pSampler) vkb_dec_raw_into(d, pSampler, sizeof(*pSampler)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateSampler", r_);
 }
 
 VkResult vkb_wire_vkCreateSamplerYcbcrConversion(VkDevice device, const VkSamplerYcbcrConversionCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSamplerYcbcrConversion* pYcbcrConversion)
@@ -2793,7 +2793,7 @@ VkResult vkb_wire_vkCreateSamplerYcbcrConversion(VkDevice device, const VkSample
     vkb_enc_u8(e, pYcbcrConversion != NULL);
     if (pYcbcrConversion) vkb_enc_bytes(e, pYcbcrConversion, sizeof(*pYcbcrConversion));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateSamplerYcbcrConversion");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2803,7 +2803,7 @@ VkResult vkb_wire_vkCreateSamplerYcbcrConversion(VkDevice device, const VkSample
         if (pYcbcrConversion) vkb_dec_raw_into(d, pYcbcrConversion, sizeof(*pYcbcrConversion)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateSamplerYcbcrConversion", r_);
 }
 
 VkResult vkb_wire_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore)
@@ -2823,7 +2823,7 @@ VkResult vkb_wire_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo
     vkb_enc_u8(e, pSemaphore != NULL);
     if (pSemaphore) vkb_enc_bytes(e, pSemaphore, sizeof(*pSemaphore));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateSemaphore");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2833,7 +2833,7 @@ VkResult vkb_wire_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo
         if (pSemaphore) vkb_dec_raw_into(d, pSemaphore, sizeof(*pSemaphore)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateSemaphore", r_);
 }
 
 VkResult vkb_wire_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkShaderModule* pShaderModule)
@@ -2853,7 +2853,7 @@ VkResult vkb_wire_vkCreateShaderModule(VkDevice device, const VkShaderModuleCrea
     vkb_enc_u8(e, pShaderModule != NULL);
     if (pShaderModule) vkb_enc_bytes(e, pShaderModule, sizeof(*pShaderModule));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateShaderModule");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2863,7 +2863,7 @@ VkResult vkb_wire_vkCreateShaderModule(VkDevice device, const VkShaderModuleCrea
         if (pShaderModule) vkb_dec_raw_into(d, pShaderModule, sizeof(*pShaderModule)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateShaderModule", r_);
 }
 
 VkResult vkb_wire_vkCreateTensorARM(VkDevice device, const VkTensorCreateInfoARM* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkTensorARM* pTensor)
@@ -2883,7 +2883,7 @@ VkResult vkb_wire_vkCreateTensorARM(VkDevice device, const VkTensorCreateInfoARM
     vkb_enc_u8(e, pTensor != NULL);
     if (pTensor) vkb_enc_bytes(e, pTensor, sizeof(*pTensor));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateTensorARM");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2893,7 +2893,7 @@ VkResult vkb_wire_vkCreateTensorARM(VkDevice device, const VkTensorCreateInfoARM
         if (pTensor) vkb_dec_raw_into(d, pTensor, sizeof(*pTensor)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateTensorARM", r_);
 }
 
 VkResult vkb_wire_vkCreateTensorViewARM(VkDevice device, const VkTensorViewCreateInfoARM* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkTensorViewARM* pView)
@@ -2913,7 +2913,7 @@ VkResult vkb_wire_vkCreateTensorViewARM(VkDevice device, const VkTensorViewCreat
     vkb_enc_u8(e, pView != NULL);
     if (pView) vkb_enc_bytes(e, pView, sizeof(*pView));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkCreateTensorViewARM");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -2923,7 +2923,7 @@ VkResult vkb_wire_vkCreateTensorViewARM(VkDevice device, const VkTensorViewCreat
         if (pView) vkb_dec_raw_into(d, pView, sizeof(*pView)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkCreateTensorViewARM", r_);
 }
 
 void vkb_wire_vkDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator)
@@ -3195,14 +3195,14 @@ VkResult vkb_wire_vkDeviceWaitIdle(VkDevice device)
     vkb_enc *e = &call_.e;
     vkb_enc_u64(e, vkb_remote((const void *)device));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkDeviceWaitIdle");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkDeviceWaitIdle", r_);
 }
 
 VkResult vkb_wire_vkEndCommandBuffer(VkCommandBuffer commandBuffer)
@@ -3212,14 +3212,14 @@ VkResult vkb_wire_vkEndCommandBuffer(VkCommandBuffer commandBuffer)
     vkb_enc *e = &call_.e;
     vkb_enc_u64(e, vkb_remote((const void *)commandBuffer));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEndCommandBuffer");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEndCommandBuffer", r_);
 }
 
 VkResult vkb_wire_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties)
@@ -3235,7 +3235,7 @@ VkResult vkb_wire_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physical
         vkb_enc_u8(e, pProperties != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEnumerateDeviceExtensionProperties");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3256,7 +3256,7 @@ VkResult vkb_wire_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physical
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEnumerateDeviceExtensionProperties", r_);
 }
 
 VkResult vkb_wire_vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties)
@@ -3271,7 +3271,7 @@ VkResult vkb_wire_vkEnumerateInstanceExtensionProperties(const char* pLayerName,
         vkb_enc_u8(e, pProperties != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEnumerateInstanceExtensionProperties");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3292,7 +3292,7 @@ VkResult vkb_wire_vkEnumerateInstanceExtensionProperties(const char* pLayerName,
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEnumerateInstanceExtensionProperties", r_);
 }
 
 VkResult vkb_wire_vkEnumerateInstanceLayerProperties(uint32_t* pPropertyCount, VkLayerProperties* pProperties)
@@ -3306,7 +3306,7 @@ VkResult vkb_wire_vkEnumerateInstanceLayerProperties(uint32_t* pPropertyCount, V
         vkb_enc_u8(e, pProperties != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEnumerateInstanceLayerProperties");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3327,7 +3327,7 @@ VkResult vkb_wire_vkEnumerateInstanceLayerProperties(uint32_t* pPropertyCount, V
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEnumerateInstanceLayerProperties", r_);
 }
 
 VkResult vkb_wire_vkEnumerateInstanceVersion(uint32_t* pApiVersion)
@@ -3338,7 +3338,7 @@ VkResult vkb_wire_vkEnumerateInstanceVersion(uint32_t* pApiVersion)
     vkb_enc_u8(e, pApiVersion != NULL);
     if (pApiVersion) vkb_enc_bytes(e, pApiVersion, sizeof(*pApiVersion));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEnumerateInstanceVersion");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3348,7 +3348,7 @@ VkResult vkb_wire_vkEnumerateInstanceVersion(uint32_t* pApiVersion)
         if (pApiVersion) vkb_dec_raw_into(d, pApiVersion, sizeof(*pApiVersion)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEnumerateInstanceVersion", r_);
 }
 
 VkResult vkb_wire_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* pPhysicalDeviceGroupCount, VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties)
@@ -3364,7 +3364,7 @@ VkResult vkb_wire_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t*
         for (uint32_t i_ = 0; pPhysicalDeviceGroupProperties && i_ < n_; i_++) vkb_enc_out_template(e, &pPhysicalDeviceGroupProperties[i_], sizeof(VkPhysicalDeviceGroupProperties));
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEnumeratePhysicalDeviceGroups");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3385,7 +3385,7 @@ VkResult vkb_wire_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t*
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEnumeratePhysicalDeviceGroups", r_);
 }
 
 VkResult vkb_wire_vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, uint32_t* pCounterCount, VkPerformanceCounterARM* pCounters, VkPerformanceCounterDescriptionARM* pCounterDescriptions)
@@ -3406,7 +3406,7 @@ VkResult vkb_wire_vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegio
         for (uint32_t i_ = 0; pCounterDescriptions && i_ < n_; i_++) vkb_enc_out_template(e, &pCounterDescriptions[i_], sizeof(VkPerformanceCounterDescriptionARM));
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3438,7 +3438,7 @@ VkResult vkb_wire_vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegio
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM", r_);
 }
 
 VkResult vkb_wire_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhysicalDeviceCount, VkPhysicalDevice* pPhysicalDevices)
@@ -3453,7 +3453,7 @@ VkResult vkb_wire_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhy
         vkb_enc_u8(e, pPhysicalDevices != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkEnumeratePhysicalDevices");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3474,7 +3474,7 @@ VkResult vkb_wire_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhy
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkEnumeratePhysicalDevices", r_);
 }
 
 VkResult vkb_wire_vkFlushMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange* pMemoryRanges)
@@ -3492,14 +3492,14 @@ VkResult vkb_wire_vkFlushMappedMemoryRanges(VkDevice device, uint32_t memoryRang
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkFlushMappedMemoryRanges");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkFlushMappedMemoryRanges", r_);
 }
 
 void vkb_wire_vkFreeCommandBuffers(VkDevice device, VkCommandPool commandPool, uint32_t commandBufferCount, const VkCommandBuffer* pCommandBuffers)
@@ -3535,11 +3535,11 @@ VkResult vkb_wire_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descrip
     } else {
         vkb_enc_u8(e, 0);
     }
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkFreeDescriptorSets");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkFreeDescriptorSets");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkFreeDescriptorSets", r_);
 }
 
 void vkb_wire_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator)
@@ -3666,7 +3666,7 @@ VkResult vkb_wire_vkGetCalibratedTimestampsKHR(VkDevice device, uint32_t timesta
     vkb_enc_u8(e, pMaxDeviation != NULL);
     if (pMaxDeviation) vkb_enc_bytes(e, pMaxDeviation, sizeof(*pMaxDeviation));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetCalibratedTimestampsKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -3686,7 +3686,7 @@ VkResult vkb_wire_vkGetCalibratedTimestampsKHR(VkDevice device, uint32_t timesta
         if (pMaxDeviation) vkb_dec_raw_into(d, pMaxDeviation, sizeof(*pMaxDeviation)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetCalibratedTimestampsKHR", r_);
 }
 
 void vkb_wire_vkGetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptorSetLayoutCreateInfo* pCreateInfo, VkDescriptorSetLayoutSupport* pSupport)
@@ -3981,14 +3981,14 @@ VkResult vkb_wire_vkGetEventStatus(VkDevice device, VkEvent event)
     vkb_enc_u64(e, vkb_remote((const void *)device));
     vkb_enc_bytes(e, &event, sizeof(event));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetEventStatus");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetEventStatus", r_);
 }
 
 VkResult vkb_wire_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pGetFdInfo, int* pFd)
@@ -4006,7 +4006,7 @@ VkResult vkb_wire_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pG
     }
     vkb_enc_u8(e, pFd != NULL);
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetFenceFdKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4014,7 +4014,7 @@ VkResult vkb_wire_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pG
     vkb_dec_bytes(d, &r_, sizeof(r_));
     { int fd_ = vkb_dec_fd(d); if (pFd) *pFd = fd_; else if (fd_ >= 0) vkb_close_fd(fd_); }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetFenceFdKHR", r_);
 }
 
 VkResult vkb_wire_vkGetFenceStatus(VkDevice device, VkFence fence)
@@ -4025,14 +4025,14 @@ VkResult vkb_wire_vkGetFenceStatus(VkDevice device, VkFence fence)
     vkb_enc_u64(e, vkb_remote((const void *)device));
     vkb_enc_bytes(e, &fence, sizeof(fence));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetFenceStatus");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetFenceStatus", r_);
 }
 
 VkResult vkb_wire_vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkImage image, VkImageDrmFormatModifierPropertiesEXT* pProperties)
@@ -4045,7 +4045,7 @@ VkResult vkb_wire_vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkIm
     vkb_enc_u8(e, pProperties != NULL);
     if (pProperties) vkb_enc_out_template(e, pProperties, sizeof(VkImageDrmFormatModifierPropertiesEXT));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetImageDrmFormatModifierPropertiesEXT");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4055,7 +4055,7 @@ VkResult vkb_wire_vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkIm
         if (pProperties) vkb_dec_out_struct(d, pProperties, sizeof(VkImageDrmFormatModifierPropertiesEXT)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetImageDrmFormatModifierPropertiesEXT", r_);
 }
 
 void vkb_wire_vkGetImageMemoryRequirements(VkDevice device, VkImage image, VkMemoryRequirements* pMemoryRequirements)
@@ -4246,7 +4246,7 @@ VkResult vkb_wire_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR* 
     }
     vkb_enc_u8(e, pFd != NULL);
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetMemoryFdKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4254,7 +4254,7 @@ VkResult vkb_wire_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR* 
     vkb_dec_bytes(d, &r_, sizeof(r_));
     { int fd_ = vkb_dec_fd(d); if (pFd) *pFd = fd_; else if (fd_ >= 0) vkb_close_fd(fd_); }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetMemoryFdKHR", r_);
 }
 
 VkResult vkb_wire_vkGetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType, int fd, VkMemoryFdPropertiesKHR* pMemoryFdProperties)
@@ -4268,7 +4268,7 @@ VkResult vkb_wire_vkGetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHa
     vkb_enc_u8(e, pMemoryFdProperties != NULL);
     if (pMemoryFdProperties) vkb_enc_out_template(e, pMemoryFdProperties, sizeof(VkMemoryFdPropertiesKHR));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetMemoryFdPropertiesKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4278,7 +4278,7 @@ VkResult vkb_wire_vkGetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHa
         if (pMemoryFdProperties) vkb_dec_out_struct(d, pMemoryFdProperties, sizeof(VkMemoryFdPropertiesKHR)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetMemoryFdPropertiesKHR", r_);
 }
 
 VkResult vkb_wire_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice physicalDevice, uint32_t* pTimeDomainCount, VkTimeDomainKHR* pTimeDomains)
@@ -4293,7 +4293,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevic
         vkb_enc_u8(e, pTimeDomains != NULL); vkb_enc_u32(e, n_);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetPhysicalDeviceCalibrateableTimeDomainsKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4314,7 +4314,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevic
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetPhysicalDeviceCalibrateableTimeDomainsKHR", r_);
 }
 
 VkResult vkb_wire_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDevice, uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties)
@@ -4330,7 +4330,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDe
         for (uint32_t i_ = 0; pProperties && i_ < n_; i_++) vkb_enc_out_template(e, &pProperties[i_], sizeof(VkCooperativeMatrixPropertiesKHR));
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4351,7 +4351,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDe
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR", r_);
 }
 
 void vkb_wire_vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalBufferInfo* pExternalBufferInfo, VkExternalBufferProperties* pExternalBufferProperties)
@@ -4547,7 +4547,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceFragmentShadingRatesKHR(VkPhysicalDevice ph
         for (uint32_t i_ = 0; pFragmentShadingRates && i_ < n_; i_++) vkb_enc_out_template(e, &pFragmentShadingRates[i_], sizeof(VkPhysicalDeviceFragmentShadingRateKHR));
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetPhysicalDeviceFragmentShadingRatesKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4568,7 +4568,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceFragmentShadingRatesKHR(VkPhysicalDevice ph
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetPhysicalDeviceFragmentShadingRatesKHR", r_);
 }
 
 VkResult vkb_wire_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties* pImageFormatProperties)
@@ -4584,7 +4584,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice phys
     vkb_enc_bytes(e, &flags, sizeof(flags));
     vkb_enc_u8(e, pImageFormatProperties != NULL);
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetPhysicalDeviceImageFormatProperties");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4594,7 +4594,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice phys
         if (pImageFormatProperties) vkb_dec_raw_into(d, pImageFormatProperties, sizeof(*pImageFormatProperties)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetPhysicalDeviceImageFormatProperties", r_);
 }
 
 VkResult vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo, VkImageFormatProperties2* pImageFormatProperties)
@@ -4613,7 +4613,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice phy
     vkb_enc_u8(e, pImageFormatProperties != NULL);
     if (pImageFormatProperties) vkb_enc_out_template(e, pImageFormatProperties, sizeof(VkImageFormatProperties2));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetPhysicalDeviceImageFormatProperties2");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4623,7 +4623,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice phy
         if (pImageFormatProperties) vkb_dec_out_struct(d, pImageFormatProperties, sizeof(VkImageFormatProperties2)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetPhysicalDeviceImageFormatProperties2", r_);
 }
 
 void vkb_wire_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties* pMemoryProperties)
@@ -4879,7 +4879,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceToolProperties(VkPhysicalDevice physicalDev
         for (uint32_t i_ = 0; pToolProperties && i_ < n_; i_++) vkb_enc_out_template(e, &pToolProperties[i_], sizeof(VkPhysicalDeviceToolProperties));
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetPhysicalDeviceToolProperties");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4900,7 +4900,7 @@ VkResult vkb_wire_vkGetPhysicalDeviceToolProperties(VkPhysicalDevice physicalDev
         }
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetPhysicalDeviceToolProperties", r_);
 }
 
 VkResult vkb_wire_vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache, size_t* pDataSize, void* pData)
@@ -4914,7 +4914,7 @@ VkResult vkb_wire_vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipeli
     if (pDataSize) vkb_enc_bytes(e, pDataSize, sizeof(*pDataSize));
     vkb_enc_u8(e, pData != NULL); vkb_enc_u64(e, pData ? (uint64_t)*pDataSize : 0);
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetPipelineCacheData");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4925,7 +4925,7 @@ VkResult vkb_wire_vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipeli
     }
     { uint64_t sz_ = vkb_dec_u64(d); if (pDataSize) { size_t cap_ = pData ? *pDataSize : 0; *pDataSize = (size_t)sz_; vkb_dec_blob_into(d, pData, cap_); } else vkb_dec_blob_into(d, NULL, 0); }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetPipelineCacheData", r_);
 }
 
 VkResult vkb_wire_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, size_t dataSize, void* pData, VkDeviceSize stride, VkQueryResultFlags flags)
@@ -4942,7 +4942,7 @@ VkResult vkb_wire_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, 
     vkb_enc_bytes(e, &stride, sizeof(stride));
     vkb_enc_bytes(e, &flags, sizeof(flags));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetQueryPoolResults");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -4950,7 +4950,7 @@ VkResult vkb_wire_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, 
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_dec_blob_into(d, pData, (size_t)(dataSize));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetQueryPoolResults", r_);
 }
 
 void vkb_wire_vkGetRenderAreaGranularity(VkDevice device, VkRenderPass renderPass, VkExtent2D* pGranularity)
@@ -5007,7 +5007,7 @@ VkResult vkb_wire_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaph
     vkb_enc_u8(e, pValue != NULL);
     if (pValue) vkb_enc_bytes(e, pValue, sizeof(*pValue));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetSemaphoreCounterValue");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -5017,7 +5017,7 @@ VkResult vkb_wire_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaph
         if (pValue) vkb_dec_raw_into(d, pValue, sizeof(*pValue)); else d->err = 1;
     }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetSemaphoreCounterValue", r_);
 }
 
 VkResult vkb_wire_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd)
@@ -5035,7 +5035,7 @@ VkResult vkb_wire_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInf
     }
     vkb_enc_u8(e, pFd != NULL);
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkGetSemaphoreFdKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
@@ -5043,7 +5043,7 @@ VkResult vkb_wire_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInf
     vkb_dec_bytes(d, &r_, sizeof(r_));
     { int fd_ = vkb_dec_fd(d); if (pFd) *pFd = fd_; else if (fd_ >= 0) vkb_close_fd(fd_); }
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkGetSemaphoreFdKHR", r_);
 }
 
 void vkb_wire_vkGetShaderModuleCreateInfoIdentifierEXT(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, VkShaderModuleIdentifierEXT* pIdentifier)
@@ -5132,14 +5132,14 @@ VkResult vkb_wire_vkImportFenceFdKHR(VkDevice device, const VkImportFenceFdInfoK
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkImportFenceFdKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkImportFenceFdKHR", r_);
 }
 
 VkResult vkb_wire_vkImportSemaphoreFdKHR(VkDevice device, const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo)
@@ -5156,14 +5156,14 @@ VkResult vkb_wire_vkImportSemaphoreFdKHR(VkDevice device, const VkImportSemaphor
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkImportSemaphoreFdKHR");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkImportSemaphoreFdKHR", r_);
 }
 
 VkResult vkb_wire_vkInvalidateMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount, const VkMappedMemoryRange* pMemoryRanges)
@@ -5181,14 +5181,14 @@ VkResult vkb_wire_vkInvalidateMappedMemoryRanges(VkDevice device, uint32_t memor
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkInvalidateMappedMemoryRanges");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkInvalidateMappedMemoryRanges", r_);
 }
 
 VkResult vkb_wire_vkMergePipelineCaches(VkDevice device, VkPipelineCache dstCache, uint32_t srcCacheCount, const VkPipelineCache* pSrcCaches)
@@ -5207,14 +5207,14 @@ VkResult vkb_wire_vkMergePipelineCaches(VkDevice device, VkPipelineCache dstCach
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkMergePipelineCaches");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkMergePipelineCaches", r_);
 }
 
 VkResult vkb_wire_vkQueueBindSparse(VkQueue queue, uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence)
@@ -5233,14 +5233,14 @@ VkResult vkb_wire_vkQueueBindSparse(VkQueue queue, uint32_t bindInfoCount, const
     }
     vkb_enc_bytes(e, &fence, sizeof(fence));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkQueueBindSparse");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkQueueBindSparse", r_);
 }
 
 VkResult vkb_wire_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence)
@@ -5258,11 +5258,11 @@ VkResult vkb_wire_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSub
         vkb_enc_u8(e, 0);
     }
     vkb_enc_bytes(e, &fence, sizeof(fence));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkQueueSubmit");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkQueueSubmit");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkQueueSubmit", r_);
 }
 
 VkResult vkb_wire_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence)
@@ -5280,11 +5280,11 @@ VkResult vkb_wire_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSu
         vkb_enc_u8(e, 0);
     }
     vkb_enc_bytes(e, &fence, sizeof(fence));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkQueueSubmit2");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkQueueSubmit2");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkQueueSubmit2", r_);
 }
 
 VkResult vkb_wire_vkQueueWaitIdle(VkQueue queue)
@@ -5294,14 +5294,14 @@ VkResult vkb_wire_vkQueueWaitIdle(VkQueue queue)
     vkb_enc *e = &call_.e;
     vkb_enc_u64(e, vkb_remote((const void *)queue));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkQueueWaitIdle");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkQueueWaitIdle", r_);
 }
 
 VkResult vkb_wire_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags)
@@ -5311,11 +5311,11 @@ VkResult vkb_wire_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandB
     vkb_enc *e = &call_.e;
     vkb_enc_u64(e, vkb_remote((const void *)commandBuffer));
     vkb_enc_bytes(e, &flags, sizeof(flags));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkResetCommandBuffer");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkResetCommandBuffer");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkResetCommandBuffer", r_);
 }
 
 VkResult vkb_wire_vkResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags)
@@ -5326,11 +5326,11 @@ VkResult vkb_wire_vkResetCommandPool(VkDevice device, VkCommandPool commandPool,
     vkb_enc_u64(e, vkb_remote((const void *)device));
     vkb_enc_bytes(e, &commandPool, sizeof(commandPool));
     vkb_enc_bytes(e, &flags, sizeof(flags));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkResetCommandPool");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkResetCommandPool");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkResetCommandPool", r_);
 }
 
 VkResult vkb_wire_vkResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags)
@@ -5341,11 +5341,11 @@ VkResult vkb_wire_vkResetDescriptorPool(VkDevice device, VkDescriptorPool descri
     vkb_enc_u64(e, vkb_remote((const void *)device));
     vkb_enc_bytes(e, &descriptorPool, sizeof(descriptorPool));
     vkb_enc_bytes(e, &flags, sizeof(flags));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkResetDescriptorPool");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkResetDescriptorPool");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkResetDescriptorPool", r_);
 }
 
 VkResult vkb_wire_vkResetEvent(VkDevice device, VkEvent event)
@@ -5355,11 +5355,11 @@ VkResult vkb_wire_vkResetEvent(VkDevice device, VkEvent event)
     vkb_enc *e = &call_.e;
     vkb_enc_u64(e, vkb_remote((const void *)device));
     vkb_enc_bytes(e, &event, sizeof(event));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkResetEvent");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkResetEvent");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkResetEvent", r_);
 }
 
 VkResult vkb_wire_vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences)
@@ -5376,11 +5376,11 @@ VkResult vkb_wire_vkResetFences(VkDevice device, uint32_t fenceCount, const VkFe
     } else {
         vkb_enc_u8(e, 0);
     }
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkResetFences");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkResetFences");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkResetFences", r_);
 }
 
 void vkb_wire_vkResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount)
@@ -5413,11 +5413,11 @@ VkResult vkb_wire_vkSetEvent(VkDevice device, VkEvent event)
     vkb_enc *e = &call_.e;
     vkb_enc_u64(e, vkb_remote((const void *)device));
     vkb_enc_bytes(e, &event, sizeof(event));
-    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
-    if (!vkb_call_exec(&call_)) return VK_ERROR_DEVICE_LOST;
+    if (vkb_async_results()) return vkb_call_exec_async(&call_) ? VK_SUCCESS : vkb_device_lost("vkSetEvent");
+    if (!vkb_call_exec(&call_)) return vkb_device_lost("vkSetEvent");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkSetEvent", r_);
 }
 
 VkResult vkb_wire_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo* pSignalInfo)
@@ -5434,14 +5434,14 @@ VkResult vkb_wire_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo
         vkb_enc_u8(e, 0);
     }
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkSignalSemaphore");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkSignalSemaphore", r_);
 }
 
 void vkb_wire_vkTrimCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolTrimFlags flags)
@@ -5497,14 +5497,14 @@ VkResult vkb_wire_vkWaitForFences(VkDevice device, uint32_t fenceCount, const Vk
     vkb_enc_bytes(e, &waitAll, sizeof(waitAll));
     vkb_enc_bytes(e, &timeout, sizeof(timeout));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkWaitForFences");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkWaitForFences", r_);
 }
 
 VkResult vkb_wire_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo, uint64_t timeout)
@@ -5522,14 +5522,14 @@ VkResult vkb_wire_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* p
     }
     vkb_enc_bytes(e, &timeout, sizeof(timeout));
     if (!vkb_call_exec(&call_)) {
-        return VK_ERROR_DEVICE_LOST;
+        return vkb_device_lost("vkWaitSemaphores");
     }
     vkb_dec *d = &call_.d;
     (void)d;
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return r_;
+    return vkb_note_lost("vkWaitSemaphores", r_);
 }
 
 /* Default entry points. */

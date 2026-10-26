@@ -325,8 +325,10 @@ void bc6h(uvec4 blk, bool sgn)
 
 void bc7(uvec4 blk)
 {
-    uint mode = 0u;
-    while (mode < 8u && bits(blk, mode, 1u) == 0u) mode++;
+    /* the mode is the lowest set bit of the first byte (8: none, an invalid block); found without a
+     * loop, which the Mali-G1-Ultra's r54p1 driver compiled wrong when blocks of different modes
+     * shared a workgroup */
+    uint mode = (blk.x & 0xffu) == 0u ? 8u : uint(findLSB(blk.x & 0xffu));
 #if defined(TRANSCODE)
     g_bc7_parts = 1u;
 #endif

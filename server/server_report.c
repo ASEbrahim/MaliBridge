@@ -56,6 +56,11 @@
 #define RP_PROCS 64
 #define RP_CLASSES 768
 #define RP_SLOW 8
+#define RP_POL 8   /* CPU policies (clusters) followed */
+#define RP_FQ 24   /* distinct clocks counted per cluster and process */
+#define HELD_SHARE 60   /* % of a process's samples at one clock that make a cluster "held"... */
+#define HELD_ABOVE 10   /* ...with at most this % above it... */
+#define HELD_MIN 5      /* ...over at least this many samples (10 s) */
 #define FIRST 320
 
 extern char **environ;
@@ -93,11 +98,16 @@ typedef struct rp_proc {
     /* while it ran */
     int64_t gpu_mem_peak;
     long avail_min_kb;
-    unsigned cpu_top_min, cpu_top_max, cpu_cap_min, gpu_min, gpu_max;
+    unsigned cpu_top_min, cpu_top_max, cpu_cap_min, gpu_min, gpu_max; /* cpu_cap_min 0: not readable */
     int thermal_max, samples;
+    /* each cluster's clocks while it ran (MHz, samples at it): a cluster that sits at one clock
+     * below what it reaches is being held there (a power mode, a per-app policy) */
+    uint16_t fq_mhz[RP_POL][RP_FQ], fq_n[RP_POL][RP_FQ];
+    uint16_t pol_samples[RP_POL];
     /* frames: the client's own line */
     char frames[700];
     double first_frame_s;
+    double last_frame_s; /* the last present the line counts (session seconds; 0: none) */
     double fps_p50;
     /* from the same line (a newer client's): swapchains asked for, memory exported or imported as
      * fds; -1: not said */
@@ -127,7 +137,11 @@ static int nprocs;
 static int dirty, started_thread;
 static long avail_min_kb = -1, mem_total_kb;
 static int64_t rss_peak_kb;
-static unsigned cpu_cap_min = 100, gpu_min_all, gpu_max_all;
+static unsigned cpu_cap_min, gpu_min_all, gpu_max_all; /* cpu_cap_min 0: no cluster's cap was readable */
+/* the CPU policies by slot (policyN), with the highest and lowest clock each showed this session
+ * and its hardware maximum (cpuinfo_max_freq; 0: not readable), MHz */
+static int pol_id[RP_POL], npol;
+static unsigned pol_seen_max[RP_POL], pol_seen_min[RP_POL], pol_hw[RP_POL];
 static int thermal_max_all = -1;
 static char gpu_src[200];
 
@@ -549,28 +563,85 @@ static long gpu_mhz(void)
     return v > 10000000 ? v / 1000000 : v > 10000 ? v / 1000 : v;
 }
 
+/* VKBRIDGE_CPUFREQ_DIR: where the CPU policies are (host tests; /sys/devices/system/cpu/cpufreq). */
+static const char *cpufreq_dir(void)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_CPUFREQ_DIR");
+    return v && *v ? v : "/sys/devices/system/cpu/cpufreq";
+}
+
 /* CPU: the fastest cluster's current clock (MHz), and the lowest cap any cluster has (scaling max
- * against hardware max, %: Samsung's SSRM lowers scaling_max_freq when the device warms). */
-static void cpu_sample(unsigned *top, unsigned *cap)
+ * against hardware max, %: Samsung's SSRM lowers scaling_max_freq when the device warms); 0 when no
+ * cluster's cap could be read (HyperOS refuses scaling_max_freq: "capped to 100%" would be a guess).
+ * Each policy's number, current clock and hardware maximum (MHz, 0: unread) into id/cur/hw, *n of them. */
+static void cpu_sample(unsigned *top, unsigned *cap, int *id, unsigned *cur_mhz, unsigned *hw_mhz, int *n)
 {
     *top = 0;
-    *cap = 100;
-    DIR *d = opendir("/sys/devices/system/cpu/cpufreq");
+    *cap = 0;
+    *n = 0;
+    const char *base = cpufreq_dir();
+    DIR *d = opendir(base);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
         if (strncmp(e->d_name, "policy", 6)) continue;
-        char p[300];
-        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpufreq/%.200s/scaling_cur_freq", e->d_name);
+        char p[600];
+        snprintf(p, sizeof(p), "%.300s/%.200s/scaling_cur_freq", base, e->d_name);
         long cur = read_num(p);
-        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpufreq/%.200s/scaling_max_freq", e->d_name);
+        snprintf(p, sizeof(p), "%.300s/%.200s/scaling_max_freq", base, e->d_name);
         long max = read_num(p);
-        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpufreq/%.200s/cpuinfo_max_freq", e->d_name);
+        snprintf(p, sizeof(p), "%.300s/%.200s/cpuinfo_max_freq", base, e->d_name);
         long hw = read_num(p);
         if (cur > 0 && (unsigned)(cur / 1000) > *top) *top = (unsigned)(cur / 1000);
-        if (max > 0 && hw > 0 && (unsigned)(max * 100 / hw) < *cap) *cap = (unsigned)(max * 100 / hw);
+        if (max > 0 && hw > 0 && (!*cap || (unsigned)(max * 100 / hw) < *cap)) *cap = (unsigned)(max * 100 / hw);
+        if (*n < RP_POL) {
+            id[*n] = atoi(e->d_name + 6);
+            cur_mhz[*n] = cur > 0 ? (unsigned)(cur / 1000) : 0;
+            hw_mhz[*n] = hw > 0 ? (unsigned)(hw / 1000) : 0;
+            (*n)++;
+        }
     }
     closedir(d);
+}
+
+/* The slot of policy `id`, a new one if there is room; -1 without. Under rlock. */
+static int pol_slot(int id)
+{
+    for (int i = 0; i < npol; i++)
+        if (pol_id[i] == id) return i;
+    if (npol == RP_POL) return -1;
+    pol_id[npol] = id;
+    pol_seen_max[npol] = pol_seen_min[npol] = pol_hw[npol] = 0;
+    return npol++;
+}
+
+/* The clusters held at one clock while process p ran, as "p0 1400 MHz 72%, p7 1850 MHz 76%"
+ * (in policy order); 0 when none. Held: at least HELD_MIN samples, HELD_SHARE% of them at one
+ * clock, at most HELD_ABOVE% above it, that clock not the lowest the cluster showed (a cluster idling at
+ * its floor is not held) and below the most it reaches (its hardware maximum, or the highest it showed
+ * this session, whichever is more). Under rlock. */
+static int held_text(const rp_proc *p, char *out, size_t cap)
+{
+    size_t len = 0;
+    int n = 0;
+    out[0] = 0;
+    for (int s = 0; s < npol; s++) {
+        unsigned total = p->pol_samples[s];
+        if (total < HELD_MIN) continue;
+        int best = -1;
+        for (int k = 0; k < RP_FQ && p->fq_n[s][k]; k++)
+            if (best < 0 || p->fq_n[s][k] > p->fq_n[s][best]) best = k;
+        if (best < 0) continue;
+        unsigned f = p->fq_mhz[s][best], at = p->fq_n[s][best], above = 0;
+        for (int k = 0; k < RP_FQ && p->fq_n[s][k]; k++)
+            if (p->fq_mhz[s][k] > f) above += p->fq_n[s][k];
+        unsigned reach = pol_hw[s] > pol_seen_max[s] ? pol_hw[s] : pol_seen_max[s];
+        if (at * 100 < total * HELD_SHARE || above * 100 > total * HELD_ABOVE) continue;
+        if (f <= pol_seen_min[s] || f * 10 > reach * 9) continue;
+        if (len < cap) len += (size_t)snprintf(out + len, cap - len, "%sp%d %u MHz %u%%", n ? ", " : "", pol_id[s], f, at * 100 / total);
+        n++;
+    }
+    return n;
 }
 
 /* Android's thermal status from the app's clock log (vkbridge-clocks.log, "thermal N"), else -1. */
@@ -614,6 +685,9 @@ static void read_frames(void)
             const char *s = strstr(line, "t_first=");
             double tf = s ? atof(s + 8) : 0;
             if (tf > 0) pr->first_frame_s = tf - t0_mono;
+            s = strstr(line, "t_last=");
+            double tl = s ? atof(s + 7) : 0;
+            if (tl > 0) pr->last_frame_s = tl - t0_mono;
             s = strstr(line, "fps_p50=");
             pr->fps_p50 = s ? atof(s + 8) : 0;
             s = strstr(line, " swapchains=");
@@ -628,12 +702,35 @@ static void read_frames(void)
     closedir(d);
 }
 
+/* The busiest live process's presents so far and the time of its last one (CLOCK_MONOTONIC s), from
+ * its frames line as last read (every 5 s): for per-frame figures elsewhere (server_hwcnt.c).
+ * 0: no process with frames. */
+int vkb_report_frames(uint64_t *presents, double *t_last)
+{
+    int found = 0;
+    pthread_mutex_lock(&rlock);
+    for (int i = 0; i < nprocs; i++) {
+        const rp_proc *p = &procs[i];
+        const char *s = p->alive ? strstr(p->frames, "presents=") : NULL;
+        if (!s) continue;
+        uint64_t n = strtoull(s + 9, NULL, 10);
+        if (found && n <= *presents) continue;
+        s = strstr(p->frames, "t_last=");
+        *presents = n;
+        *t_last = s ? atof(s + 7) : 0;
+        found = 1;
+    }
+    pthread_mutex_unlock(&rlock);
+    return found;
+}
+
 static void sample(void)
 {
     long avail = meminfo_kb("MemAvailable");
     long rss = self_rss_kb();
-    unsigned top = 0, cap = 100;
-    cpu_sample(&top, &cap);
+    unsigned top = 0, cap = 0, pcur[RP_POL], phw[RP_POL];
+    int pid_of[RP_POL], np = 0;
+    cpu_sample(&top, &cap, pid_of, pcur, phw, &np);
     long gpu = gpu_mhz();
     int th = thermal_status();
     /* each live process's memory first, outside our lock (the accounting has its own) */
@@ -650,7 +747,16 @@ static void sample(void)
     pthread_mutex_lock(&rlock);
     if (avail >= 0 && (avail_min_kb < 0 || avail < avail_min_kb)) avail_min_kb = avail;
     if (rss > rss_peak_kb) rss_peak_kb = rss;
-    if (cap < cpu_cap_min) cpu_cap_min = cap;
+    if (cap && (!cpu_cap_min || cap < cpu_cap_min)) cpu_cap_min = cap;
+    int slot[RP_POL];
+    for (int k = 0; k < np; k++) {
+        slot[k] = pol_slot(pid_of[k]);
+        if (slot[k] < 0 || !pcur[k]) continue;
+        int s = slot[k];
+        if (pcur[k] > pol_seen_max[s]) pol_seen_max[s] = pcur[k];
+        if (!pol_seen_min[s] || pcur[k] < pol_seen_min[s]) pol_seen_min[s] = pcur[k];
+        if (phw[k]) pol_hw[s] = phw[k];
+    }
     if (gpu > 0 && (!gpu_min_all || (unsigned)gpu < gpu_min_all)) gpu_min_all = (unsigned)gpu;
     if (gpu > 0 && (unsigned)gpu > gpu_max_all) gpu_max_all = (unsigned)gpu;
     if (th > thermal_max_all) thermal_max_all = th;
@@ -662,7 +768,18 @@ static void sample(void)
         if (avail >= 0 && (p->avail_min_kb < 0 || avail < p->avail_min_kb)) p->avail_min_kb = avail;
         if (!p->samples || top < p->cpu_top_min) p->cpu_top_min = top;
         if (top > p->cpu_top_max) p->cpu_top_max = top;
-        if (!p->samples || cap < p->cpu_cap_min) p->cpu_cap_min = cap;
+        if (cap && (!p->cpu_cap_min || cap < p->cpu_cap_min)) p->cpu_cap_min = cap;
+        for (int k = 0; k < np; k++) {
+            int s = slot[k];
+            if (s < 0 || !pcur[k] || p->pol_samples[s] == UINT16_MAX) continue;
+            p->pol_samples[s]++;
+            for (int j = 0; j < RP_FQ; j++)
+                if (!p->fq_n[s][j] || p->fq_mhz[s][j] == pcur[k]) {
+                    p->fq_mhz[s][j] = (uint16_t)pcur[k];
+                    p->fq_n[s][j]++;
+                    break;
+                } /* past RP_FQ distinct clocks a sample still counts in pol_samples: the shares stay true */
+        }
         if (gpu > 0 && (!p->gpu_min || (unsigned)gpu < p->gpu_min)) p->gpu_min = (unsigned)gpu;
         if (gpu > 0 && (unsigned)gpu > p->gpu_max) p->gpu_max = (unsigned)gpu;
         if (!p->samples || th > p->thermal_max) p->thermal_max = th;
@@ -808,6 +925,13 @@ static void md_switch(void *arg, const char *line)
     fprintf(arg, "> **Warning, %s**\n\n", line);
 }
 
+/* VKBRIDGE_REPORT_STALL_S: how long without a frame counts as presents stopped (30 s; 0: never). */
+static double stall_s(void)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_REPORT_STALL_S"); /* the server's, not the reporting thread's game preset */
+    return v && *v ? atof(v) : 30.0;
+}
+
 /* Everything that should be looked at, one line each (the report's head). */
 static int list_issues(FILE *f, int json)
 {
@@ -834,7 +958,17 @@ static int list_issues(FILE *f, int json)
         if (p->devices && p->first_frame_s < 0 && p->t_device > 0 && !presents_elsewhere(p) &&
             (p->alive ? now_s() : p->t_gone) - p->t_device > 60)
             issue(&is, "%s: a device for %.0f s and no frame presented", nm, (p->alive ? now_s() : p->t_gone) - p->t_device);
-        if (p->samples && p->cpu_cap_min < 70) issue(&is, "%s: CPU clocks capped to %u%% of their maximum while it ran (thermal)", nm, p->cpu_cap_min);
+        /* Frames that stopped while the game ran on (a hang the player sees as a frozen picture),
+         * or a while before it exited (a game quits within seconds of its last frame). */
+        double end = p->alive ? now_s() : p->t_gone, stall = stall_s();
+        if (p->last_frame_s > 0 && stall > 0 && end - p->last_frame_s > stall && !presents_elsewhere(p))
+            issue(&is, p->alive ? "%s: no frame for the last %.0f s while it runs (presents stopped)"
+                                : "%s: presents stopped %.0f s before it exited", nm, end - p->last_frame_s);
+        if (p->samples && p->cpu_cap_min && p->cpu_cap_min < 70)
+            issue(&is, "%s: CPU clocks capped to %u%% of their maximum while it ran (thermal)", nm, p->cpu_cap_min);
+        char held[200];
+        if (p->first_frame_s >= 0 && held_text(p, held, sizeof(held)))
+            issue(&is, "%s: CPU held at a fixed clock while it ran: %s of the time (the phone's power mode or a per-app limit may be holding it)", nm, held);
         if (p->thermal_max >= 3) issue(&is, "%s: Android thermal status reached %d", nm, p->thermal_max);
         if (p->avail_min_kb >= 0 && p->avail_min_kb < 600 * 1024)
             issue(&is, "%s: system memory ran low (%ld MB available at the lowest)", nm, p->avail_min_kb / 1024);
@@ -967,7 +1101,8 @@ static void write_md(FILE *f, int final)
     struct statvfs sv;
     if (vkb_pcache_dir() && statvfs(vkb_pcache_dir(), &sv) == 0)
         fprintf(f, "| storage | %llu MB free where the caches live |\n", (unsigned long long)sv.f_bavail * sv.f_frsize >> 20);
-    fprintf(f, "| clocks | CPU clusters capped to %u%% at the lowest; ", cpu_cap_min);
+    if (cpu_cap_min) fprintf(f, "| clocks | CPU clusters capped to %u%% at the lowest; ", cpu_cap_min);
+    else fprintf(f, "| clocks | CPU cap unknown (scaling_max_freq or cpuinfo_max_freq not readable); ");
     if (gpu_max_all) fprintf(f, "GPU %u-%u MHz (from %s)", gpu_min_all, gpu_max_all, gpu_src);
     else fprintf(f, "GPU clock not readable");
     if (thermal_max_all >= 0) fprintf(f, "; Android thermal status max %d (vkbridge-clocks.log)", thermal_max_all);
@@ -990,6 +1125,12 @@ static void write_md(FILE *f, int final)
         if (vkb_promote_describe(k->uuid, &offered, &drv, &lacks) && (offered != drv || *lacks))
             fprintf(f, "| GPU %d to apps | Vulkan %u.%u (version promotion, server_promote.c)%s%s |\n", i, VK_API_VERSION_MAJOR(offered),
                     VK_API_VERSION_MINOR(offered), *lacks ? "; " : "", lacks);
+    }
+    if (*vkb_mem_ahb_export_result()) {
+        /* no dma-heap: whether gamescope's exportable images get AHardwareBuffer pages (server_memory.c) */
+        fprintf(f, "| dma-buf export | %s pages; AHardwareBuffer ", vkb_mem_export_backing_name());
+        md_text(f, vkb_mem_ahb_export_result());
+        fprintf(f, " |\n");
     }
     fprintf(f, "\n## Bridge\n\nBuild `%s`, protocol `%016llx`. Cache directory `%s`.\n\n", VKB_GIT, (unsigned long long)VKB_PROTOCOL_HASH,
             vkb_pcache_dir() ? vkb_pcache_dir() : "(none)");
@@ -1051,8 +1192,12 @@ static void write_md(FILE *f, int final)
             fprintf(f, "- GPU: device lost %u time(s)%s%s; %u wait(s) over 2 s (longest %.1f s)\n", p->lost, p->lost ? ", first in " : "", p->lost_first,
                     p->long_waits, p->long_wait_max_ms / 1000.0);
         if (p->samples) {
-            fprintf(f, "- while it ran: GPU memory peak %lld MB; system memory available >= %ld MB; fastest CPU cluster %u-%u MHz, capped to %u%%",
-                    (long long)(p->gpu_mem_peak >> 20), p->avail_min_kb / 1024, p->cpu_top_min, p->cpu_top_max, p->cpu_cap_min);
+            fprintf(f, "- while it ran: GPU memory peak %lld MB; system memory available >= %ld MB; fastest CPU cluster %u-%u MHz, ",
+                    (long long)(p->gpu_mem_peak >> 20), p->avail_min_kb / 1024, p->cpu_top_min, p->cpu_top_max);
+            if (p->cpu_cap_min) fprintf(f, "capped to %u%%", p->cpu_cap_min);
+            else fprintf(f, "cap unknown");
+            char held[200];
+            if (held_text(p, held, sizeof(held))) fprintf(f, "; CPU held: %s", held);
             if (p->gpu_max) fprintf(f, "; GPU %u-%u MHz", p->gpu_min, p->gpu_max);
             if (p->thermal_max >= 0) fprintf(f, "; thermal status max %d", p->thermal_max);
             fprintf(f, "\n");
@@ -1115,9 +1260,12 @@ static void write_json(FILE *f, int final)
     js(f, prop("ro.build.version.release", b1));
     fprintf(f, ", \"kernel\": ");
     js(f, u.release);
-    fprintf(f, ", \"mem_total_mb\": %ld, \"mem_available_min_mb\": %ld, \"cpu_cap_min_pct\": %u, \"gpu_mhz_min\": %u, \"gpu_mhz_max\": %u, "
+    char capj[16];
+    if (cpu_cap_min) snprintf(capj, sizeof(capj), "%u", cpu_cap_min);
+    else snprintf(capj, sizeof(capj), "null"); /* not readable */
+    fprintf(f, ", \"mem_total_mb\": %ld, \"mem_available_min_mb\": %ld, \"cpu_cap_min_pct\": %s, \"gpu_mhz_min\": %u, \"gpu_mhz_max\": %u, "
                "\"thermal_max\": %d, \"server_rss_peak_mb\": %lld},\n",
-            mem_total_kb / 1024, avail_min_kb / 1024, cpu_cap_min, gpu_min_all, gpu_max_all, thermal_max_all, (long long)rss_peak_kb / 1024);
+            mem_total_kb / 1024, avail_min_kb / 1024, capj, gpu_min_all, gpu_max_all, thermal_max_all, (long long)rss_peak_kb / 1024);
     fprintf(f, "  \"bridge\": {\"build\": ");
     js(f, VKB_GIT);
     fprintf(f, ", \"protocol\": \"%016llx\", \"cache_dir\": ", (unsigned long long)VKB_PROTOCOL_HASH);
@@ -1147,6 +1295,9 @@ static void write_json(FILE *f, int final)
     fprintf(f, ",\n  \"processes\": [");
     for (int i = 0; i < nprocs; i++) {
         const rp_proc *p = &procs[i];
+        char capj[16];
+        if (p->cpu_cap_min) snprintf(capj, sizeof(capj), "%u", p->cpu_cap_min);
+        else snprintf(capj, sizeof(capj), "null");
         fprintf(f, "%s\n    {\"pid\": %d, \"name\": ", i ? "," : "", p->pid);
         js(f, proc_name(p, nm, sizeof(nm)));
         fprintf(f, ", \"comm\": ");
@@ -1181,9 +1332,13 @@ static void write_json(FILE *f, int final)
         fprintf(f, ", \"emulated_features\": ");
         js(f, p->features);
         fprintf(f, ", \"device_lost\": %u, \"long_waits\": %u, \"long_wait_max_ms\": %.0f, \"gpu_mem_peak_mb\": %lld, \"mem_available_min_mb\": %ld, "
-                   "\"cpu_mhz\": [%u, %u], \"cpu_cap_min_pct\": %u, \"gpu_mhz\": [%u, %u], \"thermal_max\": %d,\n     \"log\": [",
+                   "\"cpu_mhz\": [%u, %u], \"cpu_cap_min_pct\": %s, \"gpu_mhz\": [%u, %u], \"thermal_max\": %d, \"cpu_held\": ",
                 p->lost, p->long_waits, p->long_wait_max_ms, (long long)(p->gpu_mem_peak >> 20), p->avail_min_kb / 1024, p->cpu_top_min, p->cpu_top_max,
-                p->cpu_cap_min, p->gpu_min, p->gpu_max, p->thermal_max);
+                capj, p->gpu_min, p->gpu_max, p->thermal_max);
+        char held[200];
+        held_text(p, held, sizeof(held));
+        js(f, held);
+        fprintf(f, ",\n     \"log\": [");
         int k = 0;
         for (int c = 0; c < nclasses; c++) {
             if (classes[c].pid != p->pid) continue;
@@ -1294,12 +1449,16 @@ void vkb_report_session(const char *log_path)
         if (procs[i].alive) {
             procs[keep] = procs[i];
             procs[keep].t_hello = 0;
+            /* the policy slots start again */
+            memset(procs[keep].fq_n, 0, sizeof(procs[keep].fq_n));
+            memset(procs[keep].pol_samples, 0, sizeof(procs[keep].pol_samples));
             keep++;
         }
     nprocs = keep;
     avail_min_kb = -1;
     rss_peak_kb = 0;
-    cpu_cap_min = 100;
+    cpu_cap_min = 0;
+    npol = 0;
     gpu_min_all = gpu_max_all = 0;
     thermal_max_all = -1;
     mem_total_kb = meminfo_kb("MemTotal");

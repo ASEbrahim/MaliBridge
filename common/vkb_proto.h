@@ -91,7 +91,8 @@ typedef struct vkb_server_pd_info {
                                     * every shareable type is offered. 0: one type, from image_types. An older server's reply
                                     * ends before it (the client reads what is there: vkb_dec_raw_tail); an older client reads
                                     * the first 64 bytes */
-    uint32_t reserved;
+    uint32_t driver_id;            /* VkDriverId from the server's self-test (server_driverid.c): the client tells Arm's driver by it;
+                                    * 0: unknown or an older server (once reserved), the vendor ID decides */
 } vkb_server_pd_info;
 
 /* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an
