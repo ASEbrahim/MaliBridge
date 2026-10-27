@@ -1199,8 +1199,63 @@ static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties2(VkPhys
     fake_lazy_props(&mp->memoryProperties);
 }
 
+/* ------------------------------------------------------------------ linear images under the AHB strategy */
+
+/*
+ * Under the AHardwareBuffer memory strategy (no dma-heap: Retroid Pocket 4 Pro, kernel 4.19) the
+ * client makes its linear images with the AHB handle type so the app can map them, and the server
+ * binds them to BLOB AHardwareBuffers. Mali r32p1 cannot address such an image: it reports a
+ * rowPitch of 0 for it and reads every row as row 0 (tools/vklinear.py: a 320x240 image written
+ * through its mapping copied out as 240 copies of its first row), so a Zink staging texture mapped
+ * this way - wined3d's system-memory surfaces, Ys Origin's 320x240 DirectDraw scratch - came out
+ * as one repeated row, white on screen. Zink takes linear tiling only where the format's
+ * linearTilingFeatures allow it; with none reported it stages through buffers, whose uploads and
+ * read-backs are right here. So under this strategy no format offers linear tiling.
+ * VKBRIDGE_AHB_LINEAR=1 keeps the driver's answer (to see what a newer driver does).
+ */
+static int ahb_linear_hidden(VkPhysicalDevice pd)
+{
+    static int keep = -1;
+    if (keep < 0) {
+        const char *v = vkb_srv_env("VKBRIDGE_AHB_LINEAR");
+        keep = v && !strcmp(v, "1");
+    }
+    if (keep) return 0;
+    vkb_srv_table *t = vkb_srv_current_table();
+    const vkb_pd_knowledge *k = t ? vkb_pd_lookup(&t->real, pd) : NULL;
+    return k && k->info.strategy == VKB_MEM_AHB;
+}
+
+static void hide_linear(VkPhysicalDevice pd, VkFormatProperties *p, VkFormatProperties3 *p3)
+{
+    if (!ahb_linear_hidden(pd)) return;
+    static int told;
+    if (p->linearTilingFeatures && !__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED))
+        VKB_INFO("linear tiling hidden from clients under the AHardwareBuffer memory strategy: an image bound to a BLOB AHardwareBuffer "
+                 "reads every row as its first (Mali r32p1); Zink stages its mapped textures through buffers instead (VKBRIDGE_AHB_LINEAR=1 keeps it)");
+    p->linearTilingFeatures = 0;
+    if (p3) p3->linearTilingFeatures = 0;
+}
+
+static VKAPI_ATTR void VKAPI_CALL nolinear_GetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat format, VkFormatProperties *p)
+{
+    vkb_srv_current_table()->real.vkGetPhysicalDeviceFormatProperties(pd, format, p);
+    hide_linear(pd, p, NULL);
+}
+
+static VKAPI_ATTR void VKAPI_CALL nolinear_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat format, VkFormatProperties2 *p)
+{
+    vkb_srv_current_table()->real.vkGetPhysicalDeviceFormatProperties2(pd, format, p);
+    VkFormatProperties3 *p3 = NULL;
+    for (VkBaseOutStructure *b = p->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) p3 = (VkFormatProperties3 *)b;
+    hide_linear(pd, &p->formatProperties, p3);
+}
+
 void vkb_mem_instance_install(vkb_srv_table *t)
 {
+    if (t->real.vkGetPhysicalDeviceFormatProperties) t->dt.vkGetPhysicalDeviceFormatProperties = nolinear_GetPhysicalDeviceFormatProperties;
+    if (t->real.vkGetPhysicalDeviceFormatProperties2) t->dt.vkGetPhysicalDeviceFormatProperties2 = nolinear_GetPhysicalDeviceFormatProperties2;
     if (!fake_lazy()) return;
     if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
     if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;

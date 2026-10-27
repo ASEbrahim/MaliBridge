@@ -42,6 +42,12 @@ void vkb_emu_track_image(vkb_emu_device *e, VkImage img, const VkImageCreateInfo
     r->extent = ci->extent;
     r->mips = ci->mipLevels;
     r->layers = ci->arrayLayers;
+    r->plain_ci = *ci;
+    r->plain_ci.pNext = NULL;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+            (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & 0x400 /* ANDROID_HARDWARE_BUFFER_BIT_ANDROID */))
+            r->ahb_external = 1;
     pthread_mutex_lock(&e->lock);
     unsigned h = rh((uint64_t)img);
     r->next = e->images[h];
@@ -288,11 +294,124 @@ static const VkImageSubresource *linear_mod_sub(VkImage image, const VkImageSubr
     return tmp;
 }
 
+/*
+ * Images made with the AHardwareBuffer handle type: the client's shareable linear images under the
+ * AHB memory strategy (client/memory.c, vkb_ep_vkCreateImage; Retroid Pocket 4 Pro: no dma-heap).
+ * Vulkan leaves such an image's memory requirements undefined until an AHardwareBuffer is bound
+ * (VUID-vkGetImageMemoryRequirements-image-04004), and Mali r32p1 answers size 0, alignment 0 -
+ * the client then allocated nothing, Zink's mapped staging textures for wined3d (Ys Origin's
+ * DirectDraw scratch surface) held garbage and the picture came out white - while
+ * vkGetImageSubresourceLayout on the unbound image faulted in the driver (address 0x18) and took
+ * the server down. Both are answered from a twin: the same VkImageCreateInfo without the pNext
+ * chain, made for the question and destroyed (the layout's twin is bound to plain device memory
+ * first). Once the image itself is bound the driver's layout answer is used, since that is how it
+ * reads the memory. Newer drivers answer the unbound questions themselves; the twin is used only
+ * when the driver's requirements come back empty, or for every layout question before binding.
+ */
+static int twin_requirements(VkDevice device, vkb_emu_image *r)
+{
+    if (r->twin_req_ok) return 1;
+    VkImage twin = VK_NULL_HANDLE;
+    if (vkb_emu_real()->vkCreateImage(device, &r->plain_ci, NULL, &twin) != VK_SUCCESS) return 0;
+    vkb_emu_real()->vkGetImageMemoryRequirements(device, twin, &r->twin_req);
+    vkb_emu_real()->vkDestroyImage(device, twin, NULL);
+    r->twin_req_ok = r->twin_req.size != 0;
+    return r->twin_req_ok;
+}
+
+static int twin_layout(VkDevice device, vkb_emu_image *r, const VkImageSubresource *sub)
+{
+    if (r->twin_layout_ok) return 1;
+    if (!twin_requirements(device, r)) return 0;
+    VkImage twin = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    int ok = 0;
+    if (vkb_emu_real()->vkCreateImage(device, &r->plain_ci, NULL, &twin) != VK_SUCCESS) return 0;
+    uint32_t type = 0;
+    while (type < 32 && !(r->twin_req.memoryTypeBits >> type & 1)) type++;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r->twin_req.size, type};
+    if (type < 32 && vkb_emu_real()->vkAllocateMemory(device, &ai, NULL, &mem) == VK_SUCCESS &&
+        vkb_emu_real()->vkBindImageMemory(device, twin, mem, 0) == VK_SUCCESS) {
+        vkb_emu_real()->vkGetImageSubresourceLayout(device, twin, sub, &r->twin_layout);
+        ok = r->twin_layout_ok = 1;
+    }
+    vkb_emu_real()->vkDestroyImage(device, twin, NULL);
+    if (mem) vkb_emu_real()->vkFreeMemory(device, mem, NULL);
+    return ok;
+}
+
+static void ahb_image_requirements(VkDevice device, VkImage image, VkMemoryRequirements *req)
+{
+    vkb_emu_image *r = vkb_emu_find_image(vkb_emu_cur(), image);
+    if (!r || !r->ahb_external || (req->size && req->memoryTypeBits)) return;
+    if (!twin_requirements(device, r)) return;
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+        VKB_INFO("AHardwareBuffer image %llx (format %d %ux%u tiling %d): the driver answers no memory requirements before a buffer is "
+                 "bound (size %llu, types 0x%x); answered from a twin without the handle type: size %llu, alignment %llu, types 0x%x",
+                 (unsigned long long)(uintptr_t)image, r->format, r->extent.width, r->extent.height, (int)r->plain_ci.tiling,
+                 (unsigned long long)req->size, req->memoryTypeBits, (unsigned long long)r->twin_req.size,
+                 (unsigned long long)r->twin_req.alignment, r->twin_req.memoryTypeBits);
+    req->size = r->twin_req.size;
+    req->alignment = r->twin_req.alignment;
+    if (!req->memoryTypeBits) req->memoryTypeBits = r->twin_req.memoryTypeBits;
+}
+
+static VKAPI_ATTR void VKAPI_CALL emu_GetImageMemoryRequirements(VkDevice device, VkImage image, VkMemoryRequirements *req)
+{
+    vkb_emu_real()->vkGetImageMemoryRequirements(device, image, req);
+    ahb_image_requirements(device, image, req);
+}
+
+static VKAPI_ATTR void VKAPI_CALL emu_GetImageMemoryRequirements2(VkDevice device, const VkImageMemoryRequirementsInfo2 *info,
+                                                                 VkMemoryRequirements2 *req)
+{
+    vkb_emu_real()->vkGetImageMemoryRequirements2(device, info, req);
+    ahb_image_requirements(device, info->image, &req->memoryRequirements);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL emu_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize offset)
+{
+    VkResult r = vkb_emu_real()->vkBindImageMemory(device, image, memory, offset);
+    vkb_emu_image *rec = r == VK_SUCCESS ? vkb_emu_find_image(vkb_emu_cur(), image) : NULL;
+    if (rec) rec->bound = 1;
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL emu_BindImageMemory2(VkDevice device, uint32_t n, const VkBindImageMemoryInfo *infos)
+{
+    VkResult r = vkb_emu_real()->vkBindImageMemory2(device, n, infos);
+    if (r == VK_SUCCESS)
+        for (uint32_t i = 0; i < n; i++) {
+            vkb_emu_image *rec = vkb_emu_find_image(vkb_emu_cur(), infos[i].image);
+            if (rec) rec->bound = 1;
+        }
+    return r;
+}
+
 static VKAPI_ATTR void VKAPI_CALL emu_GetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource *sub,
                                                                VkSubresourceLayout *layout)
 {
     VkImageSubresource tmp;
     sub = linear_mod_sub(image, sub, &tmp);
+    vkb_emu_image *r = vkb_emu_find_image(vkb_emu_cur(), image);
+    /* Before binding the driver faults; after binding a BLOB AHardwareBuffer it answers rowPitch 0
+     * and four times the size (r32p1, 320x240 BGRA8: size 1228800): the twin's layout both times. */
+    if (r && r->ahb_external) {
+        if (twin_layout(device, r, sub)) {
+            static int told;
+            if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+                VKB_INFO("AHardwareBuffer image %llx (%s): layout answered from a bound twin without the handle type: offset %llu size %llu "
+                         "rowPitch %llu", (unsigned long long)(uintptr_t)image, r->bound ? "bound" : "not yet bound; the driver faults there",
+                         (unsigned long long)r->twin_layout.offset, (unsigned long long)r->twin_layout.size,
+                         (unsigned long long)r->twin_layout.rowPitch);
+            *layout = r->twin_layout;
+            fix_single_row_pitch(image, sub, layout);
+            return;
+        }
+        VKB_WARN("AHardwareBuffer image %llx: no twin could answer its layout; asking the driver%s", (unsigned long long)(uintptr_t)image,
+                 r->bound ? "" : " (not yet bound: it may fault)");
+    }
     vkb_emu_real()->vkGetImageSubresourceLayout(device, image, sub, layout);
     fix_single_row_pitch(image, sub, layout);
 }
@@ -975,6 +1094,11 @@ void vkb_emu_install(vkb_srv_table *dev)
     dt->vkDestroyImage = emu_DestroyImage;
     dt->vkGetImageSubresourceLayout = emu_GetImageSubresourceLayout;
     if (e->flags & VKB_EMU_DMABUF_EXPORT) dt->vkGetImageDrmFormatModifierPropertiesEXT = emu_GetImageDrmFormatModifierPropertiesEXT;
+    /* AHardwareBuffer-typed images: requirements and layouts from a twin (above) */
+    dt->vkGetImageMemoryRequirements = emu_GetImageMemoryRequirements;
+    if (dev->real.vkGetImageMemoryRequirements2) dt->vkGetImageMemoryRequirements2 = emu_GetImageMemoryRequirements2;
+    dt->vkBindImageMemory = emu_BindImageMemory;
+    if (dev->real.vkBindImageMemory2) dt->vkBindImageMemory2 = emu_BindImageMemory2;
     dt->vkCreateGraphicsPipelines = emu_CreateGraphicsPipelines;
     dt->vkCreateComputePipelines = emu_CreateComputePipelines;
     dt->vkCmdCopyImage = emu_CmdCopyImage;
