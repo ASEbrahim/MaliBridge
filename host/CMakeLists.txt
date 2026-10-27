@@ -292,7 +292,7 @@ vkb_host_output(flicker_check)
 
 # The layer's tests (host/layer_check.sh): a minimal app, and the BCn emulation.
 add_executable(layer-app "${VKB}/tests/layer_app.c")
-target_link_libraries(layer-app PRIVATE vkb_host_flags vulkan)
+target_link_libraries(layer-app PRIVATE vkb_host_flags -l:libvulkan.so.1)
 vkb_host_output(layer-app)
 
 # The MK-02 SPIR-V pass alone, over a corpus (host/viewport_test.sh)

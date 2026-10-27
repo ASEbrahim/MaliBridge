@@ -52,7 +52,7 @@ $(OUT)/%_check: $(VKB)/tests/%_check.c $(VKB)/tests/smoke_spv.h
 # The layer's tests (host/layer_check.sh): a minimal app, and the BCn emulation.
 $(OUT)/layer-app: $(VKB)/tests/layer_app.c
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) $(SAN) -Wall $(INC) -o $@ $< -lvulkan
+	$(CC) $(CFLAGS) $(SAN) -Wall $(INC) -o $@ $< -l:libvulkan.so.1
 
 $(OUT)/bcn_check: $(VKB)/server/bc_spv.h
 

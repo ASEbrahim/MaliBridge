@@ -64,7 +64,7 @@ mali=bc,clip,cull,divisor,maint5,depthclip,push,robustness2,dualsrc,fillmode,mul
 
 # A minimal app: the layer must be in its path, and the identity it is shown must be the layer's.
 inc=-I../third_party/Vulkan-Headers-1.4.341/include
-cc -O1 -I"$inc" -o out/layer-app ../tests/layer_app.c -lvulkan 2>/dev/null || {
+cc -O1 -I"$inc" -o out/layer-app ../tests/layer_app.c -l:libvulkan.so.1 2>/dev/null || {
   echo "cannot build out/layer-app (the Vulkan headers?)" >&2; exit 1; }
 
 # The WSI: the session's wayland, else X.
