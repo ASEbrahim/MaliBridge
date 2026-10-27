@@ -174,6 +174,13 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_GS_HIDE] = {"gs_hide", "#11", NULL, 0, G_IN_RANGE, G_IN_RANGE,
         {{V(38, 1), V(38, 2), FAM_ANY, NULL, "a beta build: Zink's geometry shaders crash its compiler", R_BETA}},
         vkb_errata_gs_install, NULL},
+    /* The Mali-G77's r32p1 (Retroid Pocket 4 Pro) rasterizes a primitive with a NaN clip-space
+     * position over the whole render target (tools/vkstrip.py); Ys Origin's dead particles keep
+     * NaN world matrices and painted every room white. The guard (spirv_nanpos.c) is exact on any
+     * driver: a NaN position never draws anywhere else. Seen on that one driver so far. */
+    [VKB_ERRATUM_NAN_POSITION] = {"nan_position", "MK-45", NULL, 0, G_IN_RANGE, G_IN_RANGE,
+        {{V(32, 0), V(33, 0), FAM_ANY, NULL, "Mali-G77 r32p1: NaN positions rasterized as full-screen sheets"}},
+        vkb_errata_nanpos_install, NULL},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
 };
 
@@ -698,6 +705,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_mem_destroy(t, e);
     vkb_errata_ds_destroy(t, e);
     vkb_errata_vbbake_destroy(e);
+    vkb_errata_nanpos_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);

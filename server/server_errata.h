@@ -28,6 +28,7 @@ typedef struct vkb_errata_dev {
     PFN_vkCreateShaderModule fp16_imi_next; /* server_errata_fp16.c (MK-20): beneath its imitation */
     struct vkb_errata_ds *ds;       /* server_errata_ds.c (MK-11) */
     struct vkb_errata_vbbake *vbbake;  /* server_errata_vbbake.c (MK-05 option B) */
+    struct vkb_errata_nanpos *nanpos;  /* server_errata_nanpos.c (MK-45) */
     struct vkb_vbbake_imi *vbbake_imi;
     int probe; /* the startup probe's: an imitation only, for one probe (vkb_errata_probe_begin);
                   it publishes nothing a server thread without a table would fall back to, and logs
@@ -106,6 +107,9 @@ void vkb_errata_vbbake_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_vbbake_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_vbbake_destroy(vkb_errata_dev *e); /* totals logged, tables freed */
 void vkb_errata_stencil_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+/* server_errata_nanpos.c: nan_position (MK-45), vertex shaders guarded against NaN positions (spirv_nanpos.c) */
+void vkb_errata_nanpos_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_nanpos_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_ds_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 /* A module an erratum rewrote is named by the code it came from (vkb_spv_app_hash): registers
