@@ -17,6 +17,11 @@
  *    1.0 forms (per bind point named by the stage flags). Exact.
  *  - VK_KHR_load_store_op_none (VKB_EMU_LOADSTORE_NONE): the driver's VK_EXT_load_store_op_none,
  *    same enumerants (server_instance.c enables it). Exact.
+ *  - depthClamp (VKB_EMU_DEPTH_CLAMP): a pipeline that clamps depth clips it instead. DXVK 1.10 asks
+ *    for the feature at every D3D11 feature level and turns clamping on only where a rasterizer
+ *    state disables depth clipping; geometry past the near or far plane is then cut rather than
+ *    flattened onto it. Approximate, logged once. Mali-G76 r26p0 lacks the feature (Abathor:
+ *    "Requested feature level not supported" down to 9_1).
  *  - multiDrawIndirect (VKB_EMU_MULTI_DRAW): vkCmdDraw(Indexed)Indirect with drawCount > 1 is
  *    recorded as drawCount single indirect draws at offset + i * stride. Exact, a little more CPU
  *    work per draw. Mali-G57 (r32p1, r38p1) lacks the feature and DXVK needs it. The DroidDeck Mali
@@ -68,7 +73,11 @@ static VkBlendFactor first_source(VkBlendFactor f, int *changed)
 void vkb_emu_compat_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods, uint32_t *nmods,
                              uint32_t cap)
 {
-    static int told_dual, told_fill, told_vp;
+    static int told_dual, told_fill, told_vp, told_clamp;
+    if ((e->flags & VKB_EMU_DEPTH_CLAMP) && ci->pRasterizationState && ci->pRasterizationState->depthClampEnable) {
+        ((VkPipelineRasterizationStateCreateInfo *)ci->pRasterizationState)->depthClampEnable = VK_FALSE;
+        once(&told_clamp, "depth clamping drawn with depth clipping instead (no depthClamp)");
+    }
     if ((e->flags & VKB_EMU_DUAL_SRC) && ci->pColorBlendState) {
         int changed = 0;
         const VkPipelineColorBlendStateCreateInfo *cb = ci->pColorBlendState;

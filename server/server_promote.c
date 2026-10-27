@@ -729,6 +729,49 @@ static void record_plain(const vkb_dispatch *d, VkPhysicalDevice pd)
     pthread_mutex_unlock(&gpus_lock);
 }
 
+/* Each version above the driver's in turn, up to want's, while every piece is there; what the next one
+ * lacks into missing. any_bcast: subgroupBroadcastDynamicId not needed - gamescope's list. Its shaders
+ * take no subgroup operations, so on a driver without subgroup shuffles (Mali-G76 r26p0, Vulkan 1.1.131)
+ * gamescope still finds a 1.2 device; the feature itself stays reported off (fill_core_features). */
+static uint32_t climb(const promo_gpu *g, const ext_list *el, uint32_t want, const VkPhysicalDeviceVulkan12Features *f12,
+                      const VkPhysicalDeviceVulkan13Features *f13, int any_bcast, char *missing, size_t cap)
+{
+    uint32_t offered = g->drv_api;
+    for (uint32_t v = VMINOR(g->drv_api) + 1; v <= 3 && v <= VMINOR(want); v++) {
+        uint32_t ver = VK_MAKE_API_VERSION(0, 1, v, 0);
+        char miss[480] = "";
+        for (size_t i = 0; i < NPLAIN; i++)
+            if (plain_exts[i].version == ver && plain_exts[i].need && !exts_has(el, plain_exts[i].ext)) append(miss, sizeof(miss), plain_exts[i].ext);
+        for (size_t i = 0; i < NNEEDS; i++) {
+            if (needs[i].version != ver) continue;
+            int bcast = !strcmp(needs[i].name, "subgroupBroadcastDynamicId");
+            if (bcast && any_bcast) continue;
+            const void *s = needs[i].core == 12 ? (const void *)f12 : (const void *)f13;
+            if (*(const VkBool32 *)((const uint8_t *)s + needs[i].off)) continue;
+            /* named by the extension it would come from */
+            char what[160];
+            const char *ext = NULL;
+            for (size_t r = 0; r < NFEATS && !ext; r++)
+                if (feats[r].core == needs[i].core && feats[r].core_off == needs[i].off) ext = feat_structs[feats[r].ef].ext;
+            if (bcast) ext = "subgroup shuffles";
+            snprintf(what, sizeof(what), "%s (%s)", ext ? ext : "?", needs[i].name);
+            append(miss, sizeof(miss), what);
+        }
+        if (v == 3) {
+            /* the extended dynamic states have no core bit: their extension's own */
+            static const uint8_t eds[] = {EF_EDS, EF_EDS2};
+            for (size_t i = 0; i < 2; i++)
+                if (!exts_has(el, feat_structs[eds[i]].ext)) append(miss, sizeof(miss), feat_structs[eds[i]].ext);
+        }
+        if (*miss) {
+            snprintf(missing, cap, "Vulkan 1.%u lacks %s", v, miss);
+            break;
+        }
+        offered = VK_MAKE_API_VERSION(0, 1, v, VK_API_VERSION_PATCH(g->drv_api));
+    }
+    return offered;
+}
+
 void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
 {
     if (ngpus >= VKB_MAX_PDS) return;
@@ -790,39 +833,11 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     chain_query(x, &f2, q_features, &q);
     fill_core_features(x, &g, x->core);
     free(x);
-    /* Each version above the driver's in turn, while every piece is there. */
-    for (uint32_t v = m + 1; v <= 3 && v <= VMINOR(want); v++) {
-        uint32_t ver = VK_MAKE_API_VERSION(0, 1, v, 0);
-        char miss[480] = "";
-        for (size_t i = 0; i < NPLAIN; i++)
-            if (plain_exts[i].version == ver && plain_exts[i].need && !exts_has(&el, plain_exts[i].ext)) append(miss, sizeof(miss), plain_exts[i].ext);
-        for (size_t i = 0; i < NNEEDS; i++) {
-            if (needs[i].version != ver) continue;
-            const void *s = needs[i].core == 12 ? (const void *)&f12 : (const void *)&f13;
-            if (*(const VkBool32 *)((const uint8_t *)s + needs[i].off)) continue;
-            /* named by the extension it would come from */
-            char what[160];
-            const char *ext = NULL;
-            for (size_t r = 0; r < NFEATS && !ext; r++)
-                if (feats[r].core == needs[i].core && feats[r].core_off == needs[i].off) ext = feat_structs[feats[r].ef].ext;
-            if (!strcmp(needs[i].name, "subgroupBroadcastDynamicId")) ext = "subgroup shuffles";
-            snprintf(what, sizeof(what), "%s (%s)", ext ? ext : "?", needs[i].name);
-            append(miss, sizeof(miss), what);
-        }
-        if (v == 3) {
-            /* the extended dynamic states have no core bit: their extension's own */
-            static const uint8_t eds[] = {EF_EDS, EF_EDS2};
-            for (size_t i = 0; i < 2; i++)
-                if (!exts_has(&el, feat_structs[eds[i]].ext)) append(miss, sizeof(miss), feat_structs[eds[i]].ext);
-        }
-        if (*miss) {
-            snprintf(g.missing, sizeof(g.missing), "Vulkan 1.%u lacks %s", v, miss);
-            break;
-        }
-        g.offered = VK_MAKE_API_VERSION(0, 1, v, VK_API_VERSION_PATCH(g.drv_api));
-    }
-    free(el.e);
+    g.offered = climb(&g, &el, want, &f12, &f13, 0, g.missing, sizeof(g.missing));
     promo_gpu ui = g; /* gamescope's: promoted when complete, tested or not */
+    ui.missing[0] = 0;
+    ui.offered = climb(&ui, &el, want, &f12, &f13, 1, ui.missing, sizeof(ui.missing));
+    free(el.e);
     if (g.offered != g.drv_api && !allowed) {
         /* not tested on this driver: said, and the app sees the driver's own version */
         VKB_INFO("promotion: %s would offer Vulkan 1.%u on its Vulkan 1.%u driver%s; off: not tested on this driver (VKBRIDGE_PROMOTE_API=1 "
@@ -838,6 +853,7 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     if (ui.offered != g.offered)
         VKB_INFO("promotion: %s offered to gamescope as Vulkan 1.%u (Steam mode's compositor; games keep 1.%u)", name, VMINOR(ui.offered),
                  VMINOR(g.offered));
+    if (*ui.missing && strcmp(ui.missing, g.missing)) VKB_INFO("promotion: %s, for gamescope: %s", name, ui.missing);
     pthread_mutex_lock(&gpus_lock);
     gpus_ui[ngpus] = ui;
     gpus[ngpus++] = g;
@@ -949,6 +965,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     const promo_gpu *g = gpu_of(t, pd);
     if (!g || !g->active) {
         t->real.vkGetPhysicalDeviceFeatures2(pd, f);
+        vkb_emu_report_features2(pd, f);
         return;
     }
     ext_list el;
@@ -957,6 +974,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     if (!x) {
         free(el.e);
         t->real.vkGetPhysicalDeviceFeatures2(pd, f);
+        vkb_emu_report_features2(pd, f);
         return;
     }
     x->drv = g->drv_api;
@@ -970,6 +988,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     }
     free(x);
     free(el.e);
+    vkb_emu_report_features2(pd, f);
 }
 
 void vkb_promote_instance_install(vkb_srv_table *t)

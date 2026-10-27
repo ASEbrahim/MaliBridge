@@ -1160,8 +1160,48 @@ static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties2(VkPhys
     fake_lazy_props(&mp->memoryProperties);
 }
 
+/* Mali r26p0 refuses a dma-buf query at DRM-modifier tiling with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+ * (VK_ERROR_FORMAT_NOT_SUPPORTED, with or without a format list), yet makes that very image on an
+ * imported dma-buf, its UNORM storage and SRGB views included. gamescope asks so for every image it
+ * hands the compositor (UNORM and SRGB views) and aborted with no modifier left (Mali-G76 MC4). Such
+ * a refusal is asked again without the flag and its format list. */
+static PFN_vkGetPhysicalDeviceImageFormatProperties2 mutable_next;
+
+static VKAPI_ATTR VkResult VKAPI_CALL mutable_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd,
+                                                                                     const VkPhysicalDeviceImageFormatInfo2 *info,
+                                                                                     VkImageFormatProperties2 *props)
+{
+    VkResult r = mutable_next(pd, info, props);
+    if (r != VK_ERROR_FORMAT_NOT_SUPPORTED || info->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+        !(info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
+        return r;
+    int dmabuf = 0;
+    for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
+            dmabuf = ((const VkPhysicalDeviceExternalImageFormatInfo *)b)->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    if (!dmabuf) return r;
+    VkPhysicalDeviceImageFormatInfo2 *ii = (VkPhysicalDeviceImageFormatInfo2 *)info;
+    VkBaseOutStructure *list = vkb_emu_chain_take(ii, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+    ii->flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    r = mutable_next(pd, ii, props);
+    ii->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    if (list) {
+        list->pNext = (VkBaseOutStructure *)ii->pNext;
+        ii->pNext = list;
+    }
+    static int told;
+    if (!__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED))
+        VKB_INFO("dma-buf image query at DRM-modifier tiling refused with a mutable format; without it: %d (format %d, usage 0x%x)", r,
+                 info->format, info->usage);
+    return r;
+}
+
 void vkb_mem_instance_install(vkb_srv_table *t)
 {
+    if (t->dt.vkGetPhysicalDeviceImageFormatProperties2) {
+        mutable_next = t->dt.vkGetPhysicalDeviceImageFormatProperties2;
+        t->dt.vkGetPhysicalDeviceImageFormatProperties2 = mutable_GetPhysicalDeviceImageFormatProperties2;
+    }
     if (!fake_lazy()) return;
     if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
     if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;

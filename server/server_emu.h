@@ -11,7 +11,7 @@
                              VKB_EMU_DMABUF_EXPORT | VKB_EMU_DUAL_SRC | VKB_EMU_FILL_MODE | VKB_EMU_MULTI_VIEWPORT | \
                              VKB_EMU_MAINT6 | VKB_EMU_LOADSTORE_NONE | VKB_EMU_PUSH_DESC | VKB_EMU_TEXEL_ALIGN | \
                              VKB_EMU_DESC_LIMITS | VKB_EMU_OPAQUE_FD | VKB_EMU_MULTI_DRAW | VKB_EMU_ROBUST2_ACCESS | \
-                             VKB_EMU_DYN_RENDER | VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)
+                             VKB_EMU_DYN_RENDER | VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX | VKB_EMU_DEPTH_CLAMP)
 
 #define VKB_EMU_BUCKETS 1024
 
@@ -157,6 +157,7 @@ void vkb_emu_vb_sizes_resolve(vkb_emu_device *e, uint32_t n, const VkBuffer *buf
 int vkb_emu_ext_hidden(const char *name); /* VKBRIDGE_FAKE_MISSING / VKBRIDGE_SERVER_HIDE_EXTS */
 int vkb_emu_hiding_exts(void);
 void vkb_emu_instance_install(vkb_srv_table *t); /* clients see the device extensions without the hidden ones */
+void vkb_emu_report_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f); /* emulated features in a client's query */
 void vkb_emu_compat_uninstall(vkb_srv_table *dev);
 /* OPAQUE_FD on dma-bufs (server_opaque.c) */
 int vkb_opaque_wanted(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t emu);
