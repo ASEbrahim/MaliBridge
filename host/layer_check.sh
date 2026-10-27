@@ -64,13 +64,18 @@ mali=bc,clip,cull,divisor,maint5,depthclip,push,robustness2,dualsrc,fillmode,mul
 
 # A minimal app: the layer must be in its path, and the identity it is shown must be the layer's.
 inc=-I../third_party/Vulkan-Headers-1.4.341/include
-cc -O1 -I"$inc" -o out/layer-app ../tests/layer_app.c -l:libvulkan.so.1 2>/dev/null || {
+cc -O1 "$inc" -o out/layer-app ../tests/layer_app.c -l:libvulkan.so.1 2>/dev/null || {
   echo "cannot build out/layer-app (the Vulkan headers?)" >&2; exit 1; }
 
 # The WSI: the session's wayland, else X.
 wsi=""
 if [ -n "$WAYLAND_DISPLAY" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then wsi=wayland
 elif [ -n "$DISPLAY" ]; then wsi=xcb
+fi
+# vulkan-tools before 1.3.280 has no --wsi: a separate vkcube-wayland, and vkcube is X only.
+if vkcube --help 2>&1 | grep -q -- --wsi; then cube="vkcube --wsi $wsi"
+elif [ "$wsi" = wayland ] && command -v vkcube-wayland >/dev/null 2>&1; then cube=vkcube-wayland
+else cube=vkcube
 fi
 
 echo "== the layer loads"
@@ -85,15 +90,15 @@ if [ -z "$wsi" ]; then
   skipped "no display: the vkcube checks need one (wayland or X)"
 else
   echo "== vkcube ($wsi)"
-  timeout 120 vkcube --wsi "$wsi" --c 10 >out/layer-plain.log 2>&1
+  VK_INSTANCE_LAYERS= timeout 120 $cube --c 10 >out/layer-plain.log 2>&1
   result $? "vkcube without the layer (the baseline)"
-  timeout 120 vkcube --wsi "$wsi" --c 10 >out/layer-on.log 2>&1
+  timeout 120 $cube --c 10 >out/layer-on.log 2>&1
   result $? "vkcube with the layer"
   grep -q "errata: device .*safe mode" out/layer-on.log
   result $? "the layer was in the path (its log)"
 
   echo "== vkcube with Mali's gaps imitated"
-  VKBRIDGE_FAKE_MISSING=$mali timeout 120 vkcube --wsi "$wsi" --c 10 >out/layer-mali.log 2>&1
+  VKBRIDGE_FAKE_MISSING=$mali timeout 120 $cube --c 10 >out/layer-mali.log 2>&1
   result $? "vkcube with the layer, the GPU taken as a Mali-G720"
   grep -q "BC emulation: BC1 UNORM decodes to" out/layer-mali.log
   result $? "the BC decoder is in place"
