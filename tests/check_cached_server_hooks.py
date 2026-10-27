@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 ASEbrahim and MaliBridge contributors
 """
 The layer's generated dispatch (layer/gen/layer_dispatch_gen.h) is built from
 codegen/cached_server_hook_list.py, a cache of the hooks our scanner found in server/.

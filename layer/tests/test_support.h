@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Fake Vulkan driver the layer can run on, and the
  * fixture that wires it up (the context, the handle registry and the

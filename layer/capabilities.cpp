@@ -1,4 +1,6 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
+ */
 #include "gen/layer_dispatch_gen.h"
 #include "layer_ctx.h"
 #include "capabilities.h"

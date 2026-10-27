@@ -1,4 +1,6 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
+ */
 #define _GNU_SOURCE
 #include "vkb_caps.h"
 #include "vkb_emu_formats.h"

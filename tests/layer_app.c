@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * A minimal Vulkan app: an instance, the physical devices, their identity. Nothing else, so that
  * the layer's own path is the only thing that can make it work (a plain app, no extension, no
