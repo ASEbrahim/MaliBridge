@@ -48,7 +48,7 @@
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
  * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16),
- * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), and example: a no-op on
+ * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), gs_hide (issue #11), and example: a no-op on
  * vkCreateImageView that counts the calls reaching it (and its imitation the calls beneath it),
  * the pattern a fix follows.
  */
@@ -162,6 +162,17 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
      * probe's single-binding shape, which a multi-binding failure alone does not show. */
     [VKB_ERRATUM_VB_BAKE] = {"vb_bake", "MK-05", "vb_strides", 1, G_PROBE_FAIL, G_PROBE_FAIL, {{0}},
         vkb_errata_vbbake_install, vkb_errata_vbbake_imitate},
+    /* Issue #11 (Galaxy S10+, Mali-G76, "v1.r38p1-01bet0", 2026-10-25): the beta driver segfaults
+     * (address 0) compiling every VS+GS+FS pipeline Zink made for Xwayland's glamor and Steam's
+     * update window - three contained crashes poison the device, Xwayland dies of the device loss
+     * and takes Steam and gamescope with it. The released r38p1 (a Galaxy G57's "-01eac0") builds
+     * the same geometry shaders without a crash, so the range is r38p1 beta builds only. The fix
+     * (server_errata_gs.c) hides geometry shaders from the processes VKBRIDGE_GS_HIDE_PROCS lists
+     * (Xwayland and Steam's own: Zink then draws without them); games keep them (DXVK requires
+     * geometryShader). Safe and performance mode alike: the crash is the driver's either way. */
+    [VKB_ERRATUM_GS_HIDE] = {"gs_hide", "#11", NULL, 0, G_IN_RANGE, G_IN_RANGE,
+        {{V(38, 1), V(38, 2), FAM_ANY, NULL, "a beta build: Zink's geometry shaders crash its compiler", R_BETA}},
+        vkb_errata_gs_install, NULL},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
 };
 
@@ -731,6 +742,23 @@ int vkb_errata_fp16_hidden(const vkb_srv_table *t, VkPhysicalDevice pd, char *wh
     read_switches(&w);
     int targeted, forced_off;
     return decide_erratum(VKB_ERRATUM_FP16_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off);
+}
+
+/* gs_hide's driver half: the erratum's decision for this physical device (the range, or
+ * VKBRIDGE_ERRATA=+/-gs_hide); the process half is server_errata_gs.c's */
+int vkb_errata_gs_driver(const vkb_srv_table *t, VkPhysicalDevice pd, char *why, size_t cap)
+{
+    char buf[320];
+    if (!why) why = buf, cap = sizeof(buf);
+    why[0] = 0;
+    if (!t || !t->real.vkGetPhysicalDeviceProperties) return 0;
+    char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    drv_version d;
+    driver_version(t, pd, &d, gpu, sizeof(gpu));
+    switches w;
+    read_switches(&w);
+    int targeted, forced_off;
+    return decide_erratum(VKB_ERRATUM_GS_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off);
 }
 
 /* example: what a fix looks like. Its wrapper calls the function it replaced (example_next), so it

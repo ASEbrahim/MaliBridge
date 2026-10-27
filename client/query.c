@@ -26,7 +26,8 @@
  * but could not copy it (a queue family without graphics/compute). Anything else (unmirrored queries, other
  * query types, VK_QUERY_RESULT_WITH_STATUS_BIT_KHR, WAIT on a query not ready yet) goes to the
  * server as before. Limit: a multiview render pass ends N consecutive queries per vkCmdEndQuery;
- * only the first is copied, so the others are right only if they were never mirrored before.
+ * only the first is copied; the others (mirrored by a host reset) are found by the stuck-query
+ * check below, which asks the server about a query the mirror has said "not ready" for too long.
  *
  * VKBRIDGE_QUERY_MIRROR=0 turns this off.
  */
@@ -34,7 +35,9 @@
 #include "vkb_client.h"
 #include "gen/vkb_client_gen.h"
 
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct vkb_qmirror {
     VkQueryPool pool;
@@ -45,6 +48,8 @@ typedef struct vkb_qmirror {
     uint32_t *ready;
     VkDeviceSize ready_off;
     uint8_t *mirrored;       /* per query, atomic */
+    uint32_t *nr_polls;      /* per query: not-ready answers from the mirror in a row (stuck_ask) */
+    uint32_t *nr_since;      /* per query: ms clock of the first of them */
 } vkb_qmirror;
 
 typedef struct vkb_qop {
@@ -88,6 +93,8 @@ static void mirror_free(vkb_device *d, vkb_qmirror *m)
     if (m->buf) vkb_ep_vkDestroyBuffer((VkDevice)d, m->buf, NULL);
     if (m->mem) vkb_ep_vkFreeMemory((VkDevice)d, m->mem, NULL);
     free(m->mirrored);
+    free(m->nr_polls);
+    free(m->nr_since);
     free(m);
 }
 
@@ -143,7 +150,11 @@ static vkb_qmirror *mirror_create(vkb_device *d, VkQueryPool pool, uint32_t coun
     VkDevice device = (VkDevice)d;
     vkb_physdev *pd = d->pd;
     vkb_qmirror *m = calloc(1, sizeof(*m));
-    if (!m || !(m->mirrored = calloc(count, 1))) {
+    if (!m || !(m->mirrored = calloc(count, 1)) || !(m->nr_polls = calloc(count, 4)) || !(m->nr_since = calloc(count, 4))) {
+        if (m) {
+            free(m->mirrored);
+            free(m->nr_polls);
+        }
         free(m);
         return NULL;
     }
@@ -159,6 +170,7 @@ static vkb_qmirror *mirror_create(vkb_device *d, VkQueryPool pool, uint32_t coun
     for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount && type == UINT32_MAX; i++) {
         if (!(req.memoryTypeBits & (1u << i)) || !pd->type_map[i].shared) continue;
         if (!(pd->info.coherent_types & (1u << pd->type_map[i].server_type))) continue;
+        if (pd->type_map[i].cached) continue; /* CPU-cached pages need invalidates: the ready words would go stale */
         if (pd->client_mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) type = i;
     }
     if (type == UINT32_MAX) {
@@ -219,6 +231,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkResetQueryPool(VkDevice device, VkQueryPool 
         for (uint32_t q = firstQuery; q < end; q++) {
             __atomic_store_n(&m->ready[q], 0, __ATOMIC_RELEASE);
             __atomic_store_n(&m->mirrored[q], 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&m->nr_polls[q], 0, __ATOMIC_RELAXED);
         }
     }
     vkb_wire_vkResetQueryPool(device, queryPool, firstQuery, queryCount);
@@ -382,7 +395,14 @@ void vkb_query_cb_end(vkb_cmdbuf *cb)
                                            (VkDeviceSize)items[i].first * 8, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     vkb_wire_vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &xfer_xfer, 0, NULL,
                                   0, NULL);
-    for (uint32_t i = 0; i < nrun; i++)
+    /* VKBRIDGE_TEST_QUERY_LOSE_READY=1 (host tests only): the first command buffer's ready words are
+     * not written, as if the update were lost on the way (Deep Rock Galactic's stall on the S11 Ultra:
+     * the GPU done, the server idle, the mirror's ready word never set). stuck_ask must end it. */
+    static int lose = -1;
+    if (lose < 0) lose = getenv("VKBRIDGE_TEST_QUERY_LOSE_READY") && atoi(getenv("VKBRIDGE_TEST_QUERY_LOSE_READY")) == 1;
+    int skip_ready = lose && __atomic_exchange_n(&lose, 0, __ATOMIC_ACQ_REL);
+    if (skip_ready) VKB_WARN("query mirror: test: this command buffer's ready words are left out (VKBRIDGE_TEST_QUERY_LOSE_READY=1)");
+    for (uint32_t i = 0; i < nrun && !skip_ready; i++)
         vkb_wire_vkCmdFillBuffer(commandBuffer, items[i].m->buf, items[i].m->ready_off + (VkDeviceSize)items[i].first * 4,
                                  (VkDeviceSize)items[i].count * 4, 1);
     VkMemoryBarrier host = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
@@ -398,15 +418,100 @@ out:
 
 /* ------------------------------------------------------------------ results */
 
-/* 1 = answered from the mirror (*result set); 0 = ask the server. */
 /* Why the last vkb_query_results call said "ask the server" (the first few are logged by the
  * caller: on the tablet DRG still made ~5,400 query round trips a second with the mirror on). */
 static __thread const char *why_wire;
 const char *vkb_query_why_wire(void) { return why_wire ? why_wire : "?"; }
 
+/* ------------------------------------------------------------------ stuck queries
+ *
+ * Deep Rock Galactic on the S11 Ultra (2026-10-27, rc7 and rc9, 5 of 6 Space Rig loads): UE4's
+ * render thread spun at 100% of a core for minutes in this file's not-ready answer (61% of its
+ * samples), with no syscalls, every DXVK thread idle, the server idle and no bridge call pending,
+ * until UE4 gave up ("GameThread timed out waiting for RenderThread after 120.00 secs"). The GPU
+ * had the query; the mirror's ready word was never set. With the mirror off every load passed.
+ * Whatever leaves a ready word unset (an update lost on the way, a query ended where no
+ * copy follows it - a multiview pass ends N queries per vkCmdEndQuery and only the first is
+ * copied), the mirror must not say "not ready" forever: no call of the app's ever reaches the
+ * server again to notice.
+ *
+ * So a query the mirror has answered "not ready" for 200 ms in a row is asked of the server once.
+ * If the driver has it, the query leaves the mirror (answered by the server, the authority, until
+ * its next reset or copy mirrors it again) and the
+ * case is logged; if not, the count starts over. The normal case is untouched: a result reaches
+ * the mirror at most a GPU frame after its submit (Stray at 14 fps: ~70 ms),
+ * and a poll that sees it ready costs no round trip, as before. The clock is read on the first 64
+ * not-ready answers of a run and then every 64th, so a tight spin pays almost nothing for it. */
+static uint32_t stuck_ms(void)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *e = getenv("VKBRIDGE_QUERY_STUCK_MS");
+        v = e && *e ? atoi(e) : 200;
+        if (v < 0) v = 0;
+    }
+    return (uint32_t)v;
+}
+
+static uint32_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
+}
+
+/* The query this thread's last vkb_query_results sent to the server as stuck (vkb_query_wire_answer). */
+static __thread struct {
+    vkb_qmirror *m;
+    VkQueryPool pool;
+    uint32_t first, count, ms;
+} stuck_probe;
+
+/* One not-ready answer for query q: 1 when it has been not ready long enough to ask the server. */
+static int stuck_ask(vkb_qmirror *m, uint32_t q, uint32_t *held)
+{
+    uint32_t limit = stuck_ms();
+    if (!limit) return 0;
+    uint32_t n = __atomic_add_fetch(&m->nr_polls[q], 1, __ATOMIC_RELAXED);
+    if (n == 1) {
+        __atomic_store_n(&m->nr_since[q], now_ms(), __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (n > 64 && (n & 63)) return 0;
+    uint32_t t = now_ms() - __atomic_load_n(&m->nr_since[q], __ATOMIC_RELAXED);
+    if (t < limit) return 0;
+    /* Start over: if the server says not ready either, the next question comes a period later. */
+    __atomic_store_n(&m->nr_polls[q], 0, __ATOMIC_RELAXED);
+    *held = t;
+    return 1;
+}
+
+static uint32_t stuck_found; /* queries the server had while the mirror said not ready (logged) */
+
+/* icd.c, after a vkGetQueryPoolResults that went to the server. */
+void vkb_query_wire_answer(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t count, VkResult r)
+{
+    (void)d;
+    vkb_qmirror *m = stuck_probe.m;
+    if (!m || stuck_probe.pool != pool || stuck_probe.first != first || stuck_probe.count != count) return;
+    stuck_probe.m = NULL;
+    if (r != VK_SUCCESS) {
+        VKB_ONCE(VKB_LOG_INFO, "query mirror: a query not ready for %u ms is not ready on the server either (logged once)", stuck_probe.ms);
+        return;
+    }
+    for (uint32_t q = first; q < first + count && q < m->count; q++) __atomic_store_n(&m->mirrored[q], 0, __ATOMIC_RELEASE);
+    uint32_t n = __atomic_add_fetch(&stuck_found, 1, __ATOMIC_RELAXED);
+    if (n <= 5 || (n & (n - 1)) == 0)
+        VKB_WARN("query mirror: query %u+%u of pool %llx was not ready in the mirror for %u ms but done on the GPU; answered by the "
+                 "server until it is reset (%u so far)",
+                 first, count, (unsigned long long)(uintptr_t)pool, stuck_probe.ms, n);
+}
+
+/* 1 = answered from the mirror (*result set); 0 = ask the server. */
 int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t count, size_t size, void *data, VkDeviceSize stride,
                       VkQueryResultFlags flags, VkResult *result)
 {
+    stuck_probe.m = NULL;
     why_wire = "status flag";
     if (flags & VK_QUERY_RESULT_WITH_STATUS_BIT_KHR) return 0;
     vkb_qmirror *m = mirror_of(d, pool);
@@ -417,13 +522,26 @@ int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t 
     why_wire = "size";
     if ((count - 1) * stride + elem > size) return 0;
     int all = 1;
+    uint32_t first_nr = UINT32_MAX;
     why_wire = "query not mirrored (reset, or not ended in a finished primary)";
     for (uint32_t q = first; q < first + count; q++) {
         if (!__atomic_load_n(&m->mirrored[q], __ATOMIC_ACQUIRE)) return 0;
-        all &= __atomic_load_n(&m->ready[q], __ATOMIC_ACQUIRE) != 0;
+        int rq = __atomic_load_n(&m->ready[q], __ATOMIC_ACQUIRE) != 0;
+        all &= rq;
+        if (!rq && first_nr == UINT32_MAX) first_nr = q;
     }
     why_wire = "WAIT on a query not ready";
     if (!all && (flags & VK_QUERY_RESULT_WAIT_BIT)) return 0; /* the server waits */
+    uint32_t held = 0;
+    if (!all && stuck_ask(m, first_nr, &held)) {
+        why_wire = "not ready in the mirror for VKBRIDGE_QUERY_STUCK_MS (asked once)";
+        stuck_probe.m = m;
+        stuck_probe.pool = pool;
+        stuck_probe.first = first;
+        stuck_probe.count = count;
+        stuck_probe.ms = held;
+        return 0;
+    }
     int ready_all = 1;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t q = first + i;
@@ -432,6 +550,8 @@ int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t 
         uint64_t v = 0;
         if (ready) v = __atomic_load_n(&m->value[q], __ATOMIC_RELAXED);
         ready_all &= ready;
+        /* A run of not-ready answers ends when the query is seen ready. */
+        if (ready && __atomic_load_n(&m->nr_polls[q], __ATOMIC_RELAXED)) __atomic_store_n(&m->nr_polls[q], 0, __ATOMIC_RELAXED);
         /* Not available: the value is written only with PARTIAL (0 is a valid partial result). */
         if (ready || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
             if (b64) memcpy(out, &v, 8);

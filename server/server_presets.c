@@ -96,6 +96,8 @@ static const char *const keys[] = {
     "VKBRIDGE_DESC_BATCH", "VKBRIDGE_NO_DESC_BATCH", "VKBRIDGE_QUERY_MIRROR",
     /* what the app is shown (vkb_preset_client_values) */
     "VKBRIDGE_HEAP_MAX_MB", "VKBRIDGE_SPOOF_GPU",
+    /* the client's frame wait (vkb_preset_client_values) */
+    "VKBRIDGE_PRESENT_TIMEOUT_S",
 };
 
 static int allowed(const char *k)
@@ -422,11 +424,15 @@ uint64_t vkb_memtotal_mb(void) { return meminfo_kb("MemTotal", "VKBRIDGE_FAKE_ME
 /* Memory free for use now in KB (MemAvailable; VKBRIDGE_FAKE_MEMAVAIL_MB for tests), 0 when unknown */
 uint64_t vkb_memavail_kb(void) { return meminfo_kb("MemAvailable", "VKBRIDGE_FAKE_MEMAVAIL_MB"); }
 
-/* The default heap cap: in safe mode on a device with 8.5 GB of RAM or less (an "8 GB" phone or
- * tablet shows 7-8 GB), when VKBRIDGE_HEAP_MAX_MB says nothing, half the RAM rounded down to
- * 512 MB, at least 2048 and at most 4096. DXVK otherwise sizes its budget, and games their
- * texture quality, as if all of RAM were video memory, and get killed for it. 0: none. */
-#define VKB_HEAP_DEFAULT_RAM_MAX_MB 8704u
+/* The default heap cap: in safe mode on a device with 12.5 GB of RAM or less (an "8 GB" phone or
+ * tablet shows 7-8 GB, a "12 GB" one 11-11.7), when VKBRIDGE_HEAP_MAX_MB says nothing, half the
+ * RAM rounded down to 512 MB, at least 2048 and at most 4096 (4096 on 12 GB devices). DXVK
+ * otherwise sizes its budget, and games their texture quality, as if all of RAM were video memory,
+ * and get killed for it. 12 GB devices were left out at first, and an XRing O3 with 11377 MB
+ * showed Titanfall 2 about 11 GB: its textures grew to 2.4 GB without ever coming down, the
+ * server to 4 GB, and the system's low-memory killer closed it within 3-5 minutes in each of three
+ * runs, with the system's other apps taking the rest (MaliBridge#18). 0: none. */
+#define VKB_HEAP_DEFAULT_RAM_MAX_MB 12800u
 uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb)
 {
     if (mode != VKB_MODE_SAFE || !ram_mb || ram_mb > VKB_HEAP_DEFAULT_RAM_MAX_MB) return 0;
@@ -449,8 +455,9 @@ void vkb_preset_client_values(vkb_server_pd_info *info)
         heap = vkb_heap_default_cap_mb(vkb_mode(), ram);
         if (heap) {
             char msg[200];
-            snprintf(msg, sizeof(msg), "heap cap: safe mode with %llu MB of RAM (8704 or less): device-local heaps shown "
-                     "as at most %llu MB (VKBRIDGE_HEAP_MAX_MB=0 turns this off)", (unsigned long long)ram, (unsigned long long)heap);
+            snprintf(msg, sizeof(msg), "heap cap: safe mode with %llu MB of RAM (%u or less): device-local heaps shown "
+                     "as at most %llu MB (VKBRIDGE_HEAP_MAX_MB=0 turns this off)", (unsigned long long)ram, VKB_HEAP_DEFAULT_RAM_MAX_MB,
+                     (unsigned long long)heap);
             if (first_time(msg)) VKB_INFO("%s", msg);
         }
     }
@@ -462,5 +469,15 @@ void vkb_preset_client_values(vkb_server_pd_info *info)
         else if (!strcmp(g, "amd")) info->spoof_gpu = VKB_SPOOF_AMD;
         else if (!strcmp(g, "0") || !strcmp(g, "off")) info->spoof_gpu = VKB_SPOOF_OFF;
         else bad_value("VKBRIDGE_SPOOF_GPU", g, "nvidia, amd or off");
+    }
+    /* VKBRIDGE_PRESENT_TIMEOUT_S=<n>: how long the client lets one frame render before it calls
+     * the device lost (client/wsi.c; 0: never). Nothing said: the client's default. */
+    const char *pt = vkb_srv_env("VKBRIDGE_PRESENT_TIMEOUT_S");
+    info->present_timeout_s = 0;
+    if (pt && *pt) {
+        char *end;
+        unsigned long long sec = strtoull(pt, &end, 10);
+        if (*end || *pt == '-') bad_value("VKBRIDGE_PRESENT_TIMEOUT_S", pt, "a number of seconds");
+        else info->present_timeout_s = !sec || sec >= VKB_PRESENT_TIMEOUT_NONE ? VKB_PRESENT_TIMEOUT_NONE : (uint32_t)sec;
     }
 }

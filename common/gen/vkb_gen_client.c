@@ -3202,7 +3202,7 @@ VkResult vkb_wire_vkDeviceWaitIdle(VkDevice device)
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return vkb_note_lost("vkDeviceWaitIdle", r_);
+    return vkb_note_fail("vkDeviceWaitIdle", r_);
 }
 
 VkResult vkb_wire_vkEndCommandBuffer(VkCommandBuffer commandBuffer)
@@ -5240,7 +5240,7 @@ VkResult vkb_wire_vkQueueBindSparse(VkQueue queue, uint32_t bindInfoCount, const
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return vkb_note_lost("vkQueueBindSparse", r_);
+    return vkb_note_fail("vkQueueBindSparse", r_);
 }
 
 VkResult vkb_wire_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence)
@@ -5262,7 +5262,7 @@ VkResult vkb_wire_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSub
     if (!vkb_call_exec(&call_)) return vkb_device_lost("vkQueueSubmit");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return vkb_note_lost("vkQueueSubmit", r_);
+    return vkb_note_fail("vkQueueSubmit", r_);
 }
 
 VkResult vkb_wire_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence)
@@ -5284,7 +5284,7 @@ VkResult vkb_wire_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSu
     if (!vkb_call_exec(&call_)) return vkb_device_lost("vkQueueSubmit2");
     VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);
     vkb_call_end(&call_);
-    return vkb_note_lost("vkQueueSubmit2", r_);
+    return vkb_note_fail("vkQueueSubmit2", r_);
 }
 
 VkResult vkb_wire_vkQueueWaitIdle(VkQueue queue)
@@ -5301,7 +5301,7 @@ VkResult vkb_wire_vkQueueWaitIdle(VkQueue queue)
     VkResult r_;
     vkb_dec_bytes(d, &r_, sizeof(r_));
     vkb_call_end(&call_);
-    return vkb_note_lost("vkQueueWaitIdle", r_);
+    return vkb_note_fail("vkQueueWaitIdle", r_);
 }
 
 VkResult vkb_wire_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags)
@@ -6496,11 +6496,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkResetFences(VkDevice device, uint
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkSetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory, float priority)
 {
     vkb_wire_vkSetDeviceMemoryPriorityEXT(device, memory, priority);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetEvent(VkDevice device, VkEvent event)
-{
-    return vkb_wire_vkSetEvent(device, event);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo* pSignalInfo)

@@ -6,7 +6,9 @@
 #   1  a build slower than the probes' limit but under the transcoders' own: passes, said slow,
 #      every BC format transcoded;
 #   2  a build past the transcoders' limit: a hang, said as a compile; only BC7 decoded (BC2 and
-#      BC3 still go to ASTC), and the device's log says which formats are decoded;
+#      BC3 still go to ASTC), and the device's log says which formats are decoded; its flag is not
+#      read as MK-20's (BC7's flag shared MK-20's bit: the Retroid Pocket 4 Pro's report said
+#      "shaderFloat16 hidden" for a died bc_transcoders, MaliBridge#10);
 #   3  a hang on an earlier transcoder: those after it are not tried, and decoded too.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
@@ -48,7 +50,8 @@ step $? "a slow build passes: $(detail slow | grep -o 'BC7->ASTC[^,]*'); transco
 start hang VKBRIDGE_PROBE_TX_FAKE=BC7-\>ASTC:5000 VKBRIDGE_PROBE_TX_TIMEOUT_S=2
 [ "$(probe_line hang)" = hang ] && detail hang | grep -q "BC7->ASTC HANG (still compiling after 2 s, interrupted; a compile, no GPU work)" &&
   ! has hang 145 && ! has hang 146 && has hang 135 && has hang 137 && has hang 131 &&
-  grep -q "BC emulation: formats 145 146 decoded, not transcoded" $work/hang/server.log
+  grep -q "BC emulation: formats 145 146 decoded, not transcoded" $work/hang/server.log &&
+  grep -q "probe: bc_transcoders hang (.*): formats of the failed BC transcoder decoded$" $work/hang/server.log && ! grep -q "MK-20" $work/hang/server.log
 step $? "a build past the limit: $(detail hang | grep -o 'BC7->ASTC HANG[^)]*)'); transcoded:$(tx hang)"
 
 # 3 a hang on BC2->ASTC: the rest not tried, and decoded

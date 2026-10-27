@@ -201,6 +201,12 @@ set(CHECK_TESTS
     dynrend_check
     wave32_check
     xfb_check
+    gshide_check
+    featclamp_check
+    gsexport_check
+    present_late_check
+    eventstatus_check
+    querystuck_check
 )
 foreach(t IN LISTS CHECK_TESTS)
     add_executable(${t}

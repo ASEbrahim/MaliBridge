@@ -6,15 +6,27 @@
  * waits with VK_ERROR_INITIALIZATION_FAILED (-3) after a signal; run against a server with the
  * imitation on, the fix on ("ok") or off ("bug").
  *
- *   wait_check ok|bug|any [case...]   cases: fence-finite fence-infinite sem-finite sem-infinite
+ *   wait_check ok|bug|early|any [case...]
+ *                                     cases: fence-finite fence-infinite sem-finite sem-infinite
  *                                     queue-idle device-idle query-wait (the default: all of them)
  *                                     fence-status, leak (exits without destroying the device,
- *                                     after a submit: the server's own vkDeviceWaitIdle)
+ *                                     after a submit: the server's own vkDeviceWaitIdle),
+ *                                     fence-late sem-late (no timeout; the timeline is signalled
+ *                                     from the host 300 ms later, the fence by a submit waiting on it)
+ *                                     sem-slow (a submit to signal it is made, its work done after
+ *                                     1.5 s; timeout 1 s: DXVK's 5 s hang check in small),
+ *                                     sem-nosubmit (timeout 1 s, nothing submitted to signal it)
  *
  * ok:  a finite wait on what is never signalled ends in VK_TIMEOUT, not before its timeout
  *      (300 ms); one on what is signalled, and the idle and query waits, in VK_SUCCESS; a polled
  *      fence status reaches VK_SUCCESS and is never -3;
  * bug: each ends in -3 (the imitation, the fix off);
+ * early: the late cases end in VK_TIMEOUT before the work is done (an early VK_TIMEOUT imitated,
+ *      the fix off: what DXVK took as a lost device in Stray); "ok" wants VK_SUCCESS after
+ *      the signal (300 ms);
+ * nograce: as ok, but sem-slow wants VK_TIMEOUT at its 1 s deadline (VKBRIDGE_WAIT_GRACE_S=0, the
+ *      old behaviour); "ok" wants VK_SUCCESS once the work is done (the grace). sem-nosubmit wants
+ *      VK_TIMEOUT at 1 s either way;
  * any: the results are printed, not judged.
  * One line per case, "OK: ..." / "FAILED: ..." last. Set VKBRIDGE_QUERY_MIRROR=0 so the query wait
  * reaches the server.
@@ -23,6 +35,7 @@
 #include <vulkan/vulkan.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,7 +56,7 @@ I(vkCreateDevice); I(vkGetDeviceProcAddr); I(vkDestroyInstance); I(vkGetDeviceQu
 I(vkAllocateCommandBuffers); I(vkBeginCommandBuffer); I(vkEndCommandBuffer); I(vkQueueSubmit); I(vkCreateFence);
 I(vkDestroyFence); I(vkWaitForFences); I(vkGetFenceStatus); I(vkCreateSemaphore); I(vkDestroySemaphore); I(vkWaitSemaphores);
 I(vkQueueWaitIdle); I(vkDeviceWaitIdle); I(vkCreateQueryPool); I(vkDestroyQueryPool); I(vkCmdResetQueryPool);
-I(vkCmdWriteTimestamp); I(vkGetQueryPoolResults); I(vkDestroyDevice);
+I(vkCmdWriteTimestamp); I(vkGetQueryPoolResults); I(vkDestroyDevice); I(vkSignalSemaphore);
 #undef I
 
 static double now_ms(void)
@@ -54,6 +67,45 @@ static double now_ms(void)
 }
 
 #define FINITE_NS 300000000ull
+#define LATE_MS 300
+
+/* Signals the timeline to 1 from the host after LATE_MS */
+static void *late_signal(void *arg)
+{
+    struct timespec ts = {0, LATE_MS * 1000000L};
+    nanosleep(&ts, NULL);
+    VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, NULL, *(VkSemaphore *)arg, 1};
+    vkSignalSemaphore(dev, &si);
+    return NULL;
+}
+
+#define SLOW_TIMEOUT_NS 1000000000ull
+#define SLOW_MS 1500
+
+struct later {
+    VkSemaphore s;
+    long ms;
+};
+/* Signals the timeline to 1 from the host after ms */
+static void *signal_after(void *arg)
+{
+    struct later *l = arg;
+    struct timespec ts = {l->ms / 1000, (l->ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+    VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, NULL, l->s, 1};
+    vkSignalSemaphore(dev, &si);
+    return NULL;
+}
+
+/* The grace cases: judged here, whatever the mode but "any" */
+static void verdict(const char *what, VkResult r, double ms, int ok)
+{
+    if (!strcmp(expect, "any")) ok = 1;
+    checks++;
+    if (!ok) failures++;
+    printf("%s %s: %d after %.0f ms\n", ok ? "PASS" : "FAIL", what, r, ms);
+    fflush(stdout);
+}
 
 /* want: the result the fix gives; min_ms: not before (finite timeouts) */
 static void judge(const char *what, VkResult r, double ms, VkResult want, double min_ms, const char *extra)
@@ -61,7 +113,9 @@ static void judge(const char *what, VkResult r, double ms, VkResult want, double
     int ok;
     if (!strcmp(expect, "bug"))
         ok = r == VK_ERROR_INITIALIZATION_FAILED;
-    else if (!strcmp(expect, "ok"))
+    else if (!strcmp(expect, "early"))
+        ok = r == VK_TIMEOUT && ms < LATE_MS - 50;
+    else if (!strcmp(expect, "ok") || !strcmp(expect, "nograce"))
         ok = r == want && ms >= min_ms;
     else
         ok = 1;
@@ -158,6 +212,7 @@ int main(int argc, char **argv)
     G(vkQueueSubmit); G(vkCreateFence); G(vkDestroyFence); G(vkWaitForFences); G(vkGetFenceStatus); G(vkCreateSemaphore);
     G(vkDestroySemaphore); G(vkWaitSemaphores); G(vkQueueWaitIdle); G(vkDeviceWaitIdle); G(vkCreateQueryPool);
     G(vkDestroyQueryPool); G(vkCmdResetQueryPool); G(vkCmdWriteTimestamp); G(vkGetQueryPoolResults); G(vkDestroyDevice);
+    G(vkSignalSemaphore);
 #undef G
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, qfam};
@@ -237,6 +292,77 @@ int main(int argc, char **argv)
         judge("query-wait (timestamp, WAIT_BIT)", r, now_ms() - t, VK_SUCCESS, 0, extra);
         vkQueueWaitIdle(queue);
         vkDestroyQueryPool(dev, pool, NULL);
+    }
+    if (wanted(argc, argv, "sem-late", 0)) {
+        VkSemaphore s = timeline();
+        uint64_t v = 1;
+        VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &s, &v};
+        pthread_t th;
+        t = now_ms();
+        pthread_create(&th, NULL, late_signal, &s);
+        r = vkWaitSemaphores(dev, &wi, UINT64_MAX);
+        judge("sem-late (signalled from the host after 300 ms, no timeout)", r, now_ms() - t, VK_SUCCESS, LATE_MS - 10, NULL);
+        pthread_join(th, NULL);
+        vkDestroySemaphore(dev, s, NULL);
+    }
+    if (wanted(argc, argv, "fence-late", 0)) {
+        VkSemaphore s = timeline();
+        VkFence f = fence();
+        uint64_t one = 1;
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 1, &one, 0, NULL};
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts, 1, &s, &stage, 0, NULL, 0, NULL};
+        pthread_t th;
+        t = now_ms();
+        vkQueueSubmit(queue, 1, &si, f); /* waits on the timeline the host signals */
+        pthread_create(&th, NULL, late_signal, &s);
+        r = vkWaitForFences(dev, 1, &f, VK_TRUE, UINT64_MAX);
+        judge("fence-late (a submit waiting on the host's signal at 300 ms, no timeout)", r, now_ms() - t, VK_SUCCESS, LATE_MS - 10, NULL);
+        pthread_join(th, NULL);
+        vkQueueWaitIdle(queue);
+        vkDestroyFence(dev, f, NULL);
+        vkDestroySemaphore(dev, s, NULL);
+    }
+    if (wanted(argc, argv, "sem-slow", 0)) {
+        /* gate: signalled from the host after SLOW_MS; s: signalled by a submit waiting on gate */
+        VkSemaphore gate = timeline(), s = timeline();
+        uint64_t one = 1;
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 1, &one, 1, &one};
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts, 1, &gate, &stage, 0, NULL, 1, &s};
+        struct later l = {gate, SLOW_MS};
+        pthread_t th;
+        t = now_ms();
+        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        pthread_create(&th, NULL, signal_after, &l);
+        VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &s, &one};
+        r = vkWaitSemaphores(dev, &wi, SLOW_TIMEOUT_NS);
+        double ms = now_ms() - t;
+        if (!strcmp(expect, "nograce"))
+            verdict("sem-slow (submitted, done after 1.5 s, timeout 1 s; no grace: VK_TIMEOUT at 1 s)", r, ms,
+                    r == VK_TIMEOUT && ms >= 990 && ms < SLOW_MS - 100);
+        else
+            verdict("sem-slow (submitted, done after 1.5 s, timeout 1 s; the grace: VK_SUCCESS when done)", r, ms,
+                    r == VK_SUCCESS && ms >= SLOW_MS - 10 && ms < SLOW_MS + 1500);
+        pthread_join(th, NULL);
+        vkQueueWaitIdle(queue);
+        vkDestroySemaphore(dev, s, NULL);
+        vkDestroySemaphore(dev, gate, NULL);
+    }
+    if (wanted(argc, argv, "sem-nosubmit", 0)) {
+        VkSemaphore s = timeline();
+        uint64_t one = 1;
+        struct later l = {s, SLOW_MS};
+        pthread_t th;
+        t = now_ms();
+        pthread_create(&th, NULL, signal_after, &l); /* signalled later from the host: never submitted */
+        VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &s, &one};
+        r = vkWaitSemaphores(dev, &wi, SLOW_TIMEOUT_NS);
+        double ms = now_ms() - t;
+        verdict("sem-nosubmit (nothing submitted to signal it, timeout 1 s: VK_TIMEOUT at 1 s)", r, ms,
+                r == VK_TIMEOUT && ms >= 990 && ms < SLOW_MS - 100);
+        pthread_join(th, NULL);
+        vkDestroySemaphore(dev, s, NULL);
     }
     if (wanted(argc, argv, "fence-status", 0)) {
         VkFence f = fence();

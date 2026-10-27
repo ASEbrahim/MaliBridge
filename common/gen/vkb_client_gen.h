@@ -426,6 +426,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkResetDescriptorPool(VkDevice device, VkD
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount);
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetDebugUtilsObjectNameEXT(VkDevice device, const VkDebugUtilsObjectNameInfoEXT* pNameInfo);
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetDebugUtilsObjectTagEXT(VkDevice device, const VkDebugUtilsObjectTagInfoEXT* pTagInfo);
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetEvent(VkDevice device, VkEvent event);
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetPrivateData(VkDevice device, VkObjectType objectType, uint64_t objectHandle, VkPrivateDataSlot privateDataSlot, uint64_t data);
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkSubmitDebugUtilsMessageEXT(VkInstance instance, VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageTypes, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData);
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkTransitionImageLayout(VkDevice device, uint32_t transitionCount, const VkHostImageLayoutTransitionInfo* pTransitions);

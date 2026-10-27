@@ -594,6 +594,78 @@ static VkResult ensure_copy_cbs(vkb_swapchain *sc, uint32_t family)
     return VK_SUCCESS;
 }
 
+/*
+ * How long one frame may take to render before the swapchain calls the device lost. A frame that
+ * is slow is not a lost device: while a game loads, the GPU can be busy for many seconds with the
+ * frame queued behind it (Watch_Dogs on a Dimensity 8300: about 2,500 BC textures
+ * converted on the GPU in 50 s with the CPU held at 1.4 GHz; the frame passed 10 s, the server
+ * lost nothing, and the 10 s limit this replaced told DXVK the device was lost). A real loss still
+ * ends the wait at once: the server's wait returns VK_ERROR_DEVICE_LOST.
+ *
+ * VKBRIDGE_PRESENT_TIMEOUT_S=<n> (0: never) in the guest's environment, else the server's value
+ * (vkbQueryServer's present_timeout_s: the game's preset, <cache dir>/env, the server's
+ * environment), else 120 s.
+ */
+#define PRESENT_TIMEOUT_DEFAULT_S 120u
+#define PRESENT_WAIT_STEP_NS (10ull * 1000 * 1000 * 1000)
+
+static uint64_t wsi_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* seconds; VKB_PRESENT_TIMEOUT_NONE: no limit */
+static uint32_t present_timeout_s(vkb_swapchain *sc)
+{
+    const char *e = getenv("VKBRIDGE_PRESENT_TIMEOUT_S");
+    if (e && *e) {
+        char *end;
+        unsigned long long v = strtoull(e, &end, 10);
+        if (!*end && *e != '-') return !v || v >= VKB_PRESENT_TIMEOUT_NONE ? VKB_PRESENT_TIMEOUT_NONE : (uint32_t)v;
+        VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_PRESENT_TIMEOUT_S=%.40s is not a number of seconds; not applied", e);
+    }
+    uint32_t srv = sc->dev && sc->dev->pd ? sc->dev->pd->info.present_timeout_s : 0;
+    return srv ? srv : PRESENT_TIMEOUT_DEFAULT_S;
+}
+
+/* Waits for a frame's fence in 10 s steps, up to the limit above, and resets it. VK_SUCCESS, or
+ * the wait's error (the server's VK_ERROR_DEVICE_LOST), or VK_ERROR_DEVICE_LOST past the limit. */
+VkResult vkb_wsi_wait_frame(vkb_swapchain *sc, VkFence fence)
+{
+    VkDevice device = (VkDevice)sc->dev;
+    static int slow_said, late_said;
+    uint32_t limit_s = present_timeout_s(sc);
+    uint64_t limit = limit_s == VKB_PRESENT_TIMEOUT_NONE ? UINT64_MAX : (uint64_t)limit_s * 1000000000ull;
+    uint64_t t0 = wsi_now_ns(), waited = 0;
+    VkResult r;
+    for (;;) {
+        uint64_t step = limit - waited < PRESENT_WAIT_STEP_NS ? limit - waited : PRESENT_WAIT_STEP_NS;
+        r = vkb_wire_vkWaitForFences(device, 1, &fence, VK_TRUE, step);
+        waited = wsi_now_ns() - t0;
+        if (r != VK_TIMEOUT) break;
+        if (waited >= limit) {
+            VKB_ERR("swapchain: a frame took more than %u s to render; the device is reported lost (VKBRIDGE_PRESENT_TIMEOUT_S, "
+                    "0: no limit)", limit_s);
+            r = VK_ERROR_DEVICE_LOST;
+            break;
+        }
+        if (!__atomic_exchange_n(&slow_said, 1, __ATOMIC_RELAXED)) {
+            if (limit == UINT64_MAX)
+                VKB_WARN("swapchain: a frame is taking more than 10 s to render (the GPU is busy, a game loading?); still waiting, "
+                         "no limit");
+            else
+                VKB_WARN("swapchain: a frame is taking more than 10 s to render (the GPU is busy, a game loading?); still waiting, "
+                         "up to %u s (VKBRIDGE_PRESENT_TIMEOUT_S)", limit_s);
+        }
+    }
+    vkb_wire_vkResetFences(device, 1, &fence);
+    if (r == VK_SUCCESS && waited >= PRESENT_WAIT_STEP_NS && !__atomic_exchange_n(&late_said, 1, __ATOMIC_RELAXED))
+        VKB_WARN("swapchain: the slow frame rendered after %.1f s and was presented late", waited / 1e9);
+    return r;
+}
+
 /* Waits (on the CPU) for the app's rendering into image `index`, reading it back when needed. */
 VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait)
 {
@@ -609,12 +681,8 @@ VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index
     }
     VkResult r = vkb_wire_vkQueueSubmit(queue, 1, &si, sc->fence);
     if (r != VK_SUCCESS) return r;
-    r = vkb_wire_vkWaitForFences(device, 1, &sc->fence, VK_TRUE, 10ull * 1000 * 1000 * 1000);
-    vkb_wire_vkResetFences(device, 1, &sc->fence);
-    if (r == VK_TIMEOUT) {
-        VKB_ERR("swapchain: a frame took more than 10 s to render");
-        return VK_ERROR_DEVICE_LOST;
-    }
+    r = vkb_wsi_wait_frame(sc, sc->fence);
+    if (r != VK_SUCCESS) return r;
     if (r == VK_SUCCESS && sc->copy_present && sc->staging_cached) {
         /* The copy is done: the CPU's stale lines of the staging buffer dropped before it is read
          * (server_memory.c: DMA_BUF_IOCTL_SYNC). */

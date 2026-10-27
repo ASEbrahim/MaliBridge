@@ -313,8 +313,7 @@ int vkb_emu_bcn_supported(const vkb_dispatch *idt, VkPhysicalDevice pd)
  * VKBRIDGE_FAKE_MISSING=...,push takes the second way on a GPU that has them (host tests). */
 static int has_push(vkb_srv_table *dev)
 {
-    const char *fake = getenv("VKBRIDGE_FAKE_MISSING");
-    if (fake && strstr(fake, "push")) return 0;
+    if (vkb_emu_faked("push")) return 0; /* the process environment or <cache dir>/env */
     VkPhysicalDeviceProperties p;
     dev->real.vkGetPhysicalDeviceProperties(dev->physical, &p);
     if (p.apiVersion >= VK_API_VERSION_1_4 && dev->api_version >= VK_API_VERSION_1_4) return dev->real.vkCmdPushDescriptorSet != NULL;

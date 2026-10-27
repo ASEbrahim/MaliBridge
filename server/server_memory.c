@@ -860,14 +860,33 @@ static int ahb_export_ok = -1;
 static uint64_t ahb_export_cpu = 2ull | (2ull << 4);
 #endif
 
+/* Host tests only (VKBRIDGE_TEST_EXPORT_PAGES=driver): the desktop's dma-heap is root's, so the
+ * emulation's pages are a dma-buf the driver itself exports from a plain allocation (made, exported,
+ * freed: the fd keeps the pages). It lets the export emulation run on the host with
+ * VKBRIDGE_FAKE_MISSING=dmabufexport; never on Android. */
+static int test_driver_pages(void)
+{
+#ifdef __ANDROID__
+    return 0;
+#else
+    static int on = -1;
+    if (on < 0) {
+        const char *v = vkb_srv_env_global("VKBRIDGE_TEST_EXPORT_PAGES");
+        on = v && !strcmp(v, "driver");
+    }
+    return on;
+#endif
+}
+
 /* Where the emulation's pages come from: 1 the dma-heap, 2 AHardwareBuffers (Android, where the
- * start's check passed), 0 nowhere. */
+ * start's check passed), 3 the driver's own dma-bufs (host tests), 0 nowhere. */
 int vkb_mem_export_backing(void)
 {
     if (vkb_mem_dmaheap_available()) return 1;
 #ifdef __ANDROID__
     if (ahb_export_ok == 1 && ahb_load()) return 2;
 #endif
+    if (test_driver_pages()) return 3;
     return 0;
 }
 
@@ -879,12 +898,32 @@ const char *vkb_mem_ahb_export_result(void)
 const char *vkb_mem_export_backing_name(void)
 {
     int b = vkb_mem_export_backing();
-    return b == 1 ? "dma-heap" : b == 2 ? "AHardwareBuffer" : "none";
+    return b == 1 ? "dma-heap" : b == 2 ? "AHardwareBuffer" : b == 3 ? "driver's own dma-bufs (host test)" : "none";
+}
+
+/* VKBRIDGE_TEST_EXPORT_PAGES=driver: len bytes the driver allocates in memory type type and exports. */
+static int driver_pages(vkb_srv_table *t, uint64_t len, uint32_t type)
+{
+    const vkb_dispatch *dt = &t->real;
+    if (!dt->vkGetMemoryFdKHR) return -1;
+    VkExportMemoryAllocateInfo ex = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ex, len, type};
+    VkDeviceMemory mem;
+    if (dt->vkAllocateMemory(t->device, &ai, NULL, &mem) != VK_SUCCESS) return -1;
+    VkMemoryGetFdInfoKHR gi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, NULL, mem, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    int fd = -1;
+    if (dt->vkGetMemoryFdKHR(t->device, &gi, &fd) != VK_SUCCESS) fd = -1;
+    dt->vkFreeMemory(t->device, mem, NULL);
+    VKB_ONCE(VKB_LOG_INFO, "export emulation: pages from the driver's own dma-bufs (VKBRIDGE_TEST_EXPORT_PAGES=driver, host test)");
+    return fd;
 }
 
 /* A dma-buf of len bytes for the emulation (the caller owns the fd), -1 on failure. */
-static int export_pages(uint64_t len, vkb_srv_mem *m)
+static int export_pages(vkb_srv_table *t, uint64_t len, uint32_t type, vkb_srv_mem *m)
 {
+    if (vkb_mem_export_backing() == 3) return driver_pages(t, len, type);
+    (void)t;
+    (void)type;
     int hfd = dmaheap_fd();
     if (hfd >= 0) {
         struct dma_heap_allocation_data hd = {len, 0, O_RDWR | O_CLOEXEC, 0};
@@ -946,7 +985,7 @@ static VkResult alloc_exportable(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb
 {
     const vkb_dispatch *dt = &t->real;
     uint64_t len = (ai->allocationSize + 4095) & ~4095ull;
-    int fd = export_pages(len, m);
+    int fd = export_pages(t, len, ai->memoryTypeIndex, m);
     if (fd < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
     if (!dt->vkGetMemoryFdPropertiesKHR ||
@@ -2000,6 +2039,16 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
         if (import_fd >= 0) {
             fit_import_type(t, &ai, import_fd);
             m->type = ai.memoryTypeIndex;
+            /* A dma-buf smaller than the import asks for is refused by the driver
+             * (VK_ERROR_INVALID_EXTERNAL_HANDLE): said with both sizes, the first few times. */
+            off_t have_len = lseek(import_fd, 0, SEEK_END);
+            if (have_len >= 0 && (uint64_t)have_len < ai.allocationSize) {
+                static int told;
+                if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+                    VKB_WARN("dma-buf import: %llu bytes asked for, the dma-buf has %llu (an importer's image laid out unlike the "
+                             "exporter's?)", (unsigned long long)ai.allocationSize, (unsigned long long)have_len);
+            }
+            lseek(import_fd, 0, SEEK_SET);
         }
         uint32_t type = ai.memoryTypeIndex;
         if (fake_lazy() && import_fd < 0 && !opaque) {
@@ -2154,6 +2203,8 @@ typedef struct {
     uint32_t classes[16]; /* memoryTypeBits of the probed images and unshared buffers (probe_image_types) */
     int nclasses;
     int more_usages; /* the sharing test looks for a buffer usage that allows the type (resources disagree) */
+    int unflagged;   /* the test buffer is made without the strategy's external handle type (the fallback below) */
+    uint32_t told;   /* test buffers' masks logged, per strategy and unflagged (log_test_buffer) */
 } selftest;
 
 /* Buffer usages the probes try: what apps make (all in one, vertex/index, indirect, uniform,
@@ -2172,6 +2223,27 @@ static const VkBufferUsageFlags probe_usages[] = {
 };
 #define PROBE_USAGES (sizeof(probe_usages) / sizeof(probe_usages[0]))
 
+/* The host-visible types of a mask. */
+static uint32_t hv_bits(const selftest *st, uint32_t bits)
+{
+    uint32_t hv = 0;
+    for (uint32_t t = 0; t < st->mp.memoryTypeCount; t++)
+        if ((bits & (1u << t)) && (st->mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) hv |= 1u << t;
+    return hv;
+}
+
+/* A self-test buffer's memoryTypeBits. VKBRIDGE_FAKE_MISSING=extbufhv (host tests): what the
+ * Xclipse 530's driver is thought to do (Galaxy A55, Samsung 24.0.539, 2026-10-26 logs): a buffer
+ * made with external handle types allows no host-visible type. */
+static uint32_t st_buffer_bits(selftest *st, VkBuffer b, VkExternalMemoryHandleTypeFlags handles, VkMemoryRequirements *r)
+{
+    st->dt.vkGetBufferMemoryRequirements(st->dev, b, r);
+    static int fake = -1;
+    if (fake < 0) fake = vkb_emu_faked("extbufhv");
+    if (fake && handles) r->memoryTypeBits &= ~hv_bits(st, r->memoryTypeBits);
+    return r->memoryTypeBits;
+}
+
 /* memoryTypeBits of a buffer of that usage and those external handle types; 0: not made. */
 static uint32_t buffer_bits(selftest *st, VkBufferUsageFlags usage, VkExternalMemoryHandleTypeFlags handles, VkDeviceSize size)
 {
@@ -2180,9 +2252,49 @@ static uint32_t buffer_bits(selftest *st, VkBufferUsageFlags usage, VkExternalMe
     VkBuffer b;
     if (st->dt.vkCreateBuffer(st->dev, &bci, NULL, &b) != VK_SUCCESS) return 0;
     VkMemoryRequirements r;
-    st->dt.vkGetBufferMemoryRequirements(st->dev, b, &r);
+    st_buffer_bits(st, b, handles, &r);
     st->dt.vkDestroyBuffer(st->dev, b, NULL);
     return r.memoryTypeBits;
+}
+
+/* Once per strategy (and once more unflagged): what the driver did with the sharing test's buffer
+ * and the probe usages, with and without the handle type. Before this, a driver that refused every
+ * type at buffer creation left no line at all (Xclipse 530: "types 0x0 shared" and nothing else). */
+static void log_test_buffer(selftest *st, uint32_t s, VkExternalMemoryHandleTypeFlags handle, VkBufferUsageFlags usage, VkResult r,
+                            uint32_t bits)
+{
+    uint32_t bit = 1u << ((s & 15) * 2 + (st->unflagged ? 1 : 0));
+    if (st->told & bit) return;
+    st->told |= bit;
+    char line[256] = "";
+    int ln = 0;
+    for (size_t u = 0; handle && u < PROBE_USAGES; u++)
+        ln += snprintf(line + ln, ln < (int)sizeof(line) ? sizeof(line) - (size_t)ln : 0, " 0x%x", buffer_bits(st, probe_usages[u], handle, 65536));
+    uint32_t plain = buffer_bits(st, usage, 0, 256u * 1024u);
+    VKB_INFO("memory sharing: %s test buffer (usage 0x%x) with handle types 0x%x%s: create %d, types 0x%x (host-visible 0x%x); "
+             "without handle types 0x%x (host-visible 0x%x)%s%s",
+             vkb_mem_strategy_name(s), usage, handle, st->unflagged ? " (unflagged)" : "", r, bits, hv_bits(st, bits), plain,
+             hv_bits(st, plain), handle ? "; probe usages with the handle type:" : "", line);
+}
+
+/* Once, for dmaheap: the memory types a dma-heap fd imports into (vkGetMemoryFdPropertiesKHR). */
+static void log_dmaheap_fd_types(selftest *st)
+{
+    int hfd = dmaheap_fd();
+    if (hfd < 0 || !st->dt.vkGetMemoryFdPropertiesKHR) {
+        VKB_INFO("dmaheap: no fd properties (%s)", hfd < 0 ? "no dma-heap" : "vkGetMemoryFdPropertiesKHR not loaded");
+        return;
+    }
+    struct dma_heap_allocation_data hd = {65536, 0, O_RDWR | O_CLOEXEC, 0};
+    if (ioctl(hfd, DMA_HEAP_IOCTL_ALLOC, &hd) < 0) {
+        VKB_INFO("dmaheap: no fd properties (allocating 64 KiB failed: %s)", strerror(errno));
+        return;
+    }
+    VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    VkResult pr = st->dt.vkGetMemoryFdPropertiesKHR(st->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, (int)hd.fd, &fp);
+    close((int)hd.fd);
+    VKB_INFO("dmaheap: a dma-heap fd imports into memory types 0x%x (host-visible 0x%x; result %d)", fp.memoryTypeBits,
+             hv_bits(st, fp.memoryTypeBits), pr);
 }
 
 static int submit_and_wait(selftest *st, VkCommandBuffer cb)
@@ -2236,8 +2348,10 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush,
 {
     const vkb_dispatch *dt = &st->dt;
     int result = 0;
-    VkExternalMemoryBufferCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, strategy_handle_type(s)};
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ext, 0, TEST_SIZE,
+    /* unflagged: the buffer without the handle type, as the client then makes its buffers */
+    VkExternalMemoryHandleTypeFlags handle = st->unflagged ? 0 : strategy_handle_type(s);
+    VkExternalMemoryBufferCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, handle};
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, handle ? &ext : NULL, 0, TEST_SIZE,
                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
@@ -2248,8 +2362,10 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush,
      * one, for the copies below), when the driver's resources disagree (more_usages): on the
      * XRing O3 the indirect and texel buffers allow types this one does not. */
     for (size_t u = 0;; u++) {
-        if (dt->vkCreateBuffer(st->dev, &bci, NULL, &buf) != VK_SUCCESS) return 0;
-        dt->vkGetBufferMemoryRequirements(st->dev, buf, &req);
+        VkResult cr = dt->vkCreateBuffer(st->dev, &bci, NULL, &buf);
+        if (cr == VK_SUCCESS) st_buffer_bits(st, buf, handle, &req);
+        if (u == 0) log_test_buffer(st, s, handle, bci.usage, cr, cr == VK_SUCCESS ? req.memoryTypeBits : 0);
+        if (cr != VK_SUCCESS) return 0;
         if (req.memoryTypeBits & (1u << type)) break;
         dt->vkDestroyBuffer(st->dev, buf, NULL);
         if (!st->more_usages || u >= PROBE_USAGES) return 0;
@@ -2738,8 +2854,10 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         for (uint32_t j = 0; j < n; j++)
             if (strcmp(req[j], "VK_KHR_external_memory") && strcmp(req[j], "VK_KHR_sampler_ycbcr_conversion") &&
                 strcmp(req[j], "VK_KHR_dedicated_allocation") && strcmp(req[j], "VK_KHR_get_memory_requirements2") &&
-                !has_ext(ex, ne, req[j]))
+                (!has_ext(ex, ne, req[j]) || vkb_emu_faked(req[j])))
                 ok = 0;
+        /* VKBRIDGE_FAKE_MISSING=hostptr (host tests): as on a driver without VK_EXT_external_memory_host */
+        if (s == VKB_MEM_HOSTPTR && vkb_emu_faked("hostptr")) ok = 0;
         /* A driver that exports no dma-buf (Mali: buffers report dma-buf features 0x4, importable
          * only) fails dmabuf at its first vkGetMemoryFdKHR: not tried. */
         if (ok && s == VKB_MEM_DMABUF && idt->vkGetPhysicalDeviceExternalBufferProperties) {
@@ -2816,6 +2934,7 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         /* The client's buffers carry this strategy's handle type: their masks with it. */
         uint32_t dl = probe_dl_types(&st, k->info.image_types, strategy_handle_type(s), 1);
         st.more_usages = dl != 0;
+        if (s == VKB_MEM_DMAHEAP) log_dmaheap_fd_types(&st);
         for (int pass = 0; pass < 2; pass++) {
             for (uint32_t t = 0; t < st.mp.memoryTypeCount; t++) {
                 if (!(st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
@@ -2845,6 +2964,52 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         }
         VKB_INFO("memory sharing: %s failed the self-test", vkb_mem_strategy_name(s));
         OUTCOME(" %s: failed (types 0x%x shared, none coherent);", vkb_mem_strategy_name(s), shareable);
+    }
+    /*
+     * Only when every method failed: the dma-buf methods again, the test buffer made WITHOUT the
+     * external handle type (the memory still exported or imported as a dma-buf). The Xclipse 530
+     * (Galaxy A55, Samsung driver, no VK_EXT_external_memory_host) is thought to give buffers made
+     * with a handle type no host-visible type, so every type failed before any allocation and the
+     * client had no memory an app can map. Binding external memory to a buffer made without its
+     * handle type is outside the spec (VUID-vkBindBufferMemory-memory-02985 for exported memory,
+     * -02726 for imported). It is used only because this self-test proves it end to end on the
+     * device (both CPU mappings the same pages, a GPU fill and copy seen by the client, the client's
+     * write seen by the GPU), and only where nothing in the spec works. The client then makes its
+     * buffers without the handle type (VKB_MEMF_UNFLAGGED_BUFFERS); images are not affected.
+     * VKBRIDGE_UNFLAGGED_BUFFERS=0 turns it off.
+     */
+    const char *uf = vkb_srv_env_global("VKBRIDGE_UNFLAGGED_BUFFERS"); /* <cache dir>/env too (read before the self-test) */
+    for (int pref = 0; pref < 2 && k->info.strategy == VKB_MEM_NONE && !(uf && *uf == '0'); pref++) {
+        uint32_t s = pref == 0 ? VKB_MEM_DMAHEAP : VKB_MEM_DMABUF;
+        int cand = 0;
+        for (int i = 0; i < nc; i++) cand |= candidates[i] == s;
+        if (!cand) continue;
+        st.unflagged = 1;
+        st.more_usages = k->info.dl_types != 0; /* the client's unflagged buffers have the plain masks */
+        uint32_t shareable = 0, coherent = 0;
+        for (uint32_t t = 0; t < st.mp.memoryTypeCount; t++) {
+            if (!(st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+            if (st.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_PROTECTED_BIT) continue;
+            int res = test_type(&st, s, t);
+            if (res) shareable |= 1u << t;
+            if (res == 1) coherent |= 1u << t;
+        }
+        if (coherent) {
+            k->info.strategy = s;
+            k->info.buffer_handle_types = 0;
+            k->info.mem_flags |= VKB_MEMF_UNFLAGGED_BUFFERS;
+            k->info.shareable_types = shareable;
+            k->info.coherent_types = coherent;
+            k->info.import_alignment = st.import_align;
+            k->info.cached_types = cached_selftest(&st, s, shareable);
+            VKB_WARN("memory sharing: %s with buffers made without its handle type (outside the Vulkan spec; this device's self-test "
+                     "passed it end to end, and no other method works)", vkb_mem_strategy_name(s));
+            OUTCOME(" %s: chosen (unflagged buffers), types 0x%x shared, 0x%x coherent, 0x%x cached readback;", vkb_mem_strategy_name(s),
+                    shareable, coherent, k->info.cached_types);
+        } else {
+            OUTCOME(" %s unflagged: failed (types 0x%x shared, none coherent);", vkb_mem_strategy_name(s), shareable);
+        }
+        st.unflagged = 0;
     }
     /* One line with every strategy's fate (the per-type lines above say why). */
     VKB_INFO("memory sharing summary for %s:%s", k->name, outcome);

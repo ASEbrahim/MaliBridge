@@ -117,7 +117,8 @@ void vkb_first_error(const char *call, VkResult r)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     VKB_WARN("%s returned %s (%d) to the game, the first time; %llu frames presented, t=%.3f%s", call, result_name(r), (int)r,
              (unsigned long long)vkb_frames_presented(), ts.tv_sec + ts.tv_nsec / 1e9,
-             r == VK_ERROR_DEVICE_LOST ? " (games report this as a lost or reset device)" : "");
+             r == VK_ERROR_DEVICE_LOST ? " (games report this as a lost or reset device)"
+             : r > 0 ? " (the driver may not return this here; DXVK reports it as a reset device)" : "");
 }
 
 /* ------------------------------------------------------------------ connection */

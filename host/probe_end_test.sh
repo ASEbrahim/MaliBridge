@@ -14,7 +14,11 @@
 #   5  a hang the watchdog cannot interrupt (compile_aces:stall), ended by a kill: died at the
 #      next start, its decision applied;
 #   6  the process stopped (SIGSTOP, a suspended session) inside a background probe until its
-#      watchdog fires: not counted as a hang, run again at the next start.
+#      watchdog fires: not counted as a hang, run again at the next start;
+#   7  the server killed (SIGKILL) inside a background probe after its last client process left,
+#      as the app ends a short session (MaliBridge#10: gamescope gone after 800 ms, the server
+#      killed right after, three times in a row inside bc_transcoders, which was then recorded as
+#      died): 3 times in a row, never counted, the probe runs again and passes.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -122,4 +126,27 @@ grep -q "probe: compile_aces reached its time limit after [0-9.]* s, [0-9.]* s o
   grep -q '"name": "compile_aces", "status": "pass"' "$p" && grep -q '"complete": true' "$p" && ! grep -q "UE4 LUT pipelines get" $log $work/s-stop2/vkbridge-server.log
 step $? "stopped inside a probe past its limit: not a hang, run again at the next start ($(grep -m1 -o 'after [0-9.]* s, [0-9.]* s of them with the process stopped' $log))"
 
-if [ $fails = 0 ]; then echo "OK: 7 steps"; else echo "FAILED: $fails of 7 steps"; exit 1; fi
+# 7  killed after the session's clients left, three times in a row
+c=$work/c-gone
+for k in 1 2 3; do
+  start $c $work/s-gone$k $slow
+  log=$work/s-gone$k/vkbridge-server.log
+  waitfor "compile_aces takes 3 s longer on purpose" $log 300
+  VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES= VKBRIDGE_SOCKET=$sock timeout 30 vulkaninfo --summary >/dev/null 2>&1
+  waitfor "client process [0-9]* gone" $log 100
+  inside=0; grep -q '"running": "compile_aces"' "$(prof $c)" && inside=1
+  killsrv KILL
+  [ $inside = 1 ] || break
+done
+mark=$(tail -c +65 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | tr -d '\0\n' | cut -c1-20)
+start $c $work/s-gone4 $slow
+log=$work/s-gone4/vkbridge-server.log
+waitfor "background probes done" $log 300
+p=$(prof $c)
+[ $inside = 1 ] && [ "$mark" = idle ] &&
+  ( for k in 2 3 4; do grep -q 'compile_aces" probe (ended after [0-9]* ms, after every client process had left (the session.s end)); running it again' $work/s-gone$k/vkbridge-server.log || exit 1; done ) &&
+  ! grep -q "without a word" $work/s-gone[1234]/vkbridge-server.log && grep -q '"name": "compile_aces", "status": "pass"' "$p" &&
+  grep -q '"complete": true' "$p" && ! grep -q '"status": "died"' "$p"
+step $? "SIGKILL after the last client left, 3 starts in a row: the session's end, never died (mark: ${mark:-none}; $(grep -m1 -o 'compile_aces" probe ([^;]*' $log | cut -c22-120))"
+
+if [ $fails = 0 ]; then echo "OK: 8 steps"; else echo "FAILED: $fails of 8 steps"; exit 1; fi

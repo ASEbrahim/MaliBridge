@@ -114,6 +114,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyPipelineCache(VkDevice device, VkPipel
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyPipelineLayout(VkDevice device, VkPipelineLayout pipelineLayout, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyRenderPass(VkDevice device, VkRenderPass renderPass, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySampler(VkDevice device, VkSampler sampler, const VkAllocationCallbacks* pAllocator);
+VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkDeviceWaitIdle(VkDevice device);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEndCommandBuffer(VkCommandBuffer commandBuffer);
@@ -135,6 +136,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_vkGetDeviceProcAddr(VkDevice devi
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceStatus(VkDevice device, VkFence fence);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkImage image, VkImageDrmFormatModifierPropertiesEXT* pProperties);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource* pSubresource, VkSubresourceLayout* pLayout);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetImageSubresourceLayout2(VkDevice device, VkImage image, const VkImageSubresource2* pSubresource, VkSubresourceLayout2* pLayout);
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_vkGetInstanceProcAddr(VkInstance instance, const char* pName);
@@ -1121,6 +1123,13 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySampler(VkDevice device, VkSampler sam
     ctx->t->dt.vkDestroySampler(device, sampler, pAllocator);
 }
 
+VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator)
+{
+    // server_wait.c (w_DestroySemaphore)
+    auto ctx = get_scoped_ctx(device);
+    ctx->t->dt.vkDestroySemaphore(device, semaphore, pAllocator);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks* pAllocator)
 {
     // server_emu_shader.c (emu_DestroyShaderModule)
@@ -1208,6 +1217,13 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceStatus(VkDevice device, VkFence f
     return ctx->t->dt.vkGetFenceStatus(device, fence);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkImage image, VkImageDrmFormatModifierPropertiesEXT* pProperties)
+{
+    // server_emu_layer.c (emu_GetImageDrmFormatModifierPropertiesEXT)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkGetImageDrmFormatModifierPropertiesEXT(device, image, pProperties);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource* pSubresource, VkSubresourceLayout* pLayout)
 {
     // server_emu_layer.c (emu_GetImageSubresourceLayout)
@@ -1252,6 +1268,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetPhysicalDeviceImageFormatProperties(Vk
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo, VkImageFormatProperties2* pImageFormatProperties)
 {
+    // server_emu.c (dmabufmod_GetPhysicalDeviceImageFormatProperties2)
     // server_emu.c (planar_GetPhysicalDeviceImageFormatProperties2)
     // server_opaque.c (op_GetPhysicalDeviceImageFormatProperties2)
     auto ctx = get_scoped_ctx(physicalDevice);
@@ -1280,6 +1297,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submi
     // server_nulldesc.c (nd_QueueSubmit)
     // server_report.c (rp_QueueSubmit)
     // server_trace.c (tr_QueueSubmit)
+    // server_wait.c (w_QueueSubmit)
     auto ctx = get_scoped_ctx(queue);
     return ctx->t->dt.vkQueueSubmit(queue, submitCount, pSubmits, fence);
 }
@@ -1291,6 +1309,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit2(VkQueue queue, uint32_t subm
     // server_nulldesc.c (nd_QueueSubmit2)
     // server_report.c (rp_QueueSubmit2)
     // server_trace.c (tr_QueueSubmit2)
+    // server_wait.c (w_QueueSubmit2)
     auto ctx = get_scoped_ctx(queue);
     return ctx->t->dt.vkQueueSubmit2(queue, submitCount, pSubmits, fence);
 }
@@ -1511,6 +1530,7 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkDestroyPipelineLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyPipelineLayout);
     if (strcmp(pName, "vkDestroyRenderPass") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyRenderPass);
     if (strcmp(pName, "vkDestroySampler") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroySampler);
+    if (strcmp(pName, "vkDestroySemaphore") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroySemaphore);
     if (strcmp(pName, "vkDestroyShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyShaderModule);
     if (strcmp(pName, "vkDeviceWaitIdle") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDeviceWaitIdle);
     if (strcmp(pName, "vkEndCommandBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkEndCommandBuffer);
@@ -1532,6 +1552,7 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkGetDeviceQueue") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDeviceQueue);
     if (strcmp(pName, "vkGetDeviceQueue2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDeviceQueue2);
     if (strcmp(pName, "vkGetFenceStatus") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetFenceStatus);
+    if (strcmp(pName, "vkGetImageDrmFormatModifierPropertiesEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetImageDrmFormatModifierPropertiesEXT);
     if (strcmp(pName, "vkGetImageSubresourceLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetImageSubresourceLayout);
     if (strcmp(pName, "vkGetImageSubresourceLayout2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetImageSubresourceLayout2);
     if (strcmp(pName, "vkGetImageSubresourceLayout2EXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetImageSubresourceLayout2);

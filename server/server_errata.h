@@ -126,4 +126,10 @@ void vkb_errata_clampzero_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_clampzero_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_clampzero_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
+/* server_errata_gs.c: gs_hide (issue #11). The fix is in the instance's queries and vkCreateDevice
+ * (vkb_errata_gs_hidden and the functions after it, vkb_server.h); its install says whether this
+ * device's process is one it hides geometry shaders from. No imitation: the crash is imitated by
+ * VKBRIDGE_TEST_CRASH_PIPELINE=gs (server_guard.c), on any build. */
+void vkb_errata_gs_install(vkb_srv_table *t, vkb_errata_dev *e);
+
 #endif
