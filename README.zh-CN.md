@@ -414,6 +414,8 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 
 ## 交流与支持
 
+所有测试、发送日志和支持 MaliBridge 的朋友都在 [致谢名单](CREDITS.zh-CN.md) 里。谢谢大家！
+
 - Discord：[加入服务器](https://discord.gg/9xC67qTjDq)，获取帮助和新消息（中国大陆可能无法直接访问）
 - 支持开发：[Ko-fi](https://ko-fi.com/asebrahim)
 - 视频：[哔哩哔哩](https://space.bilibili.com/3747573858831484) · [YouTube](https://www.youtube.com/@malibridge)

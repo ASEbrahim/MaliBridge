@@ -453,6 +453,8 @@ The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 
 ## Credits and licence
 
+Everyone who tested, sent logs and supported MaliBridge is in [CREDITS.md](CREDITS.md). Thank you!
+
 MaliBridge is GPL-3.0-or-later with two additional terms under section 7, in [NOTICE](NOTICE):
 anyone who ships MaliBridge or a work based on it keeps a visible "MaliBridge by ASEbrahim" credit
 with a link here, and a modified version can't call itself MaliBridge. See [LICENSE](LICENSE).
