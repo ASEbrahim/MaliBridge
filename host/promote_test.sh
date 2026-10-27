@@ -33,7 +33,7 @@ start() {
   [ -n "$srv" ] && kill $srv 2>/dev/null && wait $srv 2>/dev/null
   rm -f "$sock"
   : > "$log"
-  env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_FAKE_API -u VKBRIDGE_PROMOTE_API -u VKBRIDGE_PROMOTE_TESTED -u VKBRIDGE_MODE "$@" \
+  env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_MAX_API -u VKBRIDGE_FAKE_API -u VKBRIDGE_PROMOTE_API -u VKBRIDGE_PROMOTE_TESTED -u VKBRIDGE_MODE "$@" \
       VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
       "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$cache" >/dev/null 2>&1 &
   srv=$!
@@ -41,7 +41,7 @@ start() {
 }
 trap 'kill $srv 2>/dev/null; rm -f "$sock"; [ -n "$KEEP" ] || rm -rf "$work"' EXIT
 export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES=
-unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API
+unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API VKB_SERVER_LOG
 fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
 run() {
@@ -55,49 +55,52 @@ offered() { grep -m1 -o "offered as Vulkan 1\.[0-9] on its Vulkan 1\.[0-9] drive
 # 0
 start VKBRIDGE_FAKE_API=1.1
 run "$out/promote_check" 1.1
-[ $rc = 0 ] && grep -q "RADV NAVI31) would offer Vulkan 1.3 on its Vulkan 1.1 driver (VKBRIDGE_FAKE_API); off: not tested on this driver" "$log" &&
+[ $rc = 0 ] && grep -q ") would offer Vulkan 1.3 on its Vulkan 1.1 driver (VKBRIDGE_FAKE_API); off: not tested on this driver" "$log" &&
   ! grep -q "offered as\|lowered to\|promoted to" "$log" &&
   grep -q "^api=1\.1\." "$cache/apps-vulkan" && grep -q "^driver_api=1\.1\." "$cache/apps-vulkan" && grep -qx "promotion=off" "$cache/apps-vulkan"
 step $? "a 1.1 driver not tested: $(grep -m1 -o 'would offer Vulkan 1\.[0-9]' "$log"), stays 1.1, nothing lowered, apps-vulkan $(grep '^api=' "$cache/apps-vulkan") $(grep '^promotion=' "$cache/apps-vulkan"); $res"
+# The device's own name, for the tested-list substring in step 1 (the test was written on
+# "AMD Radeon Graphics (RADV NAVI31)"; any driver's name must do).
+devname=$(sed -n 's/^.*promotion: \(.*\) would offer Vulkan .*/\1/p' "$log" | head -1)
 # 1
-start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_PROMOTE_TESTED=Mali-G57,NAVI31
+start VKBRIDGE_FAKE_API=1.1 "VKBRIDGE_PROMOTE_TESTED=Mali-G57,${devname%%,*}"
 run "$out/promote_check" 1.3
-[ $rc = 0 ] && grep -q "RADV NAVI31) offered as Vulkan 1.3 on its Vulkan 1.1 driver (VKBRIDGE_FAKE_API) (tested on this driver" "$log" &&
+[ $rc = 0 ] && grep -q ") offered as Vulkan 1.3 on its Vulkan 1.1 driver (VKBRIDGE_FAKE_API) (tested on this driver" "$log" &&
   grep -q "vkCreateDevice: promoted to Vulkan 1.3 on a 1.1 driver: 1.3, 1.2 feature structures turned into the extensions'" "$log" &&
   grep -q "promotion: SPIR-V 1.6 lowered to 1.4 (1 module(s) so far; this one: 1 extension(s) declared, 0 layer capabilities, 1 dynamic broadcast" "$log"
 step $? "a 1.1 driver with the extensions: $(offered); $res"
 # 2
 start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_PROMOTE_API=1 VKBRIDGE_FAKE_MISSING=VK_KHR_dynamic_rendering
 run "$out/promote_check" 1.2
-[ $rc = 0 ] && grep -q "RADV NAVI31) offered as Vulkan 1.2 on its Vulkan 1.1 driver" "$log" &&
-  grep -q "RADV NAVI31): Vulkan 1.3 lacks VK_KHR_dynamic_rendering (dynamicRendering)$" "$log" &&
+[ $rc = 0 ] && grep -q ") offered as Vulkan 1.2 on its Vulkan 1.1 driver" "$log" &&
+  grep -q "): Vulkan 1.3 lacks VK_KHR_dynamic_rendering (dynamicRendering)$" "$log" &&
   grep -q "promotion: SPIR-V 1.5 lowered to 1.4" "$log"
 r2=$?
 for _ in $(seq 100); do [ -f "$work/malibridge-report.json" ] && grep -q '"offered_api"' "$work/malibridge-report.json" && break; sleep 0.1; done
 [ $r2 = 0 ] && grep -q "^| GPU 0 to apps | Vulkan 1.2 (version promotion, server_promote.c); Vulkan 1.3 lacks VK_KHR_dynamic_rendering (dynamicRendering) |" \
   "$work/malibridge-report.md" && grep -q '"offered_api": "1.2", "promotion_lacks": "Vulkan 1.3 lacks VK_KHR_dynamic_rendering' "$work/malibridge-report.json" &&
-  grep -q "^device=.*RADV NAVI31)$" "$cache/apps-vulkan" && grep -q "^api=1\.2\." "$cache/apps-vulkan" &&
+  grep -q "^device=.*)$" "$cache/apps-vulkan" && grep -q "^api=1\.2\." "$cache/apps-vulkan" &&
   grep -q "^driver_api=1\.1\." "$cache/apps-vulkan" && grep -qx "promotion=on" "$cache/apps-vulkan" && grep -qx "shader_int64=1" "$cache/apps-vulkan" &&
   grep -q "^max_push_constants=[0-9]" "$cache/apps-vulkan" && grep -q "^server=" "$cache/apps-vulkan"
 step $? "... without VK_KHR_dynamic_rendering: $(offered), \"$(grep -m1 -o 'Vulkan 1.3 lacks .*' "$log")\", in the session report and apps-vulkan too; $res"
 # 3
 start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_PROMOTE_API=1.2
 run "$out/promote_check" 1.2
-[ $rc = 0 ] && grep -q "RADV NAVI31) offered as Vulkan 1.2 on its Vulkan 1.1 driver (VKBRIDGE_FAKE_API) (VKBRIDGE_PROMOTE_API" "$log"
+[ $rc = 0 ] && grep -q ") offered as Vulkan 1.2 on its Vulkan 1.1 driver (VKBRIDGE_FAKE_API) (VKBRIDGE_PROMOTE_API" "$log"
 step $? "... VKBRIDGE_PROMOTE_API=1.2: $(offered); $res"
 # 4
 start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_PROMOTE_API=0
 run "$out/promote_check" 1.1
-[ $rc = 0 ] && grep -q "RADV NAVI31) stays at Vulkan 1.1 (VKBRIDGE_PROMOTE_API=0)" "$log" && ! grep -q "lowered to\|promoted to" "$log"
+[ $rc = 0 ] && grep -q ") stays at Vulkan 1.1 (VKBRIDGE_PROMOTE_API=0)" "$log" && ! grep -q "lowered to\|promoted to" "$log"
 step $? "... VKBRIDGE_PROMOTE_API=0: stays at 1.1, nothing lowered; $res"
 # 5
 start VKBRIDGE_FAKE_API=1.2 VKBRIDGE_PROMOTE_API=1
 run "$out/promote_check" 1.3
-[ $rc = 0 ] && grep -q "RADV NAVI31) offered as Vulkan 1.3 on its Vulkan 1.2 driver" "$log" && grep -q "promotion: SPIR-V 1.6 lowered to 1.5" "$log"
+[ $rc = 0 ] && grep -q ") offered as Vulkan 1.3 on its Vulkan 1.2 driver" "$log" && grep -q "promotion: SPIR-V 1.6 lowered to 1.5" "$log"
 step $? "a 1.2 driver: $(offered), SPIR-V 1.6 lowered to 1.5; $res"
 start VKBRIDGE_FAKE_API=1.2 VKBRIDGE_PROMOTE_API=1 VKBRIDGE_FAKE_MISSING=VK_EXT_texel_buffer_alignment
 run "$out/promote_check" 1.3
-[ $rc = 0 ] && grep -q "RADV NAVI31) offered as Vulkan 1.3 on its Vulkan 1.2 driver" "$log" && grep -q "^PASS texel alignments" $work/run.log
+[ $rc = 0 ] && grep -q ") offered as Vulkan 1.3 on its Vulkan 1.2 driver" "$log" && grep -q "^PASS texel alignments" $work/run.log
 step $? "... without VK_EXT_texel_buffer_alignment: $(grep -m1 -o 'PASS texel alignments.*' $work/run.log); $res"
 # 6
 start
