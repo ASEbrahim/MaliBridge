@@ -41,6 +41,11 @@ People whose reports, logs and testing directly led to fixes or shaped MaliBridg
 | [flv-byte](https://github.com/flv-byte) | motorola edge 40 neo, Galaxy Tab S10 Lite | Logs from two devices |
 | [937797140](https://github.com/937797140) | realme Neo7 | Balatro and other game reports |
 | Towelsogog (Discord) | Pixel 9 Pro (Tensor G4) | A 30-game report |
+| gon070 (Discord) | vivo X300 (Dimensity 9500) | Mad Max at 60 fps on High with settings screenshots, and heat and fps reports |
+| jimmy12120 (Discord) | Galaxy Tab S10+ (Dimensity 9300+) | Euro Truck Simulator 2 results and a Derail Valley log |
+| 1sani1 (Discord) | Infinix GT 30 Pro (Dimensity 8350) | Side-by-side fps comparisons and a Tekken 7 log |
+| s3npaii4080 (Discord) | vivo iQOO Z10 Turbo+ (Dimensity 9400+) | Skyrim results and the on-screen controller report |
+| the_chart_legend (Discord) | Galaxy Tab S11 (Dimensity 9400+) | Terraria results and the touch-controls report that led to a fix |
 
 ## Supporters
 

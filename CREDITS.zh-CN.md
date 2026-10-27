@@ -39,6 +39,11 @@ MaliBridge 由 [ASEbrahim](https://github.com/ASEbrahim) 一个人开发，但�
 | [flv-byte](https://github.com/flv-byte) | motorola edge 40 neo, Galaxy Tab S10 Lite | 两台设备的日志 |
 | [937797140](https://github.com/937797140) | realme Neo7 | Balatro 等游戏的报告 |
 | Towelsogog (Discord) | Pixel 9 Pro (Tensor G4) | 30 个游戏的测试报告 |
+| gon070 (Discord) | vivo X300 (天玑 9500) | Mad Max 高画质 60 帧的测试和设置截图，以及发热和帧率反馈 |
+| jimmy12120 (Discord) | Galaxy Tab S10+ (天玑 9300+) | Euro Truck Simulator 2 的测试结果和 Derail Valley 的日志 |
+| 1sani1 (Discord) | Infinix GT 30 Pro (天玑 8350) | 帧率对比测试和 Tekken 7 的日志 |
+| s3npaii4080 (Discord) | vivo iQOO Z10 Turbo+ (天玑 9400+) | Skyrim 的测试结果和虚拟手柄问题的反馈 |
+| the_chart_legend (Discord) | Galaxy Tab S11 (天玑 9400+) | Terraria 的测试结果，以及带来修复的触屏按键反馈 |
 
 ## 支持者
 
