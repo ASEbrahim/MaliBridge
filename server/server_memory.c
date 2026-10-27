@@ -83,7 +83,10 @@ static const vkb_native_handle *(*p_AHardwareBuffer_getNativeHandle)(const struc
 static int ahb_rarely = -1;
 static int ahb_uncached(void)
 {
-    if (ahb_rarely < 0) ahb_rarely = vkb_srv_env_global("VKBRIDGE_AHB_RARELY") != NULL;
+    if (ahb_rarely < 0) {
+        const char *v = vkb_srv_env_global("VKBRIDGE_AHB_RARELY"); /* "0" means off, like the other switches */
+        ahb_rarely = v ? strcmp(v, "0") != 0 : 0;
+    }
     return ahb_rarely;
 }
 #ifdef __ANDROID__
