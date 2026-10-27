@@ -668,6 +668,33 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties(V
     return vkb_wire_vkGetPhysicalDeviceImageFormatProperties(physicalDevice, real, type, tiling, usage, flags, pProps);
 }
 
+/* A DMA_BUF or DRM-modifier format query the driver refused (or answered without IMPORTABLE), logged
+ * once per distinct query: what gamescope asked when it found no exportable modifier is otherwise
+ * invisible (MaliBridge#10, Mali-G77 r32p1: "modifiers.size() > 0"). */
+static void log_refused_query(const VkPhysicalDeviceImageFormatInfo2 *info, int has_mod, uint64_t mod, VkResult r,
+                              VkExternalMemoryFeatureFlags features, const char *then)
+{
+    static uint64_t seen[32];
+    static unsigned nseen;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t k = ((uint64_t)info->format * 0x9e3779b97f4a7c15ull) ^ ((uint64_t)info->usage << 20) ^ ((uint64_t)info->flags << 40) ^
+                 ((uint64_t)info->tiling << 8) ^ (mod * 0xbf58476d1ce4e5b9ull) ^ (uint64_t)info->type ^ ((uint64_t)has_mod << 63);
+    pthread_mutex_lock(&lock);
+    int fresh = 1;
+    for (unsigned i = 0; i < nseen && i < 32; i++) fresh &= seen[i] != k;
+    if (fresh && nseen < 32) seen[nseen++] = k;
+    else fresh = 0;
+    pthread_mutex_unlock(&lock);
+    if (!fresh) return;
+    unsigned views = 0;
+    for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) views = ((const VkImageFormatListCreateInfo *)b)->viewFormatCount;
+    char m[40] = "none";
+    if (has_mod) snprintf(m, sizeof(m), "0x%llx", (unsigned long long)mod);
+    VKB_WARN("dma-buf image query refused by the driver: format %d type %d tiling %d usage 0x%x flags 0x%x (%u view formats) modifier %s: "
+             "result %d, external features 0x%x%s", info->format, info->type, info->tiling, info->usage, info->flags, views, m, r, features, then);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
                                                                                 const VkPhysicalDeviceImageFormatInfo2 *pInfo,
                                                                                 VkImageFormatProperties2 *pProps)
@@ -677,20 +704,62 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties2(
     info.format = vkb_emu_real_format(pd, pInfo->format, &info.usage, &info.flags);
     vkb_emu_planar_ext_usage(pd, info.format, info.tiling, info.usage, &info.flags);
     VkResult r = vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, &info, pProps);
-    if (r != VK_SUCCESS || !(pd->info.emu & VKB_EMU_DMABUF_EXPORT)) return r;
-    /* dma-buf export of images is emulated by the server (dma-heap pages): what imports, exports. */
     const VkPhysicalDeviceExternalImageFormatInfo *ei = NULL;
-    for (const VkBaseInStructure *b = pInfo->pNext; b; b = b->pNext)
+    const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mi = NULL;
+    for (const VkBaseInStructure *b = pInfo->pNext; b; b = b->pNext) {
         if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO) ei = (const void *)b;
-    if (!ei || ei->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) return r;
-    for (VkBaseOutStructure *b = pProps->pNext; b; b = b->pNext) {
-        if (b->sType != VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) continue;
-        VkExternalMemoryProperties *p = &((VkExternalImageFormatProperties *)b)->externalMemoryProperties;
-        if (p->externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) {
-            p->externalMemoryFeatures |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
-            p->exportFromImportedHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-            p->compatibleHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT) mi = (const void *)b;
+    }
+    int dmabuf = ei && ei->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkExternalMemoryProperties *xp = NULL;
+    for (VkBaseOutStructure *b = pProps->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) xp = &((VkExternalImageFormatProperties *)b)->externalMemoryProperties;
+    VkExternalMemoryFeatureFlags features = r == VK_SUCCESS && xp ? xp->externalMemoryFeatures : 0;
+    int refused = (dmabuf || mi) && (r != VK_SUCCESS || (dmabuf && !(features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)));
+    int emulating = (pd->info.emu & VKB_EMU_DMABUF_EXPORT) != 0;
+    /* The export emulation (the server's pages) on, a dma-buf image at the LINEAR modifier refused:
+     * answered from the same image at plain LINEAR tiling, exportable and importable. The server
+     * makes such an image as a plain LINEAR one and reports the LINEAR modifier: an export (a
+     * modifier list with LINEAR, server_emu_layer.c linear_mod_plain) and an import (the explicit
+     * LINEAR modifier, linear_import_plain, kept only at the dma-buf's layout). Answered without
+     * IMPORTABLE, gamescope imported its clients' LINEAR dma-bufs as OPTIMAL images, which Mali
+     * sizes larger than the dma-buf (VK_ERROR_INVALID_EXTERNAL_HANDLE; S10+ under dmabufmod). */
+    int fallback = refused && emulating && dmabuf && mi && mi->drmFormatModifier == 0 /* DRM_FORMAT_MOD_LINEAR */ &&
+                   info.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && info.type == VK_IMAGE_TYPE_2D;
+    if (refused && (dmabuf || mi->drmFormatModifier == 0))
+        log_refused_query(&info, mi != NULL, mi ? mi->drmFormatModifier : 0, r, features,
+                          fallback ? "; answered from plain LINEAR tiling (export emulated)" : "");
+    if (fallback) {
+        VkPhysicalDeviceImageFormatInfo2 lin = info;
+        lin.pNext = NULL;
+        lin.tiling = VK_IMAGE_TILING_LINEAR;
+        VkImageFormatListCreateInfo fl;
+        for (const VkBaseInStructure *b = pInfo->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+                fl = *(const VkImageFormatListCreateInfo *)b;
+                fl.pNext = NULL;
+                lin.pNext = &fl;
+            }
+        VkImageFormatProperties2 lp = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        VkResult lr = vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, &lin, &lp);
+        if (lr == VK_SUCCESS) {
+            pProps->imageFormatProperties = lp.imageFormatProperties;
+            if (xp) {
+                xp->externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+                xp->exportFromImportedHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+                xp->compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            }
+            return VK_SUCCESS;
         }
+        log_refused_query(&lin, 0, 0, lr, 0, "; the LINEAR-modifier query stays refused");
+        return r;
+    }
+    if (r != VK_SUCCESS || !emulating || !dmabuf || !xp) return r;
+    /* dma-buf export of images is emulated by the server (dma-heap pages): what imports, exports. */
+    if (xp->externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) {
+        xp->externalMemoryFeatures |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+        xp->exportFromImportedHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        xp->compatibleHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     }
     return r;
 }

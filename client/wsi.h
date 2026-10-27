@@ -106,6 +106,9 @@ extern const vkb_wsi_backend vkb_wsi_headless_backend;
 /* VKBRIDGE_WSI_AHB=0, or the server cannot allocate AHardwareBuffers: no gralloc swapchains. */
 int vkb_wsi_ahb_disabled(void);
 uint32_t vkb_drm_format(VkFormat f);
+/* A frame's fence waited for in 10 s steps, a slow frame warned about once, VK_ERROR_DEVICE_LOST
+ * only on the server's loss or past VKBRIDGE_PRESENT_TIMEOUT_S (default 120 s); reset after. */
+VkResult vkb_wsi_wait_frame(vkb_swapchain *sc, VkFence fence);
 VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait);
 
 #endif

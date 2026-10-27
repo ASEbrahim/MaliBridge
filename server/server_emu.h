@@ -25,6 +25,7 @@ typedef struct vkb_emu_image {
     void *emu;                /* per-emulation state (BCn: decode resources) */
     int64_t stat_bytes, stat_bc_src, stat_ideal; /* accounting: driver's size; BC: the original's, the decoded texels' */
     uint32_t drop;            /* VKBRIDGE_TEX_MAXDIM: the app's top levels not created (app level m is level m - drop here) */
+    int linear_mod;           /* a modifier-list dma-buf image made plain LINEAR (reports the LINEAR modifier) */
     struct vkb_emu_image *next;
 } vkb_emu_image;
 
@@ -152,6 +153,8 @@ void vkb_emu_desc_uninstall(vkb_srv_table *dev);
 int vkb_emu_faked(const char *t);
 /* VKBRIDGE_FAKE_MISSING=planarext: a multi-planar image with extended usage, refused as on the Mali-G925 */
 int vkb_emu_planar_ext_refused(VkFormat f, VkImageCreateFlags flags);
+/* VKBRIDGE_FAKE_MISSING=dmabufmod: a DRM-modifier dma-buf storage / mutable image (query or modifier-list create chain), refused as r32p1 likely does */
+int vkb_emu_dmabufmod_refused(VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, const void *chain);
 void vkb_emu_vb_sizes_resolve(vkb_emu_device *e, uint32_t n, const VkBuffer *buffers, const VkDeviceSize *offsets,
                               const VkDeviceSize *sizes);
 int vkb_emu_ext_hidden(const char *name); /* VKBRIDGE_FAKE_MISSING / VKBRIDGE_SERVER_HIDE_EXTS */

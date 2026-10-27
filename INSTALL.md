@@ -85,8 +85,8 @@ Start with something light. These run well:
 | Risk of Rain Returns | Excellent, 59-60 fps | Excellent, 59-60 fps |
 | Half-Life 2 | Excellent, 59-74 fps | Excellent, 94-103 fps |
 | Celeste | Excellent, 57-59 fps | Excellent, 60 fps |
-| Portal | Excellent, 80 fps | not tested |
-| Inscryption | Excellent, 68-83 fps | not tested |
+| Portal | Excellent, 80 fps | Excellent, 85-90 fps |
+| Inscryption | Excellent, 68-83 fps | Very playable, 55-57 fps |
 
 The [full list](README.md#games-that-run) has every game I've tested.
 

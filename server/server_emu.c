@@ -9,6 +9,7 @@
 #include "vkb_server.h"
 #include "server_emu.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -226,8 +227,55 @@ static VKAPI_ATTR VkResult VKAPI_CALL planar_GetPhysicalDeviceImageFormatPropert
     return planar_next2(pd, info, props);
 }
 
+/* VKBRIDGE_FAKE_MISSING=dmabufmod (host tests): the refusal Arm's r32p1 (Mali-G77, Retroid Pocket 4
+ * Pro, MaliBridge#10) most likely gives gamescope. Its DRM-modifier image query with DMA_BUF external
+ * memory is answered VK_ERROR_FORMAT_NOT_SUPPORTED when the image is a storage image or has a mutable
+ * format (gamescope's flippable images: BGRA8, MUTABLE_FORMAT with a UNORM / SRGB list), at every
+ * modifier: DroidDeck's compositor advertises LINEAR only, the desktop's many more, and gamescope
+ * must find none of them exportable here as it found none there. The same query for an RGBA8 sampled
+ * colour attachment (the server's own export check, vkb_emu_detect) passes, as it did there.
+ * Creating such an image with a modifier list or an explicit modifier (gamescope's imports) is
+ * refused too (driver_create_image). */
+int vkb_emu_dmabufmod_refused(VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, const void *chain)
+{
+    static int fake = -1;
+    if (fake < 0) fake = vkb_emu_faked("dmabufmod");
+    if (!fake || tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) return 0;
+    if (!(usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) return 0;
+    int dmabuf = 0, mod = 0;
+    for (const VkBaseInStructure *b = chain; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
+            dmabuf |= ((const VkPhysicalDeviceExternalImageFormatInfo *)b)->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+            dmabuf |= (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0;
+        mod |= b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT ||
+               b->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
+               b->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+    }
+    return dmabuf && mod;
+}
+
+static PFN_vkGetPhysicalDeviceImageFormatProperties2 dmabufmod_next2;
+
+static VKAPI_ATTR VkResult VKAPI_CALL dmabufmod_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd,
+                                                                                       const VkPhysicalDeviceImageFormatInfo2 *info,
+                                                                                       VkImageFormatProperties2 *props)
+{
+    if (vkb_emu_dmabufmod_refused(info->tiling, info->usage, info->flags, info->pNext)) {
+        memset(&props->imageFormatProperties, 0, sizeof(props->imageFormatProperties));
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return dmabufmod_next2(pd, info, props);
+}
+
 void vkb_emu_instance_install(vkb_srv_table *t)
 {
+    if (vkb_emu_faked("dmabufmod") && t->dt.vkGetPhysicalDeviceImageFormatProperties2 &&
+        t->dt.vkGetPhysicalDeviceImageFormatProperties2 != dmabufmod_GetPhysicalDeviceImageFormatProperties2) {
+        dmabufmod_next2 = t->dt.vkGetPhysicalDeviceImageFormatProperties2;
+        t->dt.vkGetPhysicalDeviceImageFormatProperties2 = dmabufmod_GetPhysicalDeviceImageFormatProperties2;
+        VKB_ONCE(VKB_LOG_INFO, "imitating r32p1's refusal of DRM-modifier dma-buf storage / mutable images (VKBRIDGE_FAKE_MISSING=dmabufmod)");
+    }
     if (vkb_emu_faked("planarext")) {
         if (t->dt.vkGetPhysicalDeviceImageFormatProperties) {
             planar_next1 = t->dt.vkGetPhysicalDeviceImageFormatProperties;
@@ -298,20 +346,34 @@ int vkb_emu_robust2_image_stand_in(vkb_srv_table *inst, VkPhysicalDevice pd, uin
  * VKBRIDGE_FAKE_MISSING=robust2access (host tests): that driver's robustness2 imitated. The feature
  * query answers robustBufferAccess2 and robustImageAccess2 false, and a device that asks for
  * either is refused with VK_ERROR_FEATURE_NOT_PRESENT, as a driver may.
+ * VKBRIDGE_FAKE_MISSING=geomstreams (host tests): a driver with transform feedback but without
+ * geometry streams (Mali-G720 r44p1, Galaxy Tab S10+). The query answers geometryStreams false,
+ * and a device that asks for it is refused with VK_ERROR_FEATURE_NOT_PRESENT, as that driver does.
+ * VKBRIDGE_FAKE_MISSING=drawparams (host tests): a driver without shaderDrawParameters (what issue #32's
+ * Mali-G78 r38p0 might be). The query answers it false in VkPhysicalDeviceShaderDrawParametersFeatures and
+ * VkPhysicalDeviceVulkan11Features, and a device that asks for it in either is refused the same way.
  */
 static struct {
     PFN_vkGetInstanceProcAddr gipa;
     PFN_vkGetPhysicalDeviceFeatures2 f2, f2khr;
     PFN_vkCreateDevice create;
+    int r2, gs, dp;
 } r2imit;
 
 static void r2imit_clear(void *next)
 {
-    for (VkBaseOutStructure *b = next; b; b = b->pNext)
-        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
+    for (VkBaseOutStructure *b = next; b; b = b->pNext) {
+        if (r2imit.r2 && b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
             VkPhysicalDeviceRobustness2FeaturesEXT *r = (VkPhysicalDeviceRobustness2FeaturesEXT *)b;
             r->robustBufferAccess2 = r->robustImageAccess2 = VK_FALSE;
         }
+        if (r2imit.gs && b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT)
+            ((VkPhysicalDeviceTransformFeedbackFeaturesEXT *)b)->geometryStreams = VK_FALSE;
+        if (r2imit.dp && b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES)
+            ((VkPhysicalDeviceShaderDrawParametersFeatures *)b)->shaderDrawParameters = VK_FALSE;
+        if (r2imit.dp && b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES)
+            ((VkPhysicalDeviceVulkan11Features *)b)->shaderDrawParameters = VK_FALSE;
+    }
 }
 
 static VKAPI_ATTR void VKAPI_CALL r2imit_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
@@ -329,12 +391,26 @@ static VKAPI_ATTR void VKAPI_CALL r2imit_GetPhysicalDeviceFeatures2KHR(VkPhysica
 static VKAPI_ATTR VkResult VKAPI_CALL r2imit_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *a,
                                                           VkDevice *out)
 {
-    const VkPhysicalDeviceRobustness2FeaturesEXT *r = robust2_request(ci);
+    const VkPhysicalDeviceRobustness2FeaturesEXT *r = r2imit.r2 ? robust2_request(ci) : NULL;
     if (r && (r->robustBufferAccess2 || r->robustImageAccess2)) {
         VKB_WARN("imitated robustness2: device refused (robustBufferAccess2 %u, robustImageAccess2 %u asked; the driver has neither)",
                  r->robustBufferAccess2, r->robustImageAccess2);
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
+    for (const VkBaseInStructure *b = ci->pNext; b && r2imit.gs; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT &&
+            ((const VkPhysicalDeviceTransformFeedbackFeaturesEXT *)b)->geometryStreams) {
+            VKB_WARN("imitated transform feedback: device refused (geometryStreams asked; the driver lacks it)");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+    for (const VkBaseInStructure *b = ci->pNext; b && r2imit.dp; b = b->pNext)
+        if ((b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES &&
+             ((const VkPhysicalDeviceShaderDrawParametersFeatures *)b)->shaderDrawParameters) ||
+            (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES &&
+             ((const VkPhysicalDeviceVulkan11Features *)b)->shaderDrawParameters)) {
+            VKB_WARN("imitated draw parameters: device refused (shaderDrawParameters asked; the driver lacks it)");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
     return r2imit.create(pd, ci, a, out);
 }
 
@@ -359,9 +435,14 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL r2imit_GetInstanceProcAddr(VkIns
 
 PFN_vkGetInstanceProcAddr vkb_emu_imitate_gipa(PFN_vkGetInstanceProcAddr gipa)
 {
-    if (!vkb_emu_faked("robust2access")) return gipa;
+    r2imit.r2 = vkb_emu_faked("robust2access");
+    r2imit.gs = vkb_emu_faked("geomstreams");
+    r2imit.dp = vkb_emu_faked("drawparams");
+    if (!r2imit.r2 && !r2imit.gs && !r2imit.dp) return gipa;
     r2imit.gipa = gipa;
-    VKB_INFO("imitating the Mali-G715 r54p3's robustness2: nullDescriptor only (VKBRIDGE_FAKE_MISSING=robust2access)");
+    if (r2imit.r2) VKB_INFO("imitating the Mali-G715 r54p3's robustness2: nullDescriptor only (VKBRIDGE_FAKE_MISSING=robust2access)");
+    if (r2imit.gs) VKB_INFO("imitating the Mali-G720 r44p1's transform feedback: no geometryStreams (VKBRIDGE_FAKE_MISSING=geomstreams)");
+    if (r2imit.dp) VKB_INFO("imitating a driver without shaderDrawParameters (VKBRIDGE_FAKE_MISSING=drawparams)");
     return r2imit_GetInstanceProcAddr;
 }
 
@@ -713,6 +794,212 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
             VKB_INFO("vkCreateDevice: robustness2's%s%s taken off (the driver lacks them; VKB_EMU_ROBUST2_ACCESS)%s",
                      wb ? " robustBufferAccess2" : "", wi ? " robustImageAccess2" : "", forced ? "; robustBufferAccess on" : "");
     }
+}
+
+/* Every feature structure that may extend VkDeviceCreateInfo: its members' names, the extension
+ * that brings it and the version that made it core (generated from vk.xml). */
+typedef struct feat_struct {
+    VkStructureType stype;
+    uint32_t size, core;
+    const char *name, *members, *ext;
+} feat_struct;
+#define FEAT(t, T, m, e, v) {(VkStructureType)t, (uint32_t)sizeof(T), (uint32_t)(v), #T, m, e},
+static const feat_struct feat_structs[] = {
+#include "feature_names.inc"
+};
+#undef FEAT
+#define N_FEAT (sizeof(feat_structs) / sizeof(feat_structs[0]))
+
+static const feat_struct *feat_find(VkStructureType s)
+{
+    for (size_t i = 0; i < N_FEAT; i++)
+        if (feat_structs[i].stype == s) return &feat_structs[i];
+    return NULL;
+}
+
+static int ext_listed(const VkExtensionProperties *avail, uint32_t avail_n, const char *name)
+{
+    for (uint32_t i = 0; name && i < avail_n; i++)
+        if (!strcmp(avail[i].extensionName, name)) return 1;
+    return 0;
+}
+
+/* The driver may be asked about this structure: its version or its extension. */
+static int feat_queryable(const feat_struct *f, uint32_t driver_api, const VkExtensionProperties *avail, uint32_t avail_n)
+{
+    return (f->core && driver_api >= f->core) || ext_listed(avail, avail_n, f->ext);
+}
+
+/* The driver's answer for one feature structure, into have (zeroed first); 0: too big to ask */
+typedef union {
+    VkBaseOutStructure base;
+    VkBool32 b[128];
+} feat_answer;
+static int feat_ask(vkb_srv_table *inst, VkPhysicalDevice pd, const feat_struct *f, feat_answer *have)
+{
+    if (f->size > sizeof(*have) || !inst->real.vkGetPhysicalDeviceFeatures2) return 0;
+    memset(have, 0, sizeof(*have));
+    have->base.sType = f->stype;
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, have};
+    inst->real.vkGetPhysicalDeviceFeatures2(pd, &f2);
+    return 1;
+}
+
+/* member i of a comma list, into out */
+static uint32_t member_count(const feat_struct *f)
+{
+    uint32_t n = 1;
+    for (const char *p = f->members; *p; p++) n += *p == ',';
+    uint32_t fit = (uint32_t)((f->size - sizeof(VkBaseOutStructure)) / sizeof(VkBool32)); /* past the last: padding */
+    return n < fit ? n : fit;
+}
+
+static void member_name(const char *list, uint32_t i, char *out, size_t cap)
+{
+    const char *p = list;
+    for (uint32_t j = i; j && p; j--) p = (p = strchr(p, ',')) ? p + 1 : NULL;
+    size_t n = p ? strcspn(p, ",") : 0;
+    if (!p || !n || n >= cap) {
+        snprintf(out, cap, "member %u", i);
+        return;
+    }
+    memcpy(out, p, n);
+    out[n] = 0;
+}
+
+static uint32_t driver_api_version(vkb_srv_table *inst, VkPhysicalDevice pd)
+{
+    if (!inst->real.vkGetPhysicalDeviceProperties) return VK_API_VERSION_1_0;
+    VkPhysicalDeviceProperties p;
+    memset(&p, 0, sizeof(p));
+    inst->real.vkGetPhysicalDeviceProperties(pd, &p);
+    return p.apiVersion;
+}
+
+/*
+ * Extension features an app turns on that the driver lacks are taken off before the driver sees
+ * them, as pEnabledFeatures is above. An app should turn on only what the query reported, but
+ * DXVK 1.x (1.10.3: DroidDeck's pick for Vulkan 1.1 GPUs, and a Components choice) turns on
+ * transform feedback's geometryStreams with transformFeedback for feature level 10_0 and up, and
+ * its adapter check looks at transformFeedback only. Arm's drivers have transform feedback without
+ * geometry streams (Mali-G720 r44p1), so every D3D10/11 device DXVK 1.x asked for was refused (-8)
+ * and the game stopped: Hollow Knight "Failed to initialize graphics", and Steam's
+ * d3ddriverquery64, on the Galaxy Tab S10+ (2026-10-26). A geometry shader that writes a stream
+ * other than 0 then fails to compile; D3D11 games rarely have one, and D3D10 games none.
+ * DXVK 1.10.3 also asks for shaderDrawParameters (VkPhysicalDeviceShaderDrawParametersFeatures, or
+ * in VkPhysicalDeviceVulkan11Features) without checking it; a driver that reports it false would
+ * refuse the device the same way (issue #32, Galaxy S21 Mali-G78 r38p0: not shown to lack it, the
+ * log has no 1.1 features; covered in case). Only shaderDrawParameters of the 1.1 structure is
+ * taken off: its other members stay the app's business.
+ * Only these structures, and only where the driver lists the extension (or has the version). What
+ * the bridge emulates has left the chain by now (vkb_emu_device_create_info).
+ * VKBRIDGE_FEATURE_CLAMP=0 sends the request as it came.
+ */
+#define ALL_MEMBERS UINT64_MAX
+#define MEMBER_BIT(T, m) (1ull << ((offsetof(T, m) - sizeof(VkBaseOutStructure)) / sizeof(VkBool32)))
+static const struct {
+    VkStructureType stype;
+    uint64_t members; /* bit i: member i may be taken off */
+} clamp_structs[] = {
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, ALL_MEMBERS},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, ALL_MEMBERS},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT, ALL_MEMBERS},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, ALL_MEMBERS},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT, ALL_MEMBERS},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT, ALL_MEMBERS},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, ALL_MEMBERS},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, MEMBER_BIT(VkPhysicalDeviceVulkan11Features, shaderDrawParameters)},
+};
+#undef MEMBER_BIT
+
+void vkb_emu_device_clamp_features(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci,
+                                   const VkExtensionProperties *avail, uint32_t avail_n)
+{
+    if (env_off("VKBRIDGE_FEATURE_CLAMP") || !inst->real.vkGetPhysicalDeviceFeatures2) return;
+    const size_t hdr = sizeof(VkBaseOutStructure);
+    uint32_t api = 0;
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext) {
+        size_t k = 0;
+        while (k < sizeof(clamp_structs) / sizeof(clamp_structs[0]) && clamp_structs[k].stype != b->sType) k++;
+        if (k == sizeof(clamp_structs) / sizeof(clamp_structs[0])) continue;
+        const feat_struct *f = feat_find(b->sType);
+        if (!f) continue;
+        if (!api) api = driver_api_version(inst, pd);
+        if (!feat_queryable(f, api, avail, avail_n)) continue;
+        feat_answer have;
+        if (!feat_ask(inst, pd, f, &have)) continue;
+        VkBool32 *want = (VkBool32 *)((char *)b + hdr);
+        const VkBool32 *got = (const VkBool32 *)((const char *)&have + hdr);
+        for (uint32_t i = 0; i < member_count(f) && i < 64; i++) {
+            if (!want[i] || got[i] || !(clamp_structs[k].members & (1ull << i))) continue;
+            want[i] = VK_FALSE;
+            char m[64];
+            member_name(f->members, i, m, sizeof(m));
+            VKB_INFO("vkCreateDevice: %s turned on %s.%s, which the driver lacks; taken off", inst->proc ? inst->proc->comm : "?",
+                     f->name, m);
+        }
+    }
+}
+
+/*
+ * A refused vkCreateDevice: what the request (as it reached the driver) asks for that the driver
+ * lacks, on one line: extensions it does not list, VkPhysicalDeviceFeatures members and members of
+ * any feature structure it reports false, and structures it cannot be asked about (neither the
+ * version nor the extension). Issue #32's -8 left the player guessing between geometryStreams and
+ * shaderDrawParameters; this names it. Structures that are not feature structures are not checked
+ * and are listed by number.
+ */
+void vkb_emu_device_lacks(vkb_srv_table *inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci,
+                          const VkExtensionProperties *avail, uint32_t avail_n, char *out, size_t cap)
+{
+    size_t len = 0;
+    out[0] = 0;
+#define ADD(...)                                                                                                       \
+    do {                                                                                                               \
+        if (len < cap) len += (size_t)snprintf(out + len, cap - len, __VA_ARGS__);                                    \
+    } while (0)
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++)
+        if (ci->ppEnabledExtensionNames[i] && !ext_listed(avail, avail_n, ci->ppEnabledExtensionNames[i]))
+            ADD("%s%s (extension not listed)", len ? ", " : "", ci->ppEnabledExtensionNames[i]);
+    const VkPhysicalDeviceFeatures *want = ci->pEnabledFeatures;
+    for (const VkBaseInStructure *b = ci->pNext; b && !want; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) want = &((const VkPhysicalDeviceFeatures2 *)b)->features;
+    if (want && inst->real.vkGetPhysicalDeviceFeatures) {
+        VkPhysicalDeviceFeatures have;
+        inst->real.vkGetPhysicalDeviceFeatures(pd, &have);
+        char names[400];
+        vkb_report_features(want, &have, names, sizeof(names));
+        for (char *s = names, *t; (t = strtok_r(s, " ", &s));) ADD("%sVkPhysicalDeviceFeatures.%s", len ? ", " : "", t);
+    }
+    const size_t hdr = sizeof(VkBaseOutStructure);
+    uint32_t api = driver_api_version(inst, pd);
+    char other[160] = "";
+    size_t olen = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) continue;
+        const feat_struct *f = feat_find(b->sType);
+        if (!f) {
+            if (olen < sizeof(other)) olen += (size_t)snprintf(other + olen, sizeof(other) - olen, " %d", (int)b->sType);
+            continue;
+        }
+        if (!feat_queryable(f, api, avail, avail_n)) {
+            ADD("%s%s (the driver has neither %s nor Vulkan %u.%u)", len ? ", " : "", f->name, f->ext ? f->ext : "an extension for it",
+                VK_API_VERSION_MAJOR(f->core), VK_API_VERSION_MINOR(f->core));
+            continue;
+        }
+        feat_answer have;
+        if (!feat_ask(inst, pd, f, &have)) continue;
+        const VkBool32 *w = (const VkBool32 *)((const char *)b + hdr), *h = (const VkBool32 *)((const char *)&have + hdr);
+        for (uint32_t i = 0; i < member_count(f); i++) {
+            if (!w[i] || h[i]) continue;
+            char m[64];
+            member_name(f->members, i, m, sizeof(m));
+            ADD("%s%s.%s", len ? ", " : "", f->name, m);
+        }
+    }
+    if (!len) ADD("nothing the bridge can check");
+    if (olen) ADD("; not checked:%s", other);
+#undef ADD
 }
 
 void vkb_emu_device_init(vkb_srv_table *dev, uint32_t emu)

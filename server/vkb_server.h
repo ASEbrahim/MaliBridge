@@ -110,6 +110,11 @@ typedef struct vkb_srv_table {
     struct vkb_async *async;                 /* server_async.c */
     struct vkb_vidyn *vidyn;                 /* server_vidyn.c */
     PFN_vkGetPhysicalDeviceFeatures2 vidyn_f2; /* instance: the feature query beneath server_vidyn.c's */
+    /* instance: the queries beneath gs_hide's (server_errata_gs.c), set only for its processes */
+    PFN_vkGetPhysicalDeviceFeatures gs_f1;
+    PFN_vkGetPhysicalDeviceFeatures2 gs_f2;
+    PFN_vkGetPhysicalDeviceProperties gs_p1;
+    PFN_vkGetPhysicalDeviceProperties2 gs_p2;
 } vkb_srv_table;
 
 /* server_main.c */
@@ -153,8 +158,8 @@ double vkb_guard_timeout_s(int mode, const char **why);
 #define VKB_PROBE_FLAG_TX_EAC 0x10u
 #define VKB_PROBE_FLAG_TX_ASTC 0x20u     /* BC2 / BC3 -> ASTC */
 #define VKB_PROBE_FLAG_TX_ASTC_HDR 0x40u
-#define VKB_PROBE_FLAG_TX_BC7 0x8000u    /* BC7 -> ASTC: its own (the biggest; BC2 and BC3 build where it does not) */
-#define VKB_PROBE_FLAG_TX_ALL 0x8078u
+#define VKB_PROBE_FLAG_TX_BC7 0x10000u   /* BC7 -> ASTC: its own (the biggest; BC2 and BC3 build where it does not). Was 0x8000, MK_FP16's bit: a died bc_transcoders read as MK-20 */
+#define VKB_PROBE_FLAG_TX_ALL 0x10078u
 /* The MK probes (one per Mali driver erratum it can tell): the bug's own pattern was seen. Their
  * results reach the errata decisions (server_errata.c) through vkb_errata_set_probe_source. */
 #define VKB_PROBE_FLAG_MK_WAIT 0x80u        /* wait_eintr: a wait failed or ended early after a signal (MK-01) */
@@ -181,9 +186,11 @@ int vkb_probe_decide_mode(const uint8_t uuid[VK_UUID_SIZE], int mode, uint32_t *
  * leaves it to be run again, a crash outside the probe's guard makes it died. */
 void vkb_probe_mark_end(int sig, int crashed);
 void vkb_probe_crash_marks(int all); /* 1: every fatal signal but SIGKILL reaches vkb_probe_mark_end */
+void vkb_probe_clients_gone(int gone); /* 1: the last client process left (a kill now is the session's end) */
 
 /* server_report.c: the session report (<log dir>/malibridge-report.md and .json) */
 void vkb_report_session(const char *log_path); /* a session starts (its server log's path; NULL: none) */
+int vkb_report_dir(char *out, size_t cap);      /* the session folder (the report's): 1 when known */
 void vkb_report_log(int level, const char *fmt, const char *msg); /* every log line */
 void vkb_report_hello(vkb_srv_proc *p);
 void vkb_report_gone(vkb_srv_proc *p);
@@ -252,6 +259,7 @@ enum {
     VKB_ERRATUM_FP16_HIDE,       /* MK-20 16-bit float arithmetic wrong (Mali-G715 r54) */
     VKB_ERRATUM_STENCIL_LAYOUT,  /* MK-11 a separate stencil layout in a render pass ignored */
     VKB_ERRATUM_VB_BAKE,         /* MK-05 option B: dynamic strides wrong in single-binding calls too */
+    VKB_ERRATUM_GS_HIDE,         /* issue #11: r38p1 beta segfaults compiling Zink's geometry shaders */
     VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };
@@ -310,6 +318,14 @@ void vkb_vidyn_device_destroy(vkb_srv_table *t);
 int vkb_errata_fp16_hidden(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
 void vkb_errata_fp16_instance_install(vkb_srv_table *inst); /* the feature and property queries */
 void vkb_errata_fp16_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci); /* strips what an app enables anyway */
+/* gs_hide (issue #11, server_errata_gs.c): 1 when geometry shaders are hidden from this process on
+ * this physical device - the erratum's decision for the driver (VKBRIDGE_ERRATA=+/-gs_hide
+ * included) and the process one of VKBRIDGE_GS_HIDE_PROCS; why (may be NULL) gets the reason */
+int vkb_errata_gs_hidden(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
+int vkb_errata_gs_driver(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap); /* the driver half alone */
+int vkb_errata_gs_process(const vkb_srv_proc *p);    /* the process half alone: its name is in the list */
+void vkb_errata_gs_instance_install(vkb_srv_table *inst); /* over every other query wrapper: last */
+void vkb_errata_gs_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci);
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);
@@ -344,6 +360,7 @@ int vkb_cache_subdir(const char *sub);              /* <cache dir>/<sub> made if
 int vkb_cache_write_failed(const char *what, int e); /* ENOSPC said once; 1: caller reports e */
 void vkb_cache_write_ok(void);                      /* a write went through (space again) */
 void vkb_srv_env_reload(void);             /* <cache dir>/env overrides, read at each vkCreateDevice */
+void vkb_srv_env_refresh(void);            /* the same when the file changed since (vkbQueryServer) */
 /* A switch, first found wins: on a client's connection thread that game's preset file, then
  * <cache dir>/env, the server's environment, then that game's built-in preset (server_presets.c) */
 const char *vkb_srv_env(const char *name);
@@ -389,10 +406,10 @@ const char *vkb_preset_text(const vkb_srv_proc *p, char *out, size_t cap); /* "K
 /* "preset for steam<appid>: a built-in preset exists but was not tested on <gpu>; ...", or "" */
 const char *vkb_preset_note(const vkb_srv_proc *p, char *out, size_t cap);
 uint32_t vkb_preset_client_knobs(void);  /* vkb_server_pd_info.client_knobs for this thread's client */
-void vkb_preset_client_values(vkb_server_pd_info *info); /* its .heap_max_mb and .spoof_gpu, the same way */
+void vkb_preset_client_values(vkb_server_pd_info *info); /* its .heap_max_mb, .spoof_gpu and .present_timeout_s, the same way */
 uint64_t vkb_memtotal_mb(void); /* RAM in MB (MemTotal; VKBRIDGE_FAKE_MEMTOTAL_MB for tests), 0: unknown */
 uint64_t vkb_memavail_kb(void); /* MemAvailable in KB (VKBRIDGE_FAKE_MEMAVAIL_MB for tests), 0: unknown */
-uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb); /* the safe-mode heap cap for 8 GB devices, 0: none */
+uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb); /* the safe-mode heap cap for 8 and 12 GB devices, 0: none */
 
 /* server_instance.c */
 void vkb_selftest_all(void);
@@ -463,6 +480,14 @@ PFN_vkGetInstanceProcAddr vkb_emu_imitate_gipa(PFN_vkGetInstanceProcAddr gipa);
 int vkb_emu_bcn_astc_hdr(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t api);
 void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32_t emu,
                                 VkDeviceCreateInfo *ci, vkb_arena *a);
+/* extension features the app turned on that the driver lacks, taken off (DXVK 1.x's geometryStreams and
+ * shaderDrawParameters);
+ * avail: the driver's extensions */
+void vkb_emu_device_clamp_features(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci,
+                                   const VkExtensionProperties *avail, uint32_t avail_n);
+/* a refused vkCreateDevice: what the request asks for that the driver lacks, as one line into out (#32) */
+void vkb_emu_device_lacks(vkb_srv_table *inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci,
+                          const VkExtensionProperties *avail, uint32_t avail_n, char *out, size_t cap);
 void vkb_emu_device_init(vkb_srv_table *dev, uint32_t emu);
 /* host imitation of a driver without maintenance5 (VKBRIDGE_FAKE_MISSING=maint5), at the driver boundary:
  * before every driver-near layer */

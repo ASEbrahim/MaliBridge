@@ -116,7 +116,7 @@ CLIENT_CUSTOM = {
     'vkBindBufferMemory', 'vkBindBufferMemory2', 'vkBindImageMemory', 'vkBindImageMemory2',
     'vkDestroyBuffer', 'vkDestroyImage', 'vkGetPhysicalDeviceExternalSemaphoreProperties',
     'vkGetPhysicalDeviceExternalFenceProperties', 'vkImportSemaphoreFdKHR', 'vkImportFenceFdKHR',
-    'vkGetQueryPoolResults', 'vkGetEventStatus', 'vkCreateBufferView', 'vkDestroyBufferView',
+    'vkGetQueryPoolResults', 'vkGetEventStatus', 'vkSetEvent', 'vkCreateBufferView', 'vkDestroyBufferView',
     'vkCreateQueryPool', 'vkDestroyQueryPool', 'vkResetQueryPool', 'vkCmdResetQueryPool', 'vkCmdEndQuery',
     'vkCmdEndQueryIndexedEXT', 'vkCmdWriteTimestamp', 'vkCmdWriteTimestamp2', 'vkCreateCommandPool',
     }
@@ -132,6 +132,9 @@ SERVER_CUSTOM = {
 ASYNC_RESULT = {'vkQueueSubmit', 'vkQueueSubmit2', 'vkResetDescriptorPool', 'vkResetCommandPool',
                 'vkResetCommandBuffer', 'vkResetFences', 'vkResetEvent', 'vkSetEvent', 'vkFreeDescriptorSets',
                 'vkBindBufferMemory', 'vkBindBufferMemory2', 'vkBindImageMemory', 'vkBindImageMemory2'}
+# Calls that may only return VK_SUCCESS or an error: any other result is logged too (vkb_note_fail),
+# not only a lost device. A submit or a queue wait DXVK sees fail is a device reset to the game (#21).
+NOTE_FAIL = {'vkQueueSubmit', 'vkQueueSubmit2', 'vkQueueBindSparse', 'vkQueueWaitIdle', 'vkDeviceWaitIdle'}
 
 # File descriptors: (struct, member) and (command, param).
 FD_MEMBERS = {('VkImportMemoryFdInfoKHR', 'fd'), ('VkImportSemaphoreFdInfoKHR', 'fd'),
@@ -1148,7 +1151,7 @@ for c in wire_cmds:
         cw(f'if (!vkb_call_exec(&call_)) return vkb_device_lost("{c}");')
         cw('VkResult r_ = (VkResult)vkb_dec_u32(&call_.d);')
         cw('vkb_call_end(&call_);')
-        cw(f'return vkb_note_lost("{c}", r_);')
+        cw(f'return {"vkb_note_fail" if c in NOTE_FAIL else "vkb_note_lost"}("{c}", r_);')
         cw('}')
         cw()
     else:
@@ -1207,7 +1210,7 @@ for c in wire_cmds:
                 cw('}')
         cw('vkb_call_end(&call_);')
         if ret == 'VkResult':
-            cw(f'return vkb_note_lost("{c}", r_);')
+            cw(f'return {"vkb_note_fail" if c in NOTE_FAIL else "vkb_note_lost"}("{c}", r_);')
         elif ret != 'void':
             cw('return r_;')
         cw('}')

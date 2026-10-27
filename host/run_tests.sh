@@ -204,6 +204,42 @@ run_mode() {
       { [ "$mode" != mali ] || grep -q "dma-buf image refused at tiling" "$VKB_SERVER_LOG"; }
     result $? "dmabuf_image_check ($(tail -1 out/t-dmabuf-image.log))"
   fi
+  # gamescope's export images (its nested backend's flippable images: a LINEAR-modifier list,
+  # DMA_BUF, MUTABLE_FORMAT, storage): asked, made, exported and read through the dma-buf
+  if [ -x out/gsexport_check ]; then
+    timeout 60 ./out/gsexport_check >out/t-gsexport.log 2>&1; result $? "gsexport_check ($(tail -1 out/t-gsexport.log))"
+    if [ "$mode" = mali ]; then
+      # Mali-G77 r32p1 (MaliBridge#10): the export emulation on (dmabufexport; the host's pages are
+      # the driver's own dma-bufs) and the driver refusing gamescope's modifier queries (dmabufmod).
+      # gamescope aborted on "modifiers.size() > 0": the client answers from plain LINEAR tiling,
+      # the server makes the image plain LINEAR and reports the LINEAR modifier. gamescope's imports
+      # of its clients' LINEAR dma-bufs (sampled, MUTABLE_FORMAT, the explicit LINEAR modifier) are
+      # answered importable and made plain LINEAR at the dma-buf's layout too: answered without
+      # IMPORTABLE, gamescope made them OPTIMAL, larger than the dma-buf on Mali (S10+, rc1)
+      from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+      VKB_MISSING_ADD=dmabufexport,dmabufmod VKB_SERVER_ENV=VKBRIDGE_TEST_EXPORT_PAGES=driver . ./mali_env.sh >/dev/null
+      rm -f out/t-gsexport-r32-client.log
+      VKBRIDGE_CLIENT_LOG=$PWD/out/t-gsexport-r32-client.log timeout 60 ./out/gsexport_check >out/t-gsexport-r32.log 2>&1 &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "dma-buf export: emulated, pages from the driver's own dma-bufs" &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "imitating r32p1's refusal" &&
+        [ "$(tail -n +$from "$VKB_SERVER_LOG" | grep -c "dma-buf export image with a LINEAR modifier list .* made as a plain LINEAR image")" = 4 ] &&
+        [ "$(tail -n +$from "$VKB_SERVER_LOG" | grep -c "dma-buf import image at the LINEAR modifier .* made as a plain LINEAR image")" = 4 ] &&
+        ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "dma-buf import: .* bytes asked for" &&
+        grep -q "dma-buf image query refused by the driver: format 44 type 1 tiling 1000158000 usage 0xd flags 0x8 (2 view formats) modifier 0x0: result -11, external features 0x0; answered from plain LINEAR" out/t-gsexport-r32-client.log
+      result $? "gsexport_check, r32p1's refused modifier queries with the export emulated ($(tail -1 out/t-gsexport-r32.log))"
+      if docker image inspect vkb-arch-gamescope >/dev/null 2>&1; then
+        VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
+          "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames'" \
+          >out/t-gamescope-r32.log 2>&1
+        grep -q "frames in" out/t-gamescope-r32.log && ! grep -q "Assertion" out/t-gamescope-r32.log &&
+          tail -n +$from "$VKB_SERVER_LOG" | grep -q "format 44 960x540 usage 0x[0-9a-f]* flags 0x8); made as a plain LINEAR" &&
+          tail -n +$from "$VKB_SERVER_LOG" | grep -q "dma-buf import image at the LINEAR modifier refused by the driver's format query (format 44 300x300 usage 0x4"
+        result $? "gamescope + Zink glxgears, r32p1's refused modifier queries with the export emulated ($(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-r32.log)$(grep -m1 -o 'Assertion.*' out/t-gamescope-r32.log))"
+      fi
+      unset VKB_MISSING_ADD VKB_SERVER_ENV
+      . ./mali_env.sh >/dev/null
+    fi
+  fi
   # gamescope's DMA-BUF import for other GPUs (the fd's memoryTypeBits AND the image's): on mali
   # with Mali's fd properties (dmabuftypes: a dma-buf takes only the host-visible cached types,
   # which the client offers as shared) the fd's bits were 0; the server imports in a type it takes
@@ -289,6 +325,9 @@ run_mode() {
     timeout 120 ./report_cpu_test.sh >out/t-cpu.log 2>&1; result $? "report_cpu_test ($(tail -1 out/t-cpu.log))"
     # GPU memory per process with ten programs holding memory at once (eight before a game in Steam)
     timeout 120 ./report_gpumem_test.sh >out/t-gpumem.log 2>&1; result $? "report_gpumem_test ($(tail -1 out/t-gpumem.log))"
+    # A frame held 15 s on the GPU is presented late, not a lost device (Watch_Dogs loading
+    # on a Dimensity 8300); the limit from the guest and from <cache dir>/env (a server of its own; once)
+    timeout 300 ./present_timeout_test.sh >out/t-ptimeout.log 2>&1; result $? "present_timeout_test ($(tail -1 out/t-ptimeout.log))"
     # A hangup does not end the separate server: the app stops it last, after the session's programs
     timeout 60 ./server_hup_test.sh >out/t-hup.log 2>&1; result $? "server_hup_test ($(tail -1 out/t-hup.log))"
     # A start that ends inside a probe: a stop or a kill runs it again, an abort or a hang past the
@@ -382,6 +421,16 @@ run_mode() {
     # VKBRIDGE_NO_FP16=0/1 from the environment and a game's preset; unchanged on a right driver
     # (a server of its own; once)
     timeout 600 ./fp16_test.sh >out/t-fp16.log 2>&1; result $? "fp16_test ($(tail -1 out/t-fp16.log))"
+    # Issue #11 gs_hide: the Galaxy S10+'s r38p1 beta (imitated: its version faked, a fault in every
+    # pipeline with a geometry stage) - geometry shaders hidden from the listed processes only, on that
+    # driver only, VKBRIDGE_ERRATA/VKBRIDGE_GS_HIDE_PROCS; gamescope's Xwayland (glamor on Zink, GL 3.0)
+    # dies without the fix as on the phone and draws with it (a server of its own per step; once)
+    timeout 900 ./gshide_test.sh >out/t-gshide.log 2>&1; result $? "gshide_test ($(tail -1 out/t-gshide.log))"
+    # DXVK 1.x turns on transform feedback's geometryStreams whatever the query said; a driver without
+    # it (Mali-G720 r44p1, imitated) refused every D3D10/11 device (Hollow Knight on DXVK 1.10.3, Tab
+    # S10+): the bit taken off before the driver, the device made; DXVK 1.10.3's d3d11_check with
+    # VKB_DXVK1_WINE_DIR (a server of its own; once)
+    timeout 600 ./featclamp_test.sh >out/t-featclamp.log 2>&1; result $? "featclamp_test ($(tail -1 out/t-featclamp.log))"
     # vkBeginCommandBuffer's begin info: primary and secondary (inheritance info) round trips; one
     # encoded without its count (the 2026-10-10 copy's bug, SIGSEGV at 0x10 in Mali's
     # vkBeginCommandBuffer) is refused before the driver, its commands dropped (a server of its own; once)
@@ -399,6 +448,14 @@ run_mode() {
     # guest, a preset file and a built-in preset; the untested built-in entries not applied (a
     # server of its own; once)
     timeout 300 ./heapcap_test.sh >out/t-heapcap.log 2>&1; result $? "heapcap_test ($(tail -1 out/t-heapcap.log))"
+    # <cache dir>/env written, changed or removed while the server runs: the first process after
+    # it gets the new client switches (vkbQueryServer reads the file again when it changed; a
+    # server of its own; once)
+    timeout 300 ./envfile_test.sh >out/t-envfile.log 2>&1; result $? "envfile_test ($(tail -1 out/t-envfile.log))"
+    # The Xclipse 530 (Galaxy A55): no host pointers and external buffers in no host-visible type
+    # (VKBRIDGE_FAKE_MISSING=hostptr,extbufhv): smoke 6 of 13 with the fallback off, 13 of 13 with
+    # buffers made without the handle type; nothing faked, the choice unchanged (a server of its own; once)
+    timeout 400 ./unflagged_test.sh >out/t-unflagged.log 2>&1; result $? "unflagged_test ($(tail -1 out/t-unflagged.log))"
     # Asynchronous pipeline compiles (VKBRIDGE_ASYNC_COMPILE) with a slow compiler imitated: draws
     # skipped until the pipeline is there, depth-only and full-screen pipelines synchronous, objects
     # destroyed during a compile; off by default; the other checks unchanged through the layer
@@ -482,6 +539,20 @@ run_mode() {
     result $? "polygon_check fails with the emulation off ($(grep -c '^FAIL' out/t-polygon-off.log) checks failed)"
     . ./mali_env.sh >/dev/null
   fi
+  # vkGetEventStatus after a host vkSetEvent, or after a wait that saw the GPU set the event, inside
+  # the 1 ms quiet window an earlier "reset" answer started (client/icd.c): set, never reset
+  timeout 60 ./out/eventstatus_check 2000 >out/t-eventstatus.log 2>&1 && grep -q "^OK" out/t-eventstatus.log
+  result $? "eventstatus_check ($(tail -1 out/t-eventstatus.log))"
+  # Query results answered from the client's mirror (client/query.c), and the mirror never saying
+  # "not ready" forever for a query the GPU has done (Deep Rock Galactic's stall on the S11 Ultra,
+  # 2026-10-27): a multiview pass's second query, a lost ready-word update (imitated), and DRG's
+  # pattern through DXVK on a tiler (no round trips with the mirror on)
+  timeout 120 ./out/query_check >out/t-query.log 2>&1; result $? "query_check ($(tail -1 out/t-query.log))"
+  VKBRIDGE_QUERY_MIRROR=0 timeout 120 ./out/query_check >out/t-query-off.log 2>&1; result $? "query_check, mirror off ($(tail -1 out/t-query-off.log))"
+  for c in multiview lost drg; do
+    timeout 60 ./out/querystuck_check $c >out/t-qstuck-$c.log 2>&1
+    result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (multiview|lost|Deep)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
+  done
   timeout 60 vkcube-wayland --c 120 >out/t-vkcube.log 2>&1; result $? "vkcube-wayland (dma-buf)"
   VKBRIDGE_WSI_SHM=1 timeout 60 vkcube-wayland --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube-wayland (wl_shm)"
   timeout 60 vkcube --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube (X11)"

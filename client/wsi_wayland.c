@@ -392,7 +392,6 @@ static void *present_thread(void *arg)
 {
     vkb_swapchain *sc = arg;
     wl_state *s = sc->bdata;
-    VkDevice device = (VkDevice)sc->dev;
     for (;;) {
         pthread_mutex_lock(&sc->lock);
         int have = s->len > 0, quit = s->quit;
@@ -403,12 +402,9 @@ static void *present_thread(void *arg)
         }
         pthread_mutex_unlock(&sc->lock);
         if (have) {
-            VkResult r = vkb_wire_vkWaitForFences(device, 1, &s->fences[index], VK_TRUE, 10ull * 1000 * 1000 * 1000);
-            vkb_wire_vkResetFences(device, 1, &s->fences[index]);
-            if (r == VK_TIMEOUT) {
-                VKB_ERR("swapchain: a frame took more than 10 s to render");
-                r = VK_ERROR_DEVICE_LOST;
-            }
+            /* A slow frame (a game loading) is waited for; only a real loss or a frame past the limit
+             * (VKBRIDGE_PRESENT_TIMEOUT_S) ends the swapchain (wsi.c) */
+            VkResult r = vkb_wsi_wait_frame(sc, s->fences[index]);
             if (r >= 0 && !s->dead) r = wl_present(sc, index, NULL);
             pthread_mutex_lock(&sc->lock);
             if (r < 0 || s->dead) {

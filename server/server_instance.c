@@ -262,6 +262,7 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         vkb_emu_instance_install(t);
         vkb_promote_instance_install(t);
         vkb_vidyn_instance_install(t); /* over the promotion's feature query */
+        vkb_errata_gs_instance_install(t); /* issue #11: over all of them, its processes only */
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);
@@ -305,6 +306,7 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
+    vkb_srv_env_refresh(); /* <cache dir>/env as it is now: the switches below come from it too */
     int mode = vkb_pds_select_mode();
     const vkb_pd_knowledge *k = vkb_pd_lookup(c->dt, pd);
     vkb_server_pd_info info;
@@ -508,6 +510,8 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     }
     vkb_emu_device_create_info(inst, pd, emu, ci, c->d.arena);
     vkb_errata_fp16_device_create_info(inst, pd, ci); /* MK-20: what an app enables anyway */
+    vkb_errata_gs_device_create_info(inst, pd, ci);   /* issue #11: likewise */
+    vkb_emu_device_clamp_features(inst, pd, ci, avail, avail_n); /* last: what the driver lacks never reaches it */
 
     {
         /* What reaches the driver (tablet run 6: gamescope's scalar-layout shaders were refused). */
@@ -581,6 +585,9 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     } else {
         VKB_ERR("vkCreateDevice failed: %d (%u extensions)", r, n);
         for (uint32_t i = 0; i < n; i++) VKB_ERR("  requested %s", exts[i]);
+        char lacks[1024];
+        vkb_emu_device_lacks(inst, pd, ci, avail, avail_n, lacks, sizeof(lacks));
+        VKB_ERR("vkCreateDevice failed: the driver lacks: %s", lacks);
     }
     vkb_report_device(inst, ci, r, dropped, not_passed);
     vkb_enc_u32(&c->r, (uint32_t)r);

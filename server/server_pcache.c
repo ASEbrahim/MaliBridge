@@ -165,6 +165,36 @@ typedef struct env_kv {
 static env_kv *env_tab;
 static unsigned env_n;
 static pthread_mutex_t env_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The file as last read (vkb_srv_env_refresh): there or not, and its identity, size and times */
+typedef struct env_stamp {
+    int there;
+    dev_t dev;
+    ino_t ino;
+    off_t size;
+    struct timespec mtime, ctime;
+} env_stamp;
+static env_stamp env_read;
+
+static env_stamp env_stamp_of(const struct stat *st)
+{
+    env_stamp s = {0};
+    if (!st) return s;
+    s.there = 1;
+    s.dev = st->st_dev;
+    s.ino = st->st_ino;
+    s.size = st->st_size;
+    s.mtime = st->st_mtim;
+    s.ctime = st->st_ctim;
+    return s;
+}
+
+static int env_stamp_same(const env_stamp *a, const env_stamp *b)
+{
+    if (a->there != b->there) return 0;
+    if (!a->there) return 1;
+    return a->dev == b->dev && a->ino == b->ino && a->size == b->size && a->mtime.tv_sec == b->mtime.tv_sec &&
+           a->mtime.tv_nsec == b->mtime.tv_nsec && a->ctime.tv_sec == b->ctime.tv_sec && a->ctime.tv_nsec == b->ctime.tv_nsec;
+}
 
 void vkb_srv_env_reload(void)
 {
@@ -173,6 +203,8 @@ void vkb_srv_env_reload(void)
     char path[600];
     snprintf(path, sizeof(path), "%s/env", pc_dir);
     FILE *f = fopen(path, "r");
+    struct stat st;
+    env_stamp stamp = env_stamp_of(f && fstat(fileno(f), &st) == 0 ? &st : NULL);
     env_kv *tab = NULL;
     unsigned n = 0, cap = 0;
     char line[512];
@@ -201,7 +233,26 @@ void vkb_srv_env_reload(void)
     if (env_n || n) VKB_INFO("%u override(s) from %s in effect", n, path);
     env_tab = tab; /* the previous table is left allocated (see above) */
     env_n = n;
+    env_read = stamp;
     pthread_mutex_unlock(&env_lock);
+}
+
+/* Read again only when the file changed since it was last read (written, edited, replaced or
+ * removed). At vkbQueryServer: a process asks for its client switches (VKBRIDGE_HEAP_MAX_MB,
+ * VKBRIDGE_SPOOF_GPU, VKBRIDGE_PRESENT_TIMEOUT_S, VKBRIDGE_QUERY_MIRROR, ...) before it makes a
+ * device, so without this the first process after the file changed got the values from before
+ * (only vkCreateDevice read it again). */
+void vkb_srv_env_refresh(void)
+{
+    if (!pc_dir) return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/env", pc_dir);
+    struct stat st;
+    env_stamp now = env_stamp_of(stat(path, &st) == 0 ? &st : NULL);
+    pthread_mutex_lock(&env_lock);
+    int same = env_stamp_same(&now, &env_read);
+    pthread_mutex_unlock(&env_lock);
+    if (!same) vkb_srv_env_reload();
 }
 
 const char *vkb_srv_env_list(char *out, size_t cap)

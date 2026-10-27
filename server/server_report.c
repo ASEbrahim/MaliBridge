@@ -433,12 +433,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_QueueSubmit2(VkQueue q, uint32_t n, con
     return r;
 }
 
+/* A wait that returned VK_TIMEOUT before the app's timeout had passed (on a wait with no timeout,
+ * at all): the driver's bug; wait_retry waits on, so this is seen with it off. Once per kind. */
+static void early_timeout(const char *call, VkResult r, double t, uint64_t timeout, int *said)
+{
+    if (r != VK_TIMEOUT || !timeout || __atomic_load_n(said, __ATOMIC_RELAXED)) return;
+    double took = mono_s() - t;
+    if (timeout != UINT64_MAX && took * 1e9 + 2e6 >= (double)timeout) return;
+    if (__atomic_exchange_n(said, 1, __ATOMIC_RELAXED)) return;
+    vkb_srv_table *tb = vkb_srv_current_table();
+    char tmo[48];
+    if (timeout == UINT64_MAX) snprintf(tmo, sizeof(tmo), "no timeout");
+    else snprintf(tmo, sizeof(tmo), "timeout %.3f s", timeout / 1e9);
+    VKB_WARN("device %u: %s returned VK_TIMEOUT after %.3f s, before the app's deadline (%s; process %d): DXVK takes this as a "
+             "lost device (logged once)", tb ? tb->id : 0, call, took, tmo, tb && tb->proc ? tb->proc->pid : 0);
+}
+static int early_fences, early_sems;
+
 static VKAPI_ATTR VkResult VKAPI_CALL rp_WaitForFences(VkDevice dev, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout)
 {
     vkb_report_dev *d = rdev();
     double t = mono_s();
     VkResult r = d ? d->wait_fences(dev, n, f, all, timeout) : VK_ERROR_DEVICE_LOST;
     watch_result("vkWaitForFences", r, r == VK_SUCCESS ? (mono_s() - t) * 1000.0 : 0);
+    early_timeout("vkWaitForFences", r, t, timeout, &early_fences);
     return r;
 }
 
@@ -448,6 +466,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_WaitSemaphores(VkDevice dev, const VkSe
     double t = mono_s();
     VkResult r = d ? d->wait_sems(dev, wi, timeout) : VK_ERROR_DEVICE_LOST;
     watch_result("vkWaitSemaphores", r, r == VK_SUCCESS ? (mono_s() - t) * 1000.0 : 0);
+    early_timeout("vkWaitSemaphores", r, t, timeout, &early_sems);
     return r;
 }
 
@@ -1422,6 +1441,14 @@ static void *report_main(void *arg)
         }
     }
     return NULL;
+}
+
+int vkb_report_dir(char *out, size_t cap)
+{
+    pthread_mutex_lock(&rlock);
+    snprintf(out, cap, "%s", rdir);
+    pthread_mutex_unlock(&rlock);
+    return out[0] != 0;
 }
 
 void vkb_report_session(const char *log_path)

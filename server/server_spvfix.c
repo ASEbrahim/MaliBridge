@@ -58,7 +58,10 @@
 #include "spirv_shmbarrier.h"
 #include "spirv_wave32.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <time.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,8 +77,9 @@
 #define OP_FUNCTION 54
 
 /* The last modules created, kept so a pipeline the driver refuses can be dumped for a look
- * (<pipeline cache dir>/failed-<n>.spv, pulled with run-as): the driver says nothing about why. */
+ * (<pipeline cache dir>/failed-<process>-<pid>-d<device>-<n>-<stage>.spv, dump_code): the driver says nothing about why. */
 #define KEEP 64
+static pthread_mutex_t dump_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct kept_module {
     VkShaderModule module;
     uint32_t *code;
@@ -184,18 +188,108 @@ static void fix_stages(vkb_spvfix *f, uint32_t n, const VkPipelineShaderStageCre
             }
 }
 
-static void dump_code(vkb_spvfix *f, const uint32_t *code, size_t size, const char *why)
+/* A stage's short name in a dump's file name */
+static const char *stage_tag(VkShaderStageFlagBits st)
+{
+    switch (st) {
+    case VK_SHADER_STAGE_VERTEX_BIT: return "vs";
+    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: return "tcs";
+    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return "tes";
+    case VK_SHADER_STAGE_GEOMETRY_BIT: return "gs";
+    case VK_SHADER_STAGE_FRAGMENT_BIT: return "fs";
+    case VK_SHADER_STAGE_COMPUTE_BIT: return "cs";
+    default: return "stage";
+    }
+}
+
+static int write_file(const char *path, const uint32_t *code, size_t size)
+{
+    FILE *o = fopen(path, "wb");
+    if (!o) return 0;
+    int ok = fwrite(code, 1, size, o) == size;
+    return fclose(o) == 0 && ok;
+}
+
+/* failed-<process>-<pid>-d<device>-<n>-<stage>.spv in the pipeline cache directory (pulled with
+ * run-as), and a copy in the session folder's failed-spv/ (the server log's directory: Send logs
+ * and Share logs zip that folder, so the shaders come with the logs). Named per process and
+ * device: one counter per device used to make Xwayland's dumps overwrite the ones Steam's update
+ * window had made seconds before (issue #11). 16 per device, as before; the cache directory keeps
+ * the newest DUMPS_KEPT of them over sessions. */
+#define DUMPS_KEPT 64
+static void prune_dumps(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dump {
+        char name[256];
+        time_t t;
+    } *all = NULL;
+    size_t n = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t l = strlen(e->d_name);
+        if (strncmp(e->d_name, "failed-", 7) || l < 11 || strcmp(e->d_name + l - 4, ".spv") || l >= 256) continue;
+        char p[1000];
+        struct stat st;
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (n == cap) {
+            struct dump *m = realloc(all, (cap = cap ? cap * 2 : 64) * sizeof(*all));
+            if (!m) break;
+            all = m;
+        }
+        snprintf(all[n].name, sizeof(all[n].name), "%s", e->d_name);
+        all[n++].t = st.st_mtime;
+    }
+    closedir(d);
+    while (n > DUMPS_KEPT) { /* the oldest out, one at a time (a few files) */
+        size_t old = 0;
+        for (size_t i = 1; i < n; i++)
+            if (all[i].t < all[old].t) old = i;
+        char p[1000];
+        snprintf(p, sizeof(p), "%s/%s", dir, all[old].name);
+        unlink(p);
+        all[old] = all[--n];
+    }
+    free(all);
+}
+
+static void dump_code(vkb_spvfix *f, const uint32_t *code, size_t size, const char *why, const char *tag)
 {
     const char *dir = vkb_pcache_dir();
-    if (!dir || f->dumped >= 16) return;
-    char path[600];
-    snprintf(path, sizeof(path), "%s/failed-%u.spv", dir, f->dumped++);
-    FILE *o = fopen(path, "wb");
-    if (!o && errno == ENOENT && vkb_cache_dir_ensure()) o = fopen(path, "wb"); /* the cache directory was removed */
-    if (!o) return;
-    fwrite(code, 1, size, o);
-    fclose(o);
-    VKB_ERR("%s: shader saved to %s", why, path);
+    if (!dir) return;
+    pthread_mutex_lock(&dump_lock);
+    if (f->dumped >= 16) {
+        pthread_mutex_unlock(&dump_lock);
+        return;
+    }
+    unsigned nth = f->dumped++;
+    const vkb_srv_table *t = vkb_srv_current_table();
+    const vkb_srv_proc *pr = t ? t->proc : vkb_srv_current_proc();
+    char who[40] = "";
+    for (const char *c = pr && pr->comm[0] ? pr->comm : "server"; *c && strlen(who) < 31; c++) {
+        size_t l = strlen(who);
+        who[l] = (*c == '/' || *c == ' ' || *c == '.' || (unsigned char)*c < 32) ? '_' : *c;
+        who[l + 1] = 0;
+    }
+    char name[160];
+    snprintf(name, sizeof(name), "failed-%s-%d-d%u-%u-%s.spv", who, pr ? pr->pid : 0, t ? t->id : 0, nth, tag);
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    if (nth == 0) prune_dumps(dir);
+    int ok = write_file(path, code, size);
+    if (!ok && errno == ENOENT && vkb_cache_dir_ensure()) ok = write_file(path, code, size); /* the cache directory was removed */
+    char sdir[620], spath[800];
+    int copied = 0;
+    if (vkb_report_dir(sdir, sizeof(sdir)) && *sdir) {
+        snprintf(spath, sizeof(spath), "%s/failed-spv", sdir);
+        mkdir(spath, 0700);
+        snprintf(spath, sizeof(spath), "%s/failed-spv/%s", sdir, name);
+        copied = write_file(spath, code, size);
+    }
+    pthread_mutex_unlock(&dump_lock);
+    if (ok || copied) VKB_ERR("%s: shader saved to %s%s", why, ok ? path : spath, ok && copied ? " (and to the session folder's failed-spv/)" : "");
 }
 
 /* The per-vertex block rewrite of one module's code; NULL when it is not needed (or not possible). */
@@ -507,7 +601,7 @@ static VkResult VKAPI_CALL fx_CreateShaderModule(VkDevice device, const VkShader
     }
     VkResult r = f->create_module(device, ci, a, out);
     if (r != VK_SUCCESS) {
-        dump_code(f, ci->pCode, ci->codeSize, "vkCreateShaderModule failed");
+        dump_code(f, ci->pCode, ci->codeSize, "vkCreateShaderModule failed", "module");
         free(wcode);
         return r;
     }
@@ -531,15 +625,20 @@ static void dump_stage(vkb_spvfix *f, const VkPipelineShaderStageCreateInfo *st,
     for (const VkBaseInStructure *b = st->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
             const VkShaderModuleCreateInfo *mi = (const void *)b;
-            dump_code(f, mi->pCode, mi->codeSize, why);
+            dump_code(f, mi->pCode, mi->codeSize, why, stage_tag(st->stage));
             return;
         }
     pthread_mutex_lock(&f->lock);
-    for (int i = 0; i < KEEP; i++)
-        if (f->kept[i].module == st->module && f->kept[i].code) {
-            dump_code(f, f->kept[i].code, f->kept[i].size, why);
+    /* newest first: a destroyed module's handle comes back for the next one made (issue #11's
+     * dumps showed one handle as the VS of one pipeline and the FS of the next: the oldest entry
+     * with the handle was taken) */
+    for (int j = 1; j <= KEEP; j++) {
+        kept_module *k = &f->kept[(f->next_kept - j) % KEEP];
+        if (k->module == st->module && k->code) {
+            dump_code(f, k->code, k->size, why, stage_tag(st->stage));
             break;
         }
+    }
     pthread_mutex_unlock(&f->lock);
 }
 

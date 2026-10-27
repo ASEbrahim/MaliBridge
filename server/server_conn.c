@@ -200,8 +200,10 @@ static vkb_srv_proc *proc_join(uint64_t token, int pid)
 {
     pthread_mutex_lock(&procs_lock);
     vkb_srv_proc *p = procs;
+    int first = 0;
     while (p && p->token != token) p = p->next;
     if (!p) {
+        first = !procs;
         p = calloc(1, sizeof(*p));
         p->token = token;
         p->pid = pid;
@@ -212,6 +214,7 @@ static vkb_srv_proc *proc_join(uint64_t token, int pid)
         VKB_INFO("client process %d connected", pid);
     }
     p->conns++;
+    if (first) vkb_probe_clients_gone(0); /* under procs_lock: in order with proc_leave's */
     pthread_mutex_unlock(&procs_lock);
     return p;
 }
@@ -225,6 +228,7 @@ static void proc_leave(vkb_srv_proc *p)
         while (*pp && *pp != p) pp = &(*pp)->next;
         if (*pp) *pp = p->next;
     }
+    if (last && !procs) vkb_probe_clients_gone(1); /* before the cleanup: the app's kill may come during it */
     pthread_mutex_unlock(&procs_lock);
     if (last) {
         vkb_proc_cleanup(p);
@@ -837,7 +841,8 @@ static void async_report(const vkb_srv_call *c, uint32_t cmd)
         /* The client already told the app VK_SUCCESS. */
         int32_t vr;
         memcpy(&vr, c->r.buf, sizeof(vr));
-        if (vr < 0) VKB_ERR("asynchronous %s returned %d", vkb_cmd_names[cmd], vr);
+        /* only VK_SUCCESS or an error is legal for these; a positive code is the driver's bug */
+        if (vr != VK_SUCCESS) VKB_ERR("asynchronous %s returned %d", vkb_cmd_names[cmd], vr);
     }
 }
 

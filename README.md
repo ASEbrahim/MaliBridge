@@ -42,12 +42,23 @@ Ultra (Mali-G925), 34 games I've tested are playable or better, for example Half
 Garry's Mod. Players have sent reports from 19 more Mali phones and tablets: 83 different games
 across the tables below. It is free.
 
+## New in v0.5.4.1
+
+- **Steam should start now** on the Retroid Pocket 4 Pro, Galaxy A53, POCO X4 GT, motorola edge 40 neo and other phones that stopped at "Starting display and audio", on the Galaxy A55 and A56 (Xclipse), and on the Galaxy S10+ and Note10+ with LineageOS.
+- **Games that closed early should run:** D3D10/D3D11 games on Vulkan 1.1 phones like the Galaxy S21, Stray and SOMA on the Xiaomi 17T Pro, Titanfall 2 on 12 GB devices.
+- **Stray runs faster on the Tab S11 Ultra:** about 20 fps in game instead of 14.
+- **On-screen controller:** a faint ring shows where the sticks are.
+- **When Steam can't be downloaded** (often a VPN or accelerator app), the app now says so.
+- **Chinese and Korean** in every part of the app.
+
+All changes: [release notes](https://github.com/ASEbrahim/MaliBridge/releases/tag/v0.5.4.1).
+
 ## New in v0.5.4
 
 **Fixes**
 - **Green squares and red-tinted textures on the Dimensity 9500** (Hollow Knight, Silksong, Hades and others) should be gone.
 - **Black picture with sound on Samsung Exynos (Xclipse)** phones: games should show now.
-- **Black Steam screen on older Mali GPUs** (G57, G68 and similar, like the Galaxy A16 and F15) should be fixed. If it ever comes back, set **Steam menus** to *software*.
+- **Black Steam screen on older Mali GPUs** (G57, G68 and similar): Steam's menus are drawn without the GPU there. Some of these phones still get a black screen in game mode (see [known issues](#known-issues)).
 - **Missing text in Balatro** and other OpenGL games is fixed.
 - **Fewer crashes when the phone runs low on memory**, and less stutter on later launches of a game.
 - **Games keep their picture** at the end of a session that Android had paused in the background for a long time.
@@ -141,39 +152,39 @@ They come from playing the games myself where I did, and from the frame rate oth
 
 | Game | Mali-G720 (Tab S10+) | Mali-G925 (Tab S11 Ultra) |
 |---|---|---|
-| Hades | **Excellent** | not tested |
+| Hades | **Excellent** | **Excellent**, 110-128 fps in the House of Hades |
 | Hollow Knight | **Excellent**, 87-124 fps | **Excellent**, 110+ fps (player report) |
-| ULTRAKILL | **Very playable**, 55-57 fps | not tested |
+| ULTRAKILL | **Very playable**, 55-57 fps | **Excellent**, 111-116 fps at the start of 0-1 |
 | Celeste | **Excellent**, 57-59 fps | **Excellent**, 60 fps (its cap) in play |
-| Portal | **Excellent**, 80 fps | not tested |
-| Cuphead | **Excellent** | not tested |
-| Dead Cells | **Excellent** | not tested |
-| ENDER LILIES | **Playable**, 42-44 fps | not tested |
+| Portal | **Excellent**, 80 fps | **Excellent**, 85-90 fps in the first test chamber (about 65 looking through a portal); one short pause when the first portal opened |
+| Cuphead | **Excellent** | **Excellent**, about 120 fps on the Inkwell Isle Two map |
+| Dead Cells | **Excellent** | **Excellent**, 110-120 fps in the Prisoners' Quarters |
+| ENDER LILIES | **Playable**, 42-44 fps | **Excellent**, 59-61 fps (its cap) in the first area; plain colours, as in Stray |
 | Lethal Company | **Playable**, 43-45 fps | not tested |
 | Subnautica | **Playable**, 20-24 fps with Detail set to High | **Very playable**, 28-40 fps in play (while thermally throttled), 81 fps on the menu |
-| Inscryption | **Excellent**, 68-83 fps | not tested |
-| Doki Doki Literature Club | **Excellent**, title screen 91-92 fps | not tested |
+| Inscryption | **Excellent**, 68-83 fps | **Very playable**, 55-57 fps at the first card table, with dips to about 20 |
+| Doki Doki Literature Club | **Excellent**, title screen 91-92 fps | **Excellent**, 112-114 fps in the story |
 | Half-Life 2 | **Excellent**, 59-74 fps in the opening chapter | **Excellent**, 94-103 fps in the opening chapter; about 110 fps at Water Hazard with v0.5.4 |
 | Portal 2 | **Playable**, about 45-50 fps in play with drops to around 30 | **Not rated yet** (menu only): 115 fps in the menu |
 | Hollow Knight: Silksong | **Excellent**, a steady 62-66 fps in play | **Excellent**, 72-96 fps |
 | The Elder Scrolls V: Skyrim Special Edition | **Excellent**, about 60 fps (its cap) on Medium; smooth in third person, some stutter on first load | not tested |
-| Stardew Valley | **Excellent**, 60 fps (its cap) on the title screen | **Excellent**, 57-62 fps |
+| Stardew Valley | **Excellent**, 60 fps (its cap) in play on the farm | **Excellent**, 57-62 fps |
 | Risk of Rain 2 | **Kinda playable**, at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720) | **Playable**, 30-43 fps at 1280x720; 20-28 fps in a crowded boss fight, measured while screen recording |
 | Dark Souls Remastered | **Not rated yet** (menu only): 60 fps (its cap) on the title and main menu | **Very playable**, 10 minutes of play at a median of 53.7 fps, lowest 43.9, 60 fps (its cap) while the tablet is cool; cutscenes correct |
 | Garry's Mod | **Very playable**, 49-54 fps on gm_construct (59 on the menu) | **Excellent**, on a plain map (median 104 fps); median 82 fps on the Golden City Sandbox map, lowest 34 |
 | The Witcher 3 (DX12) | **Barely runs**, long GPU stalls while loading | **Barely runs**, the intro plays at 60 fps; after loading a save the game stalls (known issue, see below) |
-| Stray | **Barely runs**, 17 fps in the opening scene (limited by the CPU) | **Not rated yet** (title screen only): DX11 (the default), 58 fps on the title screen, with plain colours (see known issues); gameplay not measured yet |
-| Deep Rock Galactic | **Kinda playable**, slow | not tested |
+| Stray | **Barely runs**, 17 fps in the opening scene (limited by the CPU) | **Playable**, about 20 fps in game; plain colours (see known issues) |
+| Deep Rock Galactic | **Kinda playable**, slow | **Known issue**: the title screen works, but the game can freeze after loading into the Space Rig. Being worked on |
 | Poppy Playtime (Chapter 1) | **Not rated yet** (menu only): 62-64 fps on the Chapter 1 main menu | **Kinda playable**, 28-32 fps in the factory lobby; plain colours, as in Stray |
 | R.E.P.O. | **Not rated yet** (menu only): about 42 fps on the main menu after a 50 s warm-up | **Playable**, about 40 fps in single player |
 | Muck | **Not rated yet** (menu only): 43 fps on the main menu over the 3D island | **Playable**, 45-48 fps on the island |
 | Phoenix Wright: Ace Attorney Trilogy | **Not rated yet** (menu only): about 118 fps on the title and menu | **Excellent**, about 118 fps (the 120 Hz display rate) |
-| Helltaker | **Not rated yet** (menu only): 59.8 fps on the title screen | **Excellent**, about 59 fps, works perfectly |
+| Helltaker | **Excellent**, 60 fps (its cap) in play | **Excellent**, about 59 fps, works perfectly |
 | GRIS | **Excellent**, about 105 fps after Continue | **Excellent**, about 119 fps |
 | A Dance of Fire and Ice | **Not rated yet** (menu only): 45-52 fps on the title scene | **Excellent**, about 106-113 fps; no input delay noticed with a Bluetooth PS5 controller |
 | Stick Fight: The Game | **Kinda playable**, a flat 30 fps in a local lobby | **Excellent**, 59-60 fps (its cap) |
 | Risk of Rain Returns | **Excellent**, 59-60 fps in play including a boss fight | **Excellent**, 59-60 fps on the title screen and in play |
-| Don't Starve Together | **Not rated yet** (menu only): 60 fps on the main menu (with `PROTON_USE_WINED3D=1`) | **Excellent**, 60 fps with `PROTON_USE_WINED3D=1`, which v0.5.4 sets automatically; without it the game closes a few seconds after start |
+| Don't Starve Together | **Excellent**, 60 fps (its cap) in a new world | **Excellent**, 60 fps |
 | ASTRONEER | **Not rated yet** (menu only): 27-29 fps on the 3D menu | **Kinda playable**, renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; plain colours |
 | The Forest | **Not rated yet** (menu only): 60 fps on the menu; the first launch stalled once after 20 s, the second was fine | **Playable**, 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
 | Outer Wilds | **Barely runs**, about 10 fps in game (73 on the title): the tablet runs short of memory (12 GB, heavy swapping) | **Playable**, 35-45 fps on the starting planet, about 75-80 in space, high 20s on Brittle Hollow, about 17 looking at the black hole with the GPU half idle; CPU-bound |
@@ -191,8 +202,11 @@ the game's own frame count. Dark Souls III on the G720 was measured standing wit
 pre-release. Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mode. The other
 G925 figures are from v0.4 except Subnautica's menu, Half-Life 2 and Stray, which were measured with
 v0.5. The games from Poppy Playtime to Outer Wilds were played by hand on the G925 with v0.5
-pre-releases in October 2026 (fps read from the launcher's frame counter). Risk of Rain Returns used to
-freeze at its intro video; v0.5 fixes that on both tablets.
+pre-releases in October 2026 (fps read from the launcher's frame counter). Hades, ULTRAKILL, Portal,
+Cuphead, Dead Cells, ENDER LILIES, Inscryption and Doki Doki Literature Club on the G925, and
+Helltaker, Stardew Valley and Don't Starve Together on the G720, were played into a real scene with
+v0.5.4.1 test builds in October 2026 and measured over 75-90 s from the screen's frame times. Risk of
+Rain Returns used to freeze at its intro video; v0.5 fixes that on both tablets.
 
 </details>
 
@@ -346,9 +360,9 @@ and SOMA closes when its first load ends.
   Proton's.
 - **Steam menus: automatic** (the default) keeps Steam's menus from coming out black on older Mali
   GPUs. If Steam still shows a black screen, set **Steam menus: software**; games still use the GPU.
-- **Games v0.5.4 sets up automatically:** Don't Starve Together, Half-Life 2 and RimWorld on older
-  phones, and Indiana Jones and the Emperor's Tomb. On older versions, Don't Starve Together needs
-  `PROTON_USE_WINED3D=1 %command%` as its launch option.
+- **Games MaliBridge sets up by itself:** Don't Starve Together, Half-Life 2 and RimWorld on older
+  phones, Indiana Jones and the Emperor's Tomb, and since v0.5.4.1 Stray, SOMA and the two Amnesia
+  games. You don't need launch options for them.
 - **Let "Processing Vulkan shaders" finish** when Steam shows it before a game: the first run
   stutters less. It gets smoother the more you play.
 - **Launch one game per session**, close other apps on phones with 8 GB of RAM, and lower the
@@ -410,14 +424,17 @@ The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 
 ## Known issues
 
+- **Black screen with sound in Steam's game mode** on some older Mali phones and tablets (Galaxy
+  A16, A54, F15, Tab S9 FE, Tab S10 Lite, Anbernic RG556). Desktop mode works on them. Being worked on.
 - **Short freezes while moving** in some games that stream their textures in as you walk (Dark
   Souls III, Hob).
 - **Steam's menus on vivo phones** can run at about 15 fps, with a white flash when a menu opens.
   If you have a vivo phone, logs from v0.5.4 help.
 - **The Witcher 3 (DX12) on the Mali-G925** plays its intro at 60 fps, but after loading a save the
   frame rate drops below 1 fps.
-- **Stray on the Mali-G925** runs with plain colours instead of its own colour grading (Poppy
-  Playtime and ASTRONEER too). Being worked on.
+- **Deep Rock Galactic on the Mali-G925** can freeze after loading into the Space Rig. Being worked on.
+- **Stray and ENDER LILIES on the Mali-G925** run with plain colours instead of their own colour
+  grading (Poppy Playtime and ASTRONEER too). Being worked on.
 - **Stray with `-dx12`** closes about 60 s after starting on the G925. The default (DX11) is fine.
 - **Risk of Rain 2**: one performance-mode launch on the G925 showed no picture for about 2 minutes
   on its title load, then went on. It did not happen again.

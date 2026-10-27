@@ -26,6 +26,8 @@
  *   crash mark (a fatal signal outside the probe's guard, died (on another thread: interrupted)
  *     on the probe's thread)
  *   no mark, still inside past its limit + 2 s           died (the watchdog could not interrupt it)
+ *   idle mark (every client process had left, then the   interrupted: the session's own end (the app
+ *     process ended without a word)                      kills the server right after its guest)
  *   no mark, within its limit                            a kill or an abort: run again; died only
  *                                                        when it ends so 2 times in a row (3 in
  *                                                        the separate server, which marks aborts
@@ -2925,6 +2927,27 @@ static void beat_start(void)
     pthread_attr_destroy(&a);
 }
 
+/* Every client process has left (1) or one is connected (0). A session's end looks so: the guest
+ * goes, its processes' connections close, and the app kills the server (SIGKILL, no mark) a few ms
+ * later. On the Retroid Pocket 4 Pro (MaliBridge#10) every gamescope start ended within 800 ms, the
+ * kill came inside the background "bc_transcoders" probe three times, and it was recorded as died:
+ * BC transcoding off and its MK-20 line wrong. A probe ended so is run again instead. Only after a
+ * client has been: a process that dies before any client connects is judged as before. */
+static int clients_gone;
+
+static void idle_write(int fd, int idle)
+{
+    if (fd >= 0 && pwrite(fd, idle ? "idle\n" : "busy\n", 5, BEAT_MARK_AT) < 0) {}
+}
+
+void vkb_probe_clients_gone(int gone)
+{
+    pthread_mutex_lock(&plock);
+    if (__atomic_exchange_n(&clients_gone, gone, __ATOMIC_ACQ_REL) != gone)
+        for (int i = 0; i < nprofiles; i++) idle_write(profiles[i].beat_fd, gone);
+    pthread_mutex_unlock(&plock);
+}
+
 /* After the profile names pf->running: its heartbeat starts. */
 static void probe_begin(pprofile *pf)
 {
@@ -2942,6 +2965,7 @@ static void probe_begin(pprofile *pf)
     if (fd >= 0) {
         __atomic_store_n(&pf->beat_fd, fd, __ATOMIC_RELEASE);
         beat_write(pf);
+        if (__atomic_load_n(&clients_gone, __ATOMIC_ACQUIRE)) idle_write(fd, 1);
     }
     pthread_mutex_unlock(&plock);
 }
@@ -3039,6 +3063,10 @@ static int judge_end(pprofile *pf, const char *name, char *detail, size_t cap)
         snprintf(detail, cap, "the process was still inside this probe %.1f s after it began (its limit: %.0f s; the watchdog could not interrupt it) when it was ended on an earlier start",
                  ms / 1000, limit);
         return END_DIED;
+    }
+    if (have && !strncmp(mark, "idle", 4)) {
+        snprintf(detail, cap, "ended after %.0f ms, after every client process had left (the session's end)", ms);
+        return END_INTERRUPTED;
     }
     int n = !strcmp(pf->suspect, name) ? pf->suspect_n + 1 : 1;
     snprintf(pf->suspect, sizeof(pf->suspect), "%s", name);

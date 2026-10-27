@@ -610,38 +610,52 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceQueue2(VkDevice device, const VkDev
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence)
 {
-    return vkb_note_error("vkQueueSubmit", vkb_wire_vkQueueSubmit(queue, submitCount, pSubmits, fence));
+    return vkb_note_fail("vkQueueSubmit", vkb_wire_vkQueueSubmit(queue, submitCount, pSubmits, fence));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2 *pSubmits, VkFence fence)
 {
-    return vkb_note_error("vkQueueSubmit2", vkb_wire_vkQueueSubmit2(queue, submitCount, pSubmits, fence));
+    return vkb_note_fail("vkQueueSubmit2", vkb_wire_vkQueueSubmit2(queue, submitCount, pSubmits, fence));
 }
 
+static void quiet_over(void);
+
+/* A wait that saw GPU work done ends the poll quiet windows (below): the app may now rely on what
+ * that work set. */
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueWaitIdle(VkQueue queue)
 {
-    return vkb_note_error("vkQueueWaitIdle", vkb_wire_vkQueueWaitIdle(queue));
+    VkResult r = vkb_wire_vkQueueWaitIdle(queue);
+    if (r == VK_SUCCESS) quiet_over();
+    return vkb_note_fail("vkQueueWaitIdle", r);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkDeviceWaitIdle(VkDevice device)
 {
-    return vkb_note_error("vkDeviceWaitIdle", vkb_wire_vkDeviceWaitIdle(device));
+    VkResult r = vkb_wire_vkDeviceWaitIdle(device);
+    if (r == VK_SUCCESS) quiet_over();
+    return vkb_note_fail("vkDeviceWaitIdle", r);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences, VkBool32 waitAll,
                                                       uint64_t timeout)
 {
-    return vkb_note_error("vkWaitForFences", vkb_wire_vkWaitForFences(device, fenceCount, pFences, waitAll, timeout));
+    VkResult r = vkb_wire_vkWaitForFences(device, fenceCount, pFences, waitAll, timeout);
+    if (r == VK_SUCCESS) quiet_over();
+    return vkb_note_wait("vkWaitForFences", "vkWaitForFences (no timeout)", r, timeout);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetFenceStatus(VkDevice device, VkFence fence)
 {
-    return vkb_note_error("vkGetFenceStatus", vkb_wire_vkGetFenceStatus(device, fence));
+    VkResult r = vkb_wire_vkGetFenceStatus(device, fence);
+    if (r == VK_SUCCESS) quiet_over();
+    return vkb_note_error("vkGetFenceStatus", r);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo *pWaitInfo, uint64_t timeout)
 {
-    return vkb_note_error("vkWaitSemaphores", vkb_wire_vkWaitSemaphores(device, pWaitInfo, timeout));
+    VkResult r = vkb_wire_vkWaitSemaphores(device, pWaitInfo, timeout);
+    if (r == VK_SUCCESS) quiet_over();
+    return vkb_note_wait("vkWaitSemaphores", "vkWaitSemaphores (no timeout)", r, timeout);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore, uint64_t *pValue)
@@ -654,13 +668,30 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSemaphoreCounterValue(VkDevice device
  * queries (no wait, no availability or partial values, which must be written) are answered here
  * for a millisecond; a result then arrives at most that much later. Per query range, per event:
  * one quiet window for all starved the ready ones while DXVK kept polling unsubmitted queries.
- * Occlusion and timestamp queries are answered from query.c's mirror first; this is the fallback. */
+ * Occlusion and timestamp queries are answered from query.c's mirror first; this is the fallback.
+ * A window may only make an answer late, never wrong: it ends at anything after which the app may
+ * rely on the new state (a host vkSetEvent, a wait that saw GPU work done). Before,
+ * an event polled reset was still answered reset for 1 ms after the app set it, or after it waited
+ * for the work that set it. */
 #define QUIET_SLOTS 4096
 typedef struct quiet_slot {
-    uint64_t key, until;
+    uint64_t key, until, gen;
 } quiet_slot;
 static quiet_slot query_quiet[QUIET_SLOTS], event_quiet[QUIET_SLOTS];
 static pthread_mutex_t quiet_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t quiet_gen; /* bumped by quiet_over: windows started before it are over */
+
+static void quiet_over(void)
+{
+    __atomic_add_fetch(&quiet_gen, 1, __ATOMIC_ACQ_REL);
+}
+
+/* Taken before the server is asked: a set or a wait that ends between the question and the
+ * answer also ends the window that answer starts. */
+static uint64_t quiet_gen_now(void)
+{
+    return __atomic_load_n(&quiet_gen, __ATOMIC_ACQUIRE);
+}
 
 static uint64_t mono_ns(void)
 {
@@ -680,17 +711,18 @@ static int quiet_now(quiet_slot *tab, uint64_t key)
 {
     pthread_mutex_lock(&quiet_lock);
     quiet_slot *q = quiet_find(tab, key);
-    int quiet = q->key == key && mono_ns() < q->until;
+    int quiet = q->key == key && q->gen == quiet_gen_now() && mono_ns() < q->until;
     pthread_mutex_unlock(&quiet_lock);
     return quiet;
 }
 
-static void quiet_start(quiet_slot *tab, uint64_t key)
+static void quiet_start(quiet_slot *tab, uint64_t key, uint64_t gen)
 {
     pthread_mutex_lock(&quiet_lock);
     quiet_slot *q = quiet_find(tab, key);
     q->key = key;
     q->until = mono_ns() + 1000000ull;
+    q->gen = gen;
     pthread_mutex_unlock(&quiet_lock);
 }
 
@@ -708,8 +740,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetQueryPoolResults(VkDevice device, VkQ
     int poll = !(flags & writes);
     uint64_t key = (uint64_t)(uintptr_t)queryPool ^ ((uint64_t)firstQuery << 40) ^ ((uint64_t)queryCount << 20);
     if (poll && quiet_now(query_quiet, key)) return VK_NOT_READY;
+    uint64_t gen = quiet_gen_now();
     VkResult r = vkb_wire_vkGetQueryPoolResults(device, queryPool, firstQuery, queryCount, dataSize, pData, stride, flags);
-    if (poll && r == VK_NOT_READY) quiet_start(query_quiet, key);
+    vkb_query_wire_answer(vkb_dev(device), queryPool, firstQuery, queryCount, r); /* a query stuck in the mirror (query.c) */
+    if (poll && r == VK_NOT_READY) quiet_start(query_quiet, key, gen);
     return r;
 }
 
@@ -718,8 +752,18 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetEventStatus(VkDevice device, VkEvent 
 {
     uint64_t key = (uint64_t)(uintptr_t)event;
     if (quiet_now(event_quiet, key)) return VK_EVENT_RESET;
+    uint64_t gen = quiet_gen_now();
     VkResult r = vkb_wire_vkGetEventStatus(device, event);
-    if (r == VK_EVENT_RESET) quiet_start(event_quiet, key);
+    if (r == VK_EVENT_RESET) quiet_start(event_quiet, key, gen);
+    return r;
+}
+
+/* Sent first, then the windows end: a poll from another thread that starts after this is ordered
+ * after the set on the server, one already answered is not trusted any more. */
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetEvent(VkDevice device, VkEvent event)
+{
+    VkResult r = vkb_wire_vkSetEvent(device, event);
+    quiet_over();
     return r;
 }
 

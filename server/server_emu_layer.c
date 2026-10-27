@@ -277,11 +277,37 @@ static void fix_single_row_pitch(VkImage image, const VkImageSubresource *sub, V
     l->rowPitch = l->size;
 }
 
+/* A modifier-list image made plain LINEAR (linear_mod_plain): its memory plane 0 is its colour aspect. */
+static const VkImageSubresource *linear_mod_sub(VkImage image, const VkImageSubresource *sub, VkImageSubresource *tmp)
+{
+    if (!(sub->aspectMask & VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)) return sub;
+    vkb_emu_image *r = vkb_emu_find_image(vkb_emu_cur(), image);
+    if (!r || !r->linear_mod) return sub;
+    *tmp = *sub;
+    tmp->aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    return tmp;
+}
+
 static VKAPI_ATTR void VKAPI_CALL emu_GetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource *sub,
                                                                VkSubresourceLayout *layout)
 {
+    VkImageSubresource tmp;
+    sub = linear_mod_sub(image, sub, &tmp);
     vkb_emu_real()->vkGetImageSubresourceLayout(device, image, sub, layout);
     fix_single_row_pitch(image, sub, layout);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL emu_GetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkImage image,
+                                                                                VkImageDrmFormatModifierPropertiesEXT *props)
+{
+    vkb_emu_image *r = vkb_emu_find_image(vkb_emu_cur(), image);
+    if (r && r->linear_mod) {
+        props->drmFormatModifier = 0; /* DRM_FORMAT_MOD_LINEAR */
+        return VK_SUCCESS;
+    }
+    const vkb_dispatch *real = vkb_emu_real();
+    return real->vkGetImageDrmFormatModifierPropertiesEXT ? real->vkGetImageDrmFormatModifierPropertiesEXT(device, image, props)
+                                                          : VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
 /* Accounting (server_memory.c): what the driver asks for the image and, for an emulated BC image,
@@ -364,6 +390,144 @@ static int dmabuf_plain_retry(VkImageCreateInfo *ci)
     return 0;
 }
 
+/* The export images of gamescope's nested backend (and any client exporting through a modifier list):
+ * DRM-modifier tiling with VkImageDrmFormatModifierListCreateInfoEXT and DMA_BUF. Arm's r32p1
+ * (Mali-G77 MC9, Retroid Pocket 4 Pro, MaliBridge#10) most likely refuses them at the LINEAR
+ * modifier: it refuses dma-buf images at LINEAR tiling outright (the dmabuf_linear_image probe), and
+ * gamescope found no exportable modifier for its output images although the export emulation was on.
+ * Where the emulation is on and the list holds LINEAR, such an image is made as a plain LINEAR image
+ * without the dma-buf handle type when the driver refuses its LINEAR-modifier dma-buf query (the
+ * client then answered that query from the plain LINEAR one, client/physdev.c) or refuses to create
+ * it. Its memory comes from the emulation's pages as for any image that asks to export; the image
+ * reports the LINEAR modifier (emu_GetImageDrmFormatModifierPropertiesEXT) and its plane 0 layout
+ * is its linear layout, with the single-row pitch patch. An image the driver makes itself is
+ * left as it was. */
+static int has_linear_mod_list(const VkImageCreateInfo *ci)
+{
+    if (ci->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) return 0;
+    int list = 0, dmabuf = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) {
+            const VkImageDrmFormatModifierListCreateInfoEXT *l = (const void *)b;
+            for (uint32_t i = 0; i < l->drmFormatModifierCount; i++) list |= l->pDrmFormatModifiers[i] == 0 /* DRM_FORMAT_MOD_LINEAR */;
+        }
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+            dmabuf |= (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0;
+    }
+    return list && dmabuf && ci->imageType == VK_IMAGE_TYPE_2D && ci->mipLevels == 1 && ci->arrayLayers == 1 &&
+           ci->samples == VK_SAMPLE_COUNT_1_BIT;
+}
+
+/* Whether the driver refuses (or will not import) the LINEAR-modifier dma-buf image ci describes. */
+static int linear_mod_refused(const vkb_srv_table *t, const VkImageCreateInfo *ci)
+{
+    if (vkb_emu_dmabufmod_refused(ci->tiling, ci->usage, ci->flags, ci->pNext)) return 1; /* host imitation */
+    const vkb_srv_table *inst = t ? t->parent : NULL;
+    if (!inst || !inst->real.vkGetPhysicalDeviceImageFormatProperties2) return 0;
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, NULL, 0,
+                                                        ci->sharingMode, 0, NULL};
+    VkPhysicalDeviceExternalImageFormatInfo ei = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &mi,
+                                                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkImageFormatListCreateInfo fl;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            fl = *(const VkImageFormatListCreateInfo *)b;
+            fl.pNext = ei.pNext;
+            ei.pNext = &fl;
+        }
+    VkPhysicalDeviceImageFormatInfo2 ii = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &ei, ci->format, ci->imageType,
+                                           VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, ci->usage, ci->flags};
+    VkExternalImageFormatProperties ep = {VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+    VkImageFormatProperties2 ip = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &ep};
+    VkResult r = inst->real.vkGetPhysicalDeviceImageFormatProperties2(t->physical, &ii, &ip);
+    return r != VK_SUCCESS || !(ep.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+}
+
+/* ci made plain LINEAR without the dma-buf handle type; why: VK_SUCCESS (the query refused) or what
+ * vkCreateImage returned. Returns 1. */
+static int linear_mod_plain(VkImageCreateInfo *ci, VkResult why)
+{
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+        VKB_INFO("dma-buf export image with a LINEAR modifier list %s (format %d %ux%u usage 0x%x flags 0x%x); made as a plain LINEAR "
+                 "image without the dma-buf handle type, reported as the LINEAR modifier (its memory is exported as allocated)",
+                 why == VK_SUCCESS ? "refused by the driver's format query" : "refused by vkCreateImage", ci->format, ci->extent.width,
+                 ci->extent.height, ci->usage, ci->flags);
+    ci->tiling = VK_IMAGE_TILING_LINEAR;
+    vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+            ext_handles *h = (ext_handles *)b;
+            h->handleTypes &= ~(VkExternalMemoryHandleTypeFlags)VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            if (!h->handleTypes) vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+            break;
+        }
+    return 1;
+}
+
+/* The compositor's side of the same images: gamescope imports a client's LINEAR dma-buf at
+ * DRM-modifier tiling with VkImageDrmFormatModifierExplicitCreateInfoEXT (the LINEAR modifier, one
+ * plane, the exporter's layout), sampled with a mutable format. Where the driver refuses that
+ * query, the client answers it from plain LINEAR as importable (client/physdev.c): answered without
+ * IMPORTABLE, gamescope made the import an OPTIMAL image with an implicit layout, which on Mali needs
+ * more memory than the linear dma-buf has (S10+ under dmaheap,dmabufmod: 3993600 bytes against
+ * 3719168, VK_ERROR_INVALID_EXTERNAL_HANDLE) and would read tiled texels from linear ones anyway.
+ * Such an image is made as a plain LINEAR image without the dma-buf handle type (as
+ * dmabuf_plain_retry does for LINEAR imports), and kept only if its own layout is the one the
+ * importer was given; otherwise it is refused as before. Its memory is the imported dma-buf. */
+static int has_linear_mod_explicit(const VkImageCreateInfo *ci, VkSubresourceLayout *plane)
+{
+    if (ci->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) return 0;
+    int lin = 0, dmabuf = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) {
+            const VkImageDrmFormatModifierExplicitCreateInfoEXT *x = (const void *)b;
+            lin = x->drmFormatModifier == 0 /* DRM_FORMAT_MOD_LINEAR */ && x->drmFormatModifierPlaneCount == 1 && x->pPlaneLayouts;
+            if (lin) *plane = x->pPlaneLayouts[0];
+        }
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+            dmabuf |= (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0;
+    }
+    return lin && dmabuf && ci->imageType == VK_IMAGE_TYPE_2D && ci->mipLevels == 1 && ci->arrayLayers == 1 &&
+           ci->samples == VK_SAMPLE_COUNT_1_BIT;
+}
+
+/* ci (has_linear_mod_explicit) made plain LINEAR without the dma-buf handle type. Returns 1. */
+static int linear_import_plain(VkImageCreateInfo *ci, VkResult why)
+{
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+        VKB_INFO("dma-buf import image at the LINEAR modifier %s (format %d %ux%u usage 0x%x flags 0x%x); made as a plain LINEAR image "
+                 "without the dma-buf handle type, reported as the LINEAR modifier (its memory is the imported dma-buf)",
+                 why == VK_SUCCESS ? "refused by the driver's format query" : "refused by vkCreateImage", ci->format, ci->extent.width,
+                 ci->extent.height, ci->usage, ci->flags);
+    ci->tiling = VK_IMAGE_TILING_LINEAR;
+    vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+            ext_handles *h = (ext_handles *)b;
+            h->handleTypes &= ~(VkExternalMemoryHandleTypeFlags)VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            if (!h->handleTypes) vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+            break;
+        }
+    return 1;
+}
+
+/* Whether the plain LINEAR image lays its texels out where the importer's plane says they are. */
+static int linear_import_layout_ok(VkDevice device, VkImage image, const VkImageCreateInfo *ci, const VkSubresourceLayout *want)
+{
+    VkImageSubresource sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+    VkSubresourceLayout l = {0};
+    vkb_emu_real()->vkGetImageSubresourceLayout(device, image, &sub, &l);
+    int ok = l.offset == want->offset && (ci->extent.height <= 1 || l.rowPitch == want->rowPitch);
+    if (!ok)
+        VKB_WARN("dma-buf import image at the LINEAR modifier (format %d %ux%u): the plain LINEAR image's layout (offset %llu, row pitch "
+                 "%llu) is not the dma-buf's (offset %llu, row pitch %llu); refused", ci->format, ci->extent.width, ci->extent.height,
+                 (unsigned long long)l.offset, (unsigned long long)l.rowPitch, (unsigned long long)want->offset,
+                 (unsigned long long)want->rowPitch);
+    return ok;
+}
+
 static VkResult driver_create_image(VkDevice device, const VkImageCreateInfo *ci, const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
     static int fake = -1;
@@ -374,6 +538,7 @@ static VkResult driver_create_image(VkDevice device, const VkImageCreateInfo *ci
                 (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))
                 return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT; /* as Mali r44 answers */
     if (vkb_emu_planar_ext_refused(ci->format, ci->flags)) return VK_ERROR_FORMAT_NOT_SUPPORTED; /* host imitation */
+    if (vkb_emu_dmabufmod_refused(ci->tiling, ci->usage, ci->flags, ci->pNext)) return VK_ERROR_FORMAT_NOT_SUPPORTED; /* host imitation */
     return vkb_emu_real()->vkCreateImage(device, ci, pAllocator, pImage);
 }
 
@@ -437,7 +602,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     uint32_t drop = vkb_texcap_create_info(e, ci);
     vkb_emu_image_create_info(e, ci);
     int opaque = vkb_opaque_image(e, ci);
+    int linear_mod = 0;
+    int lm_candidate = (e->flags & VKB_EMU_DMABUF_EXPORT) && has_linear_mod_list(ci);
+    if (lm_candidate && linear_mod_refused(e->dev, ci)) linear_mod = linear_mod_plain(ci, VK_SUCCESS);
+    VkSubresourceLayout lm_plane = {0};
+    int lm_import = !lm_candidate && (e->flags & VKB_EMU_DMABUF_EXPORT) && has_linear_mod_explicit(ci, &lm_plane);
+    if (lm_import && linear_mod_refused(e->dev, ci)) linear_mod = linear_import_plain(ci, VK_SUCCESS);
     VkResult r = driver_create_image(device, ci, pAllocator, pImage);
+    if (r != VK_SUCCESS && (lm_candidate || lm_import) && !linear_mod) {
+        linear_mod = lm_candidate ? linear_mod_plain(ci, r) : linear_import_plain(ci, r);
+        r = driver_create_image(device, ci, pAllocator, pImage);
+    }
+    if (r == VK_SUCCESS && lm_import && linear_mod && !linear_import_layout_ok(device, *pImage, ci, &lm_plane)) {
+        vkb_emu_real()->vkDestroyImage(device, *pImage, pAllocator);
+        *pImage = VK_NULL_HANDLE;
+        return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+    }
     if (r != VK_SUCCESS && opaque && vkb_opaque_retry(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO))
         r = driver_create_image(device, ci, pAllocator, pImage);
     if (r == VK_ERROR_INVALID_EXTERNAL_HANDLE && vkb_emu_strip_opaque(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO))
@@ -447,6 +627,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     if (r != VK_SUCCESS && dmabuf_plain_retry(ci)) r = driver_create_image(device, ci, pAllocator, pImage);
     if (r == VK_SUCCESS) {
         vkb_emu_track_image(e, *pImage, ci, client_format);
+        if (linear_mod) {
+            vkb_emu_image *ti = vkb_emu_find_image(e, *pImage);
+            if (ti) ti->linear_mod = 1;
+        }
         if (drop) vkb_texcap_created(e, vkb_emu_find_image(e, *pImage), drop, &app.extent, app.mipLevels);
         image_account(e, device, *pImage, ci, &app, client_format);
         for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
@@ -610,8 +794,10 @@ static VKAPI_ATTR void VKAPI_CALL emu_GetImageSubresourceLayout2(VkDevice device
     const vkb_dispatch *real = vkb_emu_real();
     if (layout->pNext && real->vkGetImageSubresourceLayout2)
         real->vkGetImageSubresourceLayout2(device, image, sub, layout);
-    else
-        real->vkGetImageSubresourceLayout(device, image, &sub->imageSubresource, &layout->subresourceLayout);
+    else {
+        VkImageSubresource tmp;
+        real->vkGetImageSubresourceLayout(device, image, linear_mod_sub(image, &sub->imageSubresource, &tmp), &layout->subresourceLayout);
+    }
     fix_single_row_pitch(image, &sub->imageSubresource, &layout->subresourceLayout);
 }
 
@@ -788,6 +974,7 @@ void vkb_emu_install(vkb_srv_table *dev)
         dt->vkGetDeviceImageSparseMemoryRequirements = emu_GetDeviceImageSparseMemoryRequirements;
     dt->vkDestroyImage = emu_DestroyImage;
     dt->vkGetImageSubresourceLayout = emu_GetImageSubresourceLayout;
+    if (e->flags & VKB_EMU_DMABUF_EXPORT) dt->vkGetImageDrmFormatModifierPropertiesEXT = emu_GetImageDrmFormatModifierPropertiesEXT;
     dt->vkCreateGraphicsPipelines = emu_CreateGraphicsPipelines;
     dt->vkCreateComputePipelines = emu_CreateComputePipelines;
     dt->vkCmdCopyImage = emu_CmdCopyImage;

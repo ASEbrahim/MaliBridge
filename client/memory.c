@@ -262,9 +262,12 @@ void *vkb_chain_clone(const void *pNext, void **mem)
     return head;
 }
 
+/* Buffers may take shared memory: with the bridge's handle types, or without any where the server's
+ * self-test passed only that (VKB_MEMF_UNFLAGGED_BUFFERS; then buffer_handle_types is 0). */
 static int can_share(vkb_device *dev)
 {
-    return dev->pd->info.strategy != VKB_MEM_NONE && dev->pd->info.buffer_handle_types;
+    return dev->pd->info.strategy != VKB_MEM_NONE &&
+           (dev->pd->info.buffer_handle_types || (dev->pd->info.mem_flags & VKB_MEMF_UNFLAGGED_BUFFERS));
 }
 
 static VkResult create_buffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator,
@@ -345,7 +348,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateImage(VkDevice device, const VkIma
                      "driver may refuse on such formats; the format covers the usage (logged once)", ci.format, ci.usage);
     }
     /* Linear images may be mapped by the app: those get the shared handle type when allowed. */
-    if (can_share(dev) && ci.tiling == VK_IMAGE_TILING_LINEAR && !(ci.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) {
+    /* (not with unflagged buffers: the self-test proved buffers only) */
+    if (can_share(dev) && dev->pd->info.buffer_handle_types && ci.tiling == VK_IMAGE_TILING_LINEAR &&
+        !(ci.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) {
         int had = 0;
         for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci.pNext; b; b = b->pNext)
             had |= b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;

@@ -39,12 +39,23 @@
 
 MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配合 DroidDeck 使用的版本（DroidDeck 是在安卓上运行 Steam 客户端和 PC 游戏的应用）。在三星 Galaxy Tab S10+（Mali-G720）和 Galaxy Tab S11 Ultra（Mali-G925）上，我测试过的 34 款游戏达到了可玩或更好的水平，例如《半条命2》约 94 fps、《空洞骑士：丝之歌》、《星露谷物语》、Risk of Rain Returns、《黑暗之魂 重制版》、《盖瑞模组》。玩家还从另外 19 款 Mali 手机和平板发来了反馈，下面的表格中共有 83 款不同的游戏。MaliBridge 是免费的。
 
+## v0.5.4.1 新内容
+
+- **Steam 现在应该能启动了**：Retroid Pocket 4 Pro、Galaxy A53、POCO X4 GT、motorola edge 40 neo 等之前停在 “Starting display and audio” 的手机，Galaxy A55 和 A56（Xclipse），以及刷了 LineageOS 的 Galaxy S10+ 和 Note10+。
+- **之前提前关闭的游戏应该能运行了**：Galaxy S21 这类 Vulkan 1.1 手机上的 D3D10/D3D11 游戏，小米 17T Pro 上的 Stray 和 SOMA，12 GB 内存设备上的《泰坦陨落2》。
+- **Stray 在 Tab S11 Ultra 上更快了**：游戏中从约 14 fps 提高到约 20 fps。
+- **屏幕虚拟手柄**：会用一个淡淡的圆圈显示摇杆的位置。
+- **下载不了 Steam 时**（常见原因是 VPN 或加速器应用），应用现在会直接提示。
+- 应用的每个部分都有**中文和韩语**。
+
+完整更新内容：[发布说明](https://github.com/ASEbrahim/MaliBridge/releases/tag/v0.5.4.1)。
+
 ## v0.5.4 新内容
 
 **修复**
 - **天玑 9500**（Mali-G1-Ultra）上《空洞骑士》《丝之歌》《哈迪斯》等游戏的**绿色方块和偏红贴图**应该已经消失。
 - **三星 Exynos（Xclipse）手机上有声音但画面全黑**：现在应该能显示游戏画面了。
-- **较旧的 Mali GPU**（G57、G68 等，例如 Galaxy A16 和 F15）上 **Steam 黑屏**应该已经修复。如果再次出现，把 **Steam menus** 设为 *software*。
+- **较旧的 Mali GPU**（G57、G68 等）上的 **Steam 黑屏**：这些手机上 Steam 的菜单改为不用 GPU 绘制。其中一部分手机在游戏模式下仍然黑屏（见[已知问题](#已知问题)）。
 - **Balatro 等 OpenGL 游戏中文字缺失**的问题已修复。
 - **手机内存不足时崩溃更少**，游戏之后再启动时卡顿也更少。
 - 会话被安卓在后台暂停很久之后，结束时**游戏画面不再丢失**。
@@ -130,39 +141,39 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 
 | 游戏 | Mali-G720（Tab S10+） | Mali-G925（Tab S11 Ultra） |
 |---|---|---|
-| Hades | **极佳** | 未测试 |
+| Hades | **极佳** | **极佳**，House of Hades 里 110-128 fps |
 | Hollow Knight | **极佳**，87-124 fps | **极佳**，110+ fps（玩家反馈） |
-| ULTRAKILL | **很流畅**，55-57 fps | 未测试 |
+| ULTRAKILL | **很流畅**，55-57 fps | **极佳**，0-1 开头 111-116 fps |
 | Celeste | **极佳**，57-59 fps | **极佳**，游戏中 60 fps（上限） |
-| Portal | **极佳**，80 fps | 未测试 |
-| Cuphead | **极佳** | 未测试 |
-| Dead Cells | **极佳** | 未测试 |
-| ENDER LILIES | **可玩**，42-44 fps | 未测试 |
+| Portal | **极佳**，80 fps | **极佳**，第一个测试室 85-90 fps（透过传送门看时约 65）；第一个传送门打开时短暂停顿一次 |
+| Cuphead | **极佳** | **极佳**，Inkwell Isle Two 地图上约 120 fps |
+| Dead Cells | **极佳** | **极佳**，Prisoners' Quarters 里 110-120 fps |
+| ENDER LILIES | **可玩**，42-44 fps | **极佳**，第一个区域 59-61 fps（上限）；颜色较平淡，和 Stray 一样 |
 | Lethal Company | **可玩**，43-45 fps | 未测试 |
 | Subnautica | **可玩**，细节设为 High 时 20-24 fps | **很流畅**，游戏中 28-40 fps（温控降频时），菜单 81 fps |
-| Inscryption | **极佳**，68-83 fps | 未测试 |
-| Doki Doki Literature Club | **极佳**，标题画面 91-92 fps | 未测试 |
+| Inscryption | **极佳**，68-83 fps | **很流畅**，第一张牌桌 55-57 fps，偶尔掉到 20 左右 |
+| Doki Doki Literature Club | **极佳**，标题画面 91-92 fps | **极佳**，剧情中 112-114 fps |
 | Half-Life 2 | **极佳**，开场章节 59-74 fps | **极佳**，开场章节 94-103 fps；v0.5.4 在 Water Hazard 约 110 fps |
 | Portal 2 | **可玩**，游戏中约 45-50 fps，偶尔掉到 30 左右 | **尚未评级**（仅菜单）：菜单 115 fps |
 | Hollow Knight: Silksong | **极佳**，游戏中稳定 62-66 fps | **极佳**，72-96 fps |
 | The Elder Scrolls V: Skyrim Special Edition | **极佳**，Medium 下约 60 fps（上限）；第三人称流畅，首次加载时有些卡顿 | 未测试 |
-| Stardew Valley | **极佳**，标题画面 60 fps（上限） | **极佳**，57-62 fps |
+| Stardew Valley | **极佳**，在农场里游玩时 60 fps（上限） | **极佳**，57-62 fps |
 | Risk of Rain 2 | **勉强可玩**，半分辨率下，人多、特效多的 Boss 战 18-30 fps（1280x720 下 15-23 fps） | **可玩**，1280x720 下 30-43 fps；拥挤的 Boss 战 20-28 fps（录屏时测量） |
 | Dark Souls Remastered | **尚未评级**（仅菜单）：标题和主菜单 60 fps（上限） | **很流畅**，玩了 10 分钟，中位数 53.7 fps，最低 43.9，平板不热时 60 fps（上限）；过场动画正常 |
 | Garry's Mod | **很流畅**，gm_construct 地图 49-54 fps（菜单 59） | **极佳**，简单地图中位数 104 fps；Golden City Sandbox 地图中位数 82 fps，最低 34 |
 | The Witcher 3 (DX12) | **勉强运行**，加载时 GPU 长时间卡住 | **勉强运行**，开场动画 60 fps；读取存档后游戏卡住（已知问题，见下文） |
-| Stray | **勉强运行**，开场 17 fps（受 CPU 限制） | **尚未评级**（仅标题画面）：DX11（默认），标题画面 58 fps，颜色较平淡（见已知问题）；尚未测游戏中帧率 |
-| Deep Rock Galactic | **勉强可玩**，较慢 | 未测试 |
+| Stray | **勉强运行**，开场 17 fps（受 CPU 限制） | **可玩**，游戏中约 20 fps；颜色较平淡（见已知问题） |
+| Deep Rock Galactic | **勉强可玩**，较慢 | **已知问题**：标题画面正常，但进入 Space Rig 后游戏可能会卡住。正在处理 |
 | Poppy Playtime (Chapter 1) | **尚未评级**（仅菜单）：第一章主菜单 62-64 fps | **勉强可玩**，工厂大厅 28-32 fps；颜色较平淡，和 Stray 一样 |
 | R.E.P.O. | **尚未评级**（仅菜单）：预热 50 秒后主菜单约 42 fps | **可玩**，单人模式约 40 fps |
 | Muck | **尚未评级**（仅菜单）：3D 岛屿背景的主菜单 43 fps | **可玩**，岛上 45-48 fps |
 | Phoenix Wright: Ace Attorney Trilogy | **尚未评级**（仅菜单）：标题和菜单约 118 fps | **极佳**，约 118 fps（120 Hz 屏幕刷新率） |
-| Helltaker | **尚未评级**（仅菜单）：标题画面 59.8 fps | **极佳**，约 59 fps，运行完美 |
+| Helltaker | **极佳**，游戏中 60 fps（上限） | **极佳**，约 59 fps，运行完美 |
 | GRIS | **极佳**，继续游戏后约 105 fps | **极佳**，约 119 fps |
 | A Dance of Fire and Ice | **尚未评级**（仅菜单）：标题场景 45-52 fps | **极佳**，约 106-113 fps；用蓝牙 PS5 手柄没有感觉到输入延迟 |
 | Stick Fight: The Game | **勉强可玩**，本地大厅稳定 30 fps | **极佳**，59-60 fps（上限） |
 | Risk of Rain Returns | **极佳**，游戏中包括 Boss 战 59-60 fps | **极佳**，标题画面和游戏中 59-60 fps |
-| Don't Starve Together | **尚未评级**（仅菜单）：主菜单 60 fps（使用 `PROTON_USE_WINED3D=1`） | **极佳**，使用 `PROTON_USE_WINED3D=1` 时 60 fps，v0.5.4 会自动设置；不设置的话游戏启动几秒后就会关闭 |
+| Don't Starve Together | **极佳**，新世界里 60 fps（上限） | **极佳**，60 fps |
 | ASTRONEER | **尚未评级**（仅菜单）：3D 菜单 27-29 fps | **勉强可玩**，画面正常（没有白屏）；全低画质约 20 fps，Ultra 约 17；受 CPU 限制；颜色较平淡 |
 | The Forest | **尚未评级**（仅菜单）：菜单 60 fps；第一次启动在 20 秒后卡住过一次，第二次正常 | **可玩**，四分之一、一半和全分辨率下都是 30-45 fps；受 CPU 限制，所以分辨率没有影响。第一次启动时崩溃过一次，之后没有再出现 |
 | Outer Wilds | **勉强运行**，游戏中约 10 fps（标题 73）：平板内存不足（12 GB，大量交换） | **可玩**，起始星球 35-45 fps，太空中约 75-80，Brittle Hollow 二十多 fps，看向黑洞时约 17（GPU 一半空闲）；受 CPU 限制 |
@@ -174,7 +185,7 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 <details>
 <summary>这些数字是怎么测的</summary>
 
-G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，以及 Half-Life 2 的 Water Hazard 数据，是 2026 年 10 月用 v0.5.4 测量的：进入游戏后站立不动，每款 60 秒，用游戏自己的帧数统计。G720 上的 Dark Souls III 是用 v0.5.4 预发布版站立测量的。G925 上的 Dark Souls Remastered 和 Garry's Mod 是在安全模式下亲手玩的。G925 的其他数据来自 v0.4，只有 Subnautica 的菜单、Half-Life 2 和 Stray 是用 v0.5 测量的。从 Poppy Playtime 到 Outer Wilds 这几款，是 2026 年 10 月用 v0.5 预发布版在 G925 上亲手玩的（fps 读自启动器的帧数计数器）。Risk of Rain Returns 以前会在开场视频卡住，v0.5 在两台平板上都修好了。
+G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，以及 Half-Life 2 的 Water Hazard 数据，是 2026 年 10 月用 v0.5.4 测量的：进入游戏后站立不动，每款 60 秒，用游戏自己的帧数统计。G720 上的 Dark Souls III 是用 v0.5.4 预发布版站立测量的。G925 上的 Dark Souls Remastered 和 Garry's Mod 是在安全模式下亲手玩的。G925 的其他数据来自 v0.4，只有 Subnautica 的菜单、Half-Life 2 和 Stray 是用 v0.5 测量的。从 Poppy Playtime 到 Outer Wilds 这几款，是 2026 年 10 月用 v0.5 预发布版在 G925 上亲手玩的（fps 读自启动器的帧数计数器）。G925 上的 Hades、ULTRAKILL、Portal、Cuphead、Dead Cells、ENDER LILIES、Inscryption 和 Doki Doki Literature Club，以及 G720 上的 Helltaker、Stardew Valley 和 Don't Starve Together，是 2026 年 10 月用 v0.5.4.1 测试版进入实际游戏场景后测量的：每款 75-90 秒，按屏幕的帧时间统计。Risk of Rain Returns 以前会在开场视频卡住，v0.5 在两台平板上都修好了。
 
 </details>
 
@@ -320,7 +331,7 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 - **安全模式：** 保持 **Safe mode** 开启（默认）。它的兼容性最好，而在我的平板上性能模式（Safe mode 关闭）只快 0-2%。游戏能正常运行后可以试试性能模式；如果出了问题，请先切回安全模式再反馈。
 - **DXVK: automatic**（默认）会在 GPU 太旧、跑不了 Proton 自带 DXVK 的手机上换用较旧的 DXVK。
 - **Steam menus: automatic**（默认）可以避免较旧的 Mali GPU 上 Steam 菜单黑屏。如果 Steam 还是黑屏，改成 **Steam menus: software**，游戏仍然使用 GPU。
-- **v0.5.4 会自动设置的游戏：** 《饥荒联机版》（Don't Starve Together）、较旧手机上的《半条命2》和《环世界》，以及 Indiana Jones and the Emperor's Tomb。旧版本上，《饥荒联机版》需要把启动选项设为 `PROTON_USE_WINED3D=1 %command%`。
+- **MaliBridge 会自动设置的游戏：** 《饥荒联机版》（Don't Starve Together）、较旧手机上的《半条命2》和《环世界》、Indiana Jones and the Emperor's Tomb，以及 v0.5.4.1 起的 Stray、SOMA 和两款 Amnesia。这些游戏不需要设置启动选项。
 - **等 “Processing Vulkan shaders” 处理完**：Steam 启动游戏前如果显示它，等它完成，第一次运行时卡顿会少一些。玩得越多越流畅。
 - **每次会话只启动一个游戏**；8 GB 内存的手机请关掉其他应用；较重的游戏可以降低分辨率。
 
@@ -369,10 +380,12 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 
 ## 已知问题
 
+- 一些较旧的 Mali 手机和平板（Galaxy A16、A54、F15、Tab S9 FE、Tab S10 Lite、Anbernic RG556）上，**Steam 游戏模式黑屏但有声音**。这些设备上桌面模式可以用。正在处理。
 - 一些边走边加载贴图的游戏（《黑暗之魂3》、Hob）在**移动时会短暂卡顿**。
 - 在 **vivo 手机**上，Steam 的菜单可能只有约 15 fps，打开菜单时会白屏闪一下。如果你有 vivo 手机，v0.5.4 的日志会有帮助。
 - **Mali-G925 上的《巫师3》（DX12）**开场动画是 60 fps，但读取存档后帧率掉到 1 fps 以下。
-- **Mali-G925 上的 Stray** 颜色较平淡，没有游戏自己的调色效果（Poppy Playtime 和 ASTRONEER 也是）。正在处理。
+- **Mali-G925 上的 Deep Rock Galactic** 进入 Space Rig 后可能会卡住。正在处理。
+- **Mali-G925 上的 Stray 和 ENDER LILIES** 颜色较平淡，没有游戏自己的调色效果（Poppy Playtime 和 ASTRONEER 也是）。正在处理。
 - **Stray 加 `-dx12` 启动**时，在 G925 上大约 60 秒后关闭。默认的 DX11 没有问题。
 - **Risk of Rain 2**：在 G925 上有一次性能模式启动时，标题加载约 2 分钟没有画面，之后恢复正常。之后没有再出现。
 - **Mali-G925 上的 Steam 窗口**可能有些慢。游戏不受影响。

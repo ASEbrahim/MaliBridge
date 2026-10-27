@@ -79,7 +79,8 @@ python3 - "$rep.json" <<'PY' 2>$work/1j.log
 import json, sys
 r = json.load(open(sys.argv[1]))
 e = {x["name"]: x for x in r["probe"][0]["errata"]}
-assert len(e) == 13, e.keys()
+assert len(e) == 14, e.keys()
+assert not e["gs_hide"]["probe"] and not e["gs_hide"]["safe"]["on"] and not e["gs_hide"]["performance"]["on"], e["gs_hide"]
 assert e["vb_bake"]["probe"] == "vb_strides" and e["vb_bake"]["probe_gates"], e["vb_bake"]
 assert not e["clamp_zero"]["probe"] and not e["clamp_zero"]["safe"]["on"], e["clamp_zero"]
 assert e["dyn_reemit"]["safe"]["on"] and not e["dyn_reemit"]["performance"]["on"], e["dyn_reemit"]

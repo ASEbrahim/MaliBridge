@@ -116,9 +116,10 @@ static void guard_env(void)
         guard_off = s && *s && *s != '0';
         /* =spin: marked pipelines spin instead (compile watchdog); =spinfc2: only until their
          * float_controls2 is stripped (the first fallback then compiles); =slow: they take
-         * VKBRIDGE_TEST_SLOW_S (3) seconds, then compile (the compute retry) */
+         * VKBRIDGE_TEST_SLOW_S (3) seconds, then compile (the compute retry); =gs: every pipeline
+         * with a geometry stage faults, marked or not (issue #11's r38p1 beta: server_errata_gs.c) */
         s = getenv("VKBRIDGE_TEST_CRASH_PIPELINE");
-        test_crash = s && *s && *s != '0' ? (!strcmp(s, "spin") ? 2 : !strcmp(s, "spinfc2") ? 3 : !strcmp(s, "slow") ? 4 : 1) : 0;
+        test_crash = s && *s && *s != '0' ? (!strcmp(s, "spin") ? 2 : !strcmp(s, "spinfc2") ? 3 : !strcmp(s, "slow") ? 4 : !strcmp(s, "gs") ? 5 : 1) : 0;
         if (guard_off) VKB_INFO("driver crash containment off (VKBRIDGE_NO_CRASH_GUARD)");
         if (test_crash) VKB_WARN("VKBRIDGE_TEST_CRASH_PIPELINE: marked pipelines fault on purpose");
     }
@@ -186,6 +187,12 @@ static double mono_s(void);
 static void test_fault(const VkPipelineShaderStageCreateInfo *stages, uint32_t n, size_t stride)
 {
     if (!test_crash) return;
+    for (uint32_t i = 0; i < n && test_crash == 5; i++)
+        if (((const VkPipelineShaderStageCreateInfo *)((const char *)stages + i * stride))->stage == VK_SHADER_STAGE_GEOMETRY_BIT) {
+            VKB_WARN("test: faulting on purpose on a geometry stage in a %s call", tls_arm ? "guarded" : "UNGUARDED");
+            *(volatile int *)(uintptr_t)0x40 = 1;
+        }
+    if (test_crash == 5) return;
     for (uint32_t i = 0; i < n; i++)
         if (marked((const VkPipelineShaderStageCreateInfo *)((const char *)stages + i * stride))) {
             if (test_crash == 3 && tls_variant) continue;

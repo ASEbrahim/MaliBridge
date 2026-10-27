@@ -109,10 +109,11 @@ step $? "the bug imitated, fix on: $res; $(lg 'split into [0-9]*; [0-9]* imitate
 run VKBRIDGE_ERRATA_IMITATE=vb_split VKBRIDGE_ERRATA_IMITATE_VB=single -- vbstride_check
 [ $rc != 0 ] && grep -q "^FAIL single-binding calls" $work/run.log && grep -q "^shape: strides wrong in single-binding calls too" $work/run.log
 step $? "the bug imitated on single calls too, fix on: the split cannot help; $(grep '^shape' $work/run.log | cut -c1-60)..."
-# <cache dir>/env is read again at each vkCreateDevice, and vulkaninfo lists the extensions before
-# it makes its devices: the first run takes the setting in, the second one shows it
+# vulkaninfo lists the extensions before it makes its devices: one run shows the setting, as
+# vkbQueryServer reads <cache dir>/env again when it changed (two runs were needed while only
+# vkCreateDevice read it)
 vi_ext() {
-  run "$@" -- "$(command -v vulkaninfo)"; run "$@" -- "$(command -v vulkaninfo)"
+  run "$@" -- "$(command -v vulkaninfo)"
   ext=$(grep -c "VK_EXT_vertex_input_dynamic_state" $work/run.log)
 }
 vi_ext VKBRIDGE_FAKE_DRIVER_VERSION=r44p1; a=$ext; hidden=$(lg 'hidden from clients (.*below r48)')

@@ -213,6 +213,7 @@ void vkb_query_cb_clear(vkb_cmdbuf *cb);
 void vkb_query_cb_end(vkb_cmdbuf *cb);
 void vkb_query_cb_execute(vkb_cmdbuf *primary, const vkb_cmdbuf *secondary);
 const char *vkb_query_why_wire(void);
+void vkb_query_wire_answer(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t count, VkResult r);
 int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t count, size_t size, void *data,
                       VkDeviceSize stride, VkQueryResultFlags flags, VkResult *result);
 
@@ -244,6 +245,25 @@ static inline VkResult vkb_note_error(const char *call, VkResult r)
 static inline VkResult vkb_note_lost(const char *call, VkResult r)
 {
     if (__builtin_expect(r == VK_ERROR_DEVICE_LOST, 0)) vkb_first_error(call, r);
+    return r;
+}
+
+/* Calls that may only return VK_SUCCESS or an error (a submit, a sparse bind, the idle waits): any
+ * other result is logged as well. A driver answering one of them with a positive code is a driver
+ * bug the game cannot handle (DXVK latches it as a device reset). */
+static inline VkResult vkb_note_fail(const char *call, VkResult r)
+{
+    if (__builtin_expect(r != VK_SUCCESS, 0)) vkb_first_error(call, r);
+    return r;
+}
+
+/* vkWaitForFences / vkWaitSemaphores: errors, and with no timeout (UINT64_MAX) anything but
+ * VK_SUCCESS - such a wait may not time out, and DXVK's timeline wait treats VK_TIMEOUT as a lost
+ * device without a log line of its own (Stray on the Dimensity 9500). */
+static inline VkResult vkb_note_wait(const char *call, const char *endless, VkResult r, uint64_t timeout)
+{
+    if (__builtin_expect(r < 0, 0)) vkb_first_error(call, r);
+    else if (__builtin_expect(r != VK_SUCCESS && timeout == UINT64_MAX, 0)) vkb_first_error(endless, r);
     return r;
 }
 

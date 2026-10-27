@@ -93,7 +93,17 @@ typedef struct vkb_server_pd_info {
                                     * the first 64 bytes */
     uint32_t driver_id;            /* VkDriverId from the server's self-test (server_driverid.c): the client tells Arm's driver by it;
                                     * 0: unknown or an older server (once reserved), the vendor ID decides */
+    uint32_t mem_flags;            /* VKB_MEMF_*; 0 from an older server */
+    uint32_t present_timeout_s;    /* VKBRIDGE_PRESENT_TIMEOUT_S from the server (a preset, <cache dir>/env): how long a frame
+                                    * may take before the client calls the device lost (client/wsi.c); VKB_PRESENT_TIMEOUT_NONE:
+                                    * never; 0: nothing said (an older server too), the client's default */
 } vkb_server_pd_info;
+
+#define VKB_PRESENT_TIMEOUT_NONE 0xffffffffu
+
+/* vkb_server_pd_info.mem_flags */
+#define VKB_MEMF_UNFLAGGED_BUFFERS 1u /* shared buffers are made without buffer_handle_types (0): the only method the server's
+                                       * self-test passed (server_memory.c, the Xclipse 530) */
 
 /* vkb_server_pd_info.client_knobs: two bits per switch, 0 when the server has nothing to say (an
  * older server sent zeros here), else VKB_KNOB_OFF or VKB_KNOB_ON. What the server has for the
