@@ -46,11 +46,15 @@ fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
 # The frame readback is the copy-present path: X11 always copies; Wayland only with
 # VKBRIDGE_WSI_SHM (otherwise it presents dma-bufs zero-copy and never reads a frame back).
+# vulkan-tools before 1.3.280 has no --wsi: vkcube is X only, and vkcube-wayland a separate program.
 frames() {
+  local wsi=; vkcube --help 2>&1 | grep -q -- --wsi && wsi=1
   if [ -n "${DISPLAY:-}" ]; then
-    timeout 60 vkcube --wsi xcb --c 60 >"$work/vkcube.log" 2>&1
-  else
+    timeout 60 vkcube ${wsi:+--wsi xcb} --c 60 >"$work/vkcube.log" 2>&1
+  elif [ -n "$wsi" ]; then
     VKBRIDGE_WSI_SHM=1 timeout 60 vkcube --wsi wayland --c 60 >"$work/vkcube.log" 2>&1
+  else
+    VKBRIDGE_WSI_SHM=1 timeout 60 vkcube-wayland --c 60 >"$work/vkcube.log" 2>&1
   fi
 }
 invalidates() { grep -o 'cached readback: [0-9]* invalidates so far' "$log" | tail -1 | grep -o '[0-9]*' || echo 0; }
