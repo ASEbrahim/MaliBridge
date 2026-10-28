@@ -745,7 +745,9 @@ void vkb_emu_shader_bgr10(vkb_emu_device *e, VkDevice device, VkGraphicsPipeline
 #define SpvOpShiftLeftLogical 196
 #define SpvOpBitwiseOr 197
 #define SpvOpBitwiseAnd 199
-#define GLSLstd450UnpackHalf2x16 62
+#define SpvOpBitcast 124
+#define SpvOpSelect 169
+#define SpvOpIEqual 170
 
 /* The interface ids of an OpEntryPoint start after its name string */
 static uint32_t entry_iface_at(const spv_inst *ep)
@@ -786,10 +788,10 @@ static int uf11_var_ok(const spv_mod *m, uint32_t var)
 static void uf11_rewrite(spv_mod *m, uint32_t var, uint32_t loc)
 {
     uint32_t vt = var_type(m, var, SpvStorageClassInput), n = comps32(m, vt);
-    uint32_t u32 = spv_type_int(m, 32, 0), f32 = spv_type_float(m, 32), v2 = spv_type_vector(m, f32, 2);
-    uint32_t glsl = spv_glsl_std450(m);
-    uint32_t c4 = spv_const_u32(m, 4), c5 = spv_const_u32(m, 5), c11 = spv_const_u32(m, 11), c20 = spv_const_u32(m, 20),
-             c22 = spv_const_u32(m, 22), c7ff = spv_const_u32(m, 0x7ff), one = spv_const_f32(m, 1.0f);
+    uint32_t u32 = spv_type_int(m, 32, 0), f32 = spv_type_float(m, 32), bty = spv_type_bool(m);
+    uint32_t c0 = spv_const_u32(m, 0), c11 = spv_const_u32(m, 11), c17 = spv_const_u32(m, 17),
+             c18 = spv_const_u32(m, 18), c22 = spv_const_u32(m, 22), c7ff = spv_const_u32(m, 0x7ff),
+             cbias = spv_const_u32(m, 112u << 23), fzero = spv_const_f32(m, 0.0f), one = spv_const_f32(m, 1.0f);
     uint32_t priv = spv_type_pointer(m, SpvStorageClassPrivate, vt), in_ptr = spv_type_pointer(m, SpvStorageClassInput, u32);
     /* access chains into it point at Private now */
     for (uint32_t i = 0; i < m->count; i++) {
@@ -835,23 +837,43 @@ static void uf11_rewrite(spv_mod *m, uint32_t var, uint32_t loc)
         const uint32_t o_[] = {__VA_ARGS__};                                             \
         at = spv_insert(m, at, op, o_, (uint16_t)(sizeof(o_) / sizeof(o_[0]))) + 1;      \
     } while (0)
-    uint32_t u = spv_new_id(m), r0 = spv_new_id(m), r = spv_new_id(m), g0 = spv_new_id(m), g1 = spv_new_id(m), g = spv_new_id(m),
-             rg = spv_new_id(m), b0 = spv_new_id(m), b = spv_new_id(m), hrg = spv_new_id(m), hb = spv_new_id(m);
-    EMIT(SpvOpLoad, u32, u, input);
-    EMIT(SpvOpBitwiseAnd, u32, r0, u, c7ff);
-    EMIT(SpvOpShiftLeftLogical, u32, r, r0, c4);         /* red: half bits 4-14 */
-    EMIT(SpvOpShiftRightLogical, u32, g0, u, c11);
-    EMIT(SpvOpBitwiseAnd, u32, g1, g0, c7ff);
-    EMIT(SpvOpShiftLeftLogical, u32, g, g1, c20);        /* green: the high half's bits 4-14 */
-    EMIT(SpvOpBitwiseOr, u32, rg, r, g);
-    EMIT(SpvOpShiftRightLogical, u32, b0, u, c22);
-    EMIT(SpvOpShiftLeftLogical, u32, b, b0, c5);         /* blue: half bits 5-14 */
-    EMIT(SpvOpExtInst, v2, hrg, glsl, GLSLstd450UnpackHalf2x16, rg);
-    EMIT(SpvOpExtInst, v2, hb, glsl, GLSLstd450UnpackHalf2x16, b);
+    uint32_t u = spv_new_id(m);
+    uint32_t r0 = spv_new_id(m), r_sh = spv_new_id(m), r_b = spv_new_id(m), r_fl = spv_new_id(m), r_c = spv_new_id(m);
+    uint32_t g0 = spv_new_id(m), g1 = spv_new_id(m), g_sh = spv_new_id(m), g_b = spv_new_id(m), g_fl = spv_new_id(m), g_c = spv_new_id(m);
+    uint32_t b0 = spv_new_id(m), b_sh = spv_new_id(m), b_b = spv_new_id(m), b_fl = spv_new_id(m), b_c = spv_new_id(m);
     uint32_t c[4] = {spv_new_id(m), spv_new_id(m), spv_new_id(m), one};
-    EMIT(SpvOpCompositeExtract, f32, c[0], hrg, 0);
-    if (n >= 2) EMIT(SpvOpCompositeExtract, f32, c[1], hrg, 1);
-    if (n >= 3) EMIT(SpvOpCompositeExtract, f32, c[2], hb, 0);
+
+    EMIT(SpvOpLoad, u32, u, input);
+
+    /* Red: bits 0..10 */
+    EMIT(SpvOpBitwiseAnd, u32, r0, u, c7ff);
+    EMIT(SpvOpShiftLeftLogical, u32, r_sh, r0, c17);
+    EMIT(SpvOpIAdd, u32, r_b, r_sh, cbias);
+    EMIT(SpvOpBitcast, f32, r_fl, r_b);
+    EMIT(SpvOpIEqual, bty, r_c, r0, c0);
+    EMIT(SpvOpSelect, f32, c[0], r_c, fzero, r_fl);
+
+    /* Green: bits 11..21 */
+    if (n >= 2) {
+        EMIT(SpvOpShiftRightLogical, u32, g0, u, c11);
+        EMIT(SpvOpBitwiseAnd, u32, g1, g0, c7ff);
+        EMIT(SpvOpShiftLeftLogical, u32, g_sh, g1, c17);
+        EMIT(SpvOpIAdd, u32, g_b, g_sh, cbias);
+        EMIT(SpvOpBitcast, f32, g_fl, g_b);
+        EMIT(SpvOpIEqual, bty, g_c, g1, c0);
+        EMIT(SpvOpSelect, f32, c[1], g_c, fzero, g_fl);
+    }
+
+    /* Blue: bits 22..31 */
+    if (n >= 3) {
+        EMIT(SpvOpShiftRightLogical, u32, b0, u, c22);
+        EMIT(SpvOpShiftLeftLogical, u32, b_sh, b0, c18);
+        EMIT(SpvOpIAdd, u32, b_b, b_sh, cbias);
+        EMIT(SpvOpBitcast, f32, b_fl, b_b);
+        EMIT(SpvOpIEqual, bty, b_c, b0, c0);
+        EMIT(SpvOpSelect, f32, c[2], b_c, fzero, b_fl);
+    }
+
     uint32_t val = c[0];
     if (n >= 2) {
         uint32_t ops[6] = {vt, val = spv_new_id(m), c[0], c[1], c[2], c[3]};

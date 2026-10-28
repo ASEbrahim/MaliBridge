@@ -104,25 +104,13 @@ void vkb_arena_free(vkb_arena *a)
 
 /* ------------------------------------------------------------------ encoder */
 
-void vkb_enc_init(vkb_enc *e)
-{
-    memset(e, 0, sizeof(*e));
-}
-
-void vkb_enc_reset(vkb_enc *e)
-{
-    e->len = 0;
-    e->nfds = 0;
-    e->oom = 0;
-}
-
 void vkb_enc_free(vkb_enc *e)
 {
     free(e->buf);
     memset(e, 0, sizeof(*e));
 }
 
-static int enc_grow(vkb_enc *e, size_t add)
+int vkb_enc_grow(vkb_enc *e, size_t add)
 {
     if (e->oom) return 0;
     size_t need = e->len + add;
@@ -138,18 +126,6 @@ static int enc_grow(vkb_enc *e, size_t add)
     e->cap = cap;
     return 1;
 }
-
-void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n)
-{
-    if (!n || !enc_grow(e, n)) return;
-    if (p) memcpy(e->buf + e->len, p, n);
-    else memset(e->buf + e->len, 0, n);
-    e->len += n;
-}
-
-void vkb_enc_u8(vkb_enc *e, uint8_t v) { vkb_enc_bytes(e, &v, 1); }
-void vkb_enc_u32(vkb_enc *e, uint32_t v) { vkb_enc_bytes(e, &v, 4); }
-void vkb_enc_u64(vkb_enc *e, uint64_t v) { vkb_enc_bytes(e, &v, 8); }
 
 static void enc_align(vkb_enc *e)
 {
@@ -339,27 +315,6 @@ void vkb_enc_out_struct(vkb_enc *e, const void *s, size_t size)
 }
 
 /* ------------------------------------------------------------------ decoder */
-
-void vkb_dec_init(vkb_dec *d, const void *buf, size_t len, vkb_arena *a, int *fds, int nfds)
-{
-    memset(d, 0, sizeof(*d));
-    d->buf = buf;
-    d->len = len;
-    d->arena = a;
-    d->fds = fds;
-    d->nfds = nfds;
-}
-
-void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
-{
-    if (d->err || d->len - d->pos < n) {
-        d->err = 1;
-        if (dst) memset(dst, 0, n);
-        return;
-    }
-    if (dst) memcpy(dst, d->buf + d->pos, n);
-    d->pos += n;
-}
 
 
 

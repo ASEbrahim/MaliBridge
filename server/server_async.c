@@ -208,7 +208,7 @@ static void proxy_add(apipe *x)
 {
     unsigned b = hbucket((uint64_t)(uintptr_t)x, PROXY_BUCKETS);
     x->hnext = proxies[b];
-    proxies[b] = x;
+    __atomic_store_n(&proxies[b], x, __ATOMIC_RELEASE);
     __atomic_add_fetch(&nproxies, 1, __ATOMIC_RELEASE);
 }
 
@@ -216,7 +216,7 @@ static void proxy_remove(apipe *x)
 {
     for (apipe **pp = &proxies[hbucket((uint64_t)(uintptr_t)x, PROXY_BUCKETS)]; *pp; pp = &(*pp)->hnext)
         if (*pp == x) {
-            *pp = x->hnext;
+            __atomic_store_n(pp, x->hnext, __ATOMIC_RELEASE);
             __atomic_sub_fetch(&nproxies, 1, __ATOMIC_RELEASE);
             return;
         }
@@ -712,16 +712,19 @@ static VKAPI_ATTR void VKAPI_CALL as_CmdBindPipeline(VkCommandBuffer cb, VkPipel
     vkb_async *a = cur();
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         if (__atomic_load_n(&nproxies, __ATOMIC_ACQUIRE)) {
-            pthread_mutex_lock(&lk);
-            apipe *x = proxy_find(p);
-            VkPipeline real = x && x->state == ST_READY ? x->real : VK_NULL_HANDLE;
-            pthread_mutex_unlock(&lk);
-            if (x && !real) { /* still compiling (or failed): its draws are dropped */
-                tls_skip = cb;
-                __atomic_add_fetch(&a->binds_skipped, 1, __ATOMIC_RELAXED);
-                return;
+            unsigned b = hbucket((uint64_t)(uintptr_t)p, PROXY_BUCKETS);
+            if (__atomic_load_n(&proxies[b], __ATOMIC_ACQUIRE)) {
+                pthread_mutex_lock(&lk);
+                apipe *x = proxy_find(p);
+                VkPipeline real = x && x->state == ST_READY ? x->real : VK_NULL_HANDLE;
+                pthread_mutex_unlock(&lk);
+                if (x && !real) { /* still compiling (or failed): its draws are dropped */
+                    tls_skip = cb;
+                    __atomic_add_fetch(&a->binds_skipped, 1, __ATOMIC_RELAXED);
+                    return;
+                }
+                if (x) p = real;
             }
-            if (x) p = real;
         }
         if (tls_skip == cb) tls_skip = VK_NULL_HANDLE;
     }

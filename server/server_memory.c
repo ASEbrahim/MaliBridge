@@ -400,8 +400,13 @@ static void *st_thread(void *arg)
 #define ADD(...) n += snprintf(line + n, n < (int)sizeof(line) ? sizeof(line) - (size_t)n : 0, __VA_ARGS__)
         int64_t live = 0, nlive = 0;
         for (int i = 0; i < CLS_N; i++) live += st.cls[i].bytes, nlive += st.cls[i].n;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+        struct mallinfo2 mi = mallinfo2();
+        long long heap = MB((int64_t)(size_t)mi.uordblks);
+#else
         struct mallinfo mi = mallinfo();
         long long heap = MB((int64_t)(size_t)mi.uordblks);
+#endif
         ADD("mem: rss %ldM (anon %ldM file %ldM shmem %ldM) heap %lldM fds %d | free %lluM swap %lluM%s | live %lldM/%lld:", rss >> 10,
             anon >> 10, file >> 10, shm >> 10, heap, nfd - 2, (unsigned long long)(avail >> 10), (unsigned long long)(swap >> 10),
             low ? " (low)" : "", MB(live), (long long)nlive);

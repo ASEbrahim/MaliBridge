@@ -36,13 +36,69 @@ struct vkb_enc {
     int nfds;
     int oom;
 };
-void vkb_enc_init(vkb_enc *e);
-void vkb_enc_reset(vkb_enc *e);   /* keeps the buffer */
+int vkb_enc_grow(vkb_enc *e, size_t add);
+
+static inline void vkb_enc_init(vkb_enc *e)
+{
+    e->buf = NULL;
+    e->len = 0;
+    e->cap = 0;
+    e->nfds = 0;
+    e->oom = 0;
+}
+
+static inline void vkb_enc_reset(vkb_enc *e)   /* keeps the buffer */
+{
+    e->len = 0;
+    e->nfds = 0;
+    e->oom = 0;
+}
+
 void vkb_enc_free(vkb_enc *e);
-void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n);
-void vkb_enc_u8(vkb_enc *e, uint8_t v);
-void vkb_enc_u32(vkb_enc *e, uint32_t v);
-void vkb_enc_u64(vkb_enc *e, uint64_t v);
+
+static inline void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n)
+{
+    if (__builtin_expect(e->len + n <= e->cap, 1)) {
+        if (p) memcpy(e->buf + e->len, p, n);
+        else memset(e->buf + e->len, 0, n);
+        e->len += n;
+    } else {
+        if (!n || !vkb_enc_grow(e, n)) return;
+        if (p) memcpy(e->buf + e->len, p, n);
+        else memset(e->buf + e->len, 0, n);
+        e->len += n;
+    }
+}
+
+static inline void vkb_enc_u8(vkb_enc *e, uint8_t v)
+{
+    if (__builtin_expect(e->len + 1 <= e->cap, 1)) {
+        e->buf[e->len++] = v;
+    } else {
+        vkb_enc_bytes(e, &v, 1);
+    }
+}
+
+static inline void vkb_enc_u32(vkb_enc *e, uint32_t v)
+{
+    if (__builtin_expect(e->len + 4 <= e->cap, 1)) {
+        memcpy(e->buf + e->len, &v, 4);
+        e->len += 4;
+    } else {
+        vkb_enc_bytes(e, &v, 4);
+    }
+}
+
+static inline void vkb_enc_u64(vkb_enc *e, uint64_t v)
+{
+    if (__builtin_expect(e->len + 8 <= e->cap, 1)) {
+        memcpy(e->buf + e->len, &v, 8);
+        e->len += 8;
+    } else {
+        vkb_enc_bytes(e, &v, 8);
+    }
+}
+
 size_t vkb_enc_raw(vkb_enc *e, const void *p, size_t n);          /* 8-aligned; returns offset */
 void vkb_enc_patch_u64(vkb_enc *e, size_t off, uint64_t v);
 void vkb_enc_str(vkb_enc *e, const char *s);
@@ -64,8 +120,29 @@ struct vkb_dec {
     int nfds;
     uint32_t fd_taken;   /* bitmask of fds handed out */
 };
-void vkb_dec_init(vkb_dec *d, const void *buf, size_t len, vkb_arena *a, int *fds, int nfds);
-void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n);
+
+static inline void vkb_dec_init(vkb_dec *d, const void *buf, size_t len, vkb_arena *a, int *fds, int nfds)
+{
+    d->buf = (const uint8_t *)buf;
+    d->pos = 0;
+    d->len = len;
+    d->err = 0;
+    d->arena = a;
+    d->fds = fds;
+    d->nfds = nfds;
+    d->fd_taken = 0;
+}
+
+static inline void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
+{
+    if (__builtin_expect(!d->err && d->len - d->pos >= n, 1)) {
+        if (dst) memcpy(dst, d->buf + d->pos, n);
+        d->pos += n;
+    } else {
+        d->err = 1;
+        if (dst) memset(dst, 0, n);
+    }
+}
 
 static inline uint8_t vkb_dec_u8(vkb_dec *d)
 {

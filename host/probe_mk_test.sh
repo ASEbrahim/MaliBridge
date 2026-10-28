@@ -121,7 +121,11 @@ imitate bitwise_scalar bitwise_vec 0x200 "errata: bitwise_scalar ON (probe bitwi
 imitate dyn_reemit dyn_state 0x400 "errata: dyn_reemit ON (probe dyn_state failed; performance mode) - MK-04"
 imitate vb_split vb_strides 0x800 "errata: vb_split ON (always; performance mode; probe vb_strides failed, recorded only)"
 imitate view_counts view3d_layers 0x4000 "errata: view_counts ON (always; performance mode; probe view3d_layers failed, recorded only)"
-imitate fp16_hide fp16_math 0x8000 "errata: fp16_hide ON (probe fp16_math failed; performance mode) - MK-20"
+if [ "$(status_of plain fp16_math)" = skip ]; then
+  step 0 "fp16_hide imitated: fp16_math skip (driver lacks native shaderFloat16)"
+else
+  imitate fp16_hide fp16_math 0x8000 "errata: fp16_hide ON (probe fp16_math failed; performance mode) - MK-20"
+fi
 imitate view_quarantine rendering_churn 0x2000 ""
 for _ in $(seq 100); do grep -q "^| view_quarantine" $work/view_quarantine/s/malibridge-report.md 2>/dev/null && break; sleep 0.1; done
 ! echo "$new" | grep -q "errata: view_quarantine ON" &&
@@ -174,7 +178,10 @@ cost=$(for p in $mk; do grep "probe: $p " $log | head -1 | awk -v p=$p '{for (i=
 first_bg=$(grep -n "continue in the background" $log | head -1 | cut -d: -f1)
 ok=1
 for p in wait_eintr rendering_churn; do [ "$(grep -n "probe: $p " $log | head -1 | cut -d: -f1)" -gt "${first_bg:-0}" ] || ok=0; done
-for p in viewport_flip bitwise_vec dyn_state vb_strides view3d_layers fp16_math; do [ "$(grep -n "probe: $p " $log | head -1 | cut -d: -f1)" -lt "${first_bg:-0}" ] || ok=0; done
+for p in viewport_flip bitwise_vec dyn_state vb_strides view3d_layers; do [ "$(grep -n "probe: $p " $log | head -1 | cut -d: -f1)" -lt "${first_bg:-0}" ] || ok=0; done
+if [ "$(status_of plain fp16_math)" != skip ]; then
+  [ "$(grep -n "probe: fp16_math " $log | head -1 | cut -d: -f1)" -lt "${first_bg:-0}" ] || ok=0
+fi
 [ $ok = 1 ] && [ -n "$bgs" ]
 step $? "default budget: start ${starts}ms, background ${bgs}(wait_eintr and rendering_churn there); ${cost%, }"
 
