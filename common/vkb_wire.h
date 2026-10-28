@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "gen/vkb_gen.h"
 
 #define VKB_MAX_FDS 16
@@ -65,9 +66,39 @@ struct vkb_dec {
 };
 void vkb_dec_init(vkb_dec *d, const void *buf, size_t len, vkb_arena *a, int *fds, int nfds);
 void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n);
-uint8_t vkb_dec_u8(vkb_dec *d);
-uint32_t vkb_dec_u32(vkb_dec *d);
-uint64_t vkb_dec_u64(vkb_dec *d);
+
+static inline uint8_t vkb_dec_u8(vkb_dec *d)
+{
+    if (d->err || d->len - d->pos < 1) {
+        d->err = 1;
+        return 0;
+    }
+    return d->buf[d->pos++];
+}
+
+static inline uint32_t vkb_dec_u32(vkb_dec *d)
+{
+    if (d->err || d->len - d->pos < 4) {
+        d->err = 1;
+        return 0;
+    }
+    uint32_t v;
+    memcpy(&v, d->buf + d->pos, 4);
+    d->pos += 4;
+    return v;
+}
+
+static inline uint64_t vkb_dec_u64(vkb_dec *d)
+{
+    if (d->err || d->len - d->pos < 8) {
+        d->err = 1;
+        return 0;
+    }
+    uint64_t v;
+    memcpy(&v, d->buf + d->pos, 8);
+    d->pos += 8;
+    return v;
+}
 void vkb_dec_raw_into(vkb_dec *d, void *dst, size_t n);
 void vkb_dec_raw_tail(vkb_dec *d, void *dst, size_t n);
 const void *vkb_dec_raw_view(vkb_dec *d, size_t n);

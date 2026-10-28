@@ -950,6 +950,9 @@ void vkb_srv_serve(int lfd)
             VKB_ERR("accept: %s", strerror(errno));
             continue;
         }
+        int buf_sz = 2 * 1024 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof(buf_sz));
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
         vkb_srv_conn *conn = calloc(1, sizeof(*conn));
         conn->sock = s;
         pthread_attr_t attr;

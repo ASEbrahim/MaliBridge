@@ -824,7 +824,7 @@ void vkb_async_device_init(vkb_srv_table *t)
     const char *im_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_IMITATE_MS");
     const char *w_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_WAIT_MS");
     const char *n_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_THREADS");
-    int on = on_s && *on_s && *on_s != '0';
+    int on = on_s && *on_s ? *on_s != '0' : (vkb_mode() == VKB_MODE_PERFORMANCE);
     double im = im_s ? atof(im_s) : 0;
     vkb_dispatch *dt = &t->dt;
     if ((!on && im <= 0) || !dt->vkCreateGraphicsPipelines || !dt->vkDestroyPipeline || !dt->vkCmdBindPipeline) return;
@@ -833,7 +833,7 @@ void vkb_async_device_init(vkb_srv_table *t)
     if (!a) return;
     a->t = t;
     a->on = on;
-    a->fullscreen = on && atoi(on_s) >= 2;
+    a->fullscreen = on && on_s && atoi(on_s) >= 2;
     a->imitate_ms = im > 0 ? im : 0;
     a->wait_ms = w_s && *w_s ? atof(w_s) : ASYNC_WAIT_MS_DEFAULT;
     if (a->wait_ms < 0) a->wait_ms = 0;

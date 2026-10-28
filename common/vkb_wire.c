@@ -361,9 +361,7 @@ void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
     d->pos += n;
 }
 
-uint8_t vkb_dec_u8(vkb_dec *d) { uint8_t v; vkb_dec_bytes(d, &v, 1); return v; }
-uint32_t vkb_dec_u32(vkb_dec *d) { uint32_t v; vkb_dec_bytes(d, &v, 4); return v; }
-uint64_t vkb_dec_u64(vkb_dec *d) { uint64_t v; vkb_dec_bytes(d, &v, 8); return v; }
+
 
 static void dec_align(vkb_dec *d)
 {

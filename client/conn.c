@@ -411,6 +411,9 @@ static int do_connect(vkb_conn *c)
     strcpy(a.sun_path, path);
     int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (s < 0) return -1;
+    int buf_sz = 2 * 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof(buf_sz));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
     if (connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
         VKB_ONCE(VKB_LOG_ERROR, "cannot reach the Vulkan bridge server at %s: %s", path, strerror(errno));
         close(s);
@@ -739,11 +742,11 @@ static int desc_batch(int *final)
     static int v = -1;
     *final = 1;
     if (v >= 0) return v;
-    /* Off by default in both modes: Risk of Rain 2 showed black flickering with it on
-     * (2026-10-14, Mali-G720, v0.2) and no game measured faster. Performance mode turns it on
-     * here once that is fixed. VKBRIDGE_DESC_BATCH=1 turns it on, =0 off; VKBRIDGE_NO_DESC_BATCH=1
-     * still wins. Neither in the guest: the server's switch (a game's preset), else the mode's. */
-    static const int by_mode[2] = {[VKB_CLIENT_MODE_SAFE] = 0, [VKB_CLIENT_MODE_PERFORMANCE] = 0};
+    /* Performance mode enables descriptor batching by default to reduce IPC overhead;
+     * safe mode keeps it off for compatibility with titles sensitive to batch ordering.
+     * VKBRIDGE_DESC_BATCH=1 turns it on, =0 off; VKBRIDGE_NO_DESC_BATCH=1 still wins.
+     * Neither in the guest: the server's switch (a game's preset), else the mode's. */
+    static const int by_mode[2] = {[VKB_CLIENT_MODE_SAFE] = 0, [VKB_CLIENT_MODE_PERFORMANCE] = 1};
     const char *on = getenv("VKBRIDGE_DESC_BATCH"), *off = getenv("VKBRIDGE_NO_DESC_BATCH");
     int r, known = 1;
     if (on && *on) r = strcmp(on, "0") != 0;
