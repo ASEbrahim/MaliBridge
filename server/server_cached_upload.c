@@ -9,13 +9,13 @@
  * into cached pages; probes/cacheprobe.c). CPU reads of uncached pages run at ~570 MB/s too.
  *
  * With the switch on, an app's shared allocations get cached AHB pages instead (up to
- * VKBRIDGE_CACHED_UPLOAD_MB, default 64, at a time), and the client still sees the coherent type
+ * VKBRIDGE_CACHED_UPLOAD_MB per process, default 64, at a time), and the client still sees the coherent type
  * it saw before - DXVK never calls vkFlushMappedMemoryRanges, so the server does the cache
  * maintenance itself, from user space on its own mapping (SCTLR_EL1.UCI; a cache maintenance by
  * VA reaches every cached copy of the page):
- *   before each vkQueueSubmit/2:  dc cvac over every such allocation (the CPU's writes reach memory);
+ *   before each vkQueueSubmit/2:  dc cvac over the submitting process's allocations (its writes reach memory);
  *   after a wait that completes newer submits than the last such pass (fences, timeline semaphores,
- *   queue/device idle):  dc civac over every such allocation (the CPU's lines are written back and
+ *   queue/device idle):  dc civac over that process's allocations (the CPU's lines are written back and
  *   dropped, so it reads what the GPU wrote). Clean and invalidate, never invalidate alone: a line
  *   the game wrote after the submit's clean is written back, not lost.
  * Measured on the RP4 Pro (probes/gpuprobe.c, 16 MB imported into Mali): without maintenance the
@@ -36,10 +36,40 @@
 static pthread_mutex_t cu_lock = PTHREAD_MUTEX_INITIALIZER;
 static vkb_srv_mem **cu_v;
 static uint32_t cu_n, cu_cap;
-static uint64_t cu_bytes;           /* reserved, the allocations' sizes */
 static uint64_t gen_submit;         /* submits seen (each cleaned before it) */
-static uint64_t gen_clean;          /* submits whose GPU writes the last clean+invalidate covered */
-static struct { uint64_t passes, ns, bytes; } st_flush, st_inval;
+static uint64_t ticket;             /* submits that asked for a clean, in arrival order */
+static struct { uint64_t passes, ns, bytes, skipped; } st_flush, st_inval;
+
+/* Per client process: its budget, and what its last passes covered. A process's submits and waits
+ * maintain its own allocations only (Wine's explorer.exe submits too, and must not clean the game's). */
+#define PROCS 32
+static struct cu_proc {
+    uint64_t owner;     /* vkb_srv_proc token; 0: free */
+    uint64_t bytes;
+    uint32_t n;
+    uint64_t covered;   /* the ticket counter when its last clean began: submits up to it are covered */
+    uint64_t gen_clean; /* submits whose GPU writes its last clean+invalidate covered */
+} procs[PROCS];
+
+static uint64_t owner_now(void)
+{
+    vkb_srv_proc *p = vkb_srv_current_proc();
+    return p ? p->token : 0;
+}
+
+/* The lock held. */
+static struct cu_proc *proc_of(uint64_t owner, int create)
+{
+    struct cu_proc *free_slot = NULL;
+    for (int i = 0; i < PROCS; i++) {
+        if (procs[i].owner == owner) return &procs[i];
+        if (!procs[i].owner && !free_slot) free_slot = &procs[i];
+    }
+    if (!create || !free_slot) return NULL;
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->owner = owner;
+    return free_slot;
+}
 
 static int cu_on(void)
 {
@@ -57,11 +87,13 @@ static uint64_t cu_budget(void)
 int vkb_cu_reserve(uint64_t size)
 {
 #if defined(__ANDROID__) && defined(__aarch64__)
-    if (!size || !cu_on()) return 0;
+    uint64_t owner = owner_now();
+    if (!size || !owner || !cu_on()) return 0;
     uint64_t budget = cu_budget();
     pthread_mutex_lock(&cu_lock);
-    int ok = cu_bytes + size <= budget;
-    if (ok) cu_bytes += size;
+    struct cu_proc *p = proc_of(owner, 1);
+    int ok = p && p->bytes + size <= budget;
+    if (ok) p->bytes += size;
     pthread_mutex_unlock(&cu_lock);
     if (!ok) VKB_ONCE(VKB_LOG_INFO, "cached upload: budget of %llu MB used up; further allocations uncached (VKBRIDGE_CACHED_UPLOAD_MB)",
                       (unsigned long long)(budget >> 20));
@@ -72,15 +104,27 @@ int vkb_cu_reserve(uint64_t size)
 #endif
 }
 
+/* The lock held. */
+static void drop_bytes_locked(uint64_t owner, uint64_t size, int one)
+{
+    struct cu_proc *p = proc_of(owner, 0);
+    if (!p) return;
+    p->bytes = p->bytes > size ? p->bytes - size : 0;
+    if (one && p->n) p->n--;
+    if (!p->n && !p->bytes) p->owner = 0;
+}
+
 void vkb_cu_unreserve(uint64_t size)
 {
+    uint64_t owner = owner_now();
     pthread_mutex_lock(&cu_lock);
-    cu_bytes = cu_bytes > size ? cu_bytes - size : 0;
+    drop_bytes_locked(owner, size, 0);
     pthread_mutex_unlock(&cu_lock);
 }
 
 void vkb_cu_add(vkb_srv_mem *m)
 {
+    uint64_t owner = owner_now();
     int fd = m->sync_fd1 - 1;
     off_t len = lseek(fd, 0, SEEK_END);
     void *p = len > 0 ? mmap(NULL, (size_t)len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
@@ -104,12 +148,14 @@ void vkb_cu_add(vkb_srv_mem *m)
     }
     m->cu_map = p;
     m->cu_len = (size_t)len;
+    m->cu_owner = owner;
     cu_v[cu_n++] = m;
-    uint32_t n = cu_n;
-    uint64_t bytes = cu_bytes;
+    struct cu_proc *pr = proc_of(owner, 1);
+    uint32_t n = pr ? ++pr->n : 0;
+    uint64_t bytes = pr ? pr->bytes : 0;
     pthread_mutex_unlock(&cu_lock);
     if (n == 1 || (n & (n - 1)) == 0)
-        VKB_INFO("cached upload: %u allocation(s) with cached pages, %llu MB (this one %llu bytes)", n,
+        VKB_INFO("cached upload: %u allocation(s) with cached pages in this process, %llu MB (this one %llu bytes)", n,
                  (unsigned long long)(bytes >> 20), (unsigned long long)m->size);
 }
 
@@ -121,7 +167,7 @@ void vkb_cu_remove(vkb_srv_mem *m)
             cu_v[i] = cu_v[--cu_n];
             break;
         }
-    cu_bytes = cu_bytes > m->size ? cu_bytes - m->size : 0;
+    drop_bytes_locked(m->cu_owner, m->size, 1);
     pthread_mutex_unlock(&cu_lock);
     munmap(m->cu_map, m->cu_len);
     m->cu_map = NULL;
@@ -136,12 +182,25 @@ static uint64_t now_ns(void)
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 
-/* Every allocation, the lock held. invalidate: clean+invalidate (dc civac), else clean (dc cvac). */
-static void maintain_locked(int invalidate)
+/* The lock held. */
+static void stat_note(int invalidate, uint64_t ns, uint64_t bytes)
+{
+    __typeof__(st_flush) *s = invalidate ? &st_inval : &st_flush;
+    uint64_t n = ++s->passes;
+    s->ns += ns, s->bytes += bytes;
+    if (n == 1 || (n & (n - 1)) == 0) /* the 1st, 2nd, 4th, 8th, ... */
+        VKB_INFO("cached upload: %llu %s passes (%llu skipped as covered), %.3f ms on average over %.1f MB (this one %.3f ms over %.1f MB)",
+                 (unsigned long long)n, invalidate ? "clean+invalidate" : "clean", (unsigned long long)s->skipped,
+                 s->ns / 1e6 / (double)n, s->bytes / 1048576.0 / (double)n, ns / 1e6, bytes / 1048576.0);
+}
+
+/* One process's allocations, the lock held. invalidate: clean+invalidate (dc civac), else clean (dc cvac). */
+static void maintain_locked(uint64_t owner, int invalidate)
 {
 #if defined(__aarch64__)
     uint64_t t0 = now_ns(), bytes = 0;
     for (uint32_t i = 0; i < cu_n; i++) {
+        if (cu_v[i]->cu_owner != owner) continue;
         uint8_t *p = cu_v[i]->cu_map, *end = p + cu_v[i]->cu_len;
         bytes += cu_v[i]->cu_len;
         if (invalidate)
@@ -150,37 +209,43 @@ static void maintain_locked(int invalidate)
             for (; p < end; p += 64) __asm__ volatile("dc cvac, %0" ::"r"(p) : "memory");
     }
     __asm__ volatile("dsb sy" ::: "memory");
-    uint64_t ns = now_ns() - t0;
-    __typeof__(st_flush) *s = invalidate ? &st_inval : &st_flush;
-    uint64_t n = ++s->passes;
-    s->ns += ns, s->bytes += bytes;
-    if (n == 1 || (n & (n - 1)) == 0) /* the 1st, 2nd, 4th, 8th, ... */
-        VKB_INFO("cached upload: %llu %s passes, %.3f ms on average over %.1f MB (this one %.3f ms over %.1f MB)",
-                 (unsigned long long)n, invalidate ? "clean+invalidate" : "clean", s->ns / 1e6 / (double)n,
-                 s->bytes / 1048576.0 / (double)n, ns / 1e6, bytes / 1048576.0);
+    stat_note(invalidate, now_ns() - t0, bytes);
 #else
-    (void)invalidate;
+    (void)owner, (void)invalidate;
 #endif
 }
 
-/* Before a submit: the CPU's writes reach memory. Returns the submit's generation. */
-static uint64_t before_submit(void)
+/* Before a submit: the process's CPU writes reach memory. A clean that began after this submit
+ * arrived covers it (the client wrote before it sent the submit), so a submit that waited for
+ * another thread's clean does not clean again. Returns the submit's generation. */
+static uint64_t before_submit(uint64_t owner)
 {
+    uint64_t mine = __atomic_add_fetch(&ticket, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_lock(&cu_lock);
-    if (cu_n) maintain_locked(0);
+    struct cu_proc *p = proc_of(owner, 0);
+    if (p && p->n) {
+        if (p->covered >= mine) st_flush.skipped++;
+        else {
+            p->covered = __atomic_load_n(&ticket, __ATOMIC_SEQ_CST);
+            maintain_locked(owner, 0);
+        }
+    }
     uint64_t g = ++gen_submit;
     pthread_mutex_unlock(&cu_lock);
     return g;
 }
 
-/* After a wait that says submits up to generation g are done. */
-static void after_wait(uint64_t g)
+/* After a wait that says the process's submits up to generation g are done. */
+static void after_wait(uint64_t owner, uint64_t g)
 {
-    if (!g || __atomic_load_n(&gen_clean, __ATOMIC_ACQUIRE) >= g) return;
+    if (!g) return;
     pthread_mutex_lock(&cu_lock);
-    if (g > gen_clean) {
-        if (cu_n) maintain_locked(1);
-        gen_clean = g;
+    struct cu_proc *p = proc_of(owner, 0);
+    if (p && p->n) {
+        if (g > p->gen_clean) {
+            maintain_locked(owner, 1);
+            p->gen_clean = g;
+        } else st_inval.skipped++;
     }
     pthread_mutex_unlock(&cu_lock);
 }
@@ -252,7 +317,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_QueueSubmit(VkQueue q, uint32_t n, cons
     NEXT(next_submit);
     if (!next) return VK_ERROR_DEVICE_LOST;
     if (!active()) return next(q, n, si, fence);
-    uint64_t g = before_submit();
+    uint64_t g = before_submit(owner_now());
     VkResult r = next(q, n, si, fence);
     if (r == VK_SUCCESS) {
         fence_note(fence, g);
@@ -272,7 +337,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_QueueSubmit2(VkQueue q, uint32_t n, con
     NEXT(next_submit2);
     if (!next) return VK_ERROR_DEVICE_LOST;
     if (!active()) return next(q, n, si, fence);
-    uint64_t g = before_submit();
+    uint64_t g = before_submit(owner_now());
     VkResult r = next(q, n, si, fence);
     if (r == VK_SUCCESS) {
         fence_note(fence, g);
@@ -296,7 +361,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_WaitForFences(VkDevice d, uint32_t n, c
             uint64_t fg = fence_gen(f[i]);
             if (fg > g) g = fg;
         }
-        after_wait(g);
+        after_wait(owner_now(), g);
     }
     return r;
 }
@@ -306,7 +371,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_GetFenceStatus(VkDevice d, VkFence f)
     NEXT(next_fence_status);
     if (!next) return VK_ERROR_DEVICE_LOST;
     VkResult r = next(d, f);
-    if (r == VK_SUCCESS && active()) after_wait(fence_gen(f));
+    if (r == VK_SUCCESS && active()) after_wait(owner_now(), fence_gen(f));
     return r;
 }
 
@@ -328,7 +393,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_WaitSemaphores(VkDevice d, const VkSema
             uint64_t sg = sem_gen(wi->pSemaphores[i], v);
             if (sg > g) g = sg;
         }
-        after_wait(g);
+        after_wait(owner_now(), g);
     }
     return r;
 }
@@ -338,7 +403,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_GetSemaphoreCounterValue(VkDevice d, Vk
     NEXT(next_sem_value);
     if (!next) return VK_ERROR_DEVICE_LOST;
     VkResult r = next(d, s, value);
-    if (r == VK_SUCCESS && active() && value) after_wait(sem_gen(s, *value));
+    if (r == VK_SUCCESS && active() && value) after_wait(owner_now(), sem_gen(s, *value));
     return r;
 }
 
@@ -347,7 +412,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_QueueWaitIdle(VkQueue q)
     NEXT(next_queue_idle);
     if (!next) return VK_ERROR_DEVICE_LOST;
     VkResult r = next(q);
-    if (r == VK_SUCCESS && active()) after_wait(__atomic_load_n(&gen_submit, __ATOMIC_ACQUIRE));
+    if (r == VK_SUCCESS && active()) after_wait(owner_now(), __atomic_load_n(&gen_submit, __ATOMIC_ACQUIRE));
     return r;
 }
 
@@ -356,7 +421,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL cu_DeviceWaitIdle(VkDevice d)
     NEXT(next_device_idle);
     if (!next) return VK_ERROR_DEVICE_LOST;
     VkResult r = next(d);
-    if (r == VK_SUCCESS && active()) after_wait(__atomic_load_n(&gen_submit, __ATOMIC_ACQUIRE));
+    if (r == VK_SUCCESS && active()) after_wait(owner_now(), __atomic_load_n(&gen_submit, __ATOMIC_ACQUIRE));
     return r;
 }
 

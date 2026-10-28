@@ -79,6 +79,7 @@ typedef struct vkb_srv_mem {
     int sync_fd1;            /* cached readback: the shared dma-buf + 1, for DMA_BUF_IOCTL_SYNC (0: not cached) */
     void *cu_map;            /* cached upload (server_cached_upload.c): the server's mapping, for cache maintenance */
     size_t cu_len;
+    uint64_t cu_owner;       /* the client process's token: its submits and waits maintain these pages */
     uint8_t stat_cls, stat_ded; /* accounting (server_memory.c): strategy class, dedicated to an image (1) / buffer (2) */
     int stat_pid;
     struct vkb_srv_mem *next;
