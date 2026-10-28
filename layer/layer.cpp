@@ -347,8 +347,15 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumeratePhysicalDeviceGroups(
     auto ctx = get_scoped_ctx(instance);
     if (!ctx || !ctx->t->real.vkEnumeratePhysicalDeviceGroups)
         return VK_ERROR_INITIALIZATION_FAILED;
-    return ctx->t->real.vkEnumeratePhysicalDeviceGroups(
+    VkResult res = ctx->t->real.vkEnumeratePhysicalDeviceGroups(
         instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+    // An app that enumerates only through groups needs its physical devices known, as
+    // vkEnumeratePhysicalDevices does
+    if (pPhysicalDeviceGroupProperties && (res == VK_SUCCESS || res == VK_INCOMPLETE))
+        for (uint32_t g = 0; g < *pPhysicalDeviceGroupCount; ++g)
+            for (uint32_t i = 0; i < pPhysicalDeviceGroupProperties[g].physicalDeviceCount; ++i)
+                register_handle(pPhysicalDeviceGroupProperties[g].physicalDevices[i], ctx.ctx);
+    return res;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumerateInstanceLayerProperties(
