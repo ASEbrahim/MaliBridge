@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -17,6 +18,7 @@
 extern "C" {
 #include "vkb_caps.h"
 #include "vkb_ext_alias.h"
+#include "vkb_gen.h"
 #include "vkb_server.h"
 }
 
@@ -36,17 +38,49 @@ void for_each_pNext(void *chain, Fn &&fn) {
         fn(b);
 }
 
-std::vector<VkExtensionProperties> query_device_extensions(vkb_srv_table *t,
+/* The driver's extensions (dt: as the server's fixes show them to the app; real: as the driver has
+ * them, for what the emulations decide and what the driver is given) */
+std::vector<VkExtensionProperties> query_device_extensions(const vkb_dispatch &d,
                                                             VkPhysicalDevice pd,
                                                             const char *layer_name) {
     uint32_t count = 0;
-    t->real.vkEnumerateDeviceExtensionProperties(pd, layer_name, &count, nullptr);
+    d.vkEnumerateDeviceExtensionProperties(pd, layer_name, &count, nullptr);
     std::vector<VkExtensionProperties> exts(count);
     if (count > 0) {
-        t->real.vkEnumerateDeviceExtensionProperties(pd, layer_name, &count, exts.data());
+        d.vkEnumerateDeviceExtensionProperties(pd, layer_name, &count, exts.data());
         exts.resize(count);
     }
     return exts;
+}
+
+/* The app's create info is the app's (const): the parts the fixes change (pEnabledFeatures and the
+ * pNext chain) are copied into the arena first, as the bridge's decoded request is its own. A
+ * structure of unknown size ends the copy: the rest of the chain stays the app's, and is left
+ * alone by the fixes below only if they find nothing to change in it. */
+void copy_device_create_info(VkDeviceCreateInfo *ci, vkb_arena *arena) {
+    if (ci->pEnabledFeatures) {
+        auto *f = static_cast<VkPhysicalDeviceFeatures *>(vkb_arena_alloc(arena, sizeof(*ci->pEnabledFeatures)));
+        if (f) {
+            *f = *ci->pEnabledFeatures;
+            ci->pEnabledFeatures = f;
+        }
+    }
+    const void **link = &ci->pNext;
+    for (auto *b = static_cast<const VkBaseInStructure *>(ci->pNext); b; b = b->pNext) {
+        size_t size = vkb_struct_size(b->sType);
+        if (b->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO)
+            size = sizeof(VkLayerDeviceCreateInfo);
+        if (!size) {
+            VKB_ONCE(VKB_LOG_INFO, "vkCreateDevice: structure type %d in the app's chain not copied (size unknown)", (int)b->sType);
+            break;
+        }
+        auto *copy = static_cast<VkBaseInStructure *>(vkb_arena_alloc(arena, size));
+        if (!copy)
+            break;
+        std::memcpy(copy, b, size);
+        *link = copy;
+        link = reinterpret_cast<const void **>(&copy->pNext);
+    }
 }
 
 /* Cache of all feature/prop/extensions queries */
@@ -63,7 +97,7 @@ public:
 private:
     static PdCaps detect(VkPhysicalDevice pd, vkb_srv_table *t) {
         PdCaps p;
-        p.exts = query_device_extensions(t, pd, nullptr);
+        p.exts = query_device_extensions(t->real, pd, nullptr);
 
         uint32_t missing = 0;
         p.caps.emu = vkb_emu_detect(&t->real, pd, &missing);
@@ -122,15 +156,21 @@ uint32_t filter_device_create_info(VkPhysicalDevice physicalDevice,
                                    LayerCtx *parent,
                                    VkDeviceCreateInfo *pCreateInfo,
                                    vkb_arena *arena) {
-    const PdCaps &p = pd_caps(physicalDevice, parent->table());
+    vkb_srv_table *inst = parent->table();
+    const PdCaps &p = pd_caps(physicalDevice, inst);
 
+    copy_device_create_info(pCreateInfo, arena);
     vkb_caps_filter_device_create_extensions(p.caps.emu, p.exts.data(),
                                               static_cast<uint32_t>(p.exts.size()),
                                               pCreateInfo, arena,
                                               /*faked=*/nullptr, nullptr);
 
-    vkb_emu_device_create_info(parent->table(), physicalDevice, p.caps.emu,
-                               pCreateInfo, arena);
+    /* In the bridge's order (server_instance.c vkb_sv_vkCreateDevice) */
+    vkb_emu_device_create_info(inst, physicalDevice, p.caps.emu, pCreateInfo, arena);
+    vkb_errata_fp16_device_create_info(inst, physicalDevice, pCreateInfo); /* MK-20: what an app enables anyway */
+    vkb_errata_gs_device_create_info(inst, physicalDevice, pCreateInfo);   /* issue #11: likewise */
+    vkb_emu_device_clamp_features(inst, physicalDevice, pCreateInfo, p.exts.data(),
+                                  static_cast<uint32_t>(p.exts.size())); /* last: what the driver lacks never reaches it */
     return p.caps.emu;
 }
 
@@ -140,7 +180,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumerateDeviceExtensionProperties(
     auto ctx = get_scoped_ctx(physicalDevice);
     const PdCaps &p = pd_caps(physicalDevice, ctx->table());
 
-    auto exts = query_device_extensions(ctx->table(), physicalDevice, pLayerName);
+    auto exts = query_device_extensions(ctx->table()->dt, physicalDevice, pLayerName);
     const uint32_t real_count = static_cast<uint32_t>(exts.size());
 
     const uint32_t cap = real_count + kExtensionCapacityBuffer + VKB_EXT_ALIAS_COUNT;
@@ -163,7 +203,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkEnumerateDeviceExtensionProperties(
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures) {
     auto ctx = get_scoped_ctx(physicalDevice);
-    ctx->table()->real.vkGetPhysicalDeviceFeatures(physicalDevice, pFeatures);
+    ctx->table()->dt.vkGetPhysicalDeviceFeatures(physicalDevice, pFeatures);
     const PdCaps &p = pd_caps(physicalDevice, ctx->table());
     vkb_caps_patch_features(&p.caps, pFeatures);
 }
@@ -171,7 +211,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceFeatures(
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceFeatures2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures) {
     auto ctx = get_scoped_ctx(physicalDevice);
-    ctx->table()->real.vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
+    ctx->table()->dt.vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
     const PdCaps &p = pd_caps(physicalDevice, ctx->table());
     vkb_caps_patch_features(&p.caps, &pFeatures->features);
 
@@ -229,7 +269,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceMemoryProperties2(
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceProperties(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties *pProperties) {
     auto ctx = get_scoped_ctx(physicalDevice);
-    ctx->table()->real.vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
+    ctx->table()->dt.vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
     const PdCaps &p = pd_caps(physicalDevice, ctx->table());
     vkb_caps_patch_properties(&p.caps, pProperties, 0);
 }
@@ -237,7 +277,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceProperties(
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties) {
     auto ctx = get_scoped_ctx(physicalDevice);
-    ctx->table()->real.vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
+    ctx->table()->dt.vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
     const PdCaps &p = pd_caps(physicalDevice, ctx->table());
     vkb_caps_patch_properties(&p.caps, &pProperties->properties, 0);
 

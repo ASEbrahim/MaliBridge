@@ -202,8 +202,48 @@ TEST_CASE("the device creation does not ask for what the GPU lacks",
     filter_device_create_info(f.physical_device(), f.context().get(), &ci,
                               &arena);
 
-    REQUIRE(features.shaderClipDistance == VK_FALSE);
-    REQUIRE(features.shaderStorageImageExtendedFormats == VK_TRUE);
+    // What the driver is given: the layer's copy
+    REQUIRE(ci.pEnabledFeatures != &features);
+    REQUIRE(ci.pEnabledFeatures->shaderClipDistance == VK_FALSE);
+    REQUIRE(ci.pEnabledFeatures->shaderStorageImageExtendedFormats == VK_TRUE);
+    // The app's own structure is left as it was
+    REQUIRE(features.shaderClipDistance == VK_TRUE);
+    REQUIRE(features.shaderStorageImageExtendedFormats == VK_FALSE);
+
+    vkb_arena_free(&arena);
+}
+
+TEST_CASE("the device creation changes copies of the app's feature chain",
+          "[capabilities]") {
+    LayerFixture f;
+    vkb_arena arena{};
+
+    VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12};
+    f2.features.shaderClipDistance = VK_TRUE; // the GPU has no clip distance
+
+    VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    ci.pNext = &f2;
+
+    filter_device_create_info(f.physical_device(), f.context().get(), &ci,
+                              &arena);
+
+    // every structure of the chain is the layer's, in the app's order
+    const VkPhysicalDeviceFeatures2 *got = nullptr;
+    bool saw_v12 = false;
+    for (auto *b = static_cast<const VkBaseInStructure *>(ci.pNext); b; b = b->pNext) {
+        REQUIRE(b != reinterpret_cast<const VkBaseInStructure *>(&f2));
+        REQUIRE(b != reinterpret_cast<const VkBaseInStructure *>(&v12));
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            got = reinterpret_cast<const VkPhysicalDeviceFeatures2 *>(b);
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+            saw_v12 = true;
+    }
+    REQUIRE(got);
+    REQUIRE(saw_v12);
+    REQUIRE(got->features.shaderClipDistance == VK_FALSE);
+    REQUIRE(f2.features.shaderClipDistance == VK_TRUE);
+    REQUIRE(f2.pNext == &v12);
 
     vkb_arena_free(&arena);
 }
