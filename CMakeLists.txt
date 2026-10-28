@@ -169,7 +169,10 @@ target_include_directories(VkLayer_malibridge_compat PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(VkLayer_malibridge_compat PRIVATE VKB_LAYER)
+# Only the loader's entry points are exported (VKB_LAYER_EXPORT): the server's C functions stay
+# inside the layer, so they cannot bind to (or be bound by) another library's of the same name
 set_target_properties(VkLayer_malibridge_compat PROPERTIES
+    C_VISIBILITY_PRESET hidden
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES
     OUTPUT_NAME "VkLayer_malibridge_compat"
@@ -181,6 +184,9 @@ target_link_options(VkLayer_malibridge_compat PRIVATE
     # layer's own copy to the loader's (the first definition in the global scope wins), and the
     # loader then takes the layer for itself causing a stackoverflow/deadlock
     -Wl,-Bsymbolic-functions
+    # The static C++ runtime (Android's c++_static) is kept inside the layer too: exported, its
+    # operator new and the like would be another library's in a game's process
+    -Wl,--exclude-libs,ALL
 )
 
 set(LAYER_JSON_PATH
