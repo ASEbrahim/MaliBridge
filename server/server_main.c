@@ -93,10 +93,14 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
      * going down anyway. */
     uintptr_t pc = 0;
     uintptr_t caller = 0;
-#if defined(__aarch64__)
-    if (uc) pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc;
-#elif defined(__x86_64__) && defined(REG_RIP)
     uintptr_t rsp = 0;
+#if defined(__aarch64__)
+    if (uc) {
+        pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc;
+        rsp = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.sp;
+        caller = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.regs[30];
+    }
+#elif defined(__x86_64__) && defined(REG_RIP)
     if (uc) {
         pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
         rsp = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RSP];
