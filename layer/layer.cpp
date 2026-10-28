@@ -12,8 +12,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <pthread.h>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 
 extern "C" {
 #include "server_emu.h"
@@ -41,6 +44,62 @@ LinkInfo *find_link_info(const void *chain, VkStructureType type) {
             return info;
     }
     return nullptr;
+}
+
+/* The process the layer runs in, as the bridge's server knows a client's (vkb_srv_proc): its name
+ * is what the per-process fixes match (gs_hide's VKBRIDGE_GS_HIDE_PROCS, issue #11) and what the
+ * logs say. */
+vkb_srv_proc *layer_proc() {
+    static vkb_srv_proc proc;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        pthread_mutex_init(&proc.olock, nullptr);
+        pthread_cond_init(&proc.ocond, nullptr);
+        proc.pid = static_cast<int>(getpid());
+        if (FILE *f = std::fopen("/proc/self/comm", "r")) {
+            if (std::fgets(proc.comm, sizeof(proc.comm), f))
+                proc.comm[std::strcspn(proc.comm, "\n")] = 0;
+            std::fclose(f);
+        }
+    });
+    return &proc;
+}
+
+/* A directory this process can write: the stuck-pipeline list, <cache dir>/env and the SPIR-V
+ * dumps live there. Winlator and its forks set HOME and TMPDIR inside their imagefs, and no
+ * XDG_CACHE_HOME; /data/local/tmp is the shell's, not an app's. First that can be made and
+ * written wins. */
+bool writable_dir(const std::string &dir) {
+    if (dir.empty() || vkb_mkdirs(dir.c_str()) != 0)
+        return false;
+    struct stat st;
+    return stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && access(dir.c_str(), W_OK | X_OK) == 0;
+}
+
+void choose_cache_dir() {
+    if (vkb_pcache_dir())
+        return;
+    auto env = [](const char *name) -> std::string {
+        const char *v = getenv(name);
+        return v && *v ? v : "";
+    };
+    const std::string xdg = env("XDG_CACHE_HOME"), home = env("HOME"), tmp = env("TMPDIR");
+    const std::string candidates[] = {
+        env("VKBRIDGE_CACHE_DIR"),
+        xdg.empty() ? "" : xdg + "/malibridge",
+        home.empty() ? "" : home + "/.cache/malibridge",
+        tmp.empty() ? "" : tmp + "/malibridge",
+        "/data/local/tmp/malibridge_cache",
+        "/tmp/malibridge",
+    };
+    for (const auto &dir : candidates) {
+        if (writable_dir(dir)) {
+            vkb_pcache_set_dir(dir.c_str());
+            return;
+        }
+    }
+    VKB_WARN("layer: no writable cache directory (VKBRIDGE_CACHE_DIR, XDG_CACHE_HOME, HOME, TMPDIR); stuck pipelines "
+             "are not remembered");
 }
 
 /* A context with a server table of its own. */
@@ -151,16 +210,19 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateInstance(
     vkb_gipa = next_gipa;
     vkb_global_dt = ctx->t->real;
 
-    if (!vkb_pcache_dir()) {
-        const char *cache_home = getenv("XDG_CACHE_HOME");
-        const std::string dir = cache_home ? std::string(cache_home) + "/malibridge"
-                                            : "/data/local/tmp/malibridge_cache";
-        vkb_pcache_set_dir(dir.c_str());
-    }
+    static std::once_flag cache_once;
+    std::call_once(cache_once, [] {
+        choose_cache_dir();
+        vkb_srv_env_reload(); /* <cache dir>/env, as the bridge reads it at start */
+    });
 
     auto *t = ctx->t.get();
+    t->proc = layer_proc();
     vkb_table_register(t);
+    /* The bridge's instance fixes (server_instance.c), those that apply in-process: the extension
+     * hiding and fp16_hide (MK-20) in vkb_emu_instance_install, gs_hide (issue #11) over them */
     vkb_emu_instance_install(t);
+    vkb_errata_gs_instance_install(t);
 
     register_handle(*pInstance, ctx);
     return VK_SUCCESS;
@@ -199,6 +261,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateDevice(
 
     /* The create info the driver gets: the emulated extensions are taken out of it, and the
      * features the GPU lacks are not asked for. */
+    vkb_srv_env_reload(); /* <cache dir>/env again at each device, as the bridge does */
     VkDeviceCreateInfo ci_copy = *pCreateInfo;
     vkb_arena arena{};
     uint32_t emu = filter_device_create_info(physicalDevice, parent.ctx.get(),
@@ -218,6 +281,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateDevice(
 
     auto *dev_table = ctx->t.get();
     dev_table->is_device = 1;
+    dev_table->proc = parent->t->proc;
     dev_table->device = *pDevice;
     dev_table->physical = physicalDevice;
     dev_table->instance = parent->t->instance;

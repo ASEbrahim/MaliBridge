@@ -29,6 +29,7 @@ esac
 build=${1:-$PWD/../build-linux-x86-64}
 out=$PWD/out/layer
 mkdir -p "$out"
+export VKBRIDGE_CACHE_DIR=${VKBRIDGE_CACHE_DIR:-$out/cache} # the layer's cache directory, not the user's ~/.cache
 pass=0; fail=0; skip=0
 result() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "  ok   $2"; else fail=$((fail+1)); echo "  FAIL $2"; fi; }
 skipped() { skip=$((skip+1)); echo "  skip $1"; }

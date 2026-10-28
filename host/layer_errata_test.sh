@@ -1,7 +1,7 @@
 #!/bin/bash
 # The driver errata in the layer (server_errata*.c), on the desktop driver: the layer runs the
 # errata in-process, so the decisions are the bridge's (host/errata_test.sh), read from the
-# process's environment - the layer has no <cache dir>/env to re-read at each device.
+# process's environment and <cache dir>/env (VKBRIDGE_CACHE_DIR here: a fresh one per run).
 #   1  the decisions by Mali driver version (VKBRIDGE_FAKE_DRIVER_VERSION) x mode: which errata
 #      are on for r44p1 (Mali-G720), r49p1 (Mali-G925, given as its beta driverInfo string), r54p2,
 #      r54p3, a job manager GPU, an Arm driver whose version cannot be read; clamp_zero (MK-32) on
@@ -11,6 +11,10 @@
 #   2  VKBRIDGE_ERRATA=+name,-name forces, an unknown name is warned about;
 #   3  the no-op example fix with its imitation beneath it, on a device whose null descriptors are
 #      emulated: the layer's own image views (the stand-ins; the app makes none) go through both.
+#
+#   4  the bridge's query and device-creation fixes in the layer: fp16_hide (MK-20) and gs_hide
+#      (issue #11) shown and enforced (fp16_check, gshide_check), the extension hiding
+#      (VKBRIDGE_SERVER_HIDE_EXTS, vulkaninfo).
 #
 # Not here, unlike the bridge's test: the probe-driven errata (the layer runs no startup probe),
 # the "same decisions again" short line (one device per process in the layer), and the protocol
@@ -22,6 +26,7 @@ out=${VKB_OUT:-$PWD/out}
 build=${VKB_BUILD:-$PWD/../build-linux-x86-64}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+export VKBRIDGE_CACHE_DIR=$work/cache # the layer's cache directory (its env file, the stuck-pipeline list): this run's own
 fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
 
@@ -115,4 +120,25 @@ fix=$(echo "$calls" | grep -o 'example: [0-9]*' | grep -o '[0-9]*'); imi=$(echo 
   [ "$(echo "$new" | grep -c 'null descriptor stand-in made')" -ge 6 ]
 step $? "the layer's own views through the fix and the imitation beneath: ${fix:-0} and ${imi:-0} ($(tail -1 $work/3.log))"
 
+# 4 the query and device-creation fixes
+clean_env="-u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_SERVER_HIDE_EXTS -u VKBRIDGE_ERRATA -u VKBRIDGE_ERRATA_IMITATE -u VKBRIDGE_MODE -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_GS_HIDE_PROCS"
+got=$(env $clean_env VKBRIDGE_ERRATA=+fp16_hide timeout 60 "$out/fp16_check" enable 2>&1)
+echo "$got" | grep -q '^features: v12.shaderFloat16=0 ext.shaderFloat16=0 v11.storageBuffer16BitAccess=1' &&
+  echo "$got" | grep -q '^device: shaderFloat16 and storageBuffer16BitAccess enabled: 0' &&
+  echo "$got" | grep -q 'fp16_hide: the app enabled shaderFloat16 anyway; taken off its device'
+step $? "fp16_hide (MK-20): shaderFloat16 hidden, 16-bit storage kept, taken off a device that enables it ($(echo "$got" | grep -o '^features: [^ ]* [^ ]*'))"
+got=$(env $clean_env VKBRIDGE_ERRATA=+gs_hide VKBRIDGE_GS_HIDE_PROCS=gshide_check timeout 60 "$out/gshide_check" 2>&1)
+echo "$got" | grep -q '^features: v10.geometryShader=0 f2.geometryShader=0' && echo "$got" | grep -q '^limits: v10.maxGeometryOutputVertices=0' &&
+  echo "$got" | grep -q '^device: geometryShader enabled: 0'
+step $? "gs_hide (issue #11): geometry shaders hidden from the named process and taken off its device ($(echo "$got" | grep -o '^features: [^ ]* [^ ]*'))"
+got=$(env $clean_env VKBRIDGE_ERRATA=+gs_hide VKBRIDGE_GS_HIDE_PROCS=someone_else timeout 60 "$out/gshide_check" 2>&1)
+echo "$got" | grep -q '^device: geometryShader enabled: 1' || ! echo "$got" | grep -q 'v10.geometryShader=0'
+step $? "gs_hide: another process keeps them ($(echo "$got" | grep -o '^features: [^ ]*'))"
+if command -v vulkaninfo >/dev/null 2>&1; then
+  ext=VK_KHR_maintenance1 # a device extension every Vulkan 1.1 driver lists, lavapipe's included
+  a=$(env $clean_env timeout 60 vulkaninfo 2>/dev/null | grep -c "$ext ")
+  b=$(env $clean_env VKBRIDGE_SERVER_HIDE_EXTS=$ext timeout 60 vulkaninfo 2>/dev/null | grep -c "$ext ")
+  [ -n "$ext" ] && [ "$a" -gt 0 ] && [ "$b" = 0 ]
+  step $? "VKBRIDGE_SERVER_HIDE_EXTS=$ext: listed $a time(s) before, $b after"
+fi
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi
