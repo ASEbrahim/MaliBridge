@@ -77,6 +77,8 @@ typedef struct vkb_srv_mem {
     void *ahb;               /* AHardwareBuffer* (Android) */
     int export_fd1;          /* VKB_EMU_DMABUF_EXPORT: the dma-buf fd + 1 handed out as the export (0: none) */
     int sync_fd1;            /* cached readback: the shared dma-buf + 1, for DMA_BUF_IOCTL_SYNC (0: not cached) */
+    void *cu_map;            /* cached upload (server_cached_upload.c): the server's mapping, for cache maintenance */
+    size_t cu_len;
     uint8_t stat_cls, stat_ded; /* accounting (server_memory.c): strategy class, dedicated to an image (1) / buffer (2) */
     int stat_pid;
     struct vkb_srv_mem *next;
@@ -399,6 +401,12 @@ void vkb_cbfail_device_init(vkb_srv_table *t); /* server_conn.c */
 void vkb_cbfail_device_destroy(vkb_srv_table *t);
 void vkb_syncfd_device_init(vkb_srv_table *t);   /* server_syncfd.c: sync-fd exports with a deadline */
 int vkb_syncfd_device_destroy(vkb_srv_table *t); /* 1: an export is still in the driver, leave the device alive */
+/* Cached upload memory, VKBRIDGE_CACHED_UPLOAD=1 (server_cached_upload.c) */
+int vkb_cu_reserve(uint64_t size);          /* 1: this shared allocation gets cached pages (budget taken) */
+void vkb_cu_unreserve(uint64_t size);
+void vkb_cu_add(vkb_srv_mem *m);            /* after the allocation, with m->sync_fd1 set */
+void vkb_cu_remove(vkb_srv_mem *m);         /* before its pages go */
+void vkb_cu_device_init(vkb_srv_table *t);
 void vkb_srv_set_current_table(vkb_srv_table *t);
 void vkb_proc_cleanup(vkb_srv_proc *p);
 vkb_srv_proc *vkb_srv_current_proc(void); /* the client process this connection thread serves, or NULL */

@@ -484,6 +484,7 @@ vkb_srv_mem *vkb_mem_find(vkb_srv_table *dev, VkDeviceMemory mem, int remove)
 /* Frees the server-side resources of an allocation (the VkDeviceMemory must already be freed). */
 static void mem_release_backing(vkb_srv_mem *m)
 {
+    if (m->cu_map) vkb_cu_remove(m);
     if (m->host_ptr) munmap(m->host_ptr, m->host_len);
 #ifdef __ANDROID__
     if (m->ahb) p_AHardwareBuffer_release(m->ahb);
@@ -770,7 +771,7 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
         }
         /* CPU usage decides how gralloc caches the pages: uncached where the self-test needed it
          * (ahb_rarely) or VKBRIDGE_AHB_RARELY=1 asks. */
-        uint64_t cpu = ahb_uncached() ? (2ull | (2ull << 4)) : (AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN);
+        uint64_t cpu = ahb_uncached() && cached != 2 ? (2ull | (2ull << 4)) : (AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN);
         vkb_ahb_desc d = {(uint32_t)sz, 1, 1, AHB_FORMAT_BLOB, cpu | AHB_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
         struct AHardwareBuffer *ahb = NULL;
         int ar = p_AHardwareBuffer_allocate(&d, &ahb);
@@ -2072,10 +2073,19 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             VKB_ONCE(VKB_LOG_WARN, "cached readback asked for in memory type %u, which the self-test did not pass; uncached pages instead",
                      ai.memoryTypeIndex);
         int opaque = vkb_opaque_shared_info(t, &ai); /* server_opaque.c */
-        r = alloc_shared(c->dt, dev, s, &ai, client_fd, cached, &m, &out_fd);
+        /* Cached upload (server_cached_upload.c): cached AHB pages the server cleans before each
+         * submit and cleans+invalidates after each wait; the client still sees a coherent type. */
+        uint64_t want = ai.allocationSize;
+        int upload = !cached && !opaque && s == VKB_MEM_AHB && vkb_cu_reserve(want);
+        r = alloc_shared(c->dt, dev, s, &ai, client_fd, upload ? 2 : cached, &m, &out_fd);
+        if (upload) {
+            if (r == VK_SUCCESS && m->sync_fd1) vkb_cu_add(m);
+            else vkb_cu_unreserve(want);
+        }
         if (r == VK_SUCCESS && opaque) vkb_opaque_shared_done(m, out_fd);
         char path[48];
-        snprintf(path, sizeof(path), "shared (%s%s)", vkb_mem_strategy_name(s), cached ? ", cached" : "");
+        snprintf(path, sizeof(path), "shared (%s%s)", vkb_mem_strategy_name(s),
+                 upload && m && m->cu_map ? ", cached upload" : cached ? ", cached" : "");
         log_alloc(t, &ai, ai.memoryTypeIndex, ded, path, r);
     } else {
         if (client_fd >= 0) close(client_fd);
