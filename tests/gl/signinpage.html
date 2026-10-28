@@ -1,0 +1,35 @@
+<!-- xclipse_zink_test.sh: a page shaped like Steam's sign-in screen (large and small text over blurred art, inputs, a toggle, a canvas QR code) for a headless Chromium through Zink -->
+<!doctype html><html><head><style>
+body{margin:0;width:1560px;height:720px;overflow:hidden;font-family:"Noto Sans",sans-serif;color:#fff;
+ background:linear-gradient(120deg,#1b2838 0%,#3a2a10 40%,#602030 70%,#101820 100%)}
+.art{position:absolute;inset:0;filter:blur(18px);opacity:.6}
+.art div{position:absolute;width:300px;height:200px;border-radius:20px}
+.panel{position:absolute;left:100px;top:60px;width:1360px;height:600px;background:rgba(14,20,27,.55);backdrop-filter:blur(6px)}
+h1{position:absolute;left:250px;top:90px;font-size:64px;font-weight:700;margin:0}
+.lbl{position:absolute;font-size:16px;font-weight:700;letter-spacing:1px;color:#c7d5e0}
+.in{position:absolute;width:560px;height:60px;border-radius:2px}
+.rm{position:absolute;left:960px;top:470px;font-size:24px;color:#c7d5e0}
+.tog{position:absolute;left:1360px;top:468px;width:60px;height:34px;border-radius:17px;background:#1a9fff}
+.tog i{position:absolute;right:3px;top:3px;width:28px;height:28px;border-radius:14px;background:#fff}
+.btn{position:absolute;left:1180px;top:560px;width:260px;height:60px;background:rgba(255,255,255,.12);font-size:26px;text-align:center;line-height:60px}
+.back{position:absolute;left:1440px;top:680px;font-size:16px;font-weight:700}
+canvas{position:absolute;left:250px;top:220px}
+</style></head><body>
+<div class="art" id="art"></div>
+<div class="panel"></div>
+<h1>Sign in</h1>
+<div class="lbl" style="left:960px;top:200px">SIGN IN WITH ACCOUNT NAME</div>
+<div class="in" style="left:960px;top:230px;background:#fff"></div>
+<div class="lbl" style="left:960px;top:330px">PASSWORD</div>
+<div class="in" style="left:960px;top:360px;background:rgba(255,255,255,.1)"></div>
+<div class="rm">Remember me</div><div class="tog"><i></i></div>
+<div class="btn">Cancel</div>
+<div class="back">B BACK</div>
+<canvas id="qr" width="200" height="200"></canvas>
+<script>
+const a=document.getElementById('art');
+for(let i=0;i<12;i++){const d=document.createElement('div');d.style.left=(i%4)*400+'px';d.style.top=Math.floor(i/4)*250+'px';
+ d.style.background='hsl('+(i*47%360)+',60%,45%)';d.style.transform='rotate('+(i*13%40-20)+'deg)';a.appendChild(d);}
+const g=document.getElementById('qr').getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,200,200);g.fillStyle='#000';
+let s=12345;for(let y=0;y<25;y++)for(let x=0;x<25;x++){s=(s*1103515245+12345)&0x7fffffff;if(s>>16&1)g.fillRect(8+x*7.36,8+y*7.36,7.36,7.36);}
+</script></body></html>

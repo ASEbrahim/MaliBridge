@@ -20,6 +20,7 @@
  *   panvk  driverID MESA_PANVK, Mesa 26.3.0's driverVersion, driverName "panvk"
  *   arm    driverID ARM_PROPRIETARY, driverVersion r44p1, driverInfo "v1.r44p1-01eac0"
  *   arm11  as arm, as a Vulkan 1.1 driver without VK_KHR_driver_properties (driverID unknown)
+ *   samsung  vendorID 0x144D and driverID SAMSUNG_PROPRIETARY, the rest the driver's (Xclipse)
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -143,7 +144,7 @@ void vkb_driver_log(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_a
 
 /* ------------------------------------------------------------------ VKBRIDGE_FAKE_DRIVER */
 
-enum { FAKE_OFF, FAKE_PANVK, FAKE_ARM, FAKE_ARM11 };
+enum { FAKE_OFF, FAKE_PANVK, FAKE_ARM, FAKE_ARM11, FAKE_SAMSUNG };
 
 static struct {
     int on;
@@ -155,6 +156,10 @@ static struct {
 
 static void fake_props(VkPhysicalDeviceProperties *p)
 {
+    if (fk.on == FAKE_SAMSUNG) {
+        p->vendorID = 0x144D;
+        return;
+    }
     p->vendorID = ARM_VENDOR;
     if (fk.on == FAKE_PANVK) p->driverVersion = VK_MAKE_VERSION(26, 3, 0);
     else p->driverVersion = (44u << 22) | (1u << 12);
@@ -170,6 +175,9 @@ static void fake_chain(void *next)
                 d->driverID = VK_DRIVER_ID_MESA_PANVK;
                 snprintf(d->driverName, sizeof(d->driverName), "panvk");
                 snprintf(d->driverInfo, sizeof(d->driverInfo), "Mesa 26.3.0");
+            } else if (fk.on == FAKE_SAMSUNG) {
+                d->driverID = VK_DRIVER_ID_SAMSUNG_PROPRIETARY;
+                snprintf(d->driverName, sizeof(d->driverName), "Samsung Proprietary driver");
             } else if (fk.on == FAKE_ARM) {
                 d->driverID = VK_DRIVER_ID_ARM_PROPRIETARY;
                 snprintf(d->driverName, sizeof(d->driverName), "Mali");
@@ -256,13 +264,16 @@ PFN_vkGetInstanceProcAddr vkb_driverid_imitate_gipa(PFN_vkGetInstanceProcAddr gi
 {
     const char *v = vkb_srv_env("VKBRIDGE_FAKE_DRIVER");
     if (!v || !*v) return gipa;
-    fk.on = !strcmp(v, "panvk") ? FAKE_PANVK : !strcmp(v, "arm") ? FAKE_ARM : !strcmp(v, "arm11") ? FAKE_ARM11 : FAKE_OFF;
+    fk.on = !strcmp(v, "panvk") ? FAKE_PANVK : !strcmp(v, "arm") ? FAKE_ARM : !strcmp(v, "arm11") ? FAKE_ARM11
+            : !strcmp(v, "samsung") ? FAKE_SAMSUNG : FAKE_OFF;
     if (!fk.on) {
-        VKB_WARN("VKBRIDGE_FAKE_DRIVER=%s means nothing (panvk, arm or arm11)", v);
+        VKB_WARN("VKBRIDGE_FAKE_DRIVER=%s means nothing (panvk, arm, arm11 or samsung)", v);
         return gipa;
     }
     fk.gipa = gipa;
-    VKB_INFO("imitating %s (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x13B5", fk.on == FAKE_PANVK ? "Mesa PanVK 26.3.0" : fk.on == FAKE_ARM ? "Arm's driver r44p1"
-                                                                      : "Arm's driver r44p1 as Vulkan 1.1 without VK_KHR_driver_properties", v);
+    if (fk.on == FAKE_SAMSUNG) VKB_INFO("imitating Samsung's driver (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x144D, driverID SAMSUNG_PROPRIETARY", v);
+    else
+        VKB_INFO("imitating %s (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x13B5", fk.on == FAKE_PANVK ? "Mesa PanVK 26.3.0" : fk.on == FAKE_ARM ? "Arm's driver r44p1"
+                                                                          : "Arm's driver r44p1 as Vulkan 1.1 without VK_KHR_driver_properties", v);
     return fk_GetInstanceProcAddr;
 }

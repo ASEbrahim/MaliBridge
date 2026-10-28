@@ -313,6 +313,8 @@ run_mode() {
   # of an older Mali's feature set, both from <cache dir>/env (a server of its own; once)
   if [ "$mode" = plain ]; then
     timeout 300 ./wait_imitate_test.sh >out/t-wait.log 2>&1; result $? "wait_imitate_test ($(tail -1 out/t-wait.log))"
+    # waitlost_test.sh: a timed-out semaphore wait answered VK_ERROR_DEVICE_LOST, checked where the probe saw it
+    timeout 300 ./waitlost_test.sh >out/t-waitlost.log 2>&1; result $? "waitlost_test ($(tail -1 out/t-waitlost.log))"
     # A pipeline compile that never ends (the G925's compiler on Stray): interrupted, the call fails
     timeout 400 ./compile_watchdog_test.sh >out/t-spin.log 2>&1; result $? "compile_watchdog_test ($(tail -1 out/t-spin.log))"
     # UE4's layer-only pass-through geometry stage folded into the vertex shader (Stray's stuck
@@ -349,6 +351,8 @@ run_mode() {
     # piece is missing), core structures and names through the extensions, SPIR-V lowered (the corpus
     # spirv-val clean), the switch, Mali's gaps on top (a server of its own per step; once)
     timeout 600 ./promote_test.sh >out/t-promote.log 2>&1; result $? "promote_test ($(tail -1 out/t-promote.log))"
+    # apicap_test.sh: the Vulkan version cap for Steam mode's processes, and its switch
+    timeout 600 ./apicap_test.sh >out/t-apicap.log 2>&1; result $? "apicap_test ($(tail -1 out/t-apicap.log))"
     # shm_barrier: barriers between shared-memory writes and reads in compute shaders (per-game:
     # RE Engine titles), forced on and from a preset file: right values in shmbarrier_check, the
     # corpus cases' barriers where expected and spirv-val clean
@@ -392,6 +396,10 @@ run_mode() {
     # Dynamic rendering as render passes (Zink's requirement; Mali's Vulkan 1.1 drivers lack it): the
     # driver's own, emulated at 1.2, switched off, and on a 1.1 driver promoted to 1.2
     timeout 300 ./dynrend_test.sh >out/t-dynrend.log 2>&1; result $? "dynrend_test ($(tail -1 out/t-dynrend.log))"
+    # a1zink_test.sh: extended dynamic state hidden and dynamic rendering as render passes, and its switch
+    timeout 300 ./a1zink_test.sh >out/t-a1zink.log 2>&1; result $? "a1zink_test ($(tail -1 out/t-a1zink.log))"
+    # server switches from <cache dir>/env
+    timeout 300 ./envswitch_test.sh >out/t-envswitch.log 2>&1; result $? "envswitch_test ($(tail -1 out/t-envswitch.log))"
     # The MK probes: each erratum's bug imitated beneath its probe makes it fail with the bug's
     # pattern and the decision follow (probe-gated errata on in performance mode), none without;
     # the report's errata table; the slow light probes in the background (a server of its own; once)
@@ -456,6 +464,10 @@ run_mode() {
     # (VKBRIDGE_FAKE_MISSING=hostptr,extbufhv): smoke 6 of 13 with the fallback off, 13 of 13 with
     # buffers made without the handle type; nothing faked, the choice unchanged (a server of its own; once)
     timeout 400 ./unflagged_test.sh >out/t-unflagged.log 2>&1; result $? "unflagged_test ($(tail -1 out/t-unflagged.log))"
+    # xclipse_zink_test.sh: Zink on Samsung's Xclipse driver without EDS2 (push descriptors kept)
+    timeout 400 ./xclipse_zink_test.sh >out/t-xclipse-zink.log 2>&1; result $? "xclipse_zink_test ($(tail -1 out/t-xclipse-zink.log))"
+    # syncfd_test.sh: sync-fd exports answered within a deadline; a held async submit named in the log
+    timeout 300 ./syncfd_test.sh >out/t-syncfd.log 2>&1; result $? "syncfd_test ($(tail -1 out/t-syncfd.log))"
     # Asynchronous pipeline compiles (VKBRIDGE_ASYNC_COMPILE) with a slow compiler imitated: draws
     # skipped until the pipeline is there, depth-only and full-screen pipelines synchronous, objects
     # destroyed during a compile; off by default; the other checks unchanged through the layer

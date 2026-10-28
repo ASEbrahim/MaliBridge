@@ -16,14 +16,22 @@
  * with layout A's pipeline (Balatro's missing text); with the extension, a driver or an emulation
  * that kept the old vertex input would show here as wrong colours.
  * "SKIP" when the device does not offer the extension (or its feature).
+ *   vidyn_check [engine] exit       makes its device and pipeline, then exits without destroying them
+ *   vidyn_check [engine] dead-peer  runs "exit" in another process after its own device, then draws on
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 #include <dlfcn.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+extern char **environ;
 
 static const uint32_t spv_vert[] = {
 #include "vidyn_vert.inc"
@@ -150,6 +158,7 @@ static void bind(VkCommandBuffer cb, VkBuffer vb, VkDeviceSize off, VkBuffer tin
 int main(int argc, char **argv)
 {
     const char *engine = argc > 1 ? argv[1] : "mesa zink";
+    const char *how = argc > 2 ? argv[2] : "";
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) { printf("FAIL no libvulkan\n"); return 1; }
     gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
@@ -172,14 +181,17 @@ int main(int argc, char **argv)
     vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof(*ep));
     vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ep);
-    int have = 0, gpl = 0;
+    int have = 0, gpl = 0, push = 0, eds2 = 0;
     for (uint32_t i = 0; i < ne; i++) {
         have |= !strcmp(ep[i].extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
         gpl |= !strcmp(ep[i].extensionName, "VK_EXT_graphics_pipeline_library");
+        push |= !strcmp(ep[i].extensionName, "VK_KHR_push_descriptor");
+        eds2 |= !strcmp(ep[i].extensionName, "VK_EXT_extended_dynamic_state2");
     }
     free(ep);
     printf("extensions: %s %s, %s VK_EXT_graphics_pipeline_library\n", have ? "with" : "without",
            VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, gpl ? "with" : "without");
+    printf("offered: VK_KHR_push_descriptor %d, VK_EXT_extended_dynamic_state2 %d\n", push, eds2); /* xclipse_zink_test */
     VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &vf};
     if (have) vkGetPhysicalDeviceFeatures2(pd, &f2);
@@ -212,6 +224,16 @@ int main(int argc, char **argv)
     D(vkCmdCopyImageToBuffer); D(vkCmdPipelineBarrier); D(vkCmdExecuteCommands); D(vkDeviceWaitIdle);
 #undef D
     if (!check(vkCmdSetVertexInputEXT != NULL, "vkCmdSetVertexInputEXT", NULL)) goto out;
+    if (!strcmp(how, "dead-peer")) {
+        char *cargv[] = {argv[0], (char *)engine, "exit", NULL};
+        pid_t pid;
+        int st = 0;
+        int ok = posix_spawn(&pid, argv[0], NULL, NULL, cargv, environ) == 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+                 WEXITSTATUS(st) == 0;
+        if (!check(ok, "a process that exits without destroying its device", NULL)) goto out;
+        struct timespec ts = {1, 0}; /* the server's cleanup of it */
+        nanosleep(&ts, NULL);
+    }
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
 
@@ -301,6 +323,11 @@ int main(int argc, char **argv)
     r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe);
     snprintf(msg, sizeof(msg), "VkResult %d", r);
     if (!check(r == VK_SUCCESS, "pipeline with the vertex input dynamic", msg)) goto out;
+    if (!strcmp(how, "exit")) {
+        printf("exiting without destroying anything\n");
+        fflush(stdout);
+        _exit(0);
+    }
     /* the modules go before the first draw, as DXVK's do */
     vkDestroyShaderModule(dev, vs, NULL);
     vkDestroyShaderModule(dev, fs, NULL);

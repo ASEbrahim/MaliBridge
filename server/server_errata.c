@@ -34,7 +34,8 @@
  *                                     probe had recorded them (tests of the decisions; on a device
  *                                     VKBRIDGE_PROBE_FAKE=<probe>:fail fails the real probe)
  *   VKBRIDGE_WAIT_FIX=0               v0.4's name for -wait_retry; VKBRIDGE_WAIT_FAKE_ERROR (how the
- *                                     wait imitation fails, server_wait.c) imitates on any build
+ *                                     wait imitation fails, server_wait.c) imitates on any build, as does
+ *                                     VKBRIDGE_WAIT_FAKE_LOST
  *   VKBRIDGE_NO_FP16=1 / =0           +fp16_hide / -fp16_hide (also a per-game preset key); it wins
  *                                     over VKBRIDGE_ERRATA for that one erratum
  *
@@ -309,6 +310,20 @@ static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_vers
     version_from(&p2.properties, dp.driverInfo, dp.driverID ? dp.driverID : vkb_driver_id(&t->real, pd, t->api_version), d);
 }
 
+/* The Arm driver's release (38 for r38p1), -1 when not Arm's or not decoded; *arm: Arm's own driver, *jm: a job manager GPU. */
+int vkb_errata_arm_release_pd(const vkb_srv_table *t, VkPhysicalDevice pd, int *arm, int *jm)
+{
+    if (arm) *arm = 0;
+    if (jm) *jm = 0;
+    if (!t || !pd) return -1;
+    drv_version d;
+    char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    driver_version(t, pd, &d, gpu, sizeof(gpu));
+    if (arm) *arm = d.arm;
+    if (jm) *jm = d.family == FAM_JM;
+    return d.arm && d.known ? (int)d.r : -1;
+}
+
 static const erratum_range *in_range(const erratum *e, const drv_version *d, const char *gpu, int perf)
 {
     if (!d->arm || !d->known) return NULL;
@@ -390,6 +405,7 @@ static uint32_t imitated_set(int warn)
 #endif
     const char *wfake = vkb_srv_env("VKBRIDGE_WAIT_FAKE_ERROR");
     if (wfake && *wfake && strcmp(wfake, "0")) imitate |= 1u << VKB_ERRATUM_WAIT_RETRY;
+    if (vkb_wait_fake_lost()) imitate |= 1u << VKB_ERRATUM_WAIT_RETRY; /* VKBRIDGE_WAIT_FAKE_LOST, server_wait.c */
     return imitate;
 }
 

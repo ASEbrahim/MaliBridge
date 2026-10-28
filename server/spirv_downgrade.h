@@ -23,7 +23,7 @@
  *     bridge then reports shaderOutputViewportIndex / shaderOutputLayer off);
  *   - OpGroupNonUniformBroadcast with an id that is not a constant (1.5's subgroupBroadcastDynamicId)
  *     made OpGroupNonUniformShuffle, which takes any id and gives the same value (capability
- *     GroupNonUniformShuffle; the bridge reports the feature only when the driver has shuffles).
+ *     GroupNonUniformShuffle) where the driver has shuffles, else a chain of constant-lane broadcasts.
  * Whether the driver can do what the module asks for is the features' business: the bridge reports
  * a feature only when the driver's extension has it.
  *
@@ -44,6 +44,7 @@ typedef struct vkb_downgrade_stats {
     unsigned extensions;        /* OpExtension instructions added */
     unsigned layer_caps;        /* ShaderViewportIndex / ShaderLayer replaced */
     unsigned broadcasts;        /* dynamic-id broadcasts made shuffles */
+    unsigned unrolled;          /* dynamic-id broadcasts made a chain over the lanes (no shuffles) */
 } vkb_downgrade_stats;
 
 /* A module above `target` (VKB_SPV_1_4 or 1.5) rewritten for it. 1: rewritten (*out malloc'd,
@@ -51,5 +52,8 @@ typedef struct vkb_downgrade_stats {
  * possible (*why says why; the module is left as it is). st may be NULL. */
 int vkb_spv_downgrade(const uint32_t *code, size_t size, uint32_t target, uint32_t **out, size_t *out_size,
                       vkb_downgrade_stats *st, const char **why);
+/* As vkb_spv_downgrade; lanes > 0 makes each dynamic-id broadcast a chain over that many lanes. */
+int vkb_spv_downgrade_ex(const uint32_t *code, size_t size, uint32_t target, uint32_t lanes, uint32_t **out, size_t *out_size,
+                         vkb_downgrade_stats *st, const char **why);
 
 #endif

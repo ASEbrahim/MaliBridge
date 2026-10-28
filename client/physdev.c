@@ -389,6 +389,8 @@ static int bridged_device_ext(const char *name)
     return 0;
 }
 
+static void cap_api(const vkb_physdev *pd, uint32_t *api);
+
 int vkb_physdev_ready(vkb_physdev *pd)
 {
     if (pd->ready) return pd->ready > 0;
@@ -409,6 +411,7 @@ int vkb_physdev_ready(vkb_physdev *pd)
     vkb_call_end(&c);
     vkb_client_knobs_set(pd->info.client_knobs);
     vkb_wire_vkGetPhysicalDeviceProperties((VkPhysicalDevice)pd, &pd->props);
+    cap_api(pd, &pd->props.apiVersion); /* the device's version (icd.c dev->api_version) follows it */
     vkb_wire_vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)pd, &pd->server_mem);
     build_memory_model(pd);
 
@@ -479,9 +482,20 @@ uint32_t vkb_max_api(void)
     return VKB_API_VERSION;
 }
 
+/* The server's cap for this process (vkb_server_pd_info.api_cap); the patch level stays the driver's. */
+static void cap_api(const vkb_physdev *pd, uint32_t *api)
+{
+    uint32_t cap = pd->info.api_cap;
+    if (!cap || VK_API_VERSION_MINOR(*api) <= VK_API_VERSION_MINOR(cap)) return;
+    VKB_ONCE(VKB_LOG_INFO, "Vulkan shown to this process as 1.%u, not 1.%u (the server's VKBRIDGE_STEAM_API_CAP)",
+             VK_API_VERSION_MINOR(cap), VK_API_VERSION_MINOR(*api));
+    *api = VK_MAKE_API_VERSION(0, 1, VK_API_VERSION_MINOR(cap), VK_API_VERSION_PATCH(*api));
+}
+
 static void patch_props(vkb_physdev *pd, VkPhysicalDeviceProperties *p)
 {
     if (p->apiVersion > vkb_max_api()) p->apiVersion = vkb_max_api();
+    if (vkb_physdev_ready(pd)) cap_api(pd, &p->apiVersion);
     const char *from;
     uint32_t sp = vkb_physdev_ready(pd) ? spoof_choice(pd, &from) : 0;
     if (!sp) return;

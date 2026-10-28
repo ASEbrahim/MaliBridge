@@ -163,9 +163,20 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
              * took the last device made, gone once that one was destroyed: the dedicated_import
              * record of the null descriptors' buffer locked a NULL mutex (Tab S10+, v0.5.1 rc1). */
             vkb_srv_set_current_table(t);
+            if (t->is_device && vkb_syncfd_device_destroy(t)) {
+                /* a sync-fd export still in the driver (server_syncfd.c): the device and t are left */
+                VKB_WARN("process %d exited without destroying device %u, which is left alive (a sync-fd export in the driver)", p->pid,
+                         t->id);
+                pthread_mutex_lock(&tables_lock);
+                tables[i] = t; /* kept registered: its id is not reused under that call */
+                pthread_mutex_unlock(&tables_lock);
+                vkb_srv_set_current_table(NULL);
+                continue;
+            }
             if (t->is_device) {
                 VKB_INFO("process %d exited without destroying device %u; cleaning up", p->pid, t->id);
                 vkb_async_device_destroy(t);
+                vkb_vidyn_device_destroy(t); /* as vkDestroyDevice does */
                 vkb_emu_device_quiesce(t);
                 vkb_cbfail_device_destroy(t);
                 if (t->real.vkDeviceWaitIdle) t->real.vkDeviceWaitIdle(t->device);
@@ -247,18 +258,70 @@ static void proc_leave(vkb_srv_proc *p)
     }
 }
 
+/* Every connection, for order_stall's look at what a stalled process is running. */
+#define CONNS_MAX 512
+static vkb_srv_conn *conns_all[CONNS_MAX];
+static pthread_mutex_t conns_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void conns_track(vkb_srv_conn *c, int on)
+{
+    pthread_mutex_lock(&conns_lock);
+    for (int i = 0; i < CONNS_MAX; i++)
+        if (on ? !conns_all[i] : conns_all[i] == c) {
+            conns_all[i] = on ? c : NULL;
+            break;
+        }
+    pthread_mutex_unlock(&conns_lock);
+}
+
+/* Coarse (a few ms): it is read for every request, and only stalls of seconds are reported. */
+static uint64_t mono_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Logs which earlier asynchronous request of the process is still running, on which connection, and for how long. */
+static void order_stall(vkb_srv_proc *p, uint32_t cmd, int s, uint64_t barrier, uint64_t watermark)
+{
+    char line[512];
+    int n = 0;
+    uint64_t now = mono_now_ns();
+    pthread_mutex_lock(&conns_lock);
+    for (int i = 0; i < CONNS_MAX && n < (int)sizeof(line) - 96; i++) {
+        vkb_srv_conn *c = conns_all[i];
+        if (!c || c->proc != p) continue;
+        uint32_t r = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
+        uint64_t since = __atomic_load_n(&c->running_ns, __ATOMIC_RELAXED);
+        if (!r || r - 1 >= VKB_CMD_COUNT) continue;
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " %s for %.1f s;", vkb_cmd_names[r - 1], since && now > since ? (now - since) / 1e9 : 0.0);
+    }
+    pthread_mutex_unlock(&conns_lock);
+    VKB_WARN("process %d (%s): %s has waited %d s for the process's earlier requests (up to %llu, %llu done); running:%s",
+             p->pid, p->comm, cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", s, (unsigned long long)barrier,
+             (unsigned long long)watermark, n ? line : " nothing (a request not yet arrived)");
+}
+
 /* Waits until every async request of the process up to `barrier` has run. */
-static void order_wait(vkb_srv_proc *p, uint64_t barrier)
+static void order_wait(vkb_srv_proc *p, uint64_t barrier, uint32_t cmd)
 {
     if (!p || !barrier) return;
     pthread_mutex_lock(&p->olock);
-    int waited = 0;
+    int waited = 0, slow = 0;
     p->owaiters++;
     while (p->watermark < barrier) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 1;
-        if (pthread_cond_timedwait(&p->ocond, &p->olock, &ts) != 0 && ++waited >= 3 && p->conn_closed) {
+        int e = pthread_cond_timedwait(&p->ocond, &p->olock, &ts);
+        if (e != 0 && p->watermark < barrier && (++slow == 5 || (slow > 5 && slow % 60 == 0))) {
+            uint64_t wm = p->watermark;
+            pthread_mutex_unlock(&p->olock); /* conns_lock is never taken with olock held */
+            order_stall(p, cmd, slow, barrier, wm);
+            pthread_mutex_lock(&p->olock);
+        }
+        if (e != 0 && ++waited >= 3 && p->conn_closed) {
             /* A connection of this process is gone with requests it never sent: go on. */
             VKB_WARN("process %d: async request %llu never arrived; continuing", p->pid, (unsigned long long)(p->watermark + 1));
             p->watermark = barrier;
@@ -793,6 +856,27 @@ static int srv_recv(vkb_srv_conn *conn, vkb_msg_hdr *h, uint8_t **payload, int *
 }
 
 /* Runs one request whose payload is in c->d: dispatch table lookup, then the handler. */
+/* VKBRIDGE_TEST_DELAY_CMD=<command> VKBRIDGE_TEST_DELAY_MS=<ms> (host tests): the first such request waits that long first. */
+static void test_delay(uint32_t cmd)
+{
+    static int want = -2;
+    static uint32_t ms;
+    if (want == -2) {
+        const char *n = getenv("VKBRIDGE_TEST_DELAY_CMD"), *v = getenv("VKBRIDGE_TEST_DELAY_MS");
+        int w = -1;
+        for (uint32_t i = 0; n && v && i < VKB_CMD_COUNT; i++)
+            if (vkb_cmd_names[i] && !strcmp(vkb_cmd_names[i], n)) w = (int)i;
+        ms = v ? (uint32_t)atoi(v) : 0;
+        __atomic_store_n(&want, w, __ATOMIC_RELEASE);
+    }
+    if (want < 0 || cmd != (uint32_t)want) return;
+    int expected = (int)cmd;
+    if (!__atomic_compare_exchange_n(&want, &expected, -1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    VKB_INFO("test: %s held %u ms (VKBRIDGE_TEST_DELAY_CMD)", vkb_cmd_names[cmd], ms);
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
+}
+
 static void run_request(vkb_srv_conn *conn, vkb_srv_call *c, uint32_t cmd, uint32_t table, uint64_t wait_ns)
 {
     vkb_enc_reset(&c->r);
@@ -826,7 +910,11 @@ static void run_request(vkb_srv_conn *conn, vkb_srv_call *c, uint32_t cmd, uint3
     if (vkb_verbose) VKB_DBG("-> %s", vkb_cmd_names[cmd]);
     vkb_srv_current_cmd = vkb_cmd_names[cmd];
     vkb_srv_crash_detail[0] = 0;
+    __atomic_store_n(&conn->running_ns, mono_now_ns(), __ATOMIC_RELAXED);
+    __atomic_store_n(&conn->running, cmd + 1, __ATOMIC_RELEASE);
+    test_delay(cmd);
     vkb_srv_handlers[cmd](c);
+    __atomic_store_n(&conn->running, 0, __ATOMIC_RELEASE);
     vkb_srv_current_cmd = NULL;
     vkb_srv_set_current_table(NULL);
     if (st_period) stats_add(cmd, mono_ns() - t1, wait_ns);
@@ -888,6 +976,7 @@ void vkb_sv_vkbBatch(vkb_srv_call *c)
 static void *conn_main(void *arg)
 {
     vkb_srv_conn *conn = arg;
+    conns_track(conn, 1);
     vkb_srv_call c;
     vkb_enc_init(&c.r);
     int fds[VKB_MAX_FDS];
@@ -900,7 +989,7 @@ static void *conn_main(void *arg)
         uint64_t wait_ns = 0;
         if (conn->proc && h.cmd < VKB_CMD_COUNT && h.cmd != VKB_CMD_vkbHello) {
             uint64_t t0 = st_period ? mono_ns() : 0;
-            order_wait(conn->proc, h.barrier);
+            order_wait(conn->proc, h.barrier, h.cmd);
             if (st_period) wait_ns = mono_ns() - t0;
         }
         if (h.cmd == VKB_CMD_vkbBatch && (h.flags & VKB_F_NOREPLY) && !nfds && conn->proc) {
@@ -930,6 +1019,7 @@ static void *conn_main(void *arg)
         for (int i = 0; i < c.nclose; i++) close(c.close_after[i]);
         vkb_arena_reset(&conn->arena);
     }
+    conns_track(conn, 0);
     close(conn->sock);
     vkb_enc_free(&c.r);
     free(conn->rb);

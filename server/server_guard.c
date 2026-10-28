@@ -112,7 +112,7 @@ static int test_crash = -1;
 static void guard_env(void)
 {
     if (guard_off < 0) {
-        const char *s = getenv("VKBRIDGE_NO_CRASH_GUARD");
+        const char *s = vkb_srv_env_global("VKBRIDGE_NO_CRASH_GUARD");
         guard_off = s && *s && *s != '0';
         /* =spin: marked pipelines spin instead (compile watchdog); =spinfc2: only until their
          * float_controls2 is stripped (the first fallback then compiles); =slow: they take

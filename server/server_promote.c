@@ -588,6 +588,7 @@ typedef struct promo_gpu {
     uint32_t offered;      /* the version the app sees: drv_api when nothing is promoted */
     uint32_t spv_max;      /* the SPIR-V version the driver takes */
     int shuffle;           /* subgroup shuffles in the driver: dynamic-id broadcasts lowered to them */
+    uint32_t lanes;        /* without shuffles: the largest subgroup, each dynamic-id broadcast a chain over its lanes */
     int active;            /* translation wrappers on (VKBRIDGE_PROMOTE_API not 0, driver below 1.3) */
     char missing[512];     /* what the next version lacks (for the log and the session report) */
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
@@ -656,7 +657,8 @@ static void fill_core_features(const translate *x, const promo_gpu *g, VkBaseOut
         if (r->ef == EF_PRIVATE) v = VK_TRUE; /* the client's own (descriptor.c) */
         *(VkBool32 *)((uint8_t *)c + r->core_off) = v;
     }
-    if (core[1]) ((VkPhysicalDeviceVulkan12Features *)core[1])->subgroupBroadcastDynamicId = g && g->shuffle;
+    /* A shuffle where the driver has them, else a chain of constant-lane broadcasts (spirv_downgrade.h). */
+    if (core[1]) ((VkPhysicalDeviceVulkan12Features *)core[1])->subgroupBroadcastDynamicId = g && (g->shuffle || g->lanes);
 }
 
 static void fill_core_props(const translate *x, VkBaseOutStructure *core[3], const VkPhysicalDeviceLimits *limits)
@@ -755,7 +757,19 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     exts_get(d, pd, &el);
     uint32_t m = VMINOR(g.drv_api);
     g.spv_max = m >= 3 ? VKB_SPV_1_6 : m == 2 ? VKB_SPV_1_5 : exts_has(&el, "VK_KHR_spirv_1_4") ? VKB_SPV_1_4 : 0x00010300u;
-    g.shuffle = (sg.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0;
+    g.shuffle = (sg.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0 && !vkb_emu_faked("shuffle");
+    if (!g.shuffle) {
+        /* every lane a subgroup can have: the driver's size, or with subgroup size control its largest */
+        g.lanes = sg.subgroupSize;
+        if (exts_has(&el, "VK_EXT_subgroup_size_control")) {
+            VkPhysicalDeviceSubgroupSizeControlProperties sc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+            VkPhysicalDeviceProperties2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sc};
+            d->vkGetPhysicalDeviceProperties2(pd, &q2);
+            if (sc.maxSubgroupSize > g.lanes) g.lanes = sc.maxSubgroupSize;
+        }
+        if (!g.lanes) g.lanes = 1;
+        if (g.lanes > 128) g.lanes = 128;
+    }
     const char *src;
     int forced;
     uint32_t want = promote_wanted(&src, &forced);
@@ -835,6 +849,9 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     else
         VKB_INFO("promotion: %s stays at Vulkan 1.%u%s", name, m, fake_api() ? " (VKBRIDGE_FAKE_API)" : "");
     if (*g.missing) VKB_INFO("promotion: %s: %s", name, g.missing);
+    if (!g.shuffle && ui.offered != ui.drv_api && !BELOW(ui.offered, V12))
+        VKB_INFO("promotion: %s has no subgroup shuffles: a dynamic-id broadcast (Vulkan 1.2) becomes %u constant-lane broadcasts and selects",
+                 name, g.lanes);
     if (ui.offered != g.offered)
         VKB_INFO("promotion: %s offered to gamescope as Vulkan 1.%u (Steam mode's compositor; games keep 1.%u)", name, VMINOR(ui.offered),
                  VMINOR(g.offered));
@@ -1134,6 +1151,7 @@ PFN_vkGetDeviceProcAddr vkb_promote_gdpa(PFN_vkGetDeviceProcAddr real)
 typedef struct lower_dev {
     VkDevice dev;
     uint32_t target;
+    uint32_t lanes; /* no shuffles: dynamic-id broadcasts as chains over this many lanes (0: shuffles) */
     PFN_vkCreateShaderModule create_module;
     PFN_vkCreateGraphicsPipelines create_gfx;
     PFN_vkCreateComputePipelines create_comp;
@@ -1158,11 +1176,11 @@ static int lower_find(VkDevice d, lower_dev *out)
 }
 
 /* The module for the driver: code itself (0), a lowered copy (1, *out to free), or -1 (logged). */
-static int lower(uint32_t target, const uint32_t *code, size_t size, uint32_t **out, size_t *out_size)
+static int lower(uint32_t target, uint32_t lanes, const uint32_t *code, size_t size, uint32_t **out, size_t *out_size)
 {
     vkb_downgrade_stats st;
     const char *why;
-    int r = vkb_spv_downgrade(code, size, target, out, out_size, &st, &why);
+    int r = vkb_spv_downgrade_ex(code, size, target, lanes, out, out_size, &st, &why);
     if (r < 0) {
         VKB_ONCE(VKB_LOG_WARN, "promotion: a SPIR-V %u.%u module not lowered to %u.%u (%s); given to the driver as it is", (st.from >> 16) & 0xff,
                  (st.from >> 8) & 0xff, (target >> 16) & 0xff, (target >> 8) & 0xff, why ? why : "?");
@@ -1172,9 +1190,9 @@ static int lower(uint32_t target, const uint32_t *code, size_t size, uint32_t **
         unsigned long n = __atomic_add_fetch(&lowered_total, 1, __ATOMIC_RELAXED);
         if (n == 1 || !(n & (n - 1)))
             VKB_INFO("promotion: SPIR-V %u.%u lowered to %u.%u (%lu module(s) so far; this one: %u extension(s) declared, %u layer "
-                     "capabilities, %u dynamic broadcast(s) made shuffles)",
+                     "capabilities, %u dynamic broadcast(s) made shuffles, %u made chains over %u lanes)",
                      (st.from >> 16) & 0xff, (st.from >> 8) & 0xff, (target >> 16) & 0xff, (target >> 8) & 0xff, n, st.extensions,
-                     st.layer_caps, st.broadcasts);
+                     st.layer_caps, st.broadcasts, st.unrolled, lanes);
     }
     return r;
 }
@@ -1186,7 +1204,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL lw_CreateShaderModule(VkDevice device, con
     if (!lower_find(device, &l)) return VK_ERROR_INITIALIZATION_FAILED;
     uint32_t *code = NULL;
     size_t size = 0;
-    if (lower(l.target, ci->pCode, ci->codeSize, &code, &size) <= 0) return l.create_module(device, ci, a, m);
+    if (lower(l.target, l.lanes, ci->pCode, ci->codeSize, &code, &size) <= 0) return l.create_module(device, ci, a, m);
     VkShaderModuleCreateInfo c = *ci;
     c.pCode = code;
     c.codeSize = size;
@@ -1213,14 +1231,14 @@ static VkShaderModuleCreateInfo *inline_module(const VkPipelineShaderStageCreate
 }
 
 /* Returns how many swaps were made into sw (cap of them). */
-static uint32_t swap_stages(uint32_t target, uint32_t n, const VkPipelineShaderStageCreateInfo *st, inline_swap *sw, uint32_t have, uint32_t cap)
+static uint32_t swap_stages(uint32_t target, uint32_t lanes, uint32_t n, const VkPipelineShaderStageCreateInfo *st, inline_swap *sw, uint32_t have, uint32_t cap)
 {
     for (uint32_t i = 0; i < n && have < cap; i++) {
         VkShaderModuleCreateInfo *m = inline_module(&st[i]);
         if (!m || m->codeSize < 8 || m->pCode[1] <= target) continue;
         uint32_t *code = NULL;
         size_t size = 0;
-        if (lower(target, m->pCode, m->codeSize, &code, &size) <= 0) continue;
+        if (lower(target, lanes, m->pCode, m->codeSize, &code, &size) <= 0) continue;
         sw[have] = (inline_swap){m, m->pCode, m->codeSize, code};
         m->pCode = code;
         m->codeSize = size;
@@ -1248,7 +1266,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL lw_CreateGraphicsPipelines(VkDevice device
     if (!lower_find(device, &l)) return VK_ERROR_INITIALIZATION_FAILED;
     inline_swap sw[SWAPS];
     uint32_t ns = 0;
-    for (uint32_t i = 0; i < n; i++) ns = swap_stages(l.target, infos[i].stageCount, infos[i].pStages, sw, ns, SWAPS);
+    for (uint32_t i = 0; i < n; i++) ns = swap_stages(l.target, l.lanes, infos[i].stageCount, infos[i].pStages, sw, ns, SWAPS);
     VkResult r = l.create_gfx(device, cache, n, infos, a, out);
     swap_back(sw, ns);
     return r;
@@ -1262,7 +1280,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL lw_CreateComputePipelines(VkDevice device,
     if (!lower_find(device, &l)) return VK_ERROR_INITIALIZATION_FAILED;
     inline_swap sw[SWAPS];
     uint32_t ns = 0;
-    for (uint32_t i = 0; i < n; i++) ns = swap_stages(l.target, 1, &infos[i].stage, sw, ns, SWAPS);
+    for (uint32_t i = 0; i < n; i++) ns = swap_stages(l.target, l.lanes, 1, &infos[i].stage, sw, ns, SWAPS);
     VkResult r = l.create_comp(device, cache, n, infos, a, out);
     swap_back(sw, ns);
     return r;
@@ -1279,7 +1297,7 @@ void vkb_promote_device_init(vkb_srv_table *t)
     for (int i = 0; i < LOWER_DEVS && slot < 0; i++)
         if (!lower_devs[i].dev) slot = i;
     if (slot >= 0) {
-        lower_devs[slot] = (lower_dev){t->device, g->spv_max, t->real.vkCreateShaderModule, t->real.vkCreateGraphicsPipelines,
+        lower_devs[slot] = (lower_dev){t->device, g->spv_max, g->lanes, t->real.vkCreateShaderModule, t->real.vkCreateGraphicsPipelines,
                                        t->real.vkCreateComputePipelines};
         t->real.vkCreateShaderModule = lw_CreateShaderModule;
         t->real.vkCreateGraphicsPipelines = lw_CreateGraphicsPipelines;

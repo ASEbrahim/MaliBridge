@@ -216,7 +216,7 @@ void vkb_selftest_all(void)
         vkb_mem_selftest(k, inst, &dt, pds[i]);
         k->info.emu_available = vkb_emu_detect(&dt, pds[i], &k->info.missing);
         k->info.emu = k->info.emu_available;
-        const char *emu_env = getenv("VKBRIDGE_EMULATE");
+        const char *emu_env = vkb_srv_env_global("VKBRIDGE_EMULATE");
         if (emu_env && !strcmp(emu_env, "0")) k->info.emu = 0;
         /* what the driver really does (server_probe.c): may switch emulations on */
         vkb_probe_device(k, inst, &dt, pds[i]);
@@ -316,6 +316,7 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
     info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: the game's preset file, <cache dir>/env, ... */
     vkb_preset_client_values(&info);               /* the heap cap and GPU identity the app is shown, the same way */
     vkb_mem_cached_gate(&info, mode); /* server_memory.c: cached readback per VKBRIDGE_CACHED_READBACK and the mode */
+    info.api_cap = vkb_steam_api_cap(c->table, pd); /* server_apicap.c: the Vulkan version cap for Steam mode's processes */
     if ((info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)) && !vkb_emu_bgr10_for(c->table, pd))
         info.emu &= ~(VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX);
     vkb_enc_raw(&c->r, &info, sizeof(info));
@@ -575,6 +576,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_vidyn_device_init(t, vidyn); /* over every layer that makes pipelines: its variants go through them all */
             vkb_async_device_init(t); /* over every layer that sees pipelines: the client's may be stand-ins */
             vkb_cbfail_device_init(t); /* submits leave out command buffers the driver would not begin (server_conn.c) */
+            vkb_syncfd_device_init(t); /* sync-fd exports answered within a deadline (server_syncfd.c) */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);
             VKB_INFO("device %u created on %s (pid %d, %u extensions, memory sharing %s)", id, k ? k->name : "?",
@@ -603,6 +605,8 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
+    /* A sync-fd export still in the driver on this device: the device and its table are left as they are. */
+    if (vkb_syncfd_device_destroy(t)) return;
     vkb_table_unregister(t);
     vkb_async_device_destroy(t);
     vkb_vidyn_device_destroy(t);

@@ -82,7 +82,39 @@ static const char *hide_list(void)
     return snap;
 }
 
+/* On the gate (server_apicap.c) by default: VK_EXT_extended_dynamic_state not offered and dynamic rendering emulated with render passes; decided once, at the self-test. */
+static int a1_on;
+
+static int a1_decide(const vkb_dispatch *idt, VkPhysicalDevice pd)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_A1_ZINK");
+    int on;
+    const char *why = "VKBRIDGE_A1_ZINK=1";
+    if (v && !strcmp(v, "0")) on = 0;
+    else if (v && !strcmp(v, "1")) on = 1;
+    else {
+        static vkb_srv_table probe; /* the gate reads the driver through it */
+        probe.real = *idt;
+        probe.api_version = VK_API_VERSION_1_3;
+        on = vkb_black_gate(&probe, pd, &why);
+    }
+    if (on)
+        VKB_ONCE(VKB_LOG_INFO, "a1: VK_EXT_extended_dynamic_state not offered and dynamic rendering made as render passes (%s; "
+                 "VKBRIDGE_A1_ZINK=0 turns it off)", why);
+    __atomic_store_n(&a1_on, on, __ATOMIC_RELEASE);
+    return on;
+}
+
 int vkb_emu_ext_hidden(const char *name)
+{
+    /* the emulated VK_KHR_dynamic_rendering is added by the client, as for VKBRIDGE_FAKE_MISSING=dynrend */
+    if (__atomic_load_n(&a1_on, __ATOMIC_ACQUIRE) &&
+        (!strcmp(name, "VK_EXT_extended_dynamic_state") || !strcmp(name, "VK_KHR_dynamic_rendering")))
+        return 1;
+    return vkb_emu_ext_hidden_by_env(name);
+}
+
+int vkb_emu_ext_hidden_by_env(const char *name)
 {
     const char *hide = hide_list(), *fake = fake_list();
     if (hide && token(hide, name)) return 1;
@@ -115,7 +147,26 @@ static int calts_hidden(const char *name)
 
 int vkb_emu_hiding_exts(void)
 {
-    return hide_list() != NULL || fake_list() != NULL;
+    return hide_list() != NULL || fake_list() != NULL || __atomic_load_n(&a1_on, __ATOMIC_ACQUIRE);
+}
+
+/* Zink on Samsung's Xclipse driver: VK_EXT_extended_dynamic_state2 left out for Zink; push descriptors too with =push (VKBRIDGE_XCLIPSE_ZINK) */
+static const char *const xclipse_zink_hidden[] = {"VK_KHR_push_descriptor", "VK_EXT_extended_dynamic_state2"};
+
+/* Which of the two are left out: bit 0 push descriptors, bit 1 EDS2 (0: none) */
+static int xclipse_zink(const vkb_srv_table *t, const vkb_srv_table *inst, VkPhysicalDevice pd)
+{
+    if (!inst || !inst->zink) return 0;
+    const char *v = vkb_srv_env("VKBRIDGE_XCLIPSE_ZINK");
+    if (v && !strcmp(v, "0")) return 0;
+    int forced = v && (!strcmp(v, "1") || !strcmp(v, "push") || !strcmp(v, "eds2"));
+    if (!forced && vkb_driver_id(&t->real, pd, inst->api_version ? inst->api_version : VK_API_VERSION_1_1) != VK_DRIVER_ID_SAMSUNG_PROPRIETARY)
+        return 0;
+    int m = v && !strcmp(v, "push") ? 3 : 2;
+    VKB_ONCE(VKB_LOG_INFO, "xclipse: %s not offered to Zink (%s; VKBRIDGE_XCLIPSE_ZINK=0 turns it off)",
+             m == 3 ? "VK_EXT_extended_dynamic_state2 and VK_KHR_push_descriptor" : "VK_EXT_extended_dynamic_state2",
+             v && strcmp(v, "1") ? "VKBRIDGE_XCLIPSE_ZINK" : v ? "VKBRIDGE_XCLIPSE_ZINK=1" : "Samsung's driver");
+    return m;
 }
 
 /* The device extensions a client sees, without the hidden ones (vkb_emu_ext_hidden). */
@@ -146,7 +197,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
      * them (vkb_emu_bgr10_for). */
     const vkb_pd_knowledge *k = inst && inst->zink && !vidyn ? vkb_pd_lookup(&t->real, pd) : NULL;
     int hide_vi_dyn = k && (k->info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX));
-    int have_vi_dyn = 0;
+    int have_vi_dyn = 0, xz = xclipse_zink(t, inst, pd);
     for (uint32_t i = 0; i < n; i++) {
         const char *e = all[i].extensionName;
         int is_vi = !strcmp(e, "VK_EXT_vertex_input_dynamic_state");
@@ -155,6 +206,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
             all[kept++] = all[i], have_vi_dyn = 1;
             continue;
         }
+        if (((xz & 1) && !strcmp(e, xclipse_zink_hidden[0])) || ((xz & 2) && !strcmp(e, xclipse_zink_hidden[1]))) continue;
         if (!vkb_emu_ext_hidden(e) && !(erratum && !strcmp(e, erratum)) && !calts_hidden(e) && !(hide_vi_dyn && is_vi) &&
             !(no_gpl && !strcmp(e, "VK_EXT_graphics_pipeline_library")))
             all[kept++] = all[i];
@@ -292,7 +344,7 @@ void vkb_emu_instance_install(vkb_srv_table *t)
     if (!t->real.vkEnumerateDeviceExtensionProperties) return;
     /* always: the driver errata hide by GPU and driver version (vkb_errata_hidden_ext) */
     t->dt.vkEnumerateDeviceExtensionProperties = hide_EnumerateDeviceExtensionProperties;
-    if (vkb_emu_hiding_exts()) VKB_ONCE(VKB_LOG_INFO, "device extensions hidden from clients: VKBRIDGE_FAKE_MISSING=%s VKBRIDGE_SERVER_HIDE_EXTS=%s",
+    if (hide_list() || fake_list()) VKB_ONCE(VKB_LOG_INFO, "device extensions hidden from clients: VKBRIDGE_FAKE_MISSING=%s VKBRIDGE_SERVER_HIDE_EXTS=%s",
              fake_list() ? fake_list() : "", hide_list() ? hide_list() : "");
 }
 
@@ -605,7 +657,9 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     /* Zink (Mesa 25 and later: Steam's UI, every OpenGL game) refuses a device without dynamic
      * rendering; Mali's Vulkan 1.1 drivers (r32p1) lack it. Renderings become render passes
      * (server_emu_dynrend.c), made with vkCreateRenderPass2 (core in 1.2, an extension before). */
-    int dynrend_missing = !dynrend && (props.apiVersion < VK_API_VERSION_1_3 || (fake && token(fake, "dynrend")));
+    int a1 = a1_decide(idt, pd);
+    if (a1) dynrend = 0;
+    int dynrend_missing = !dynrend && (props.apiVersion < VK_API_VERSION_1_3 || (fake && token(fake, "dynrend")) || a1);
     if (dynrend_missing && (rp2 || props.apiVersion >= VK_API_VERSION_1_2) && !env_off("VKBRIDGE_EMU_DYNREND")) emu |= VKB_EMU_DYN_RENDER;
     /* Zink offers OpenGL 3.3 only with GL_ARB_vertex_type_2_10_10_10_rev, which wants every packed
      * 10-10-10-2 vertex format. Mali (G720 r44p1, G68, G57, G925 ...) lacks the BGRA signed one,

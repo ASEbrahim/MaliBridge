@@ -11,6 +11,7 @@
 
 enum {
     OP_GROUP_BROADCAST = 337, OP_GROUP_SHUFFLE = 345, OP_CONSTANT_NULL = 46, OP_SPEC_CONSTANT = 50, OP_SPEC_CONSTANT_OP = 52,
+    OP_UCONVERT = 113, OP_SELECT = 169, OP_IEQUAL = 170,
     CAP_SHUFFLE = 65, CAP_LAYER = 69, CAP_VIEWPORT = 70, CAP_VIEWPORT_LAYER_EXT = 5254,
 };
 
@@ -68,8 +69,101 @@ static int is_constant(const spv_mod *m, uint32_t id)
     return op == SpvOpConstant || op == OP_CONSTANT_NULL || op == OP_SPEC_CONSTANT || op == OP_SPEC_CONSTANT_OP;
 }
 
+/* The type of the value `id` (the result type of its definition), or 0. */
+static uint32_t type_of(const spv_mod *m, uint32_t id)
+{
+    int d = spv_find_def(m, id);
+    if (d < 0 || m->ins[d].n < 3 || spv_result_id(&m->ins[d]) != id || m->ins[d].w[1] != id) return 0;
+    return m->ins[d].w[0];
+}
+
+/* Components of a vector type (1: a scalar). */
+static uint32_t components(const spv_mod *m, uint32_t type)
+{
+    int d = spv_find_def(m, type);
+    return d >= 0 && m->ins[d].op == SpvOpTypeVector && m->ins[d].n >= 4 ? m->ins[d].w[2] : 1;
+}
+
+static void emit(spv_mod *m, uint32_t *at, uint16_t op, const uint32_t *ops, uint16_t n)
+{
+    spv_insert(m, *at, op, ops, n);
+    (*at)++;
+}
+
+#define MAX_LANES 128u
+
+/* Every dynamic-id broadcast as a chain over `lanes` constant lanes; its result id is the chain's last select. */
+static unsigned unroll_broadcasts(spv_mod *m, uint32_t lanes)
+{
+    if (lanes > MAX_LANES) lanes = MAX_LANES;
+    unsigned found = 0;
+    uint32_t comps = 0; /* bit n: a result of n components */
+    for (uint32_t i = 0; i < m->count; i++) {
+        const spv_inst *in = &m->ins[i];
+        if (in->op != OP_GROUP_BROADCAST || in->n < 6 || is_constant(m, in->w[4])) continue;
+        found++;
+        uint32_t c = components(m, in->w[0]);
+        if (c < 32) comps |= 1u << c;
+    }
+    if (!found) return 0;
+    uint32_t u32 = spv_type_int(m, 32, 0), boolean = spv_type_bool(m);
+    uint32_t bvec[32] = {0};
+    for (uint32_t c = 2; c < 32; c++)
+        if (comps & (1u << c)) bvec[c] = spv_type_vector(m, boolean, c);
+    uint32_t lane[MAX_LANES];
+    for (uint32_t k = 0; k < lanes; k++) lane[k] = spv_const_u32(m, k);
+    for (uint32_t i = 0; i < m->count && !m->err; i++) {
+        spv_inst *in = &m->ins[i];
+        if (in->op != OP_GROUP_BROADCAST || in->n < 6 || is_constant(m, in->w[4])) continue;
+        uint32_t type = in->w[0], result = in->w[1], scope = in->w[2], value = in->w[3], id = in->w[4];
+        uint32_t c = components(m, type);
+        int td = spv_find_def(m, type_of(m, id));
+        uint32_t width = td >= 0 && m->ins[td].op == SpvOpTypeInt ? m->ins[td].w[1] : 32;
+        spv_remove(m, i);
+        uint32_t at = i;
+        if (width != 32) {
+            /* compared as 32 bits (a lane number fits) */
+            uint32_t conv = spv_new_id(m), ops[3] = {u32, conv, id};
+            emit(m, &at, OP_UCONVERT, ops, 3);
+            id = conv;
+        }
+        uint32_t acc = lanes > 1 ? spv_new_id(m) : result;
+        uint32_t b0[5] = {type, acc, scope, value, lane[0]};
+        emit(m, &at, OP_GROUP_BROADCAST, b0, 5);
+        for (uint32_t k = 1; k < lanes; k++) {
+            uint32_t bk = spv_new_id(m), eq = spv_new_id(m);
+            uint32_t ob[5] = {type, bk, scope, value, lane[k]};
+            emit(m, &at, OP_GROUP_BROADCAST, ob, 5);
+            uint32_t oe[4] = {boolean, eq, id, lane[k]};
+            emit(m, &at, OP_IEQUAL, oe, 4);
+            uint32_t cond = eq;
+            if (c > 1 && c < 32) {
+                /* a condition per component (a scalar one for a vector is SPIR-V 1.4's only) */
+                uint32_t oc[2 + 31];
+                cond = spv_new_id(m);
+                oc[0] = bvec[c];
+                oc[1] = cond;
+                for (uint32_t j = 0; j < c; j++) oc[2 + j] = eq;
+                emit(m, &at, SpvOpCompositeConstruct, oc, (uint16_t)(2 + c));
+            }
+            uint32_t sel = k + 1 == lanes ? result : spv_new_id(m);
+            uint32_t os[5] = {type, sel, cond, bk, acc};
+            emit(m, &at, OP_SELECT, os, 5);
+            acc = sel;
+        }
+        i = at - 1;
+    }
+    return found;
+}
+
 int vkb_spv_downgrade(const uint32_t *code, size_t size, uint32_t target, uint32_t **out, size_t *out_size,
                       vkb_downgrade_stats *st, const char **why)
+{
+    return vkb_spv_downgrade_ex(code, size, target, 0, out, out_size, st, why);
+}
+
+int vkb_spv_downgrade_ex(const uint32_t *code, size_t size, uint32_t target, uint32_t lanes, uint32_t **out, size_t *out_size,
+                         vkb_downgrade_stats *st, const char **why)
 {
     vkb_downgrade_stats local;
     if (!st) st = &local;
@@ -110,8 +204,10 @@ int vkb_spv_downgrade(const uint32_t *code, size_t size, uint32_t target, uint32
         if (target < VKB_SPV_1_5 && in->op == SpvOpCapability && in->n >= 2 && (in->w[0] == CAP_LAYER || in->w[0] == CAP_VIEWPORT))
             layer_caps++;
     }
-    /* 1.5's dynamic-id broadcast: a shuffle (same operands: scope, value, id). */
-    if (target < VKB_SPV_1_5) {
+    /* 1.5's dynamic-id broadcast: a shuffle, or without shuffles a chain over the lanes. */
+    if (target < VKB_SPV_1_5 && lanes) {
+        st->unrolled = unroll_broadcasts(&m, lanes);
+    } else if (target < VKB_SPV_1_5) {
         for (uint32_t i = 0; i < m.count; i++) {
             spv_inst *in = &m.ins[i];
             if (in->op != OP_GROUP_BROADCAST || in->n < 6 || is_constant(&m, in->w[4])) continue;

@@ -7,6 +7,7 @@
 #   1  ... on the tested list (VKBRIDGE_PROMOTE_TESTED): offered as 1.3; promote_check 1.3 (core
 #      structures, core names, no extensions enabled, SPIR-V 1.6 lowered to 1.4, dynamic
 #      rendering/sync2/copy2); the steps below turn it on with VKBRIDGE_PROMOTE_API=1;
+#   1b ... without subgroup shuffles (VKBRIDGE_FAKE_MISSING=shuffle): 1.3, broadcasts as chains;
 #   2  ... without VK_KHR_dynamic_rendering: offered as 1.2, and the log says what 1.3 lacks;
 #      <cache dir>/apps-vulkan says 1.2 on a 1.1 driver, promotion=on (the launcher's DXVK choice);
 #   3  ... VKBRIDGE_PROMOTE_API=1.2: 1.2;  4  ... VKBRIDGE_PROMOTE_API=0: 1.1, nothing installed;
@@ -66,6 +67,13 @@ run "$out/promote_check" 1.3
   grep -q "vkCreateDevice: promoted to Vulkan 1.3 on a 1.1 driver: 1.3, 1.2 feature structures turned into the extensions'" "$log" &&
   grep -q "promotion: SPIR-V 1.6 lowered to 1.4 (1 module(s) so far; this one: 1 extension(s) declared, 0 layer capabilities, 1 dynamic broadcast" "$log"
 step $? "a 1.1 driver with the extensions: $(offered); $res"
+# 1b
+start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_PROMOTE_API=1 VKBRIDGE_FAKE_MISSING=shuffle
+run "$out/promote_check" 1.3
+[ $rc = 0 ] && grep -q "RADV NAVI31) offered as Vulkan 1.3 on its Vulkan 1.1 driver" "$log" &&
+  grep -q "RADV NAVI31) has no subgroup shuffles: a dynamic-id broadcast (Vulkan 1.2) becomes [0-9]* constant-lane broadcasts" "$log" &&
+  grep -q "promotion: SPIR-V 1.6 lowered to 1.4 (.* 0 dynamic broadcast(s) made shuffles, 1 made chains over [0-9]* lanes)" "$log"
+step $? "... without subgroup shuffles (Mali r18-r26): $(offered), the dynamic broadcast a chain over $(grep -m1 -o 'becomes [0-9]* constant-lane' "$log" | grep -o '[0-9]*') lanes; $res"
 # 2
 start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_PROMOTE_API=1 VKBRIDGE_FAKE_MISSING=VK_KHR_dynamic_rendering
 run "$out/promote_check" 1.2
@@ -131,16 +139,22 @@ else
     docker build -q -t vkb-spirv-tools - >/dev/null
   run_t="docker run --rm -i -u $(id -u):$(id -g) -v $work:$work -v $PWD/..:$PWD/..:ro vkb-spirv-tools"
 fi
-mkdir -p "$work/in" "$work/rw4" "$work/rw5"
+mkdir -p "$work/in" "$work/rw4" "$work/rw5" "$work/rw16"
 $run_t bash -c "for s in $PWD/../tests/downgrade/*.spvasm; do b=\$(basename \$s .spvasm); spirv-as --target-env spv1.\${b##*_1} -o $work/in/\$b.spv \$s || echo \"cannot assemble \$b\"; done" >"$work/as.log" 2>&1
 "$out/downgrade_corpus" 1.4 "$work/rw4" "$work"/in/*.spv >"$work/c4.log"; rc4=$?
 "$out/downgrade_corpus" 1.5 "$work/rw5" "$work"/in/*_16.spv >"$work/c5.log"; rc5=$?
+# without shuffles (subgroups of 16): the broadcasts as chains
+"$out/downgrade_corpus" 1.4:16 "$work/rw16" "$work"/in/bcast*_15.spv >"$work/c16.log" || rc4=1
 val=$($run_t bash -c "ok=0 bad=0; for f in $work/rw4/*.spv; do if spirv-val --target-env vulkan1.1spv1.4 \$f >/dev/null 2>$work/v.err; then ok=\$((ok+1)); else bad=\$((bad+1)); echo \"invalid: \${f##*/}: \$(head -1 $work/v.err)\" >&2; fi; done;
+  for f in $work/rw16/*.spv; do if spirv-val --target-env vulkan1.1spv1.4 \$f >/dev/null 2>$work/v.err; then ok=\$((ok+1)); else bad=\$((bad+1)); echo \"invalid (chains): \${f##*/}: \$(head -1 $work/v.err)\" >&2; fi; done;
   for f in $work/rw5/*.spv; do if spirv-val --target-env vulkan1.2 \$f >/dev/null 2>$work/v.err; then ok=\$((ok+1)); else bad=\$((bad+1)); echo \"invalid (1.5): \${f##*/}: \$(head -1 $work/v.err)\" >&2; fi; done; echo \$ok \$bad")
 read -r vok vbad <<< "$val"
 c4=$work/c4.log
-[ $rc4 = 0 ] && [ $rc5 = 0 ] && [ ! -s "$work/as.log" ] && [ "${vbad:-1}" = 0 ] && [ "${vok:-0}" = 9 ] &&
+[ $rc4 = 0 ] && [ $rc5 = 0 ] && [ ! -s "$work/as.log" ] && [ "${vbad:-1}" = 0 ] && [ "${vok:-0}" = 12 ] &&
   grep -qx "bcast_15.spv: 1.5 -> 1.4, 1 extension(s), 0 layer capabilities, 1 broadcast(s) made shuffles" "$c4" &&
+  grep -qx "bcastvec_15.spv: 1.5 -> 1.4, 0 extension(s), 0 layer capabilities, 2 broadcast(s) made shuffles" "$c4" &&
+  grep -qx "bcast_15.spv: 1.5 -> 1.4, 1 extension(s), 0 layer capabilities, 0 broadcast(s) made shuffles, 1 made chains" "$work/c16.log" &&
+  grep -qx "bcastvec_15.spv: 1.5 -> 1.4, 0 extension(s), 0 layer capabilities, 0 broadcast(s) made shuffles, 2 made chains" "$work/c16.log" &&
   grep -qx "di_bda_15.spv: 1.5 -> 1.4, 4 extension(s), 0 layer capabilities, 0 broadcast(s) made shuffles" "$c4" &&
   grep -qx "layer_15.spv: 1.5 -> 1.4, 1 extension(s), 2 layer capabilities, 0 broadcast(s) made shuffles" "$c4" &&
   grep -qx "demote_16.spv: 1.6 -> 1.4, 0 extension(s), 0 layer capabilities, 0 broadcast(s) made shuffles" "$c4" &&

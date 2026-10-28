@@ -6,7 +6,7 @@
  * waits with VK_ERROR_INITIALIZATION_FAILED (-3) after a signal; run against a server with the
  * imitation on, the fix on ("ok") or off ("bug").
  *
- *   wait_check ok|bug|early|any [case...]
+ *   wait_check ok|bug|early|lost|any [case...]
  *                                     cases: fence-finite fence-infinite sem-finite sem-infinite
  *                                     queue-idle device-idle query-wait (the default: all of them)
  *                                     fence-status, leak (exits without destroying the device,
@@ -27,6 +27,7 @@
  * nograce: as ok, but sem-slow wants VK_TIMEOUT at its 1 s deadline (VKBRIDGE_WAIT_GRACE_S=0, the
  *      old behaviour); "ok" wants VK_SUCCESS once the work is done (the grace). sem-nosubmit wants
  *      VK_TIMEOUT at 1 s either way;
+ * lost: a finite wait on what is never signalled ends in VK_ERROR_DEVICE_LOST; the rest as ok;
  * any: the results are printed, not judged.
  * One line per case, "OK: ..." / "FAILED: ..." last. Set VKBRIDGE_QUERY_MIRROR=0 so the query wait
  * reaches the server.
@@ -117,6 +118,8 @@ static void judge(const char *what, VkResult r, double ms, VkResult want, double
         ok = r == VK_TIMEOUT && ms < LATE_MS - 50;
     else if (!strcmp(expect, "ok") || !strcmp(expect, "nograce"))
         ok = r == want && ms >= min_ms;
+    else if (!strcmp(expect, "lost"))
+        ok = want == VK_TIMEOUT ? r == VK_ERROR_DEVICE_LOST : r == want;
     else
         ok = 1;
     checks++;

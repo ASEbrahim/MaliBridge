@@ -42,6 +42,16 @@ Ultra (Mali-G925), 34 games I've tested are playable or better, for example Half
 Garry's Mod. Players have sent reports from 19 more Mali phones and tablets: 83 different games
 across the tables below. It is free.
 
+## New in v0.5.4.2
+
+- **Steam's game mode should no longer show a black screen** on the Galaxy A16, A54, F15, Tab S9 FE, Tab S10 Lite, Anbernic RG556, GammaOS handhelds with the Unisoc T770, and the Galaxy S10 and Note10+ phones on custom ROMs.
+- **Phones with older Mali drivers** (G52, G57, G72, G76, G77) should get to Steam now instead of stopping before the display comes up.
+- **Galaxy A56:** Steam's sign-in screen comes up now and draws correctly.
+- **Steam libraries on an SD card or external drive** start much faster.
+- **Steam's update** no longer stops when you switch apps and come back, and the first download tries another of Valve's servers when one can't be reached.
+
+All changes: [release notes](https://github.com/ASEbrahim/MaliBridge/releases/tag/v0.5.4.2).
+
 ## New in v0.5.4.1
 
 - **Steam should start now** on the Retroid Pocket 4 Pro, Galaxy A53, POCO X4 GT, motorola edge 40 neo and other phones that stopped at "Starting display and audio", on the Galaxy A55 and A56 (Xclipse), and on the Galaxy S10+ and Note10+ with LineageOS.
@@ -58,7 +68,7 @@ All changes: [release notes](https://github.com/ASEbrahim/MaliBridge/releases/ta
 **Fixes**
 - **Green squares and red-tinted textures on the Dimensity 9500** (Hollow Knight, Silksong, Hades and others) should be gone.
 - **Black picture with sound on Samsung Exynos (Xclipse)** phones: games should show now.
-- **Black Steam screen on older Mali GPUs** (G57, G68 and similar): Steam's menus are drawn without the GPU there. Some of these phones still get a black screen in game mode (see [known issues](#known-issues)).
+- **Black Steam screen on older Mali GPUs** (G57, G68 and similar): Steam's menus are drawn without the GPU there. The black screen some of them still had in game mode should be fixed in v0.5.4.2.
 - **Missing text in Balatro** and other OpenGL games is fixed.
 - **Fewer crashes when the phone runs low on memory**, and less stutter on later launches of a game.
 - **Games keep their picture** at the end of a session that Android had paused in the background for a long time.
@@ -424,8 +434,8 @@ The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 
 ## Known issues
 
-- **Black screen with sound in Steam's game mode** on some older Mali phones and tablets (Galaxy
-  A16, A54, F15, Tab S9 FE, Tab S10 Lite, Anbernic RG556). Desktop mode works on them. Being worked on.
+- **OpenGL games** on the Galaxy A16, A54, F15, Tab S9 FE, Tab S10 Lite and Anbernic RG556 are not
+  tested yet.
 - **Short freezes while moving** in some games that stream their textures in as you walk (Dark
   Souls III, Hob).
 - **Steam's menus on vivo phones** can run at about 15 fps, with a white flash when a menu opens.
