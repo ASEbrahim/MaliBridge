@@ -208,7 +208,7 @@ static void proxy_add(apipe *x)
 {
     unsigned b = hbucket((uint64_t)(uintptr_t)x, PROXY_BUCKETS);
     x->hnext = proxies[b];
-    proxies[b] = x;
+    __atomic_store_n(&proxies[b], x, __ATOMIC_RELEASE);
     __atomic_add_fetch(&nproxies, 1, __ATOMIC_RELEASE);
 }
 
@@ -216,7 +216,7 @@ static void proxy_remove(apipe *x)
 {
     for (apipe **pp = &proxies[hbucket((uint64_t)(uintptr_t)x, PROXY_BUCKETS)]; *pp; pp = &(*pp)->hnext)
         if (*pp == x) {
-            *pp = x->hnext;
+            __atomic_store_n(pp, x->hnext, __ATOMIC_RELEASE);
             __atomic_sub_fetch(&nproxies, 1, __ATOMIC_RELEASE);
             return;
         }
@@ -712,16 +712,19 @@ static VKAPI_ATTR void VKAPI_CALL as_CmdBindPipeline(VkCommandBuffer cb, VkPipel
     vkb_async *a = cur();
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         if (__atomic_load_n(&nproxies, __ATOMIC_ACQUIRE)) {
-            pthread_mutex_lock(&lk);
-            apipe *x = proxy_find(p);
-            VkPipeline real = x && x->state == ST_READY ? x->real : VK_NULL_HANDLE;
-            pthread_mutex_unlock(&lk);
-            if (x && !real) { /* still compiling (or failed): its draws are dropped */
-                tls_skip = cb;
-                __atomic_add_fetch(&a->binds_skipped, 1, __ATOMIC_RELAXED);
-                return;
+            unsigned b = hbucket((uint64_t)(uintptr_t)p, PROXY_BUCKETS);
+            if (__atomic_load_n(&proxies[b], __ATOMIC_ACQUIRE)) {
+                pthread_mutex_lock(&lk);
+                apipe *x = proxy_find(p);
+                VkPipeline real = x && x->state == ST_READY ? x->real : VK_NULL_HANDLE;
+                pthread_mutex_unlock(&lk);
+                if (x && !real) { /* still compiling (or failed): its draws are dropped */
+                    tls_skip = cb;
+                    __atomic_add_fetch(&a->binds_skipped, 1, __ATOMIC_RELAXED);
+                    return;
+                }
+                if (x) p = real;
             }
-            if (x) p = real;
         }
         if (tls_skip == cb) tls_skip = VK_NULL_HANDLE;
     }
@@ -824,7 +827,7 @@ void vkb_async_device_init(vkb_srv_table *t)
     const char *im_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_IMITATE_MS");
     const char *w_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_WAIT_MS");
     const char *n_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_THREADS");
-    int on = on_s && *on_s && *on_s != '0';
+    int on = on_s && *on_s ? *on_s != '0' : (vkb_mode() == VKB_MODE_PERFORMANCE);
     double im = im_s ? atof(im_s) : 0;
     vkb_dispatch *dt = &t->dt;
     if ((!on && im <= 0) || !dt->vkCreateGraphicsPipelines || !dt->vkDestroyPipeline || !dt->vkCmdBindPipeline) return;
@@ -833,7 +836,7 @@ void vkb_async_device_init(vkb_srv_table *t)
     if (!a) return;
     a->t = t;
     a->on = on;
-    a->fullscreen = on && atoi(on_s) >= 2;
+    a->fullscreen = on && on_s && atoi(on_s) >= 2;
     a->imitate_ms = im > 0 ? im : 0;
     a->wait_ms = w_s && *w_s ? atof(w_s) : ASYNC_WAIT_MS_DEFAULT;
     if (a->wait_ms < 0) a->wait_ms = 0;

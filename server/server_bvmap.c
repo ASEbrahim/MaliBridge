@@ -23,7 +23,7 @@
 /* As the descriptor set names (server_dsmap.c): 16 tag bits, never those of a driver pointer. */
 #define VKB_BV_TAG 0xBBBB000000000000ull
 #define VKB_BV_TAG_MASK 0xFFFF000000000000ull
-#define BV_BUCKETS 8192
+#define BV_BUCKETS 65536
 #define BV_TMPL_BUCKETS 256
 
 typedef struct bv_ent {
@@ -76,7 +76,7 @@ static int texel_type(VkDescriptorType ty)
 static unsigned bucket(uint64_t id)
 {
     id *= 0x9e3779b97f4a7c15ull;
-    return (unsigned)(id >> 51) & (BV_BUCKETS - 1);
+    return (unsigned)(id >> 48) & (BV_BUCKETS - 1);
 }
 
 static unsigned tmpl_bucket(VkDescriptorUpdateTemplate t)
@@ -92,16 +92,13 @@ static void missing(vkb_bvmap *m, const char *where, uint64_t id)
                 (unsigned long long)id, (unsigned long long)m->named);
 }
 
-/* Translates the view at *p in place: a client name becomes the driver's view, or null. */
-static void fix(vkb_bvmap *m, const char *where, VkBufferView *p)
+static inline void fix_locked(vkb_bvmap *m, const char *where, VkBufferView *p)
 {
     if (!tagged(*p)) return;
     uint64_t id = (uint64_t)*p;
-    pthread_mutex_lock(&m->lock);
     bv_ent *e = m->buckets[bucket(id)];
     while (e && e->id != id) e = e->next;
     *p = e ? e->view : VK_NULL_HANDLE;
-    pthread_mutex_unlock(&m->lock);
     if (!e) missing(m, where, id);
 }
 
@@ -115,10 +112,26 @@ static int any_named(vkb_bvmap *m)
 /* The request's own arrays are patched: they live in the server's receive buffer/arena. */
 static void fix_writes(vkb_bvmap *m, const char *where, uint32_t n, const VkWriteDescriptorSet *w)
 {
+    int any = 0;
+    for (uint32_t i = 0; i < n && !any; i++) {
+        if (!texel_type(w[i].descriptorType) || !w[i].pTexelBufferView) continue;
+        for (uint32_t j = 0; j < w[i].descriptorCount; j++) {
+            if (tagged(w[i].pTexelBufferView[j])) {
+                any = 1;
+                break;
+            }
+        }
+    }
+    if (!any) return;
+
+    pthread_mutex_lock(&m->lock);
     for (uint32_t i = 0; i < n; i++) {
         if (!texel_type(w[i].descriptorType) || !w[i].pTexelBufferView) continue;
-        for (uint32_t j = 0; j < w[i].descriptorCount; j++) fix(m, where, (VkBufferView *)&w[i].pTexelBufferView[j]);
+        for (uint32_t j = 0; j < w[i].descriptorCount; j++) {
+            fix_locked(m, where, (VkBufferView *)&w[i].pTexelBufferView[j]);
+        }
     }
+    pthread_mutex_unlock(&m->lock);
 }
 
 static void fix_template_data(vkb_bvmap *m, const char *where, VkDescriptorUpdateTemplate tmpl, const void *data)
@@ -127,12 +140,17 @@ static void fix_template_data(vkb_bvmap *m, const char *where, VkDescriptorUpdat
     pthread_mutex_lock(&m->lock);
     bv_tmpl *t = m->tmpls[tmpl_bucket(tmpl)];
     while (t && t->tmpl != tmpl) t = t->next;
-    pthread_mutex_unlock(&m->lock);
-    /* Read unlocked: the app may not destroy a template while it is being used. */
-    for (uint32_t i = 0; t && i < t->count; i++) {
-        const VkDescriptorUpdateTemplateEntry *e = &t->entries[i];
-        for (uint32_t j = 0; j < e->descriptorCount; j++) fix(m, where, (VkBufferView *)((uint8_t *)data + e->offset + (size_t)j * e->stride));
+    if (!t) {
+        pthread_mutex_unlock(&m->lock);
+        return;
     }
+    for (uint32_t i = 0; i < t->count; i++) {
+        const VkDescriptorUpdateTemplateEntry *e = &t->entries[i];
+        for (uint32_t j = 0; j < e->descriptorCount; j++) {
+            fix_locked(m, where, (VkBufferView *)((uint8_t *)data + e->offset + (size_t)j * e->stride));
+        }
+    }
+    pthread_mutex_unlock(&m->lock);
 }
 
 /* ------------------------------------------------------------------ wrappers */

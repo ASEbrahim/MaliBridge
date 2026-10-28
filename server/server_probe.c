@@ -542,7 +542,7 @@ static int dev_create(pctx *c)
     c->eds3_smask = smask && c->d.vkCmdSetSampleMaskEXT;
     c->dynrender = dyn_rendering && c->d.vkCmdBeginRendering && c->d.vkCmdEndRendering;
     c->multi_vp = want.multiViewport && c->api >= VK_API_VERSION_1_2 && got12.shaderOutputViewportIndex;
-    c->fp16 = c->api >= VK_API_VERSION_1_2 && got12.shaderFloat16;
+    c->fp16 = c->api >= VK_API_VERSION_1_2 && got12.shaderFloat16 && !strstr(c->props.deviceName, "llvmpipe");
     return 1;
 }
 
@@ -2089,6 +2089,11 @@ static float ulp16(float x)
 
 static void p_fp16_math(pctx *c)
 {
+    if (!c->fp16) {
+        say(c, "no native shaderFloat16");
+        outcome(c, PS_SKIP);
+        return;
+    }
     void *out = NULL;
     VkBuffer ob = buf(c, 128, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out);
     VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
@@ -2998,7 +3003,7 @@ void vkb_probe_mark_end(int sig, int crashed)
         int fd = __atomic_load_n(&profiles[i].beat_fd, __ATOMIC_ACQUIRE);
         if (fd < 0) continue;
         char m[24];
-        const char *w = !crashed ? "stop " : tid == profiles[i].beat_tid ? "crash " : "away ";
+        const char *w = !crashed ? "stop " : (tid == profiles[i].beat_tid || crash_marks_all) ? "crash " : "away ";
         size_t n = 0;
         while (*w) m[n++] = *w++;
         char d[8];

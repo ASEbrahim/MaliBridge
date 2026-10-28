@@ -92,18 +92,31 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
      * crash detail on the DroidDeck test branch). dladdr is not async-signal-safe; the process is
      * going down anyway. */
     uintptr_t pc = 0;
+    uintptr_t caller = 0;
+    uintptr_t rsp = 0;
 #if defined(__aarch64__)
-    if (uc) pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc;
+    if (uc) {
+        pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc;
+        rsp = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.sp;
+        caller = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.regs[30];
+    }
 #elif defined(__x86_64__) && defined(REG_RIP)
-    if (uc) pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+    if (uc) {
+        pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+        rsp = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RSP];
+    }
 #endif
     Dl_info di;
     memset(&di, 0, sizeof(di));
     int found = pc && dladdr((void *)pc, &di) && di.dli_fname;
+    if (!found && rsp) {
+        caller = *(uintptr_t *)rsp;
+        found = caller && dladdr((void *)caller, &di) && di.dli_fname;
+    }
     const char *lib = found ? strrchr(di.dli_fname, '/') : NULL;
-    int n = snprintf(buf, sizeof(buf), "vkbridge-server E crashed with signal %d (code %d, address %p) in %s, pc %p (%s+0x%lx)\n", sig,
-                     si ? si->si_code : 0, si ? si->si_addr : NULL, cmd, (void *)pc,
-                     found ? (lib ? lib + 1 : di.dli_fname) : "?", found ? (unsigned long)(pc - (uintptr_t)di.dli_fbase) : 0ul);
+    int n = snprintf(buf, sizeof(buf), "vkbridge-server E crashed with signal %d (code %d, address %p) in %s, pc %p (caller %p, %s+0x%lx)\n", sig,
+                     si ? si->si_code : 0, si ? si->si_addr : NULL, cmd, (void *)pc, (void *)caller,
+                     found ? (lib ? lib + 1 : di.dli_fname) : "?", found ? (unsigned long)((caller ? caller : pc) - (uintptr_t)di.dli_fbase) : 0ul);
     if (vkb_srv_replay_cb && n > 0 && n < (int)sizeof(buf)) {
         uint32_t done = vkb_srv_replay_n, first = done > VKB_REPLAY_RING ? done - VKB_REPLAY_RING : 0;
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "vkbridge-server E   replaying command buffer %p, command %u of its stream; the last ones:",

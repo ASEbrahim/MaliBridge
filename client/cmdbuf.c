@@ -30,9 +30,21 @@ vkb_enc *vkb_cmd_record_begin(VkCommandBuffer commandBuffer, uint32_t cmd)
     }
     vkb_enc *e = &cb->stream;
     /* entries start 8-aligned */
-    while (e->len & 7) vkb_enc_u8(e, 0);
-    vkb_enc_u32(e, cmd);
-    vkb_enc_u32(e, 0);
+    size_t pad = (8 - (e->len & 7)) & 7;
+    if (__builtin_expect(e->len + pad + 8 <= e->cap, 1)) {
+        if (pad) {
+            memset(e->buf + e->len, 0, pad);
+            e->len += pad;
+        }
+        uint32_t *hdr = (uint32_t *)(e->buf + e->len);
+        hdr[0] = cmd;
+        hdr[1] = 0;
+        e->len += 8;
+    } else {
+        while (e->len & 7) vkb_enc_u8(e, 0);
+        vkb_enc_u32(e, cmd);
+        vkb_enc_u32(e, 0);
+    }
     cb->entry = e->len;
     return e;
 }
@@ -41,11 +53,11 @@ void vkb_cmd_record_end(VkCommandBuffer commandBuffer)
 {
     vkb_cmdbuf *cb = vkb_cb(commandBuffer);
     vkb_enc *e = &cb->stream;
-    if (e->oom) {
+    if (__builtin_expect(e->oom != 0, 0)) {
         cb->broken = 1;
         return;
     }
-    if (e->nfds) {
+    if (__builtin_expect(e->nfds != 0, 0)) {
         VKB_ERR("internal: a recorded command carries a file descriptor");
         cb->broken = 1;
         e->nfds = 0;

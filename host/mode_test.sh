@@ -16,7 +16,7 @@
 #   5  imitated probe results (VKBRIDGE_PROBE_FAKE): a probe that ended in error keeps its
 #      emulation in safe mode only, a failed one gets it in both; the report's probe table says
 #      why, and its JSON carries both masks;
-#   6  the client's mode (the guest's VKBRIDGE_MODE): descriptor batching off in both modes;
+#   6  the client's mode (the guest's VKBRIDGE_MODE): descriptor batching off in safe mode, on in performance mode;
 #   7  the report diff tool warns first when two reports differ in mode;
 #   8  the protocol hash is unchanged.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
@@ -158,9 +158,9 @@ step $? "imitated results: push_descriptor error -> emulated in safe mode only (
 # 6
 start client
 msgs() { VKBRIDGE_STATS=100000 timeout 120 env "$@" "$out/desc_traffic_check" 2>&1 | grep -o '[0-9]* messages' | head -1; }
-ms=$(msgs VKBRIDGE_MODE=safe); mp=$(msgs VKBRIDGE_MODE=performance); mb=$(msgs VKBRIDGE_MODE=performance VKBRIDGE_DESC_BATCH=1)
-[ -n "$ms" ] && [ "$ms" = "$mp" ] && [ "$mb" != "$mp" ]
-step $? "client: descriptor batching off in both modes (safe $ms, performance $mp, VKBRIDGE_DESC_BATCH=1 $mb)"
+ms=$(msgs VKBRIDGE_MODE=safe); mp=$(msgs VKBRIDGE_MODE=performance); mo=$(msgs VKBRIDGE_MODE=performance VKBRIDGE_NO_DESC_BATCH=1)
+[ -n "$ms" ] && [ "$ms" = "$mo" ] && [ "$ms" != "$mp" ]
+step $? "client: descriptor batching off in safe ($ms), on in performance ($mp), VKBRIDGE_NO_DESC_BATCH=1 wins ($mo)"
 
 # 7
 stop

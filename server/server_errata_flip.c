@@ -833,7 +833,14 @@ static void record(vkb_errata_flip *s, const VkGraphicsPipelineCreateInfo *ci, p
         }
     }
     const VkPipelineLibraryCreateInfoKHR *links = chain_find(ci->pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR);
-    if (keep && links && links->libraryCount && !(r->libs = malloc(links->libraryCount * sizeof(*r->libs)))) keep = 0;
+    if (links && links->libraryCount && (r->libs = malloc(links->libraryCount * sizeof(*r->libs)))) {
+        pthread_mutex_lock(&s->lock);
+        for (uint32_t k = 0; k < links->libraryCount; k++) {
+            r->libs[r->nlibs++] = (uint64_t)links->pLibraries[k];
+            obj_ref_locked(s, (uint64_t)links->pLibraries[k], OBJ_PIPELINE);
+        }
+        pthread_mutex_unlock(&s->lock);
+    }
     pthread_mutex_lock(&s->lock);
     if (keep) {
         r->can_vary = 1;
@@ -841,10 +848,6 @@ static void record(vkb_errata_flip *s, const VkGraphicsPipelineCreateInfo *ci, p
         r->layout = ci->layout;
         obj_ref_locked(s, (uint64_t)r->rp, OBJ_RENDER_PASS);
         obj_ref_locked(s, (uint64_t)r->layout, OBJ_LAYOUT);
-        for (uint32_t k = 0; links && k < links->libraryCount; k++) {
-            r->libs[r->nlibs++] = (uint64_t)links->pLibraries[k];
-            obj_ref_locked(s, (uint64_t)links->pLibraries[k], OBJ_PIPELINE);
-        }
         s->retained += r->enc_len;
     } else {
         for (uint32_t k = 0; k < r->nstages; k++) blob_put_locked(s, r->mods[k]);

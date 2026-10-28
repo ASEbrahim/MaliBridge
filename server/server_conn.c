@@ -166,6 +166,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
             if (t->is_device) {
                 VKB_INFO("process %d exited without destroying device %u; cleaning up", p->pid, t->id);
                 vkb_async_device_destroy(t);
+                vkb_vidyn_device_destroy(t);
                 vkb_emu_device_quiesce(t);
                 vkb_cbfail_device_destroy(t);
                 if (t->real.vkDeviceWaitIdle) t->real.vkDeviceWaitIdle(t->device);
@@ -532,11 +533,16 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
     }
     VkResult begin_r = VK_SUCCESS;
     size_t pos = 0;
-    vkb_enc scratch;
-    vkb_enc_init(&scratch);
     uint32_t ncmds = 0;
     vkb_srv_replay_cb = cb;
     vkb_srv_replay_n = 0;
+    vkb_srv_call sub;
+    memset(&sub, 0, sizeof(sub));
+    vkb_enc_init(&sub.r);
+    sub.dt = c->dt;
+    sub.table = c->table;
+    sub.conn = c->conn;
+    sub.in_stream = 1;
     while (s && pos + 8 <= len) {
         uint32_t id, n;
         memcpy(&id, s + pos, 4);
@@ -546,24 +552,18 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
             VKB_ERR("command stream: bad entry (id %u, %u bytes) after %u commands", id, n, ncmds);
             c->status = VKB_ST_BAD_MESSAGE;
             vkb_srv_replay_cb = VK_NULL_HANDLE;
-            vkb_enc_free(&scratch);
+            vkb_enc_free(&sub.r);
+            vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
             return;
         }
-        vkb_srv_call sub;
-        memset(&sub, 0, sizeof(sub));
         vkb_dec_init(&sub.d, s + pos, n, c->d.arena, NULL, 0);
-        sub.r = scratch;
         vkb_enc_reset(&sub.r);
-        sub.dt = c->dt;
-        sub.table = c->table;
-        sub.conn = c->conn;
-        sub.in_stream = 1;
+        sub.status = VKB_ST_OK;
+        sub.nclose = 0;
         vkb_srv_current_cmd = vkb_cmd_names[id];
         vkb_srv_replay_ring[ncmds % VKB_REPLAY_RING] = vkb_cmd_names[id];
         vkb_srv_replay_n = ncmds + 1;
         vkb_srv_handlers[id](&sub);
-        vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
-        scratch = sub.r;
         if (sub.status != VKB_ST_OK) {
             VKB_ERR("command stream: %s failed (status %u)", vkb_cmd_names[id], sub.status);
             if (id == VKB_CMD_vkBeginCommandBuffer) {
@@ -572,12 +572,13 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
                 VKB_ERR("command stream: command buffer %p not begun; its %zu bytes of commands are dropped", (void *)cb, len);
                 failed_set(cb, 1);
                 vkb_srv_replay_cb = VK_NULL_HANDLE;
-                vkb_enc_free(&scratch);
+                vkb_enc_free(&sub.r);
                 vkb_enc_u32(&c->r, (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY);
+                vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
                 return;
             }
         }
-        if (id == VKB_CMD_vkBeginCommandBuffer && scratch.len >= 4) memcpy(&begin_r, scratch.buf, 4);
+        if (id == VKB_CMD_vkBeginCommandBuffer && sub.r.len >= 4) memcpy(&begin_r, sub.r.buf, 4);
         if (id == VKB_CMD_vkBeginCommandBuffer && begin_r == VK_SUCCESS && test_begin_fail()) {
             c->dt->vkEndCommandBuffer(cb); /* begun by the driver: the test's refusal leaves it ended */
             begin_r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -590,14 +591,15 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
                     "and submits leave it out", (void *)cb, begin_r, len);
             failed_set(cb, 1);
             vkb_srv_replay_cb = VK_NULL_HANDLE;
-            vkb_enc_free(&scratch);
+            vkb_enc_free(&sub.r);
             vkb_enc_u32(&c->r, (uint32_t)begin_r);
+            vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
             return;
         }
         pos += (n + 7) & ~(size_t)7;
         ncmds++;
     }
-    vkb_enc_free(&scratch);
+    vkb_enc_free(&sub.r);
     vkb_srv_current_cmd = "vkEndCommandBuffer (the driver's, after the stream)";
     VkResult r = c->dt->vkEndCommandBuffer(cb);
     vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
@@ -950,6 +952,9 @@ void vkb_srv_serve(int lfd)
             VKB_ERR("accept: %s", strerror(errno));
             continue;
         }
+        int buf_sz = 2 * 1024 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof(buf_sz));
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
         vkb_srv_conn *conn = calloc(1, sizeof(*conn));
         conn->sock = s;
         pthread_attr_t attr;

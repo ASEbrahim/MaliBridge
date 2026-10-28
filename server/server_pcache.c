@@ -932,24 +932,20 @@ static void *saver(void *arg)
     for (;;) {
         struct timespec ts = {PC_SAVE_PERIOD_S, 0};
         nanosleep(&ts, NULL);
-        /* A cache is unlinked under pc_lock but freed only under save_lock (device_destroy), so
-         * with save_lock held every cache reached through the list stays valid; pc_lock is taken
-         * only to step, and a new device does not wait for a save. */
+        /* A cache is unlinked under pc_lock and freed under save_lock (device_destroy), so
+         * with save_lock held every cache reached through the list stays valid; pc_lock is held
+         * while stepping the list so unlinks don't race with traversal. */
         pthread_mutex_lock(&save_lock);
         time_t now = mono_s();
         pthread_mutex_lock(&pc_lock);
-        vkb_pcache *p = pc_list;
-        pthread_mutex_unlock(&pc_lock);
-        while (p) {
+        for (vkb_pcache *p = pc_list; p; p = p->next) {
             if (__atomic_load_n(&p->dirty, __ATOMIC_RELAXED) && save_due(p, now)) {
                 merge_apps(p, 0);
                 save(p);
                 p->last_save = now;
             }
-            pthread_mutex_lock(&pc_lock);
-            p = p->next;
-            pthread_mutex_unlock(&pc_lock);
         }
+        pthread_mutex_unlock(&pc_lock);
         pthread_mutex_unlock(&save_lock);
     }
     return NULL;
@@ -1288,18 +1284,17 @@ void vkb_pcache_device_destroy(vkb_srv_table *t)
 {
     vkb_pcache *p = t->pcache;
     if (!p) return;
+    pthread_mutex_lock(&save_lock); /* serialize with saver: p stays valid and caches are untouched */
     pthread_mutex_lock(&pc_lock);
     for (vkb_pcache **pp = &pc_list; *pp; pp = &(*pp)->next) {
         if (*pp == p) {
-            *pp = p->next; /* p->next is left as it was: the saver may be stepping from p */
+            *pp = p->next;
             break;
         }
     }
     pthread_mutex_unlock(&pc_lock);
-    pthread_mutex_lock(&save_lock); /* after the saver's save of it, if it is in one */
     if (merge_apps(p, 1)) p->dirty = 1;
     if (p->dirty) save(p);
-    pthread_mutex_unlock(&save_lock);
     t->dt.vkCreateGraphicsPipelines = p->create_gfx;
     t->dt.vkCreateComputePipelines = p->create_compute;
     t->dt.vkCreatePipelineCache = p->create_cache;
@@ -1314,4 +1309,5 @@ void vkb_pcache_device_destroy(vkb_srv_table *t)
     pthread_mutex_destroy(&p->alock);
     t->pcache = NULL;
     free(p);
+    pthread_mutex_unlock(&save_lock);
 }

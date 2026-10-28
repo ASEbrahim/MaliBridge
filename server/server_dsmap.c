@@ -20,7 +20,7 @@
  * pointers in their top byte (0xb4...), so Mali's own set handles had it set too (tablet run 6). */
 #define VKB_DS_TAG 0xDDDD000000000000ull
 #define VKB_DS_TAG_MASK 0xFFFF000000000000ull
-#define DS_BUCKETS 8192
+#define DS_BUCKETS 65536
 #define DS_LOCAL 64
 
 typedef struct ds_ent {
@@ -66,7 +66,7 @@ typedef struct vkb_dsmap {
 static unsigned bucket(uint64_t id)
 {
     id *= 0x9e3779b97f4a7c15ull;
-    return (unsigned)(id >> 51) & (DS_BUCKETS - 1);
+    return (unsigned)(id >> 48) & (DS_BUCKETS - 1);
 }
 
 static vkb_dsmap *cur(void)
@@ -80,15 +80,22 @@ static int tagged(VkDescriptorSet s)
     return ((uint64_t)s & VKB_DS_TAG_MASK) == VKB_DS_TAG;
 }
 
+/* Unlocked lookup: caller must hold m->lock */
+static inline VkDescriptorSet lookup_locked(vkb_dsmap *m, VkDescriptorSet s)
+{
+    if (!tagged(s)) return s;
+    uint64_t id = (uint64_t)s;
+    ds_ent *e = m->buckets[bucket(id)];
+    while (e && e->id != id) e = e->next;
+    return e ? e->set : VK_NULL_HANDLE;
+}
+
 /* The driver's set for a client name; VK_NULL_HANDLE when its allocation failed. */
 static VkDescriptorSet lookup(vkb_dsmap *m, VkDescriptorSet s)
 {
     if (!tagged(s)) return s;
-    uint64_t id = (uint64_t)s;
     pthread_mutex_lock(&m->lock);
-    ds_ent *e = m->buckets[bucket(id)];
-    while (e && e->id != id) e = e->next;
-    VkDescriptorSet r = e ? e->set : VK_NULL_HANDLE;
+    VkDescriptorSet r = lookup_locked(m, s);
     pthread_mutex_unlock(&m->lock);
     return r;
 }
@@ -311,11 +318,12 @@ static void VKAPI_CALL ds_UpdateDescriptorSets(VkDevice device, uint32_t nw, con
     uint32_t kw = 0, kc = 0;
     /* DXVK writes one set per call, a write per binding: one lookup for the run. */
     VkDescriptorSet from = VK_NULL_HANDLE, to = VK_NULL_HANDLE;
+    pthread_mutex_lock(&m->lock);
     for (uint32_t i = 0; i < nw; i++) {
         w2[kw] = w[i];
         if (w[i].dstSet != from || !from) {
             from = w[i].dstSet;
-            to = lookup(m, from);
+            to = lookup_locked(m, from);
         }
         w2[kw].dstSet = to;
         if (w2[kw].dstSet) kw++;
@@ -323,11 +331,12 @@ static void VKAPI_CALL ds_UpdateDescriptorSets(VkDevice device, uint32_t nw, con
     }
     for (uint32_t i = 0; i < nc; i++) {
         c2[kc] = cp[i];
-        c2[kc].srcSet = lookup(m, cp[i].srcSet);
-        c2[kc].dstSet = lookup(m, cp[i].dstSet);
+        c2[kc].srcSet = lookup_locked(m, cp[i].srcSet);
+        c2[kc].dstSet = lookup_locked(m, cp[i].dstSet);
         if (c2[kc].srcSet && c2[kc].dstSet) kc++;
         else missing(m, "vkUpdateDescriptorSets (copy)");
     }
+    pthread_mutex_unlock(&m->lock);
     if (kw || kc) m->update(device, kw, w2, kc, c2);
 out:
     if (w2 != w_local) free(w2);
@@ -406,11 +415,27 @@ static VkResult VKAPI_CALL ds_AllocateDescriptorSets(VkDevice device, const VkDe
 /* Translates n sets into out; 0 when one of them does not exist. */
 static int translate(vkb_dsmap *m, uint32_t n, const VkDescriptorSet *in, VkDescriptorSet *out)
 {
+    int any_tagged = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (tagged(in[i])) {
+            any_tagged = 1;
+            break;
+        }
+    }
+    if (!any_tagged) {
+        for (uint32_t i = 0; i < n; i++) out[i] = in[i];
+        return 1;
+    }
+    pthread_mutex_lock(&m->lock);
     for (uint32_t i = 0; i < n; i++) {
         /* VK_NULL_HANDLE is allowed in binds (graphicsPipelineLibrary) and stays so. */
-        out[i] = in[i] ? lookup(m, in[i]) : VK_NULL_HANDLE;
-        if (in[i] && !out[i]) return 0;
+        out[i] = in[i] ? lookup_locked(m, in[i]) : VK_NULL_HANDLE;
+        if (in[i] && !out[i]) {
+            pthread_mutex_unlock(&m->lock);
+            return 0;
+        }
     }
+    pthread_mutex_unlock(&m->lock);
     return 1;
 }
 

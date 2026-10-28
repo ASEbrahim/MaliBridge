@@ -303,8 +303,9 @@ void vkb_emu_polygon_created(vkb_emu_device *e, VkDevice device, VkPipelineCache
     rec->dyn_topo = info->dyn_topo;
     rec->dyn_restart = info->dyn_restart;
     pthread_mutex_lock(&s->lock);
-    rec->next = s->b[ph(p)];
-    s->b[ph(p)] = rec;
+    unsigned idx = ph(p);
+    rec->next = s->b[idx];
+    __atomic_store_n(&s->b[idx], rec, __ATOMIC_RELEASE);
     uint64_t n = ++s->n_variants;
     pthread_mutex_unlock(&s->lock);
     __atomic_store_n(&s->live, 1, __ATOMIC_RELEASE);
@@ -315,8 +316,10 @@ void vkb_emu_polygon_created(vkb_emu_device *e, VkDevice device, VkPipelineCache
 
 static int find_rec(poly_dev *s, VkPipeline p, poly_rec *out)
 {
+    unsigned idx = ph(p);
+    if (!__atomic_load_n(&s->b[idx], __ATOMIC_ACQUIRE)) return 0;
     pthread_mutex_lock(&s->lock);
-    poly_rec *r = s->b[ph(p)];
+    poly_rec *r = s->b[idx];
     while (r && r->p != p) r = r->next;
     if (r) *out = *r;
     pthread_mutex_unlock(&s->lock);
@@ -328,10 +331,11 @@ static VKAPI_ATTR void VKAPI_CALL p_DestroyPipeline(VkDevice device, VkPipeline 
     poly_dev *s = pdev();
     if (p && live(s)) {
         pthread_mutex_lock(&s->lock);
-        poly_rec **pp = &s->b[ph(p)];
+        unsigned idx = ph(p);
+        poly_rec **pp = &s->b[idx];
         while (*pp && (*pp)->p != p) pp = &(*pp)->next;
         poly_rec *r = *pp;
-        if (r) *pp = r->next;
+        if (r) __atomic_store_n(pp, r->next, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&s->lock);
         if (r) vkb_emu_real()->vkDestroyPipeline(device, r->variant, NULL);
         free(r);

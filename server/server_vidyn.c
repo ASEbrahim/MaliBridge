@@ -561,10 +561,14 @@ static VkResult vi_edit(VkGraphicsPipelineCreateInfo *ci, vkb_arena *arena, void
         VkDynamicState s = ci->pDynamicState->pDynamicStates[i];
         if (s != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT && s != VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE) list[nl++] = s;
     }
-    *dyn = *ci->pDynamicState;
-    dyn->dynamicStateCount = nl;
-    dyn->pDynamicStates = list;
-    ci->pDynamicState = dyn;
+    if (nl) {
+        *dyn = *ci->pDynamicState;
+        dyn->dynamicStateCount = nl;
+        dyn->pDynamicStates = list;
+        ci->pDynamicState = dyn;
+    } else {
+        ci->pDynamicState = NULL;
+    }
     /* made when it is needed: never "compile required" */
     ci->flags &= ~(VkPipelineCreateFlags)(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT | VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT);
     for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
