@@ -2,6 +2,7 @@
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  */
 #include "capabilities.h"
+#include "layer_crash.h"
 #include "layer_ctx.h"
 
 #include <vulkan/vk_layer.h>
@@ -298,6 +299,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateDevice(
     vkb_table_register(dev_table);
 
     ScopedLayerContext scope(ctx);
+    layer_crash_install(); /* before the guard: its contained crashes need the handler */
     vkb_guard_device_init(dev_table);
     vkb_errata_device_init(dev_table);
     vkb_emu_device_init(dev_table, emu);

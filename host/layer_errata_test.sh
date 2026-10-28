@@ -14,7 +14,10 @@
 #
 #   4  the bridge's query and device-creation fixes in the layer: fp16_hide (MK-20) and gs_hide
 #      (issue #11) shown and enforced (fp16_check, gshide_check), the extension hiding
-#      (VKBRIDGE_SERVER_HIDE_EXTS, vulkaninfo).
+#      (VKBRIDGE_SERVER_HIDE_EXTS, vulkaninfo); a driver crash inside a pipeline compile fails that
+#      call (crash_contain_check with VKBRIDGE_TEST_CRASH_PIPELINE=1), the process's own faults
+#      still reach its own handler (layer_sigchain_check), and without the layer's handler
+#      (VKBRIDGE_LAYER_CRASH_HANDLER=0) the same crash ends the process.
 #
 # Not here, unlike the bridge's test: the probe-driven errata (the layer runs no startup probe),
 # the "same decisions again" short line (one device per process in the layer), and the protocol
@@ -120,7 +123,7 @@ fix=$(echo "$calls" | grep -o 'example: [0-9]*' | grep -o '[0-9]*'); imi=$(echo 
   [ "$(echo "$new" | grep -c 'null descriptor stand-in made')" -ge 6 ]
 step $? "the layer's own views through the fix and the imitation beneath: ${fix:-0} and ${imi:-0} ($(tail -1 $work/3.log))"
 
-# 4 the query and device-creation fixes
+# 4 the query and device-creation fixes, and crash containment
 clean_env="-u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_SERVER_HIDE_EXTS -u VKBRIDGE_ERRATA -u VKBRIDGE_ERRATA_IMITATE -u VKBRIDGE_MODE -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_GS_HIDE_PROCS"
 got=$(env $clean_env VKBRIDGE_ERRATA=+fp16_hide timeout 60 "$out/fp16_check" enable 2>&1)
 echo "$got" | grep -q '^features: v12.shaderFloat16=0 ext.shaderFloat16=0 v11.storageBuffer16BitAccess=1' &&
@@ -141,4 +144,18 @@ if command -v vulkaninfo >/dev/null 2>&1; then
   [ -n "$ext" ] && [ "$a" -gt 0 ] && [ "$b" = 0 ]
   step $? "VKBRIDGE_SERVER_HIDE_EXTS=$ext: listed $a time(s) before, $b after"
 fi
+got=$(env $clean_env VKBRIDGE_TEST_CRASH_PIPELINE=1 timeout 120 "$out/crash_contain_check" 2>&1); r=$?
+[ $r = 0 ] && ! echo "$got" | grep -q '^FAIL' && [ "$(echo "$got" | grep -c 'CONTAINED driver crash')" = 3 ]
+step $? "driver crashes in compiles contained: $(echo "$got" | grep -c '^PASS') checks pass, $(echo "$got" | grep -c 'CONTAINED driver crash') contained (exit $r)"
+env $clean_env VKBRIDGE_LAYER_CRASH_HANDLER=0 VKBRIDGE_TEST_CRASH_PIPELINE=1 timeout 120 "$out/crash_contain_check" >/dev/null 2>&1; r=$?
+[ $r != 0 ]
+step $? "without the layer's handler the same crash ends the process (exit $r)"
+if cc -O1 -I../third_party/Vulkan-Headers-1.4.341/include -o "$work/layer_sigchain_check" ../tests/layer_sigchain_check.c -ldl 2>/dev/null; then
+  got=$(env $clean_env timeout 60 "$work/layer_sigchain_check" 2>&1); r=$?
+  [ $r = 0 ] && echo "$got" | grep -q '^OK'
+  step $? "the process's own faults reach its own handler: $(echo "$got" | grep -c '^PASS') checks pass (exit $r)"
+else
+  step 1 "cannot build layer_sigchain_check"
+fi
+
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi
