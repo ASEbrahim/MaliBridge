@@ -29,6 +29,11 @@
  * gl_PerVertex blocks (spirv_pervertex.c); loose ones crash Mali's compiler (tablet run 8, Steam's
  * first Zink pipeline). Those modules are rewritten into new code, not in place.
  *
+ * And, with its own switch: workgroup variables declared with an initializer zeroed by one invocation
+ * of each workgroup (spirv_wgzero.h): Mali's own initialization of them cost Crash Bandicoot 4's
+ * DXVK 3.x compute shaders 69 of 186 ms of GPU time a frame. On for ARM GPUs; VKBRIDGE_WG_ZERO=1/0
+ * forces it.
+ *
  * And, with its own switch: an optimization barrier after every left shift by a constant
  * (spirv_shlbarrier.c, Lee Gao's MaliOptimizationBarrierPass): Mali's compiler folds such a shift
  * into the memory accesses around it and can turn them speculative - GPU faults, a lost device.
@@ -57,6 +62,7 @@
 #include "spirv_lockstep.h"
 #include "spirv_shmbarrier.h"
 #include "spirv_wave32.h"
+#include "spirv_wgzero.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -112,6 +118,8 @@ typedef struct vkb_spvfix {
     int told_fail;         /* the first refused compute pipeline logged */
     int fixes;           /* VKBRIDGE_SPIRV_FIX: the composites, per-vertex blocks, YCbCr samplers */
     int shl;             /* VKBRIDGE_SHL_BARRIER: barriers after constant left shifts */
+    int wgzero;          /* VKBRIDGE_WG_ZERO: workgroup variable initializers done by one invocation */
+    unsigned long wgz_modules, wgz_vars;
     unsigned long shl_modules, shl_barriers, shl_seen;
     int shm;             /* VKBRIDGE_SHARED_BARRIER: barriers between shared-memory writes and reads
                             (1: at the top level, 2: also inside workgroup-uniform ifs and loops) */
@@ -352,6 +360,25 @@ static uint32_t *subst_code(vkb_spvfix *f, const uint32_t *code, size_t size, si
     return out;
 }
 
+/* The wg_zero rewrite of one module's code; NULL when nothing changes. */
+static uint32_t *wg_zero(vkb_spvfix *f, const uint32_t *code, size_t size, size_t *out_size)
+{
+    if (!f->wgzero) return NULL;
+    uint32_t *out = NULL;
+    unsigned vars = 0;
+    const char *why = NULL;
+    int r = vkb_spv_wg_zero(code, size, &out, out_size, &vars, &why);
+    if (r < 0) {
+        VKB_ONCE(VKB_LOG_WARN, "SPIR-V fix: wg_zero: a module left as it is (%s)", why);
+        return NULL;
+    }
+    if (r == 0) return NULL;
+    unsigned long before = __atomic_fetch_add(&f->wgz_modules, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&f->wgz_vars, vars, __ATOMIC_RELAXED);
+    if (!before) VKB_INFO("SPIR-V fix: wg_zero: workgroup variable initializers done by one invocation (first module: %u)", vars);
+    return out;
+}
+
 /* The shl_barrier rewrite of one module's code; NULL when nothing changes. */
 static uint32_t *shl_barrier(vkb_spvfix *f, const uint32_t *code, size_t size, size_t *out_size)
 {
@@ -502,7 +529,7 @@ static uint32_t *wave32(vkb_spvfix *f, const uint32_t *code, size_t size, const 
     return out;
 }
 
-/* The rewrites of one module's code (per-vertex blocks when pervertex, then shl_barrier, then
+/* The rewrites of one module's code (wg_zero, per-vertex blocks when pervertex, then shl_barrier, then
  * shm_barrier, then wave32): new
  * code (malloc'd) or NULL when nothing changes. shl_barrier's output is named by the code it came
  * from (vkb_errata_spv_origin); the per-vertex rewrite's keeps its own name, as before. */
@@ -511,6 +538,11 @@ static uint32_t *rewrite(vkb_spvfix *f, const uint32_t *code, size_t size, int p
     size_t s1 = 0, s2 = 0;
     uint32_t *c1 = subst_code(f, code, size, &s1), *c2;
     if (c1) vkb_errata_spv_origin(c1, s1, code, size);
+    if ((c2 = wg_zero(f, c1 ? c1 : code, c1 ? s1 : size, &s2))) {
+        vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
+        free(c1);
+        c1 = c2, s1 = s2;
+    }
     if (f->fixes && pervertex && (c2 = wrap_pervertex(c1 ? c1 : code, c1 ? s1 : size, &s2))) {
         free(c1);
         c1 = c2, s1 = s2;
@@ -571,7 +603,7 @@ static void rewrite_stage(vkb_spvfix *f, const VkPipelineShaderStageCreateInfo *
 {
     int pervertex = (st->stage & (VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) != 0;
-    if (!f->shl && !f->shm && !f->wave32 && !f->subst && !(f->fixes && pervertex)) return;
+    if (!f->shl && !f->shm && !f->wave32 && !f->subst && !f->wgzero && !(f->fixes && pervertex)) return;
     for (VkBaseInStructure *b = (VkBaseInStructure *)st->pNext; b; b = (VkBaseInStructure *)b->pNext) {
         if (b->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) continue;
         VkShaderModuleCreateInfo *mi = (VkShaderModuleCreateInfo *)b;
@@ -898,6 +930,8 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
      * shift and, once, the driver's pipeline cache entries of the modules it changes) */
     const char *shl_env = vkb_srv_env("VKBRIDGE_SHL_BARRIER");
     int shl = shl_env && *shl_env ? strcmp(shl_env, "0") != 0 : arm;
+    const char *wgz_env = vkb_srv_env("VKBRIDGE_WG_ZERO");
+    int wgz = wgz_env && *wgz_env ? strcmp(wgz_env, "0") != 0 : arm;
     /* shm_barrier: only when asked for (a per-game preset): it adds barriers, which cost time */
     const char *shm_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER");
     int shm = shm_env && *shm_env && strcmp(shm_env, "0") != 0 ? (strcmp(shm_env, "2") ? 1 : 2) : 0;
@@ -923,7 +957,7 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
      * VK_ERROR_UNKNOWN, every game black, MaliBridge#20). VKBRIDGE_YCBCR_SWAP=0/1 overrides. */
     const char *yc_env = vkb_srv_env("VKBRIDGE_YCBCR_SWAP");
     int ycs = yc_env && *yc_env ? strcmp(yc_env, "0") != 0 : on || p.vendorID == 0x144D;
-    int spv = on || shl || shm || w32 || subst;
+    int spv = on || shl || shm || w32 || subst || wgz;
     /* Installed on every GPU: the sampler and layout hooks count YCbCr samplers for the failure
      * line (they run when such objects are made, never per frame); the module and pipeline hooks
      * only where a SPIR-V change is on (they keep copies of every module). */
@@ -935,6 +969,7 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     f->fixes = on;
     f->ycbcr_swap = ycs;
     f->shl = shl;
+    f->wgzero = wgz;
     f->shm = shm;
     f->shm_dump = shm_dump;
     f->dump_max = max_env && *max_env ? strtoul(max_env, NULL, 10) : 1024;
@@ -970,9 +1005,9 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     dt->vkDestroyPipelineLayout = fx_DestroyPipelineLayout;
     t->spvfix = f;
     if (!spv && !ycs && !(yc_env && *yc_env)) return; /* only counting: nothing to say */
-    VKB_INFO("device %u: Mali SPIR-V fixes %s, YCbCr compute samplers %s%s, shl_barrier %s%s%s", t->id, on ? "on" : "off",
-             ycs ? "swapped" : "kept", yc_env && *yc_env ? " (VKBRIDGE_YCBCR_SWAP)" : "", shl ? "on" : "off",
-             shl_env && *shl_env ? " (VKBRIDGE_SHL_BARRIER)" : "", shm == 2   ? ", shm_barrier on, level 2 (VKBRIDGE_SHARED_BARRIER)"
+    VKB_INFO("device %u: Mali SPIR-V fixes %s, YCbCr compute samplers %s%s, wg_zero %s%s, shl_barrier %s%s%s", t->id,
+             on ? "on" : "off", ycs ? "swapped" : "kept", yc_env && *yc_env ? " (VKBRIDGE_YCBCR_SWAP)" : "", wgz ? "on" : "off",
+             wgz_env && *wgz_env ? " (VKBRIDGE_WG_ZERO)" : "", shl ? "on" : "off", shl_env && *shl_env ? " (VKBRIDGE_SHL_BARRIER)" : "", shm == 2   ? ", shm_barrier on, level 2 (VKBRIDGE_SHARED_BARRIER)"
              : shm ? ", shm_barrier on (VKBRIDGE_SHARED_BARRIER)"
                    : "");
     if (f->shm_only || f->shm_skip)
