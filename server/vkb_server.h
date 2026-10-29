@@ -120,6 +120,11 @@ typedef struct vkb_srv_table {
     PFN_vkGetPhysicalDeviceFeatures2 gs_f2;
     PFN_vkGetPhysicalDeviceProperties gs_p1;
     PFN_vkGetPhysicalDeviceProperties2 gs_p2;
+    /* instance: the queries beneath msaa2_as_4's (server_errata_msaa2.c) */
+    PFN_vkGetPhysicalDeviceProperties ms_p1;
+    PFN_vkGetPhysicalDeviceProperties2 ms_p2;
+    PFN_vkGetPhysicalDeviceImageFormatProperties ms_if1;
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 ms_if2;
 } vkb_srv_table;
 
 /* server_main.c */
@@ -267,7 +272,8 @@ enum {
     VKB_ERRATUM_VB_BAKE,         /* MK-05 option B: dynamic strides wrong in single-binding calls too */
     VKB_ERRATUM_GS_HIDE,         /* issue #11: r38p1 beta segfaults compiling Zink's geometry shaders */
     VKB_ERRATUM_NAN_POSITION,    /* MK-45 a NaN clip-space position rasterized over the whole target (Mali-G77 r32p1) */
-    VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
+    VKB_ERRATUM_MSAA2_AS_4,      /* MK-46 no 2x multisampling (1x and 4x only); D3D9 games that ask for 2x quit */
+    VKB_ERRATUM_EXAMPLE,        /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };
 enum { VKB_ERRATA_PROBE_NOT_RUN, VKB_ERRATA_PROBE_PASS, VKB_ERRATA_PROBE_FAIL };
@@ -334,6 +340,11 @@ int vkb_errata_gs_driver(const vkb_srv_table *inst, VkPhysicalDevice pd, char *w
 int vkb_errata_gs_process(const vkb_srv_proc *p);    /* the process half alone: its name is in the list */
 void vkb_errata_gs_instance_install(vkb_srv_table *inst); /* over every other query wrapper: last */
 void vkb_errata_gs_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci);
+/* msaa2_as_4 (MK-46, server_errata_msaa2.c): 1 when this physical device's clients are offered 2x
+ * multisampling the driver lacks (it has 4x) - the erratum's decision (VKBRIDGE_ERRATA=-msaa2_as_4
+ * turns it off) and the driver's sample counts; why (may be NULL) gets the reason */
+int vkb_errata_msaa2_shown(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
+void vkb_errata_msaa2_instance_install(vkb_srv_table *inst); /* the property and image format queries */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);

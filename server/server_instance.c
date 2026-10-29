@@ -263,6 +263,7 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         vkb_promote_instance_install(t);
         vkb_vidyn_instance_install(t); /* over the promotion's feature query */
         vkb_errata_gs_instance_install(t); /* issue #11: over all of them, its processes only */
+        vkb_errata_msaa2_instance_install(t); /* MK-46: 2x sample counts over every other query */
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);

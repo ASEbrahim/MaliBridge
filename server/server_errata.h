@@ -29,6 +29,7 @@ typedef struct vkb_errata_dev {
     struct vkb_errata_ds *ds;       /* server_errata_ds.c (MK-11) */
     struct vkb_errata_vbbake *vbbake;  /* server_errata_vbbake.c (MK-05 option B) */
     struct vkb_errata_nanpos *nanpos;  /* server_errata_nanpos.c (MK-45) */
+    struct vkb_errata_msaa2 *msaa2;    /* server_errata_msaa2.c (MK-46) */
     struct vkb_vbbake_imi *vbbake_imi;
     int probe; /* the startup probe's: an imitation only, for one probe (vkb_errata_probe_begin);
                   it publishes nothing a server thread without a table would fall back to, and logs
@@ -111,6 +112,11 @@ void vkb_errata_stencil_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_nanpos_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_nanpos_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_ds_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+/* server_errata_msaa2.c: msaa2_as_4 (MK-46), 2x images, render passes and pipelines made with 4
+ * samples where the driver has 4x and not 2x; the queries are vkb_errata_msaa2_instance_install's */
+void vkb_errata_msaa2_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_msaa2_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+int vkb_errata_msaa2_driver_lacks(const vkb_srv_table *t, VkPhysicalDevice pd);
 
 /* A module an erratum rewrote is named by the code it came from (vkb_spv_app_hash): registers
  * the new code's hash -> the app's hash of `in` (itself maybe an erratum's output); 1 when the

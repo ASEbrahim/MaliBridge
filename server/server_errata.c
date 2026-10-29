@@ -49,7 +49,8 @@
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
  * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16),
- * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), gs_hide (issue #11), and example: a no-op on
+ * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), gs_hide (issue #11),
+ * nan_position (MK-45), msaa2_as_4 (MK-46), and example: a no-op on
  * vkCreateImageView that counts the calls reaching it (and its imitation the calls beneath it),
  * the pattern a fix follows.
  */
@@ -181,6 +182,14 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_NAN_POSITION] = {"nan_position", "MK-45", NULL, 0, G_IN_RANGE, G_IN_RANGE,
         {{V(32, 0), V(33, 0), FAM_ANY, NULL, "Mali-G77 r32p1: NaN positions rasterized as full-screen sheets"}},
         vkb_errata_nanpos_install, NULL},
+    /* Not a bug: the Mali-G77's r32p1 (Retroid Pocket 4 Pro) multisamples at 1x and 4x only, which
+     * Vulkan allows. DXVK 1.10's D3D9 reports 2x to the game anyway and then cannot make the
+     * texture, and a game that asked for it quits: Tales of Symphonia (372360) closed its window
+     * at once ("D3D9: Cannot create texture ... Samples: 2"). 2x is offered and made with 4
+     * samples (server_errata_msaa2.c); a driver with 2x of its own is left alone. */
+    [VKB_ERRATUM_MSAA2_AS_4] = {"msaa2_as_4", "MK-46", NULL, 0, G_ALWAYS, G_ALWAYS,
+        {{V(0, 0), V_MAX, FAM_ANY, NULL, "drivers with 1x and 4x multisampling only"}},
+        vkb_errata_msaa2_install, NULL},
     [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
 };
 
@@ -706,6 +715,7 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
     vkb_errata_ds_destroy(t, e);
     vkb_errata_vbbake_destroy(e);
     vkb_errata_nanpos_destroy(t, e);
+    vkb_errata_msaa2_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -766,6 +776,48 @@ int vkb_errata_fp16_hidden(const vkb_srv_table *t, VkPhysicalDevice pd, char *wh
     read_switches(&w);
     int targeted, forced_off;
     return decide_erratum(VKB_ERRATUM_FP16_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off);
+}
+
+/* The driver's own sample counts beneath every query wrapper: 1 when it multisamples at 4x and not
+ * at 2x (framebuffer colour), cached per physical device */
+int vkb_errata_msaa2_driver_lacks(const vkb_srv_table *t, VkPhysicalDevice pd)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct { VkPhysicalDevice pd; int lacks; } seen[8];
+    static int nseen;
+    int lacks = -1;
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < nseen; i++)
+        if (seen[i].pd == pd) lacks = seen[i].lacks;
+    pthread_mutex_unlock(&lock);
+    if (lacks >= 0) return lacks;
+    VkPhysicalDeviceProperties p;
+    memset(&p, 0, sizeof(p));
+    t->real.vkGetPhysicalDeviceProperties(pd, &p);
+    VkSampleCountFlags c = p.limits.framebufferColorSampleCounts & p.limits.framebufferDepthSampleCounts;
+    lacks = (c & VK_SAMPLE_COUNT_4_BIT) && !(c & VK_SAMPLE_COUNT_2_BIT);
+    pthread_mutex_lock(&lock);
+    if (nseen < 8) seen[nseen].pd = pd, seen[nseen].lacks = lacks, nseen++;
+    pthread_mutex_unlock(&lock);
+    return lacks;
+}
+
+int vkb_errata_msaa2_shown(const vkb_srv_table *t, VkPhysicalDevice pd, char *why, size_t cap)
+{
+    char buf[320];
+    if (!why) why = buf, cap = sizeof(buf);
+    why[0] = 0;
+    if (!t || !t->real.vkGetPhysicalDeviceProperties || !vkb_errata_msaa2_driver_lacks(t, pd)) return 0;
+    char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    drv_version d;
+    driver_version(t, pd, &d, gpu, sizeof(gpu));
+    switches w;
+    read_switches(&w);
+    int targeted, forced_off;
+    if (!decide_erratum(VKB_ERRATUM_MSAA2_AS_4, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off)) return 0;
+    size_t o = strlen(why);
+    snprintf(why + o, cap - o, "; %s multisamples at 1x and 4x only", gpu);
+    return 1;
 }
 
 /* gs_hide's driver half: the erratum's decision for this physical device (the range, or
