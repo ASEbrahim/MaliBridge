@@ -77,6 +77,9 @@ typedef struct vkb_srv_mem {
     void *ahb;               /* AHardwareBuffer* (Android) */
     int export_fd1;          /* VKB_EMU_DMABUF_EXPORT: the dma-buf fd + 1 handed out as the export (0: none) */
     int sync_fd1;            /* cached readback: the shared dma-buf + 1, for DMA_BUF_IOCTL_SYNC (0: not cached) */
+    void *cu_map;            /* cached upload (server_cached_upload.c): the server's mapping, for cache maintenance */
+    size_t cu_len;
+    uint64_t cu_owner;       /* the client process's token: its submits and waits maintain these pages */
     uint8_t stat_cls, stat_ded; /* accounting (server_memory.c): strategy class, dedicated to an image (1) / buffer (2) */
     int stat_pid;
     struct vkb_srv_mem *next;
@@ -117,6 +120,11 @@ typedef struct vkb_srv_table {
     PFN_vkGetPhysicalDeviceFeatures2 gs_f2;
     PFN_vkGetPhysicalDeviceProperties gs_p1;
     PFN_vkGetPhysicalDeviceProperties2 gs_p2;
+    /* instance: the queries beneath msaa2_as_4's (server_errata_msaa2.c) */
+    PFN_vkGetPhysicalDeviceProperties ms_p1;
+    PFN_vkGetPhysicalDeviceProperties2 ms_p2;
+    PFN_vkGetPhysicalDeviceImageFormatProperties ms_if1;
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 ms_if2;
 } vkb_srv_table;
 
 /* server_main.c */
@@ -263,7 +271,9 @@ enum {
     VKB_ERRATUM_STENCIL_LAYOUT,  /* MK-11 a separate stencil layout in a render pass ignored */
     VKB_ERRATUM_VB_BAKE,         /* MK-05 option B: dynamic strides wrong in single-binding calls too */
     VKB_ERRATUM_GS_HIDE,         /* issue #11: r38p1 beta segfaults compiling Zink's geometry shaders */
-    VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
+    VKB_ERRATUM_NAN_POSITION,    /* MK-45 a NaN clip-space position rasterized over the whole target (Mali-G77 r32p1) */
+    VKB_ERRATUM_MSAA2_AS_4,      /* MK-46 no 2x multisampling (1x and 4x only); D3D9 games that ask for 2x quit */
+    VKB_ERRATUM_EXAMPLE,        /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };
 enum { VKB_ERRATA_PROBE_NOT_RUN, VKB_ERRATA_PROBE_PASS, VKB_ERRATA_PROBE_FAIL };
@@ -330,6 +340,11 @@ int vkb_errata_gs_driver(const vkb_srv_table *inst, VkPhysicalDevice pd, char *w
 int vkb_errata_gs_process(const vkb_srv_proc *p);    /* the process half alone: its name is in the list */
 void vkb_errata_gs_instance_install(vkb_srv_table *inst); /* over every other query wrapper: last */
 void vkb_errata_gs_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci);
+/* msaa2_as_4 (MK-46, server_errata_msaa2.c): 1 when this physical device's clients are offered 2x
+ * multisampling the driver lacks (it has 4x) - the erratum's decision (VKBRIDGE_ERRATA=-msaa2_as_4
+ * turns it off) and the driver's sample counts; why (may be NULL) gets the reason */
+int vkb_errata_msaa2_shown(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
+void vkb_errata_msaa2_instance_install(vkb_srv_table *inst); /* the property and image format queries */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);
@@ -398,6 +413,12 @@ void vkb_cbfail_device_init(vkb_srv_table *t); /* server_conn.c */
 void vkb_cbfail_device_destroy(vkb_srv_table *t);
 void vkb_syncfd_device_init(vkb_srv_table *t);   /* server_syncfd.c: sync-fd exports with a deadline */
 int vkb_syncfd_device_destroy(vkb_srv_table *t); /* 1: an export is still in the driver, leave the device alive */
+/* Cached upload memory, VKBRIDGE_CACHED_UPLOAD=1 (server_cached_upload.c) */
+int vkb_cu_reserve(uint64_t size);          /* 1: this shared allocation gets cached pages (budget taken) */
+void vkb_cu_unreserve(uint64_t size);
+void vkb_cu_add(vkb_srv_mem *m);            /* after the allocation, with m->sync_fd1 set */
+void vkb_cu_remove(vkb_srv_mem *m);         /* before its pages go */
+void vkb_cu_device_init(vkb_srv_table *t);
 void vkb_srv_set_current_table(vkb_srv_table *t);
 void vkb_proc_cleanup(vkb_srv_proc *p);
 vkb_srv_proc *vkb_srv_current_proc(void); /* the client process this connection thread serves, or NULL */

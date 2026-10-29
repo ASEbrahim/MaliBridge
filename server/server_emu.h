@@ -26,6 +26,14 @@ typedef struct vkb_emu_image {
     int64_t stat_bytes, stat_bc_src, stat_ideal; /* accounting: driver's size; BC: the original's, the decoded texels' */
     uint32_t drop;            /* VKBRIDGE_TEX_MAXDIM: the app's top levels not created (app level m is level m - drop here) */
     int linear_mod;           /* a modifier-list dma-buf image made plain LINEAR (reports the LINEAR modifier) */
+    /* An image made with the AHardwareBuffer handle type (the client's shareable linear images under
+     * the AHB memory strategy) has no memory requirements or layout the driver can answer until an
+     * AHardwareBuffer is bound (Mali r32p1 answers size 0 and faults in vkGetImageSubresourceLayout):
+     * both are answered from a twin made from plain_ci, the same image without the handle type. */
+    VkImageCreateInfo plain_ci;
+    uint8_t ahb_external, bound, twin_req_ok, twin_layout_ok;
+    VkMemoryRequirements twin_req;
+    VkSubresourceLayout twin_layout;
     struct vkb_emu_image *next;
 } vkb_emu_image;
 

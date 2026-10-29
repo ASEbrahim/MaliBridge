@@ -263,6 +263,7 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         vkb_promote_instance_install(t);
         vkb_vidyn_instance_install(t); /* over the promotion's feature query */
         vkb_errata_gs_instance_install(t); /* issue #11: over all of them, its processes only */
+        vkb_errata_msaa2_instance_install(t); /* MK-46: 2x sample counts over every other query */
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);
@@ -576,6 +577,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_vidyn_device_init(t, vidyn); /* over every layer that makes pipelines: its variants go through them all */
             vkb_async_device_init(t); /* over every layer that sees pipelines: the client's may be stand-ins */
             vkb_cbfail_device_init(t); /* submits leave out command buffers the driver would not begin (server_conn.c) */
+            vkb_cu_device_init(t); /* cached upload: cache maintenance around submits and waits (server_cached_upload.c) */
             vkb_syncfd_device_init(t); /* sync-fd exports answered within a deadline (server_syncfd.c) */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);

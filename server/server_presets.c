@@ -86,6 +86,8 @@ static const char *const keys[] = {
     "VKBRIDGE_SPIRV_SUBST",
     "VKBRIDGE_NO_XFB_FOLD", "VKBRIDGE_NO_NULLDESC", "VKBRIDGE_NULLDESC_2D", "VKBRIDGE_NO_ELASTIC_POOLS", "VKBRIDGE_FLIP_RETAIN_MB",
     "VKBRIDGE_BITWISE_ALL", "VKBRIDGE_NO_COMPRESSION", "VKBRIDGE_NO_FORCED_ROBUSTNESS", "VKBRIDGE_NO_PCACHE",
+    /* memory: read per allocation on the connection thread (server_cached_upload.c) */
+    "VKBRIDGE_CACHED_UPLOAD", "VKBRIDGE_CACHED_UPLOAD_MB",
     /* extensions */
     "VKBRIDGE_HIDE_CALIBRATED_TS", "VKBRIDGE_NO_FP16",
     /* pipeline compiles */
