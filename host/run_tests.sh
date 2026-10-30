@@ -22,7 +22,9 @@ stencillayout dynrend probe_mk viewport_test mode presets calts robust2 fp16 beg
 heapcap asyncpipe fossilize viewport_check view3d viewchurn dynstate vbstride dedhint cullmode_check
 divisor polygon polygon_off vkcube_wayland_dmabuf vkcube_wayland_shm vkcube_x11 gamescope
 divisor_g925 divisor_khr report_stall report_cpu report_gpumem present_timeout server_hup gshide
-featclamp envfile unflagged eventstatus query querystuck gsexport"
+featclamp envfile unflagged eventstatus query querystuck gsexport vtxlayout beginfail endfail secfail
+submitfail waitlost apicap ycbcr_swap driverid vidyn a1zink envswitch poolfull lowmem xclipse_zink syncfd
+xfb xfb_nofold hotpath"
 if [ "${1:-}" = --list ]; then
   printf '%s\n' $VKB_TEST_NAMES
   exit 0
@@ -132,16 +134,70 @@ run_mode() {
     # held Zink at OpenGL 3.2; fetched as A2B10G10R10_SNORM with red and blue swapped back in the
     # vertex shader. A GL 3.3 core program reads (204, 0, 51) through Zink with the format imitated
     # missing. The desktop driver offers VK_EXT_vertex_input_dynamic_state, as Mali r48 and later
-    # do: the server hides it from Zink only, and a Vulkan client that is not Zink still lists it.
+    # do: Zink gets it, and its vertex input with the format is made static in a pipeline variant
+    # (server_vidyn.c); a Vulkan client that is not Zink still lists it.
     if want bgr10; then
       VKB_MISSING_ADD=bgr10vtx . ./mali_env.sh >/dev/null
       MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink timeout 60 python3 -I ../tests/gl/glbgr10.py >out/t-bgr10.log 2>&1
       timeout 60 vulkaninfo 2>/dev/null | grep -c "VK_EXT_vertex_input_dynamic_state" >out/t-bgr10-vulkaninfo.log
       grep -q "^RESULT ok" out/t-bgr10.log && grep -q "red and blue swapped back in the vertex shader" "$VKB_SERVER_LOG" &&
-        { grep -q "hidden from Zink" "$VKB_SERVER_LOG" || grep -q "vertex fetch emulated" "$VKB_SERVER_LOG"; } &&
+        grep -q "offered to Zink: the driver's" "$VKB_SERVER_LOG" && grep -q "first pipeline variant with vkCmdSetVertexInputEXT" "$VKB_SERVER_LOG" &&
         [ "$(cat out/t-bgr10-vulkaninfo.log)" -ge 1 ]
-      result $? "BGRA 10-10-10-2 vertex fetch through Zink ($(grep -o 'RESULT.*' out/t-bgr10.log | cut -c1-60)); vulkaninfo still lists vertex input dynamic state"
+      result $? "BGRA 10-10-10-2 vertex fetch through Zink, a pipeline variant ($(grep -o 'RESULT.*' out/t-bgr10.log | cut -c1-60)); vulkaninfo still lists vertex input dynamic state"
       unset VKB_MISSING_ADD
+    fi
+    # Zink on a driver without VK_EXT_vertex_input_dynamic_state (the G720 r44's): the server's,
+    # every draw from a variant. Two vertex layouts with one program, as Mali's Zink sees the
+    # device (no pipeline libraries, no extended dynamic state 3), each draw its own colour.
+    if want vtxlayout; then
+      VKB_MISSING_ADD=vidyn . ./mali_env.sh >/dev/null
+      VKBRIDGE_HIDE_EXTS=$VKBRIDGE_HIDE_EXTS,VK_EXT_graphics_pipeline_library,VK_EXT_extended_dynamic_state3 \
+        MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink timeout 60 python3 -I ../tests/gl/glvtxlayout.py >out/t-vtxlayout.log 2>&1
+      grep -q "^RESULT ok" out/t-vtxlayout.log && grep -q "offered to Zink: the server's" "$VKB_SERVER_LOG" &&
+        grep -q "first pipeline variant with vkCmdSetVertexInputEXT" "$VKB_SERVER_LOG"
+      result $? "two vertex layouts through Zink, vertex input dynamic state emulated ($(grep -o 'RESULT.*' out/t-vtxlayout.log | cut -c1-70))"
+      unset VKB_MISSING_ADD
+    fi
+    # A vkBeginCommandBuffer the driver refuses (out of memory: Cyberpunk on the XRing O3): its commands
+    # are not replayed and submits leave it out, so the server lives; the smoke test loses that one
+    # check's work and passes the ones after it.
+    if want beginfail; then
+      VKB_SERVER_ENV=VKBRIDGE_TEST_BEGIN_FAIL=2 . ./mali_env.sh >/dev/null
+      timeout 120 ./out/vkbridge-smoke >out/t-beginfail.log 2>&1
+      kill -0 "$VKB_SERVER_PID" 2>/dev/null && grep -q "did not record left out" "$VKB_SERVER_LOG" &&
+        grep -q "12 of 13 checks passed" out/t-beginfail.log
+      result $? "a refused vkBeginCommandBuffer: server alive, submit leaves it out ($(tail -1 out/t-beginfail.log))"
+      unset VKB_SERVER_ENV
+    fi
+    # The driver's vkEndCommandBuffer failing: the command buffer is left out of submits the same way.
+    if want endfail; then
+      VKB_SERVER_ENV=VKBRIDGE_TEST_END_FAIL=2 . ./mali_env.sh >/dev/null
+      timeout 120 ./out/vkbridge-smoke >out/t-endfail.log 2>&1
+      kill -0 "$VKB_SERVER_PID" 2>/dev/null && grep -q "did not record left out" "$VKB_SERVER_LOG" &&
+        grep -q "12 of 13 checks passed" out/t-endfail.log
+      result $? "a failed vkEndCommandBuffer: server alive, submit leaves it out ($(tail -1 out/t-endfail.log))"
+      unset VKB_SERVER_ENV
+    fi
+    # A secondary whose end failed: the primary's vkCmdExecuteCommands leaves it out, the primary runs.
+    if want secfail; then
+      VKB_SERVER_ENV=VKBRIDGE_TEST_END_FAIL=1 . ./mali_env.sh >/dev/null
+      timeout 60 ./out/begin_check ok >out/t-secfail.log 2>&1
+      kill -0 "$VKB_SERVER_PID" 2>/dev/null && grep -q "vkCmdExecuteCommands: 1 command buffer(s) the driver did not record left out" "$VKB_SERVER_LOG" &&
+        grep -q "PASS primary: vkEndCommandBuffer" out/t-secfail.log && grep -q "FAILED: 1 of 12" out/t-secfail.log
+      result $? "a secondary the driver did not record: left out of the primary ($(tail -1 out/t-secfail.log))"
+      unset VKB_SERVER_ENV
+    fi
+    # A Vulkan error the game gets is logged by the client the first time each call returns it (Stray
+    # stopped on a device reset with nothing in either log, #21): three submits fail with a lost
+    # device (synchronous results, so the client sees them), the client's log has one line for them.
+    if want submitfail; then
+      VKB_SERVER_ENV=VKBRIDGE_TEST_SUBMIT_FAIL=2 . ./mali_env.sh >/dev/null
+      rm -f out/t-submitfail-client.log
+      VKBRIDGE_SYNC=1 VKBRIDGE_FRAMES=0 VKBRIDGE_CLIENT_LOG=$PWD/out/t-submitfail-client.log timeout 120 ./out/vkbridge-smoke >out/t-submitfail.log 2>&1
+      n=$(grep -c "vkQueueSubmit returned VK_ERROR_DEVICE_LOST (-4) to the game, the first time" out/t-submitfail-client.log 2>/dev/null)
+      kill -0 "$VKB_SERVER_PID" 2>/dev/null && [ "$(grep -c "VKBRIDGE_TEST_SUBMIT_FAIL" "$VKB_SERVER_LOG")" = 3 ] && [ "${n:-0}" = 1 ]
+      result $? "three failed submits: the client logs the first, once (${n:-0} line(s); $(tail -1 out/t-submitfail.log))"
+      unset VKB_SERVER_ENV
     fi
     # B10G11R11 float vertex fetch (VKB_EMU_UF11_VTX): Mali before r49 lacks it, which held Zink below
     # OpenGL 4.4; fetched as R32_UINT and unpacked in the vertex shader. A GL program reads
@@ -354,6 +410,10 @@ run_mode() {
     if want wait_imitate; then
       timeout 300 ./wait_imitate_test.sh >out/t-wait.log 2>&1; result $? "wait_imitate_test ($(tail -1 out/t-wait.log))"
     fi
+    # waitlost_test.sh: a timed-out semaphore wait answered VK_ERROR_DEVICE_LOST, checked where the probe saw it
+    if want waitlost; then
+      timeout 300 ./waitlost_test.sh >out/t-waitlost.log 2>&1; result $? "waitlost_test ($(tail -1 out/t-waitlost.log))"
+    fi
     # A pipeline compile that never ends (the G925's compiler on Stray): interrupted, the call fails
     if want compile_watchdog; then
       timeout 400 ./compile_watchdog_test.sh >out/t-spin.log 2>&1; result $? "compile_watchdog_test ($(tail -1 out/t-spin.log))"
@@ -418,6 +478,10 @@ run_mode() {
     if want promote; then
       timeout 600 ./promote_test.sh >out/t-promote.log 2>&1; result $? "promote_test ($(tail -1 out/t-promote.log))"
     fi
+    # apicap_test.sh: the Vulkan version cap for Steam mode's processes, and its switch
+    if want apicap; then
+      timeout 600 ./apicap_test.sh >out/t-apicap.log 2>&1; result $? "apicap_test ($(tail -1 out/t-apicap.log))"
+    fi
     # shm_barrier: barriers between shared-memory writes and reads in compute shaders (per-game:
     # RE Engine titles), forced on and from a preset file: right values in shmbarrier_check, the
     # corpus cases' barriers where expected and spirv-val clean
@@ -429,6 +493,18 @@ run_mode() {
     # corpus cases where expected and spirv-val clean
     if want wave32; then
       timeout 600 ./wave32_test.sh >out/t-wave32.log 2>&1; result $? "wave32_test ($(tail -1 out/t-wave32.log))"
+    fi
+    # The YCbCr sampler swap in compute layouts (Mali, Samsung's Xclipse; MaliBridge#20): the
+    # driver's refusal imitated, pipelines refused with the swap off and built with it on, the
+    # first failure logged with its layout's YCbCr samplers; gamescope's composite pipelines too
+    if want ycbcr_swap; then
+      timeout 600 ./ycbcr_swap_test.sh >out/t-ycbcr-swap.log 2>&1; result $? "ycbcr_swap_test ($(tail -1 out/t-ycbcr-swap.log))"
+    fi
+    # Arm's driver told by driverID: Mesa PanVK imitated (vendor 0x13B5, a Mesa driverVersion inside
+    # the errata's ranges) gets none of Arm's errata or fixes, Arm's driver gets them, and a driver
+    # without driverID is told by the vendor ID as before (a server of its own per step; once)
+    if want driverid; then
+      timeout 300 ./driverid_test.sh >out/t-driverid.log 2>&1; result $? "driverid_test ($(tail -1 out/t-driverid.log))"
     fi
     # MK-32 clamp_zero: the zero limit dropped (imitated) fails clampzero_check, the opaque zero over it
     # passes, narrow from the version gate and wide when forced; the corpus through both is spirv-val clean
@@ -450,6 +526,11 @@ run_mode() {
     if want vbbake; then
       timeout 300 ./vbbake_test.sh >out/t-vbbake.log 2>&1; result $? "vbbake_test ($(tail -1 out/t-vbbake.log))"
     fi
+    # Zink's vertex input dynamic state: the driver's, or made static in pipeline variants (the
+    # extension and the packed formats imitated missing), one layout after another and in a secondary
+    if want vidyn; then
+      timeout 600 ./vidyn_test.sh >out/t-vidyn.log 2>&1; result $? "vidyn_test ($(tail -1 out/t-vidyn.log))"
+    fi
     # MK-16 cull_nontri (a dynamic cull mode culls points and lines): failing with its bug imitated
     # and the fix off, passing with the fix; the version gate (a server of its own; once)
     if want cullmode_test; then
@@ -469,6 +550,14 @@ run_mode() {
     # driver's own, emulated at 1.2, switched off, and on a 1.1 driver promoted to 1.2
     if want dynrend; then
       timeout 300 ./dynrend_test.sh >out/t-dynrend.log 2>&1; result $? "dynrend_test ($(tail -1 out/t-dynrend.log))"
+    fi
+    # a1zink_test.sh: extended dynamic state hidden and dynamic rendering as render passes, and its switch
+    if want a1zink; then
+      timeout 300 ./a1zink_test.sh >out/t-a1zink.log 2>&1; result $? "a1zink_test ($(tail -1 out/t-a1zink.log))"
+    fi
+    # server switches from <cache dir>/env
+    if want envswitch; then
+      timeout 300 ./envswitch_test.sh >out/t-envswitch.log 2>&1; result $? "envswitch_test ($(tail -1 out/t-envswitch.log))"
     fi
     # The MK probes: each erratum's bug imitated beneath its probe makes it fail with the bug's
     # pattern and the decision follow (probe-gated errata on in performance mode), none without;
@@ -533,6 +622,14 @@ run_mode() {
     if want begin_encoding; then
       timeout 120 ./begin_encoding_test.sh >out/t-begin.log 2>&1; result $? "begin_encoding_test ($(tail -1 out/t-begin.log))"
     fi
+    if want poolfull; then
+      timeout 120 ./poolfull_test.sh >out/t-poolfull.log 2>&1; result $? "poolfull_test ($(tail -1 out/t-poolfull.log))"
+    fi
+    # Low memory (MaliBridge#18): said once with what the server holds, its memory line marked, idle
+    # descriptor overflow pools freed at resets and made again when needed (a server of its own; once)
+    if want lowmem; then
+      timeout 120 ./lowmem_test.sh >out/t-lowmem.log 2>&1; result $? "lowmem_test ($(tail -1 out/t-lowmem.log))"
+    fi
     # Cached readback: the self-test's cached pages, offered per VKBRIDGE_CACHED_READBACK and the
     # mode; the client's frame readback (vkcube's X11 path) and an app's non-coherent cached type
     # read back right through DMA_BUF_IOCTL_SYNC (dma-buf strategy; a server of its own; once)
@@ -557,6 +654,14 @@ run_mode() {
     # buffers made without the handle type; nothing faked, the choice unchanged (a server of its own; once)
     if want unflagged; then
       timeout 400 ./unflagged_test.sh >out/t-unflagged.log 2>&1; result $? "unflagged_test ($(tail -1 out/t-unflagged.log))"
+    fi
+    # xclipse_zink_test.sh: Zink on Samsung's Xclipse driver without EDS2 (push descriptors kept)
+    if want xclipse_zink; then
+      timeout 400 ./xclipse_zink_test.sh >out/t-xclipse-zink.log 2>&1; result $? "xclipse_zink_test ($(tail -1 out/t-xclipse-zink.log))"
+    fi
+    # syncfd_test.sh: sync-fd exports answered within a deadline; a held async submit named in the log
+    if want syncfd; then
+      timeout 300 ./syncfd_test.sh >out/t-syncfd.log 2>&1; result $? "syncfd_test ($(tail -1 out/t-syncfd.log))"
     fi
     # Asynchronous pipeline compiles (VKBRIDGE_ASYNC_COMPILE) with a slow compiler imitated: draws
     # skipped until the pipeline is there, depth-only and full-screen pipelines synchronous, objects
@@ -613,6 +718,29 @@ run_mode() {
     [ $rc = 0 ] && [ -n "$(grep -o 'requires [01]' out/t-dedhint-r1.log)" ] &&
       [ "$(grep -o 'requires [01]' out/t-dedhint-r1.log)" = "$(grep -o 'requires [01]' out/t-dedhint-r0.log)" ]
     result $? "dedhint_check (on: $(tail -1 out/t-dedhint-1.log); off: $(tail -1 out/t-dedhint-0.log); default: $(tail -1 out/t-dedhint-def.log); requires unchanged: $(grep -c 'requires 1' out/t-dedhint-r1.log) required)"
+  fi
+  # Transform feedback as DXVK's D3D11 stream output uses it (two buffers, counters resumed,
+  # vkCmdDrawIndirectByteCountEXT), captured by the vertex stage and by DXVK's pass-through point
+  # geometry stage; on mali that stage is folded into the vertex shader (Mali's geometry shaders are
+  # slow) and must capture the same bytes, and with VKBRIDGE_NO_XFB_FOLD=1 it is kept. 77: no XFB.
+  if want xfb; then
+    for st in vs gs; do
+      timeout 60 ./out/xfb_check $st >out/t-xfb-$st.log 2>&1; rc=$?; [ $rc = 77 ] && rc=0
+      [ $rc = 0 ] && [ "$mode" = mali ] && [ $st = gs ] && ! grep -q "skipped" out/t-xfb-$st.log &&
+        { grep -q "stream output geometry shaders folded into their vertex shaders" "$VKB_SERVER_LOG" || rc=1; }
+      result $rc "xfb_check, $st captures ($(tail -1 out/t-xfb-$st.log))"
+    done
+  fi
+  if want xfb_nofold; then
+    if [ "$mode" = mali ]; then
+      from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+      VKB_SERVER_ENV=VKBRIDGE_NO_XFB_FOLD=1 . ./mali_env.sh >/dev/null
+      timeout 60 ./out/xfb_check gs >out/t-xfb-nofold.log 2>&1; rc=$?; [ $rc = 77 ] && rc=0
+      [ $rc = 0 ] && tail -n +$from "$VKB_SERVER_LOG" | grep -q "stream output geometry shaders folded" && rc=1
+      result $rc "xfb_check, gs captures with VKBRIDGE_NO_XFB_FOLD=1: the geometry stage kept ($(tail -1 out/t-xfb-nofold.log))"
+      . ./mali_env.sh >/dev/null
+    fi
+    # Points and lines with a dynamic cull mode set, triangles culled after them (MK-16, on in safe mode)
   fi
   # Points and lines with a dynamic cull mode set, triangles culled after them (MK-16, on in safe mode)
   if want cullmode_check; then
@@ -690,18 +818,28 @@ divisor_variants() {
     VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check >out/t-divisor-g925.log 2>&1 &&
       VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check --core14 >>out/t-divisor-g925.log 2>&1 &&
       tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "lacks vertexAttributeInstanceRateZeroDivisor; emulated instead" &&
-      tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "VK_EXT_vertex_attribute_divisor is enabled as VK_KHR_vertex_attribute_divisor"
+      tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor"
     result $? "divisor_check, Mali-G925's KHR divisor without the zero divisor: emulated ($(grep -c '^PASS' out/t-divisor-g925.log) passed)"
   fi
   if want divisor_khr; then
     l=$(wc -l < "$VKB_SERVER_LOG")
     VKB_MISSING=VK_EXT_vertex_attribute_divisor . ./bridge_env.sh >/dev/null
     VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check >out/t-divisor-khr.log 2>&1 &&
-      tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "VK_EXT_vertex_attribute_divisor is enabled as VK_KHR_vertex_attribute_divisor" &&
+      tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "VK_EXT_vertex_attribute_divisor enabled as VK_KHR_vertex_attribute_divisor" &&
       ! tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "emulation 0x[0-9a-f]* installed"
     result $? "divisor_check, complete KHR-only divisor: EXT name aliased, native ($(tail -1 out/t-divisor-khr.log))"
   fi
 }
+# The request arena and the null-descriptor set map on their own (no driver): checks, and the
+# times against the code before 2026-10-21 (hotpath_bench_old), shown, not judged
+if want hotpath; then
+  if [ -x out/hotpath_bench ]; then
+    timeout 120 ./out/hotpath_bench >out/t-hotpath.log 2>&1
+    r=$?
+    [ -x out/hotpath_bench_old ] && timeout 120 ./out/hotpath_bench_old >out/t-hotpath-old.log 2>&1
+    result $r "hotpath_bench ($(grep -m1 -o '[0-9.]* us per request' out/t-hotpath.log | cut -d' ' -f1-2) per ~600 KiB request, was $(grep -m1 -o '[0-9.]* us per request' out/t-hotpath-old.log 2>/dev/null | cut -d' ' -f1-2); 1M sets: $(grep '1000000 sets' out/t-hotpath.log | grep -o '[0-9.]* ns per lookup'), was $(grep '1000000 sets' out/t-hotpath-old.log 2>/dev/null | grep -o '[0-9.]* ns per lookup'))"
+  fi
+fi
 run_mode plain
 if want_any divisor_g925 divisor_khr; then divisor_variants; fi
 server_errors; result $? "no protocol errors in the server log (plain)"

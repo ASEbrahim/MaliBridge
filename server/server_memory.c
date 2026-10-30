@@ -83,7 +83,7 @@ static const vkb_native_handle *(*p_AHardwareBuffer_getNativeHandle)(const struc
 static int ahb_rarely = -1;
 static int ahb_uncached(void)
 {
-    if (ahb_rarely < 0) ahb_rarely = getenv("VKBRIDGE_AHB_RARELY") != NULL;
+    if (ahb_rarely < 0) ahb_rarely = vkb_srv_env_global("VKBRIDGE_AHB_RARELY") != NULL;
     return ahb_rarely;
 }
 #ifdef __ANDROID__
@@ -449,7 +449,7 @@ static void *st_thread(void *arg)
 /* The thread watches for low memory with the lines off too. */
 static void st_start(void)
 {
-    const char *e = getenv("VKBRIDGE_MEM_STATS");
+    const char *e = vkb_srv_env_global("VKBRIDGE_MEM_STATS");
     pthread_t th;
     if (pthread_create(&th, NULL, st_thread, e && *e == '0' ? NULL : (void *)1) == 0) pthread_detach(th);
 }
@@ -522,7 +522,7 @@ static int dmaheap_fd(void)
     pthread_mutex_lock(&lock);
     if (fd == -2) {
         const char *names[] = {"/dev/dma_heap/system-uncached", "/dev/dma_heap/system"};
-        if (getenv("VKBRIDGE_DMAHEAP_CACHED")) names[0] = "/dev/dma_heap/system";
+        if (vkb_srv_env_global("VKBRIDGE_DMAHEAP_CACHED")) names[0] = "/dev/dma_heap/system";
         fd = -1;
         if (vkb_emu_faked("dmaheap")) VKB_INFO("dmaheap: none, as on a phone without /dev/dma_heap (VKBRIDGE_FAKE_MISSING=dmaheap)");
         for (int i = 0; i < 2 && fd < 0 && !vkb_emu_faked("dmaheap"); i++) {
@@ -718,7 +718,7 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
          * dma-heap pages into the Mali-G715's uncached type 0 with no such check, and it ran there).
          * Out of the spec; the self-test still checks the bytes both ways before a type is used. */
         static int any_type = -1;
-        if (any_type < 0) any_type = getenv("VKBRIDGE_DMAHEAP_ANY_TYPE") && *getenv("VKBRIDGE_DMAHEAP_ANY_TYPE") == '1';
+        if (any_type < 0) any_type = vkb_srv_env_global("VKBRIDGE_DMAHEAP_ANY_TYPE") && *vkb_srv_env_global("VKBRIDGE_DMAHEAP_ANY_TYPE") == '1';
         if (pr != VK_SUCCESS || !(fp.memoryTypeBits & (1u << ai->memoryTypeIndex))) {
             VKB_INFO("dmaheap: fd properties %d, memory types 0x%x (want type %u)%s", pr, fp.memoryTypeBits, ai->memoryTypeIndex,
                      any_type ? "; importing anyway (VKBRIDGE_DMAHEAP_ANY_TYPE)" : "");
@@ -2073,7 +2073,7 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             /* Pages the dma-heap would not give, or the driver would not import: the memory is still
              * made, without a dma-buf (most allocations asking for export are never exported; one
              * that is fails at vkGetMemoryFdKHR instead of here). VKBRIDGE_EXPORT_FALLBACK=0: not. */
-            const char *fb = getenv("VKBRIDGE_EXPORT_FALLBACK");
+            const char *fb = vkb_srv_env_global("VKBRIDGE_EXPORT_FALLBACK");
             if (r != VK_SUCCESS && whole && !(fb && *fb == '0')) {
                 log_alloc(t, &ai, type, ded, path, r);
                 ai.pNext = nl ? links[0] : NULL;
@@ -2322,7 +2322,7 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush,
 static int test_type(selftest *st, uint32_t s, uint32_t type)
 {
     int coherent_flag = (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-    if (!coherent_flag && !getenv("VKBRIDGE_SELFTEST_NOFLUSH")) {
+    if (!coherent_flag && !vkb_srv_env_global("VKBRIDGE_SELFTEST_NOFLUSH")) {
         int r = test_type_mode(st, s, type, 1, 0);
         if (r) {
             VKB_INFO("  %s, type %u: coherent in practice (no flushes needed)", vkb_mem_strategy_name(s), type);
@@ -2413,7 +2413,7 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush,
     }
     int coherent = (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     /* VKBRIDGE_SELFTEST_NOFLUSH=1 forces it for every type. */
-    if (no_flush || getenv("VKBRIDGE_SELFTEST_NOFLUSH")) coherent = 1;
+    if (no_flush || vkb_srv_env_global("VKBRIDGE_SELFTEST_NOFLUSH")) coherent = 1;
     if (cached) coherent = 0; /* always flushed: what the client does with these pages */
     VkMappedMemoryRange whole = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, m->mem, 0, VK_WHOLE_SIZE};
 
@@ -2524,7 +2524,7 @@ static void log_external_props(const vkb_dispatch *idt, VkPhysicalDevice pd)
  */
 static uint32_t cached_selftest(selftest *st, uint32_t s, uint32_t shareable)
 {
-    const char *e = getenv("VKBRIDGE_CACHED_READBACK");
+    const char *e = vkb_srv_env_global("VKBRIDGE_CACHED_READBACK");
     if (e && *e == '0') return 0;
     if (s != VKB_MEM_DMABUF && s != VKB_MEM_DMAHEAP && s != VKB_MEM_AHB) {
         VKB_INFO("cached readback: not with %s (no dma-buf to sync through)", vkb_mem_strategy_name(s));
@@ -2838,7 +2838,7 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
 
     uint32_t candidates[4];
     int nc = 0;
-    const char *force = getenv("VKBRIDGE_MEMORY");
+    const char *force = vkb_srv_env_global("VKBRIDGE_MEMORY");
     char outcome[400] = ""; /* each strategy's fate, for the summary line */
     int on = 0;
 #define OUTCOME(...) on += snprintf(outcome + on, on < (int)sizeof(outcome) ? sizeof(outcome) - (size_t)on : 0, __VA_ARGS__)
@@ -2949,7 +2949,7 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
             ahb_rarely = 1;
             shareable = 0;
         }
-        if (s == VKB_MEM_AHB && !coherent && ahb_rarely && !getenv("VKBRIDGE_AHB_RARELY")) ahb_rarely = 0; /* no better: as before */
+        if (s == VKB_MEM_AHB && !coherent && ahb_rarely && !vkb_srv_env_global("VKBRIDGE_AHB_RARELY")) ahb_rarely = 0; /* no better: as before */
         if (coherent) {
             k->info.strategy = s;
             k->info.buffer_handle_types = strategy_handle_type(s);

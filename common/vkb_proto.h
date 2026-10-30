@@ -97,6 +97,7 @@ typedef struct vkb_server_pd_info {
     uint32_t present_timeout_s;    /* VKBRIDGE_PRESENT_TIMEOUT_S from the server (a preset, <cache dir>/env): how long a frame
                                     * may take before the client calls the device lost (client/wsi.c); VKB_PRESENT_TIMEOUT_NONE:
                                     * never; 0: nothing said (an older server too), the client's default */
+    uint32_t api_cap;              /* the highest Vulkan version this process is shown (VK_MAKE_API_VERSION(0, 1, minor, 0)); 0: no cap */
 } vkb_server_pd_info;
 
 #define VKB_PRESENT_TIMEOUT_NONE 0xffffffffu

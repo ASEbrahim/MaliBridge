@@ -149,7 +149,7 @@ static VkResult make_module(VkDevice device, const spv_mod *m, VkShaderModule *o
     uint32_t *code;
     size_t size = spv_write(m, &code);
     if (!size) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    const char *dump = getenv("VKBRIDGE_DUMP_SPIRV");
+    const char *dump = vkb_srv_env_global("VKBRIDGE_DUMP_SPIRV");
     if (dump && *dump) {
         static int seq;
         char path[512];

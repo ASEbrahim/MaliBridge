@@ -78,6 +78,12 @@
 #include "probe_spv.h"
 
 #include <dirent.h>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <vulkan/vulkan_android.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -196,6 +202,7 @@ typedef struct pctx {
     VkCommandPool pool;
     int divisor, divisor_zero, depth_clip, push, null_desc, gs, layer_vs, timeline, clip, mdi, bc, ext_fd, dmabuf, drm_mod,
         compression, bindless;
+    int ahb; /* VK_ANDROID_external_memory_android_hardware_buffer on, where the driver has no dma-buf import (ahb_share) */
     int eds, eds3_smask, dynrender, multi_vp; /* the MK probes': extended dynamic state (core 1.3 or EXT), its
                                                  EDS3 sample mask, dynamic rendering, 2 viewports from the VS */
     uint32_t possible;                        /* emulations the bridge can stand in with here (emu_possible) */
@@ -455,6 +462,13 @@ static int dev_create(pctx *c)
     if (has_ext(c, "VK_KHR_push_descriptor") && !(c->emu & VKB_EMU_PUSH_DESC)) exts[ne++] = "VK_KHR_push_descriptor";
     if (has_ext(c, "VK_KHR_external_memory_fd")) exts[ne++] = "VK_KHR_external_memory_fd";
     if (has_ext(c, "VK_EXT_external_memory_dma_buf") && has_ext(c, "VK_KHR_external_memory_fd")) exts[ne++] = "VK_EXT_external_memory_dma_buf";
+    /* Android buffers, only where the driver takes no dma-buf: the ahb_share probe. */
+    int want_ahb = 0;
+#ifdef __ANDROID__
+    want_ahb = !has_ext(c, "VK_EXT_external_memory_dma_buf") && c->api >= VK_API_VERSION_1_1 &&
+               has_ext(c, "VK_ANDROID_external_memory_android_hardware_buffer") && has_ext(c, "VK_EXT_queue_family_foreign");
+    if (want_ahb) exts[ne++] = "VK_ANDROID_external_memory_android_hardware_buffer", exts[ne++] = "VK_EXT_queue_family_foreign";
+#endif
     if (has_ext(c, "VK_EXT_image_drm_format_modifier") && c->api >= VK_API_VERSION_1_1) {
         exts[ne++] = "VK_EXT_image_drm_format_modifier";
         if (c->api < VK_API_VERSION_1_2 && has_ext(c, "VK_KHR_image_format_list")) exts[ne++] = "VK_KHR_image_format_list";
@@ -535,6 +549,7 @@ static int dev_create(pctx *c)
     c->ext_fd = has_ext(c, "VK_KHR_external_memory_fd") && c->d.vkGetMemoryFdKHR;
     c->dmabuf = c->ext_fd && has_ext(c, "VK_EXT_external_memory_dma_buf");
     c->drm_mod = has_ext(c, "VK_EXT_image_drm_format_modifier") && c->api >= VK_API_VERSION_1_1;
+    c->ahb = want_ahb;
     c->compression = cc.imageCompressionControl && c->d.vkGetImageSubresourceLayout2;
     c->bindless = bindless;
     c->eds = (c->api >= VK_API_VERSION_1_3 || eds.extendedDynamicState) && c->d.vkCmdBindVertexBuffers2 && c->d.vkCmdSetDepthWriteEnable &&
@@ -929,6 +944,225 @@ static void p_dmabuf_linear(pctx *c)
     if (refused) say(c, " - handled at run time: such images are made without the handle type (server_emu_layer.c)");
     if (disagree) say(c, "; the format query and the create disagree");
     outcome(c, refused ? PS_FAIL : PS_PASS);
+}
+
+/* ahb_share: export, import and CPU-read checks of an image over an AHardwareBuffer; recorded only. */
+#ifdef __ANDROID__
+typedef struct {
+    uint32_t width, height, layers, format;
+    uint64_t usage;
+    uint32_t stride, rfu0;
+    uint64_t rfu1;
+} probe_ahb_desc;
+typedef struct {
+    int version, numFds, numInts;
+    int data[0];
+} probe_native_handle;
+static struct {
+    int state;
+    int (*allocate)(const probe_ahb_desc *, struct AHardwareBuffer **);
+    void (*release)(struct AHardwareBuffer *);
+    void (*describe)(const struct AHardwareBuffer *, probe_ahb_desc *);
+    const probe_native_handle *(*handle)(const struct AHardwareBuffer *);
+} pahb;
+
+static int pahb_load(void)
+{
+    if (pahb.state) return pahb.state > 0;
+    pahb.state = -1;
+    void *h = dlopen("libnativewindow.so", RTLD_NOW);
+    if (!h) h = dlopen("libandroid.so", RTLD_NOW);
+    if (!h) return 0;
+    *(void **)&pahb.allocate = dlsym(h, "AHardwareBuffer_allocate");
+    *(void **)&pahb.release = dlsym(h, "AHardwareBuffer_release");
+    *(void **)&pahb.describe = dlsym(h, "AHardwareBuffer_describe");
+    *(void **)&pahb.handle = dlsym(h, "AHardwareBuffer_getNativeHandle");
+    if (pahb.allocate && pahb.release && pahb.describe && pahb.handle) pahb.state = 1;
+    return pahb.state > 0;
+}
+
+#define PAHB_CLEAR 0xffbf8040u /* RGBA8 (0.25, 0.5, 0.75, 1.0) as bytes 40 80 bf ff */
+
+static int near_rgba(uint32_t got)
+{
+    for (int k = 0; k < 4; k++) {
+        int a = (int)((got >> (8 * k)) & 0xff), b = (int)((PAHB_CLEAR >> (8 * k)) & 0xff);
+        if (a - b > 1 || b - a > 1) return 0;
+    }
+    return 1;
+}
+
+/* An image over an AHardwareBuffer: imported (ahb set) or exported (ahb NULL, *out_ahb gets it with a reference). */
+static VkImage ahb_image(pctx *c, struct AHardwareBuffer *ahb, struct AHardwareBuffer **out_ahb, uint32_t w, uint32_t h, VkResult *res)
+{
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)vkb_gipa(c->inst, "vkGetDeviceProcAddr");
+    PFN_vkGetAndroidHardwareBufferPropertiesANDROID props =
+        gdpa ? (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)gdpa(c->dev, "vkGetAndroidHardwareBufferPropertiesANDROID") : NULL;
+    PFN_vkGetMemoryAndroidHardwareBufferANDROID get =
+        gdpa ? (PFN_vkGetMemoryAndroidHardwareBufferANDROID)gdpa(c->dev, "vkGetMemoryAndroidHardwareBufferANDROID") : NULL;
+    *res = VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (!props || !get) return VK_NULL_HANDLE;
+    VkExternalMemoryImageCreateInfo emi = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL,
+                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &emi, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {w, h, 1}, 1, 1,
+                            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage i = VK_NULL_HANDLE;
+    if ((*res = c->d.vkCreateImage(c->dev, &ci, NULL, &i)) != VK_SUCCESS) return VK_NULL_HANDLE;
+    track(c, O_IMG, H(i));
+    VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, i, VK_NULL_HANDLE};
+    VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, &ded, ahb};
+    VkExportMemoryAllocateInfo ex = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &ded,
+                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+    VkMemoryRequirements mr;
+    c->d.vkGetImageMemoryRequirements(c->dev, i, &mr);
+    if (ahb) {
+        VkAndroidHardwareBufferPropertiesANDROID hp = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+        if ((*res = props(c->dev, ahb, &hp)) != VK_SUCCESS) return VK_NULL_HANDLE;
+        mr.size = hp.allocationSize;
+        mr.memoryTypeBits &= hp.memoryTypeBits;
+    }
+    /* an exported one: allocationSize 0, the driver sizes the buffer */
+    if (!ahb) mr.size = 0;
+    VkDeviceMemory m = alloc(c, &mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, ahb ? (const void *)&imp : (const void *)&ex);
+    if (!m) {
+        *res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        return VK_NULL_HANDLE;
+    }
+    if ((*res = c->d.vkBindImageMemory(c->dev, i, m, 0)) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (!ahb) {
+        VkMemoryGetAndroidHardwareBufferInfoANDROID gi = {VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, NULL, m};
+        if ((*res = get(c->dev, &gi, out_ahb)) != VK_SUCCESS || !*out_ahb) return VK_NULL_HANDLE;
+    }
+    return i;
+}
+
+/* Clears i (from UNDEFINED) and releases it to the foreign queue family in GENERAL. */
+static VkResult ahb_clear_release(pctx *c, VkImage i)
+{
+    VkCommandBuffer cb = cmd(c);
+    if (!cb) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    img_barrier(c, cb, i, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
+    VkClearColorValue col = {.float32 = {0.25f, 0.5f, 0.75f, 1.0f}};
+    VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    c->d.vkCmdClearColorImage(cb, i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &rng);
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_IMAGE_LAYOUT_GENERAL, c->qf, VK_QUEUE_FAMILY_FOREIGN_EXT, i, rng};
+    c->d.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    return submit(c, cb);
+}
+
+/* Acquires i from the foreign family and copies its texel (x, y) into a word. */
+static VkResult ahb_read(pctx *c, VkImage i, uint32_t x, uint32_t y, uint32_t *out)
+{
+    void *map = NULL;
+    VkBuffer b = buf(c, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &map);
+    VkCommandBuffer cb = b ? cmd(c) : VK_NULL_HANDLE;
+    if (!cb) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier a = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT, c->qf, i, rng};
+    c->d.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &a);
+    VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int32_t)x, (int32_t)y, 0}, {1, 1, 1}};
+    c->d.vkCmdCopyImageToBuffer(cb, i, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b, 1, &r);
+    VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    c->d.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+    VkResult res = submit(c, cb);
+    if (res == VK_SUCCESS) *out = *(volatile uint32_t *)map;
+    return res;
+}
+#endif
+
+static void p_ahb_share(pctx *c)
+{
+#ifndef __ANDROID__
+    say(c, "Android only");
+    outcome(c, PS_SKIP);
+#else
+    if (c->dmabuf || has_ext(c, "VK_EXT_external_memory_dma_buf")) {
+        say(c, "not needed: the driver takes dma-bufs");
+        outcome(c, PS_SKIP);
+        return;
+    }
+    if (!c->ahb || !pahb_load()) {
+        say(c, "no Android buffers here (%s)", c->ahb ? "libnativewindow functions missing" : "no VK_ANDROID_external_memory_android_hardware_buffer");
+        outcome(c, PS_SKIP);
+        return;
+    }
+    int bad = 0;
+    const uint32_t W = 64, H = 64;
+    /* export -> import */
+    struct AHardwareBuffer *ahb = NULL;
+    VkResult r;
+    VkImage a = ahb_image(c, NULL, &ahb, W, H, &r);
+    if (!a) {
+        say(c, "export: %d", r);
+        bad = 1;
+    } else {
+        probe_ahb_desc d;
+        memset(&d, 0, sizeof(d));
+        pahb.describe(ahb, &d);
+        const probe_native_handle *nh = pahb.handle(ahb);
+        say(c, "export: %ux%u format %u stride %u usage 0x%llx, %d fd(s)", d.width, d.height, d.format, d.stride,
+            (unsigned long long)d.usage, nh ? nh->numFds : -1);
+        r = ahb_clear_release(c, a);
+        VkImage b = r == VK_SUCCESS ? ahb_image(c, ahb, NULL, W, H, &r) : VK_NULL_HANDLE;
+        uint32_t got = 0;
+        if (b) r = ahb_read(c, b, W / 2, H / 2, &got);
+        if (!b || r != VK_SUCCESS) say(c, "; import: %d", r), bad = 1;
+        else {
+            say(c, "; import: texel 0x%08x (want 0x%08x)%s", got, PAHB_CLEAR, near_rgba(got) ? "" : " WRONG");
+            bad |= !near_rgba(got);
+        }
+        pahb.release(ahb);
+    }
+    /* our own CPU-readable buffer: the layout a copying compositor would read */
+    if (!c->gpu_stuck) {
+        probe_ahb_desc want = {W, H, 1, 1 /* R8G8B8A8_UNORM */, 3ull /* CPU_READ_OFTEN */ | (1ull << 8) | (1ull << 9), 0, 0, 0};
+        struct AHardwareBuffer *own = NULL;
+        int ar = pahb.allocate(&want, &own);
+        if (ar != 0 || !own) {
+            say(c, "; cpu: allocate %d", ar);
+            bad = 1;
+        } else {
+            probe_ahb_desc d;
+            memset(&d, 0, sizeof(d));
+            pahb.describe(own, &d);
+            VkImage i = ahb_image(c, own, NULL, W, H, &r);
+            if (i) r = ahb_clear_release(c, i);
+            const probe_native_handle *nh = pahb.handle(own);
+            uint64_t need = (uint64_t)d.stride * 4u * H;
+            int fd = -1;
+            for (int k = 0; nh && k < nh->numFds && fd < 0; k++) {
+                off_t end = lseek(nh->data[k], 0, SEEK_END);
+                if (end > 0 && (uint64_t)end >= need) fd = nh->data[k];
+            }
+            if (!i || r != VK_SUCCESS) say(c, "; cpu: import/clear %d", r), bad = 1;
+            else if (fd < 0) say(c, "; cpu: stride %u, no fd of %llu bytes", d.stride, (unsigned long long)need), bad = 1;
+            else {
+                void *p = mmap(NULL, (size_t)need, PROT_READ, MAP_SHARED, fd, 0);
+                if (p == MAP_FAILED) say(c, "; cpu: mmap %s", strerror(errno)), bad = 1;
+                else {
+                    struct {
+                        uint64_t flags;
+                    } sy = {1 /* DMA_BUF_SYNC_READ */ | 0 /* START */};
+                    ioctl(fd, 0x40086200 /* DMA_BUF_IOCTL_SYNC */, &sy);
+                    uint32_t got = ((volatile uint32_t *)p)[(H / 2) * d.stride + W / 2];
+                    sy.flags = 1 | 4 /* END */;
+                    ioctl(fd, 0x40086200, &sy);
+                    munmap(p, (size_t)need);
+                    say(c, "; cpu: stride %u, texel 0x%08x%s", d.stride, got, near_rgba(got) ? "" : " WRONG (not linear?)");
+                    bad |= !near_rgba(got);
+                }
+            }
+            pahb.release(own);
+        }
+    }
+    outcome(c, bad ? PS_FAIL : PS_PASS);
+#endif
 }
 
 /* Layouts of thin LINEAR images: rowPitch 0 broke Chromium (CEF's GPU process). */
@@ -1712,6 +1946,8 @@ static void p_waits(pctx *c)
     double el = mono_ms() - t0;
     say(c, "; timeline at 0, wait for 1: 0 -> %d, 2 ms -> %d after %.1f ms", a, b, el);
     bad |= a != VK_TIMEOUT || b != VK_TIMEOUT;
+    /* the timed-out wait answered VK_ERROR_DEVICE_LOST while the poll says VK_TIMEOUT */
+    int lost_at_timeout = a == VK_TIMEOUT && b == VK_ERROR_DEVICE_LOST;
     /* signalled from the queue (wait-before-signal on the host side) */
     VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 0, NULL, 1, &v};
     VkSubmitInfo sub = {VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts, 0, NULL, NULL, 0, NULL, 1, &s};
@@ -1721,7 +1957,11 @@ static void p_waits(pctx *c)
     if (c->d.vkGetSemaphoreCounterValue) c->d.vkGetSemaphoreCounterValue(c->dev, s, &now);
     say(c, "; signalled by a submission (%d): wait -> %d, value %llu", q, w, (unsigned long long)now);
     bad |= q != VK_SUCCESS || w != VK_SUCCESS || now != 1;
-    if (bad) say(c, " - illegal results are retried at run time (server_wait.c)");
+    if (lost_at_timeout && q == VK_SUCCESS && w == VK_SUCCESS && now == 1) {
+        c->want_flags |= VKB_PROBE_FLAG_WAIT_LOST;
+        say(c, " - a timed-out wait answered VK_ERROR_DEVICE_LOST with the device fine");
+    } else if (bad)
+        say(c, " - illegal results are retried at run time (server_wait.c)");
     c->d.vkQueueWaitIdle(c->q);
     outcome(c, bad ? PS_FAIL : PS_PASS);
 }
@@ -2657,6 +2897,7 @@ static const probe_def probes[] = {
     {"dma_heaps", p_dma_heaps, 0, 0, 0, "F02"},
     {"dmabuf_export", p_dmabuf_export, VKB_EMU_DMABUF_EXPORT, 0, 0, "F03"},
     {"dmabuf_linear_image", p_dmabuf_linear, 0, 0, 0, "F05"},
+    {"ahb_share", p_ahb_share, 0, 0, 0, "F03"},
     {"linear_layout", p_linear_layout, 0, 0, 0, "F06"},
     {"compressed_formats", p_formats, 0, 0, 0, "F08"},
     {"bc_native", p_bc_native, VKB_EMU_BCN, 0, 0, "F08"},
@@ -2670,7 +2911,7 @@ static const probe_def probes[] = {
     {"depth_clip", p_depth_clip, VKB_EMU_DEPTH_CLIP, 0, 0, "F19"},
     {"clip_distance", p_clip_distance, VKB_EMU_CLIP_DISTANCE, 0, 0, "F21"},
     {"spec_select", p_spec_select, 0, VKB_PROBE_FLAG_SPIRV_FIX, 0, "F23"},
-    {"waits", p_waits, 0, 0, 0, "F30"},
+    {"waits", p_waits, 0, VKB_PROBE_FLAG_WAIT_LOST, 0, "F30"},
     {"layer_vs", p_layer_vs, 0, 0, 0, "F22"},
     {"layer_gs", p_layer_gs, 0, VKB_PROBE_FLAG_GS_FOLD, 0, "F22"},
     {"pipeline_cache", p_pipeline_cache, 0, 0, 0, "F37"},
@@ -2727,6 +2968,7 @@ static const char *flag_text(uint32_t f)
     if (f & VKB_PROBE_FLAG_MK_CHURN) return "the bug's pattern (MK-06): a re-made view rendered stale";
     if (f & VKB_PROBE_FLAG_LUT_NOW) return "UE4 LUT pipelines get their stand-in at once";
     if (f & VKB_PROBE_FLAG_GS_FOLD) return "layer-only geometry stages folded into the vertex shader";
+    if (f & VKB_PROBE_FLAG_WAIT_LOST) return "timed-out semaphore waits the driver answers with VK_ERROR_DEVICE_LOST are checked, and given as VK_TIMEOUT when the device is fine";
     if (f & VKB_PROBE_FLAG_SPIRV_FIX) return "SPIR-V spec-constant fix on";
     if (f & VKB_PROBE_FLAG_TX_ALL) return "formats of the failed BC transcoder decoded";
     return "?";
@@ -3257,6 +3499,9 @@ static int probe_one(pctx *c, const probe_def *p, presult *r, int *dev_lost)
     /* an MK probe sees its erratum's imitation (host builds, VKBRIDGE_ERRATA_IMITATE) */
     vkb_dispatch saved = c->d;
     void *imi = p->mk && app ? vkb_errata_probe_begin(p->erratum, &c->d, c->dev, c->pd, c->api) : NULL;
+    /* waits sees VKBRIDGE_WAIT_FAKE_LOST's imitation (a timed-out wait answered VK_ERROR_DEVICE_LOST) */
+    if (!imi && app && p->fn == p_waits && vkb_wait_fake_lost())
+        imi = vkb_errata_probe_begin(VKB_ERRATUM_WAIT_RETRY, &c->d, c->dev, c->pd, c->api);
     /* the transcoders arm each build themselves (a hang there must not end the whole probe) */
     double limit = probe_limit_s(p);
     int sig = 0;

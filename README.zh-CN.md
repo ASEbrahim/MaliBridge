@@ -39,6 +39,16 @@
 
 MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配合 DroidDeck 使用的版本（DroidDeck 是在安卓上运行 Steam 客户端和 PC 游戏的应用）。在三星 Galaxy Tab S10+（Mali-G720）和 Galaxy Tab S11 Ultra（Mali-G925）上，我测试过的 34 款游戏达到了可玩或更好的水平，例如《半条命2》约 94 fps、《空洞骑士：丝之歌》、《星露谷物语》、Risk of Rain Returns、《黑暗之魂 重制版》、《盖瑞模组》。玩家还从另外 19 款 Mali 手机和平板发来了反馈，下面的表格中共有 83 款不同的游戏。MaliBridge 是免费的。
 
+## v0.5.4.2 新内容
+
+- **Steam 游戏模式应该不会再黑屏了**：Galaxy A16、A54、F15、Tab S9 FE、Tab S10 Lite、Anbernic RG556、使用紫光展锐 T770 的 GammaOS 掌机，以及刷了第三方系统的 Galaxy S10 和 Note10+ 手机。
+- **使用较旧驱动的 Mali 手机**（G52、G57、G72、G76、G77）现在应该能进入 Steam，不会在画面出来之前就停住。
+- **Galaxy A56：**现在能正常显示 Steam 的登录画面。
+- **SD 卡或外接硬盘上的 Steam 游戏库**启动快了很多。
+- **Steam 更新**时切换到别的应用再回来，不会再停住；第一次下载时如果连不上 Valve 的某个服务器，会换另一个试。
+
+完整更新内容：[发布说明](https://github.com/ASEbrahim/MaliBridge/releases/tag/v0.5.4.2)。
+
 ## v0.5.4.1 新内容
 
 - **Steam 现在应该能启动了**：Retroid Pocket 4 Pro、Galaxy A53、POCO X4 GT、motorola edge 40 neo 等之前停在 “Starting display and audio” 的手机，Galaxy A55 和 A56（Xclipse），以及刷了 LineageOS 的 Galaxy S10+ 和 Note10+。
@@ -55,7 +65,7 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 **修复**
 - **天玑 9500**（Mali-G1-Ultra）上《空洞骑士》《丝之歌》《哈迪斯》等游戏的**绿色方块和偏红贴图**应该已经消失。
 - **三星 Exynos（Xclipse）手机上有声音但画面全黑**：现在应该能显示游戏画面了。
-- **较旧的 Mali GPU**（G57、G68 等）上的 **Steam 黑屏**：这些手机上 Steam 的菜单改为不用 GPU 绘制。其中一部分手机在游戏模式下仍然黑屏（见[已知问题](#已知问题)）。
+- **较旧的 Mali GPU**（G57、G68 等）上的 **Steam 黑屏**：这些手机上 Steam 的菜单改为不用 GPU 绘制。其中一部分手机在游戏模式下仍然黑屏，v0.5.4.2 应该已经修复。
 - **Balatro 等 OpenGL 游戏中文字缺失**的问题已修复。
 - **手机内存不足时崩溃更少**，游戏之后再启动时卡顿也更少。
 - 会话被安卓在后台暂停很久之后，结束时**游戏画面不再丢失**。
@@ -380,7 +390,7 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 
 ## 已知问题
 
-- 一些较旧的 Mali 手机和平板（Galaxy A16、A54、F15、Tab S9 FE、Tab S10 Lite、Anbernic RG556）上，**Steam 游戏模式黑屏但有声音**。这些设备上桌面模式可以用。正在处理。
+- Galaxy A16、A54、F15、Tab S9 FE、Tab S10 Lite 和 Anbernic RG556 上的 **OpenGL 游戏**还没有测试。
 - 一些边走边加载贴图的游戏（《黑暗之魂3》、Hob）在**移动时会短暂卡顿**。
 - 在 **vivo 手机**上，Steam 的菜单可能只有约 15 fps，打开菜单时会白屏闪一下。如果你有 vivo 手机，v0.5.4 的日志会有帮助。
 - **Mali-G925 上的《巫师3》（DX12）**开场动画是 60 fps，但读取存档后帧率掉到 1 fps 以下。

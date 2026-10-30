@@ -22,6 +22,7 @@
 #         into the session folder
 #      b  the default (Xwayland listed): no crash in Xwayland, every x11perf test drawn, Xwayland
 #         alive; a program not listed (glxgears) keeps geometry shaders (its crashes contained)
+#      c  as b on a job manager GPU taken as a Vulkan 1.1 driver, with server_emu.c's hiding on too
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 here=$PWD
@@ -120,7 +121,9 @@ EOF
   MALI_MISSING=bc,clip,cull,divisor,maint5,depthclip,push,robustness2,dualsrc,fillmode,multiviewport,maint6,desclimits,opaquefd,lazymem,dmabuflinear,planarext
   MALI_HIDE=VK_KHR_maintenance5,VK_KHR_push_descriptor,VK_EXT_robustness2,VK_KHR_robustness2,VK_EXT_vertex_attribute_divisor,VK_KHR_vertex_attribute_divisor,VK_EXT_depth_clip_enable,VK_KHR_maintenance6
   session() { # session <name> [server env...]: gamescope's output in $dir/gamescope.log
-    start "$@" $BETA VKBRIDGE_TEST_CRASH_PIPELINE=gs VKBRIDGE_SPIRV_FIX=1 VKBRIDGE_FAKE_MISSING=$MALI_MISSING vk_require_etc2=true vk_require_astc=true
+    local name=$1
+    shift
+    start "$name" $BETA VKBRIDGE_TEST_CRASH_PIPELINE=gs VKBRIDGE_SPIRV_FIX=1 VKBRIDGE_FAKE_MISSING=$MALI_MISSING vk_require_etc2=true vk_require_astc=true "$@"
     chmod 666 "$sock"
     timeout 120 docker run --rm --device /dev/dri/renderD128 --tmpfs /run/xdg:mode=0700 \
       -e XDG_RUNTIME_DIR=/run/xdg -e WAYLAND_DISPLAY=host-wayland -e HOME=/root \
@@ -148,6 +151,12 @@ EOF
     grep -q "errata: gs_hide: geometry shaders hidden from Xwayland" "$log" && ! ls "$dir/c/failed-Xwayland-"* >/dev/null 2>&1 &&
     { [ -z "$pg" ] || ls "$dir/c/failed-glxgears-$pg-"*-gs.spv >/dev/null 2>&1; }
   step $? "the same with gs_hide: Xwayland draws every x11perf test ($n) and lives, no crash in it; glxgears (not listed) keeps geometry shaders ($(ls "$dir/c" | grep -c '^failed-glxgears') dumps from its contained crashes)"
+  session xc VKBRIDGE_FAKE_DRIVER_VERSION=v1.r38p1-01bet0:jm VKBRIDGE_FAKE_API=1.1
+  n=$(grep -aoE "XPERF rc=[0-9]+ results=[0-9]+" "$dir/gamescope.log")
+  [ "$n" = "XPERF rc=0 results=8" ] && grep -aq "ALIVE yes" "$dir/gamescope.log" && ! grep -aq "Caught signal\|X11 I/O error" "$dir/gamescope.log" &&
+    grep -q "errata: gs_hide: geometry shaders hidden from Xwayland" "$log" &&
+    grep -q "a1: VK_EXT_extended_dynamic_state not offered .*Vulkan 1.1 to apps" "$log" && ! ls "$dir/c/failed-Xwayland-"* >/dev/null 2>&1
+  step $? "the S10 / Note10+ phone's setup (beta, job manager, Vulkan 1.1): gs_hide and a1 on, Xwayland draws every x11perf test ($n) and lives"
 fi
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

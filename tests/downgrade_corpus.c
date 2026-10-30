@@ -2,7 +2,7 @@
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * The SPIR-V lowering of version promotion (server/spirv_downgrade.c) over a corpus:
- *   downgrade_corpus <1.4|1.5> outdir file.spv...
+ *   downgrade_corpus <1.4|1.5>[:lanes] outdir file.spv...  (:lanes: broadcasts as chains over that many lanes)
  * For each module above the target: lowered, the new code written to outdir/<name> for spirv-val;
  * checked that the lowering of its own output changes nothing. One line per module -
  *   <name>: 1.<m> -> 1.<t>, <e> extension(s), <l> layer capabilities, <b> broadcast(s) made shuffles
@@ -31,9 +31,9 @@ static uint32_t *load(const char *path, size_t *size)
 
 int main(int argc, char **argv)
 {
-    unsigned tminor;
-    if (argc < 4 || sscanf(argv[1], "1.%u", &tminor) != 1) {
-        fprintf(stderr, "usage: downgrade_corpus <1.4|1.5> outdir file.spv...\n");
+    unsigned tminor, lanes = 0;
+    if (argc < 4 || sscanf(argv[1], "1.%u:%u", &tminor, &lanes) < 1) {
+        fprintf(stderr, "usage: downgrade_corpus <1.4|1.5>[:lanes] outdir file.spv...\n");
         return 2;
     }
     uint32_t target = 0x00010000u | (tminor << 8);
@@ -54,7 +54,7 @@ int main(int argc, char **argv)
         size_t os = 0, os2 = 0;
         vkb_downgrade_stats st;
         const char *why;
-        int r = vkb_spv_downgrade(code, size, target, &o, &os, &st, &why);
+        int r = vkb_spv_downgrade_ex(code, size, target, lanes, &o, &os, &st, &why);
         if (r < 0) {
             printf("%s: FAIL: not lowered: %s\n", base, why);
             failed++;
@@ -62,14 +62,16 @@ int main(int argc, char **argv)
             printf("%s: at or below the target\n", base);
         } else {
             lowered++;
-            if (vkb_spv_downgrade(o, os, target, &o2, &os2, NULL, &why) != 0) printf("%s: FAIL: its own output lowered again\n", base), failed++;
+            if (vkb_spv_downgrade_ex(o, os, target, lanes, &o2, &os2, NULL, &why) != 0) printf("%s: FAIL: its own output lowered again\n", base), failed++;
             char out[8192];
             snprintf(out, sizeof(out), "%s/%s", outdir, base);
             FILE *f = fopen(out, "wb");
             if (!f || fwrite(o, 1, os, f) != os) printf("%s: cannot write %s\n", base, out), failed++;
             if (f) fclose(f);
-            printf("%s: 1.%u -> 1.%u, %u extension(s), %u layer capabilities, %u broadcast(s) made shuffles\n", base, (st.from >> 8) & 0xff,
+            printf("%s: 1.%u -> 1.%u, %u extension(s), %u layer capabilities, %u broadcast(s) made shuffles", base, (st.from >> 8) & 0xff,
                    tminor, st.extensions, st.layer_caps, st.broadcasts);
+            if (lanes) printf(", %u made chains", st.unrolled);
+            printf("\n");
         }
         free(code), free(o), free(o2);
     }

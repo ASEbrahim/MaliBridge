@@ -51,6 +51,8 @@ typedef struct vkb_srv_conn {
     int fdn;
     vkb_arena arena;
     pthread_t thread;
+    uint32_t running;     /* the request it is running, command id + 1 (0: none; atomic, read by order_stall) */
+    uint64_t running_ns;  /* since when (CLOCK_MONOTONIC_COARSE) */
 } vkb_srv_conn;
 
 /* Startup knowledge about each physical device (keyed by deviceUUID). */
@@ -160,6 +162,7 @@ double vkb_guard_timeout_s(int mode, const char **why);
 #define VKB_PROBE_FLAG_TX_ASTC_HDR 0x40u
 #define VKB_PROBE_FLAG_TX_BC7 0x10000u   /* BC7 -> ASTC: its own (the biggest; BC2 and BC3 build where it does not). Was 0x8000, MK_FP16's bit: a died bc_transcoders read as MK-20 */
 #define VKB_PROBE_FLAG_TX_ALL 0x10078u
+#define VKB_PROBE_FLAG_WAIT_LOST 0x20000u /* waits: a timed-out wait answered VK_ERROR_DEVICE_LOST; server_wait.c checks such answers */
 /* The MK probes (one per Mali driver erratum it can tell): the bug's own pattern was seen. Their
  * results reach the errata decisions (server_errata.c) through vkb_errata_set_probe_source. */
 #define VKB_PROBE_FLAG_MK_WAIT 0x80u        /* wait_eintr: a wait failed or ended early after a signal (MK-01) */
@@ -293,6 +296,7 @@ int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driv
  * builds), its imitation goes beneath *d, which the probe then calls - the probe sees the bug an
  * affected driver has. Returns what vkb_errata_probe_end takes (NULL: nothing imitated). */
 void *vkb_errata_probe_begin(int id, vkb_dispatch *d, VkDevice dev, VkPhysicalDevice pd, uint32_t api);
+int vkb_wait_fake_lost(void); /* server_wait.c: VKBRIDGE_WAIT_FAKE_LOST */
 void vkb_errata_probe_end(void *h);
 /* FNV-1a of a module's SPIR-V as the app made it: a module an erratum rewrote is named by the
  * code it was rewritten from (server_errata_bitwise.c); what layers beneath the errata hash with */
@@ -392,6 +396,8 @@ void vkb_srv_reply_status(vkb_srv_call *c, uint32_t status);
 vkb_srv_table *vkb_srv_current_table(void);
 void vkb_cbfail_device_init(vkb_srv_table *t); /* server_conn.c */
 void vkb_cbfail_device_destroy(vkb_srv_table *t);
+void vkb_syncfd_device_init(vkb_srv_table *t);   /* server_syncfd.c: sync-fd exports with a deadline */
+int vkb_syncfd_device_destroy(vkb_srv_table *t); /* 1: an export is still in the driver, leave the device alive */
 void vkb_srv_set_current_table(vkb_srv_table *t);
 void vkb_proc_cleanup(vkb_srv_proc *p);
 vkb_srv_proc *vkb_srv_current_proc(void); /* the client process this connection thread serves, or NULL */
@@ -456,6 +462,11 @@ VkResult vkb_opaque_alloc_retry(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb_
 int vkb_opaque_shared_info(vkb_srv_table *t, VkMemoryAllocateInfo *ai);
 void vkb_opaque_shared_done(vkb_srv_mem *m, int out_fd);
 const VkMemoryGetFdInfoKHR *vkb_opaque_get_fd_info(vkb_srv_table *t, const VkMemoryGetFdInfoKHR *gi, VkMemoryGetFdInfoKHR *tmp);
+
+/* server_apicap.c: Steam mode's own processes capped on the gate (vkbQueryServer's api_cap). */
+int vkb_errata_arm_release_pd(const vkb_srv_table *t, VkPhysicalDevice pd, int *arm, int *jm);
+int vkb_black_gate(const vkb_srv_table *t, VkPhysicalDevice pd, const char **why);
+uint32_t vkb_steam_api_cap(const vkb_srv_table *t, VkPhysicalDevice pd);
 
 /* server_driverid.c: Arm's own driver told from others with Arm's vendor ID (Mesa PanVK) by driverID.
  * vkb_driver_id: the VkDriverId, 0 when the driver cannot say (asked once per physical device, kept

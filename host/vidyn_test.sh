@@ -13,9 +13,11 @@
 #     5  the extension and both formats imitated missing: 4 variants
 #     6  a client that is not Zink with vidyn imitated missing: no extension (SKIP)
 #     7  VKBRIDGE_EMU_VIDYN=0 with BGRA 10-10-10-2 imitated missing: hidden from Zink as before (SKIP)
+#     8  a Zink process exits without destroying its device: its vertex input state is cleaned up and the other process still draws right
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
+srvbin=${VKB_SERVER_BIN:-$out/vkbridge-server}
 icd=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json}
 work=$(mktemp -d)
 sock=${XDG_RUNTIME_DIR:-/tmp}/vkbridge-vidyn-$$.sock
@@ -33,7 +35,7 @@ server() {
   rm -rf "$work/c" && mkdir -p "$work/c"
   env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_ERRATA -u VKBRIDGE_ERRATA_IMITATE -u VKBRIDGE_MODE \
       -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_EMU_VIDYN -u VKBRIDGE_ASYNC_COMPILE "$@" \
-      VK_DRIVER_FILES=$icd VK_ICD_FILENAMES= "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$work/c" >/dev/null 2>&1 &
+      VK_DRIVER_FILES=$icd VK_ICD_FILENAMES= "$srvbin" --socket "$sock" --log "$log" --cache-dir "$work/c" >/dev/null 2>&1 &
   srv=$!
   for _ in $(seq 100); do [ -S "$sock" ] && break; sleep 0.1; done
 }
@@ -46,7 +48,7 @@ run() {
   printf '%s\n' "$@" > "$work/c/env"
   local l; l=$(wc -l < "$log")
   VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES= VKBRIDGE_HIDE_EXTS= VKBRIDGE_MAX_API= \
-    timeout 120 "$out/vidyn_check" "$engine" >$work/run.log 2>&1
+    timeout 120 "$out/vidyn_check" "$engine" $HOW >$work/run.log 2>&1
   rc=$?
   res=$(tail -1 $work/run.log)
   sleep 0.3 # the device's last log lines
@@ -93,5 +95,12 @@ server VKBRIDGE_FAKE_MISSING=bgr10vtx VKBRIDGE_EMU_VIDYN=0
 run
 [ $rc = 0 ] && grep -q "^SKIP the extension is not offered" $work/run.log && echo "$new" | grep -q "hidden from Zink (packed vertex fetch emulated)"
 step $? "VKBRIDGE_EMU_VIDYN=0, BGRA 10-10-10-2 imitated missing: hidden from Zink as before ($(grep -m1 '^SKIP' $work/run.log))"
+
+server VKBRIDGE_FAKE_MISSING=vidyn VKBRIDGE_ASYNC_COMPILE=1
+HOW=dead-peer run
+kept=$(echo "$new" | grep -c "pipeline(s) kept")
+[ $rc = 0 ] && ! grep -q "^SKIP" $work/run.log && grep -q "exiting without destroying anything" $work/run.log &&
+  echo "$new" | grep -q "exited without destroying device" && [ "$kept" = 2 ] && ! echo "$new" | grep -q "crashed with signal\|AddressSanitizer"
+step $? "a Zink process gone without destroying its device, another drawing on: $res; vertex input totals logged for $kept of the 2 devices"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

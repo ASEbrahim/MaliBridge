@@ -109,6 +109,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDescriptorPool(VkDevice device, VkDesc
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout descriptorSetLayout, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDescriptorUpdateTemplate(VkDevice device, VkDescriptorUpdateTemplate descriptorUpdateTemplate, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator);
+VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
@@ -138,6 +139,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceImageSubresourceLayout(VkDevice devi
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_vkGetDeviceProcAddr(VkDevice device, const char* pName);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pGetFdInfo, int* pFd);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceStatus(VkDevice device, VkFence fence);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkImage image, VkImageDrmFormatModifierPropertiesEXT* pProperties);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource* pSubresource, VkSubresourceLayout* pLayout);
@@ -158,6 +160,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceProperties(VkPhysicalDevice 
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, size_t dataSize, void* pData, VkDeviceSize stride, VkQueryResultFlags flags);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetRenderingAreaGranularity(VkDevice device, const VkRenderingAreaInfo* pRenderingAreaInfo, VkExtent2D* pGranularity);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueWaitIdle(VkQueue queue);
@@ -1058,6 +1061,13 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDescriptorUpdateTemplate(VkDevice devi
     ctx->t->dt.vkDestroyDescriptorUpdateTemplate(device, descriptorUpdateTemplate, pAllocator);
 }
 
+VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator)
+{
+    // server_syncfd.c (sx_DestroyFence)
+    auto ctx = get_scoped_ctx(device);
+    ctx->t->dt.vkDestroyFence(device, fence, pAllocator);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator)
 {
     // server_emu_dynrend.c (d_DestroyImage)
@@ -1128,6 +1138,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySampler(VkDevice device, VkSampler sam
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator)
 {
+    // server_syncfd.c (sx_DestroySemaphore)
     // server_wait.c (w_DestroySemaphore)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroySemaphore(device, semaphore, pAllocator);
@@ -1212,6 +1223,13 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceImageSubresourceLayout(VkDevice devi
     ctx->t->dt.vkGetDeviceImageSubresourceLayout(device, pInfo, pLayout);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pGetFdInfo, int* pFd)
+{
+    // server_syncfd.c (sx_GetFenceFdKHR)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkGetFenceFdKHR(device, pGetFdInfo, pFd);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceStatus(VkDevice device, VkFence fence)
 {
     // server_wait.c (imi_GetFenceStatus)
@@ -1291,6 +1309,13 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetRenderingAreaGranularity(VkDevice device, 
     // server_emu_layer.c (emu_GetRenderingAreaGranularity)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkGetRenderingAreaGranularity(device, pRenderingAreaInfo, pGranularity);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd)
+{
+    // server_syncfd.c (sx_GetSemaphoreFdKHR)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkGetSemaphoreFdKHR(device, pGetFdInfo, pFd);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence)
@@ -1526,6 +1551,7 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkDestroyDescriptorUpdateTemplate") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyDescriptorUpdateTemplate);
     if (strcmp(pName, "vkDestroyDescriptorUpdateTemplateKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyDescriptorUpdateTemplate);
     if (strcmp(pName, "vkDestroyDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyDevice);
+    if (strcmp(pName, "vkDestroyFence") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyFence);
     if (strcmp(pName, "vkDestroyImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyImage);
     if (strcmp(pName, "vkDestroyImageView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyImageView);
     if (strcmp(pName, "vkDestroyPipeline") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyPipeline);
@@ -1554,6 +1580,7 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDeviceProcAddr);
     if (strcmp(pName, "vkGetDeviceQueue") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDeviceQueue);
     if (strcmp(pName, "vkGetDeviceQueue2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDeviceQueue2);
+    if (strcmp(pName, "vkGetFenceFdKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetFenceFdKHR);
     if (strcmp(pName, "vkGetFenceStatus") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetFenceStatus);
     if (strcmp(pName, "vkGetImageDrmFormatModifierPropertiesEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetImageDrmFormatModifierPropertiesEXT);
     if (strcmp(pName, "vkGetImageSubresourceLayout") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetImageSubresourceLayout);
@@ -1565,6 +1592,7 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkGetQueryPoolResults") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetQueryPoolResults);
     if (strcmp(pName, "vkGetRenderingAreaGranularity") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetRenderingAreaGranularity);
     if (strcmp(pName, "vkGetRenderingAreaGranularityKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetRenderingAreaGranularity);
+    if (strcmp(pName, "vkGetSemaphoreFdKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetSemaphoreFdKHR);
     if (strcmp(pName, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkQueueSubmit);
     if (strcmp(pName, "vkQueueSubmit2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkQueueSubmit2);
     if (strcmp(pName, "vkQueueSubmit2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkQueueSubmit2);

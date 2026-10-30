@@ -1,0 +1,14 @@
+#version 450
+// Dynamic-id broadcasts of a vector and of a boolean vector.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Out { vec4 v[]; } outs;
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    uint lane = (gl_WorkGroupID.x + 1u) % gl_SubgroupSize;
+    vec4 x = subgroupBroadcast(vec4(float(i), 1.0, 2.0, float(i * 2u)), lane);
+    bvec2 b = subgroupBroadcast(bvec2(i > 3u, i < 9u), lane);
+    outs.v[i] = b.x && b.y ? x : -x;
+}

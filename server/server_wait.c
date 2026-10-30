@@ -57,6 +57,8 @@
  * submit); the first case is logged with how long the work took, then a tally; a wait the grace did
  * not save is always logged.
  *
+ * A timed-out semaphore wait answered VK_ERROR_DEVICE_LOST, where the startup probe saw it, gets the poll's answer.
+ *
  * Switches: VKBRIDGE_ERRATA=-wait_retry turns the fix off (VKBRIDGE_WAIT_FIX=0 still does).
  * The imitation (VKBRIDGE_ERRATA_IMITATE=wait_retry on host builds; VKBRIDGE_WAIT_FAKE_ERROR set
  * imitates on any build) fails waits with -3 beneath the fix, after up to 20 ms of the driver's
@@ -69,6 +71,7 @@
  *                           of each kind
  *     kind: fence, sem, idle (both idle waits), query, status (vkGetFenceStatus); default all but
  *           status (an app polling a fence status that never answers would never end)
+ *   VKBRIDGE_WAIT_FAKE_LOST=1: timed-out semaphore waits answered VK_ERROR_DEVICE_LOST (alone, no -3)
  *   VKBRIDGE_WAIT_FAKE_RESULT=timeout: the fence and semaphore waits taken end with VK_TIMEOUT
  *           instead of -3, and only when the driver's own wait of up to 20 ms did not finish and the
  *           app's timeout is longer than that (the early timeout above; -3 stays on the other kinds)
@@ -264,6 +267,43 @@ static VkResult retry_loop(waitop *w, VkResult first)
     return r;
 }
 
+/* ------------------------------------------------------------------ a timed-out wait answered -4 */
+
+static int lost_fix_env = -1; /* read at each install (-1: the probe decides) */
+static unsigned long lost_tally[O_COUNT + 1];
+
+static int lost_fix_on(void)
+{
+    return lost_fix_env >= 0 ? lost_fix_env : vkb_probe_flag(VKB_PROBE_FLAG_WAIT_LOST);
+}
+
+/* The driver's vkWaitSemaphores, with a VK_ERROR_DEVICE_LOST from a wait with a timeout checked where the probe saw it. */
+static VkResult sem_wait_drv(const vkb_dispatch *nx, VkDevice d, const VkSemaphoreWaitInfo *wi, uint64_t timeout)
+{
+    uint64_t s = now_ns();
+    VkResult r = nx->vkWaitSemaphores(d, wi, timeout);
+    if (r != VK_ERROR_DEVICE_LOST || !timeout || !wi || !wi->semaphoreCount || !lost_fix_on()) return r;
+    VkResult p = nx->vkWaitSemaphores(d, wi, 0);
+    if (p != VK_SUCCESS && p != VK_TIMEOUT) return r; /* lost for real */
+    uint64_t v = 0;
+    if (nx->vkGetSemaphoreCounterValue && nx->vkGetSemaphoreCounterValue(d, wi->pSemaphores[0], &v) != VK_SUCCESS) return r;
+    uint64_t took = now_ns() - s;
+    __atomic_add_fetch(&lost_tally[p == VK_SUCCESS ? O_SUCCESS : O_TIMEOUT], 1, __ATOMIC_RELAXED);
+    unsigned long n = __atomic_add_fetch(&lost_tally[O_COUNT], 1, __ATOMIC_RELAXED);
+    if (n == 1)
+        VKB_WARN("wait_retry: vkWaitSemaphores: the driver answered a wait with VK_ERROR_DEVICE_LOST after %.3f s (timeout %.3f s) "
+                 "with the device fine (semaphore at %llu, wants %llu): the app gets %d%s",
+                 took / 1e9, timeout == UINT64_MAX ? -1.0 : timeout / 1e9, (unsigned long long)v, (unsigned long long)wi->pValues[0], p,
+                 p == VK_TIMEOUT ? " (VK_TIMEOUT)" : " (VK_SUCCESS)");
+    unsigned long q = 10;
+    while (q < n && q < 1000000000ul) q *= 10;
+    if (n >= 10 && n == q)
+        VKB_INFO("wait_retry: vkWaitSemaphores: %lu VK_ERROR_DEVICE_LOST answer(s) with the device fine so far: %lu given as "
+                 "VK_TIMEOUT, %lu as VK_SUCCESS", n, __atomic_load_n(&lost_tally[O_TIMEOUT], __ATOMIC_RELAXED),
+                 __atomic_load_n(&lost_tally[O_SUCCESS], __ATOMIC_RELAXED));
+    return p;
+}
+
 /* ------------------------------------------------------------------ submitted signals (the grace) */
 
 static void sem_state(const vkb_dispatch *nx, VkDevice d, const VkSemaphoreWaitInfo *wi, char *out, size_t cap);
@@ -421,7 +461,7 @@ static VkResult grace_wait(const vkb_dispatch *nx, VkDevice d, const VkSemaphore
         }
         tries++;
         uint64_t s = now_ns();
-        r = nx->vkWaitSemaphores(d, wi, end - now);
+        r = sem_wait_drv(nx, d, wi, end - now);
         if (r == VK_SUCCESS || (r < 0 && legal(r))) break;
         if (now_ns() - s < 2 * MS) { /* -3 or an early timeout at once: back off */
             nap_ns(nap);
@@ -487,7 +527,7 @@ typedef struct {
 static VkResult sem_wait(void *c, uint64_t timeout)
 {
     sem_ctx *x = c;
-    return x->nx->vkWaitSemaphores(x->d, x->wi, timeout);
+    return sem_wait_drv(x->nx, x->d, x->wi, timeout);
 }
 static VkResult sem_poll(void *c)
 {
@@ -515,7 +555,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_WaitSemaphores(VkDevice d, const VkSemap
 {
     const vkb_dispatch *nx = vkb_errata_next(0);
     uint64_t t0 = now_ns();
-    VkResult r = nx->vkWaitSemaphores(d, wi, timeout);
+    VkResult r = sem_wait_drv(nx, d, wi, timeout);
     if (!legal(r) || early_timeout(r, t0, timeout)) {
         sem_ctx x = {nx, d, wi};
         waitop w = {K_SEM, sem_wait, sem_poll, &x, timeout, t0, ""};
@@ -639,6 +679,11 @@ void vkb_wait_retry_install(vkb_srv_table *t, vkb_errata_dev *e)
         ERRATA_HOOK(t, vkQueueSubmit2, w_QueueSubmit2);
         ERRATA_HOOK(t, vkDestroySemaphore, w_DestroySemaphore);
     }
+    const char *lf = vkb_srv_env("VKBRIDGE_WAIT_LOST_FIX");
+    lost_fix_env = lf && *lf ? strcmp(lf, "0") != 0 : -1;
+    if (lost_fix_env >= 0)
+        VKB_INFO("wait_retry: timed-out semaphore waits answered VK_ERROR_DEVICE_LOST: %s (VKBRIDGE_WAIT_LOST_FIX=%s)",
+                 lost_fix_env ? "checked" : "passed on", lf);
     if (g && *g) VKB_INFO("wait_retry: semaphore waits past their deadline with the work submitted: %s (VKBRIDGE_WAIT_GRACE_S=%s)",
                           grace_ns ? "waited on" : "not waited on", g);
     if (cap_override_ns >= 0) VKB_INFO("wait_retry: retrying for at most %s ms (VKBRIDGE_WAIT_RETRY_MS)", cap);
@@ -649,6 +694,27 @@ void vkb_wait_retry_install(vkb_srv_table *t, vkb_errata_dev *e)
 enum { HOW_ONCE, HOW_ALT, HOW_ALL, HOW_FIRST };
 static int imi_how;
 static int imi_timeout; /* VKBRIDGE_WAIT_FAKE_RESULT=timeout: an early VK_TIMEOUT, not -3 */
+static int imi_lost;    /* VKBRIDGE_WAIT_FAKE_LOST: a timed-out semaphore wait answered VK_ERROR_DEVICE_LOST */
+static int imi_eintr = 1; /* the -3 imitation asked for (not VKBRIDGE_WAIT_FAKE_LOST alone) */
+
+int vkb_wait_fake_lost(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_WAIT_FAKE_LOST");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+/* Whether the -3 imitation was asked for: VKBRIDGE_WAIT_FAKE_ERROR, or VKBRIDGE_ERRATA_IMITATE naming wait_retry */
+static int eintr_asked(void)
+{
+    const char *f = vkb_srv_env("VKBRIDGE_WAIT_FAKE_ERROR"), *i = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE");
+    return (f && *f && strcmp(f, "0")) || (i && strstr(i, "wait_retry"));
+}
+
+/* The driver's answer under VKBRIDGE_WAIT_FAKE_LOST */
+static VkResult imi_lost_of(VkResult r, uint64_t timeout)
+{
+    return imi_lost && timeout && r == VK_TIMEOUT ? VK_ERROR_DEVICE_LOST : r;
+}
 static unsigned imi_kinds;
 static long imi_left[K_COUNT];
 static __thread unsigned imi_flip[K_COUNT];
@@ -658,7 +724,7 @@ static int imi_take(int kind)
 {
     /* the startup probe's wait_eintr: its fence and semaphore waits fail, the app's counts untouched */
     vkb_errata_dev *pe = vkb_errata_cur();
-    if (pe && pe->probe) return kind == K_FENCE || kind == K_SEM;
+    if (pe && pe->probe) return imi_eintr && (kind == K_FENCE || kind == K_SEM);
     if (!(imi_kinds >> kind & 1)) return 0;
     if (imi_how == HOW_ALL) return 1;
     if (imi_how == HOW_ONCE) return !retrying;
@@ -686,9 +752,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL imi_WaitForFences(VkDevice d, uint32_t n, 
 static VKAPI_ATTR VkResult VKAPI_CALL imi_WaitSemaphores(VkDevice d, const VkSemaphoreWaitInfo *wi, uint64_t timeout)
 {
     const vkb_dispatch *nx = vkb_errata_next(1);
-    if (!timeout || (imi_early() && timeout <= SLICE) || !imi_take(K_SEM)) return nx->vkWaitSemaphores(d, wi, timeout);
+    if (!timeout || (imi_early() && timeout <= SLICE) || !imi_take(K_SEM)) return imi_lost_of(nx->vkWaitSemaphores(d, wi, timeout), timeout);
     VkResult r = nx->vkWaitSemaphores(d, wi, timeout < SLICE ? timeout : SLICE);
-    return !imi_early() ? VK_ERROR_INITIALIZATION_FAILED : r;
+    return !imi_early() ? VK_ERROR_INITIALIZATION_FAILED : imi_lost_of(r, timeout);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL imi_QueueWaitIdle(VkQueue q)
@@ -721,6 +787,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL imi_GetFenceStatus(VkDevice d, VkFence f)
 
 void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e)
 {
+    imi_lost = vkb_wait_fake_lost();
+    imi_eintr = !imi_lost || eintr_asked();
     if (e->probe) { /* the probe's own waits only (imi_take): nothing here changes */
         ERRATA_HOOK(t, vkWaitForFences, imi_WaitForFences);
         ERRATA_HOOK(t, vkWaitSemaphores, imi_WaitSemaphores);
@@ -745,6 +813,7 @@ void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e)
         while (*c == '+' || *c == ',' || *c == ' ') c++;
     }
     if (!k) imi_kinds = bits[0] | bits[1] | bits[2] | bits[3];
+    if (!imi_eintr) imi_kinds = 0; /* VKBRIDGE_WAIT_FAKE_LOST alone */
     const char *res = vkb_srv_env("VKBRIDGE_WAIT_FAKE_RESULT");
     imi_timeout = res && !strcmp(res, "timeout");
     for (int i = 0; i < K_COUNT; i++) __atomic_store_n(&imi_left[i], n, __ATOMIC_RELAXED);
@@ -758,6 +827,9 @@ void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e)
     for (int i = 0; i < 5; i++)
         if ((imi_kinds & bits[i]) == bits[i]) snprintf(ks + strlen(ks), sizeof(ks) - strlen(ks), "%s%s", *ks ? "," : "", names[i]);
     const char *how = imi_timeout ? "-3, fence and semaphore waits with an early VK_TIMEOUT" : "-3";
+    if (imi_lost)
+        VKB_INFO("wait_retry: device %u: timed-out semaphore waits answered VK_ERROR_DEVICE_LOST (VKBRIDGE_WAIT_FAKE_LOST)", t->id);
+    if (!imi_eintr) return;
     if (imi_how == HOW_FIRST)
         VKB_INFO("wait_retry: device %u: the first %ld blocking call(s) of each kind (%s) fail with %s", t->id, n, ks, how);
     else

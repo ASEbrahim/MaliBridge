@@ -1,0 +1,128 @@
+; tests/downgrade/src/bcastvec.comp by glslc --target-env=vulkan1.2, spirv-dis --raw-id
+; SPIR-V
+; Version: 1.5
+; Generator: Google Shaderc over Glslang; 11
+; Bound: 77
+; Schema: 0
+               OpCapability Shader
+               OpCapability GroupNonUniform
+               OpCapability GroupNonUniformBallot
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %4 "main" %10 %15 %21 %55
+               OpExecutionMode %4 LocalSize 64 1 1
+               OpSource GLSL 450
+               OpSourceExtension "GL_GOOGLE_cpp_style_line_directive"
+               OpSourceExtension "GL_GOOGLE_include_directive"
+               OpSourceExtension "GL_KHR_shader_subgroup_ballot"
+               OpSourceExtension "GL_KHR_shader_subgroup_basic"
+               OpName %4 "main"
+               OpName %8 "i"
+               OpName %10 "gl_LocalInvocationIndex"
+               OpName %12 "lane"
+               OpName %15 "gl_WorkGroupID"
+               OpName %21 "gl_SubgroupSize"
+               OpName %27 "x"
+               OpName %43 "b"
+               OpName %53 "Out"
+               OpMemberName %53 0 "v"
+               OpName %55 "outs"
+               OpDecorate %10 BuiltIn LocalInvocationIndex
+               OpDecorate %15 BuiltIn WorkgroupId
+               OpDecorate %21 RelaxedPrecision
+               OpDecorate %21 BuiltIn SubgroupSize
+               OpDecorate %22 RelaxedPrecision
+               OpDecorate %52 ArrayStride 16
+               OpMemberDecorate %53 0 Offset 0
+               OpDecorate %53 Block
+               OpDecorate %55 DescriptorSet 0
+               OpDecorate %55 Binding 0
+               OpDecorate %76 BuiltIn WorkgroupSize
+          %2 = OpTypeVoid
+          %3 = OpTypeFunction %2
+          %6 = OpTypeInt 32 0
+          %7 = OpTypePointer Function %6
+          %9 = OpTypePointer Input %6
+         %10 = OpVariable %9 Input
+         %13 = OpTypeVector %6 3
+         %14 = OpTypePointer Input %13
+         %15 = OpVariable %14 Input
+         %16 = OpConstant %6 0
+         %19 = OpConstant %6 1
+         %21 = OpVariable %9 Input
+         %24 = OpTypeFloat 32
+         %25 = OpTypeVector %24 4
+         %26 = OpTypePointer Function %25
+         %30 = OpConstant %24 1
+         %31 = OpConstant %24 2
+         %33 = OpConstant %6 2
+         %38 = OpConstant %6 3
+         %40 = OpTypeBool
+         %41 = OpTypeVector %40 2
+         %42 = OpTypePointer Function %41
+         %47 = OpConstant %6 9
+         %52 = OpTypeRuntimeArray %25
+         %53 = OpTypeStruct %52
+         %54 = OpTypePointer StorageBuffer %53
+         %55 = OpVariable %54 StorageBuffer
+         %56 = OpTypeInt 32 1
+         %57 = OpConstant %56 0
+         %59 = OpTypePointer Function %40
+         %73 = OpTypePointer StorageBuffer %25
+         %75 = OpConstant %6 64
+         %76 = OpConstantComposite %13 %75 %19 %19
+          %4 = OpFunction %2 None %3
+          %5 = OpLabel
+          %8 = OpVariable %7 Function
+         %12 = OpVariable %7 Function
+         %27 = OpVariable %26 Function
+         %43 = OpVariable %42 Function
+         %65 = OpVariable %26 Function
+         %11 = OpLoad %6 %10
+               OpStore %8 %11
+         %17 = OpAccessChain %9 %15 %16
+         %18 = OpLoad %6 %17
+         %20 = OpIAdd %6 %18 %19
+         %22 = OpLoad %6 %21
+         %23 = OpUMod %6 %20 %22
+               OpStore %12 %23
+         %28 = OpLoad %6 %8
+         %29 = OpConvertUToF %24 %28
+         %32 = OpLoad %6 %8
+         %34 = OpIMul %6 %32 %33
+         %35 = OpConvertUToF %24 %34
+         %36 = OpCompositeConstruct %25 %29 %30 %31 %35
+         %37 = OpLoad %6 %12
+         %39 = OpGroupNonUniformBroadcast %25 %38 %36 %37
+               OpStore %27 %39
+         %44 = OpLoad %6 %8
+         %45 = OpUGreaterThan %40 %44 %38
+         %46 = OpLoad %6 %8
+         %48 = OpULessThan %40 %46 %47
+         %49 = OpCompositeConstruct %41 %45 %48
+         %50 = OpLoad %6 %12
+         %51 = OpGroupNonUniformBroadcast %41 %38 %49 %50
+               OpStore %43 %51
+         %58 = OpLoad %6 %8
+         %60 = OpAccessChain %59 %43 %16
+         %61 = OpLoad %40 %60
+         %62 = OpAccessChain %59 %43 %19
+         %63 = OpLoad %40 %62
+         %64 = OpLogicalAnd %40 %61 %63
+               OpSelectionMerge %67 None
+               OpBranchConditional %64 %66 %69
+         %66 = OpLabel
+         %68 = OpLoad %25 %27
+               OpStore %65 %68
+               OpBranch %67
+         %69 = OpLabel
+         %70 = OpLoad %25 %27
+         %71 = OpFNegate %25 %70
+               OpStore %65 %71
+               OpBranch %67
+         %67 = OpLabel
+         %72 = OpLoad %25 %65
+         %74 = OpAccessChain %73 %55 %57 %58
+               OpStore %74 %72
+               OpReturn
+               OpFunctionEnd
