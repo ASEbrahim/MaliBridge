@@ -93,12 +93,19 @@ static int gamescope_minor(int m)
     return m < 2 ? 2 : m;
 }
 
+/* 1 for Steam mode's own processes: gamescope, Xwayland, steamwebhelper, steam */
+int vkb_steam_own_process(const char *comm)
+{
+    return comm && (!strncmp(comm, "gamescope", 9) || !strcmp(comm, "Xwayland") || !strcmp(comm, "steamwebhelper") ||
+                    !strcmp(comm, "steam"));
+}
+
 uint32_t vkb_steam_api_cap(const vkb_srv_table *t, VkPhysicalDevice pd)
 {
     const vkb_srv_proc *pr = t ? t->proc : NULL;
     const char *comm = pr && pr->comm[0] ? pr->comm : "";
     int gs = !strncmp(comm, "gamescope", 9);
-    if (!gs && strcmp(comm, "Xwayland") && strcmp(comm, "steamwebhelper") && strcmp(comm, "steam")) return 0;
+    if (!vkb_steam_own_process(comm)) return 0;
     const char *v = vkb_srv_env_global("VKBRIDGE_STEAM_API_CAP");
     int minor = cap_value(v);
     const char *why = NULL;

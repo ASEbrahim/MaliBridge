@@ -85,6 +85,17 @@ static const char *hide_list(void)
 
 /* On the gate (server_apicap.c) by default: VK_EXT_extended_dynamic_state not offered and dynamic rendering emulated with render passes; decided once, at the self-test. */
 static int a1_on;
+/* In-process (the Vulkan layer): the one process it serves. The gate is for Steam mode's own
+ * processes there; a game's process gets the driver's dynamic rendering unless VKBRIDGE_A1_ZINK=1. */
+static int a1_layer, a1_layer_steam;
+static char a1_layer_comm[32];
+
+void vkb_emu_a1_layer(const char *comm)
+{
+    snprintf(a1_layer_comm, sizeof(a1_layer_comm), "%s", comm ? comm : "");
+    a1_layer_steam = vkb_steam_own_process(a1_layer_comm);
+    __atomic_store_n(&a1_layer, 1, __ATOMIC_RELEASE);
+}
 
 static int a1_decide(const vkb_dispatch *idt, VkPhysicalDevice pd)
 {
@@ -93,7 +104,11 @@ static int a1_decide(const vkb_dispatch *idt, VkPhysicalDevice pd)
     const char *why = "VKBRIDGE_A1_ZINK=1";
     if (v && !strcmp(v, "0")) on = 0;
     else if (v && !strcmp(v, "1")) on = 1;
-    else {
+    else if (__atomic_load_n(&a1_layer, __ATOMIC_ACQUIRE) && !a1_layer_steam) {
+        on = 0;
+        VKB_ONCE(VKB_LOG_INFO, "a1: off in the layer for %s, not one of Steam mode's processes (VKBRIDGE_A1_ZINK=1 turns it on)",
+                 a1_layer_comm[0] ? a1_layer_comm : "this process");
+    } else {
         static vkb_srv_table probe; /* the gate reads the driver through it */
         probe.real = *idt;
         probe.api_version = VK_API_VERSION_1_3;

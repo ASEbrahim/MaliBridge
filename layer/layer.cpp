@@ -219,6 +219,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateInstance(
 
     auto *t = ctx->t.get();
     t->proc = layer_proc();
+    vkb_emu_a1_layer(t->proc->comm); /* the a1 gate (server_apicap.c): Steam mode's own processes only */
     vkb_table_register(t);
     /* The bridge's instance fixes (server_instance.c), those that apply in-process: the extension
      * hiding and fp16_hide (MK-20) in vkb_emu_instance_install, gs_hide (issue #11) over them */

@@ -144,6 +144,17 @@ if command -v vulkaninfo >/dev/null 2>&1; then
   [ -n "$ext" ] && [ "$a" -gt 0 ] && [ "$b" = 0 ]
   step $? "VKBRIDGE_SERVER_HIDE_EXTS=$ext: listed $a time(s) before, $b after"
 fi
+if command -v vulkaninfo >/dev/null 2>&1; then
+  # The a1 gate (server_apicap.c) on an old job-manager Arm driver: in the layer only Steam mode's own
+  # processes lose VK_EXT_extended_dynamic_state; a game's process keeps it unless VKBRIDGE_A1_ZINK=1
+  eds() { grep -c "VK_EXT_extended_dynamic_state " "$work/a1.txt"; }
+  cp "$(command -v vulkaninfo)" "$work/steam"
+  env $clean_env -u VKBRIDGE_A1_ZINK VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:jm timeout 60 vulkaninfo >"$work/a1.txt" 2>/dev/null; a=$(eds)
+  env $clean_env VKBRIDGE_A1_ZINK=1 VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:jm timeout 60 vulkaninfo >"$work/a1.txt" 2>/dev/null; b=$(eds)
+  env $clean_env -u VKBRIDGE_A1_ZINK VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:jm timeout 60 "$work/steam" >"$work/a1.txt" 2>/dev/null; c=$(eds)
+  [ "$a" -gt 0 ] && [ "$b" = 0 ] && [ "$c" = 0 ]
+  step $? "a1 gate (r38p1 job manager imitated): a game's process keeps VK_EXT_extended_dynamic_state ($a), VKBRIDGE_A1_ZINK=1 hides it ($b), a process named steam loses it ($c)"
+fi
 got=$(env $clean_env VKBRIDGE_TEST_CRASH_PIPELINE=1 timeout 120 "$out/crash_contain_check" 2>&1); r=$?
 [ $r = 0 ] && ! echo "$got" | grep -q '^FAIL' && [ "$(echo "$got" | grep -c 'CONTAINED driver crash')" = 3 ]
 step $? "driver crashes in compiles contained: $(echo "$got" | grep -c '^PASS') checks pass, $(echo "$got" | grep -c 'CONTAINED driver crash') contained (exit $r)"
