@@ -18,6 +18,8 @@ result() {
     pass=$((pass+1)); echo "  ok   $2"
   else
     fail=$((fail+1)); echo "  FAIL $2"
+    # A script's own log (third argument): the steps that failed and the checks' FAIL lines.
+    [ -n "$3" ] && grep -E '^ +FAIL' "$3" 2>/dev/null | cut -c1-600 | sed 's/^/    from the log: /'
     # The server's log (protocol errors) and the check's own log (if it exists) reveal why.
     echo "  server log (last 100 lines):"
     tail -n 100 "$VKB_SERVER_LOG" 2>/dev/null | sed 's/^/    /'
@@ -225,23 +227,23 @@ run_mode() {
   if [ "$mode" = plain ]; then
     # Version promotion: a 1.1 / 1.2 driver offered as 1.3 (or 1.2 when a piece is missing), core
     # structures and names through the extensions, SPIR-V lowered (the corpus spirv-val clean)
-    timeout 600 ./promote_test.sh >out/ci-promote.log 2>&1; result $? "promote_test ($(tail -1 out/ci-promote.log))"
+    timeout 600 ./promote_test.sh >out/ci-promote.log 2>&1; result $? "promote_test ($(tail -1 out/ci-promote.log))" "out/ci-promote.log"
     # shm_barrier: barriers between shared-memory writes and reads in compute shaders
-    timeout 600 ./shmbarrier_test.sh >out/ci-shmbarrier.log 2>&1; result $? "shmbarrier_test ($(tail -1 out/ci-shmbarrier.log))"
+    timeout 600 ./shmbarrier_test.sh >out/ci-shmbarrier.log 2>&1; result $? "shmbarrier_test ($(tail -1 out/ci-shmbarrier.log))" "out/ci-shmbarrier.log"
     # wave32: 32-lane subgroups emulated in compute shaders on lavapipe's 8-wide ones
-    timeout 600 ./wave32_test.sh >out/ci-wave32.log 2>&1; result $? "wave32_test ($(tail -1 out/ci-wave32.log))"
+    timeout 600 ./wave32_test.sh >out/ci-wave32.log 2>&1; result $? "wave32_test ($(tail -1 out/ci-wave32.log))" "out/ci-wave32.log"
     # vb_bake: the G68's last-stride-to-every-binding bug imitated, the variants over it
-    timeout 300 ./vbbake_test.sh >out/ci-vbbake.log 2>&1; result $? "vbbake_test ($(tail -1 out/ci-vbbake.log))"
+    timeout 300 ./vbbake_test.sh >out/ci-vbbake.log 2>&1; result $? "vbbake_test ($(tail -1 out/ci-vbbake.log))" "out/ci-vbbake.log"
     # MK-11 stencil_layout: a separate stencil layout ignored, the fix's combined one
-    timeout 300 ./stencillayout_test.sh >out/ci-stencillayout.log 2>&1; result $? "stencillayout_test ($(tail -1 out/ci-stencillayout.log))"
+    timeout 300 ./stencillayout_test.sh >out/ci-stencillayout.log 2>&1; result $? "stencillayout_test ($(tail -1 out/ci-stencillayout.log))" "out/ci-stencillayout.log"
     # Dynamic rendering as render passes: the driver's own, emulated at 1.2, switched off, promoted
-    timeout 300 ./dynrend_test.sh >out/ci-dynrend.log 2>&1; result $? "dynrend_test ($(tail -1 out/ci-dynrend.log))"
+    timeout 300 ./dynrend_test.sh >out/ci-dynrend.log 2>&1; result $? "dynrend_test ($(tail -1 out/ci-dynrend.log))" "out/ci-dynrend.log"
     # The G715 r54p3's robustness2 (nullDescriptor only): both robust-access features taken off
-    timeout 600 ./robust2_test.sh >out/ci-robust2.log 2>&1; result $? "robust2_test ($(tail -1 out/ci-robust2.log))"
+    timeout 600 ./robust2_test.sh >out/ci-robust2.log 2>&1; result $? "robust2_test ($(tail -1 out/ci-robust2.log))" "out/ci-robust2.log"
     # MK-20 fp16_hide: a wrong 16-bit driver has shaderFloat16 hidden (storage kept)
-    timeout 600 ./fp16_test.sh >out/ci-fp16.log 2>&1; result $? "fp16_test ($(tail -1 out/ci-fp16.log))"
+    timeout 600 ./fp16_test.sh >out/ci-fp16.log 2>&1; result $? "fp16_test ($(tail -1 out/ci-fp16.log))" "out/ci-fp16.log"
     # Asynchronous pipeline compiles with a slow compiler imitated
-    timeout 300 ./asyncpipe_test.sh >out/ci-asyncpipe.log 2>&1; result $? "asyncpipe_test ($(tail -1 out/ci-asyncpipe.log))"
+    timeout 300 ./asyncpipe_test.sh >out/ci-asyncpipe.log 2>&1; result $? "asyncpipe_test ($(tail -1 out/ci-asyncpipe.log))" "out/ci-asyncpipe.log"
   fi
 }
 # The KHR-only divisor drivers (host/run_tests.sh has them) are left out: they need a driver whose

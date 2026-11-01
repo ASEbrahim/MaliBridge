@@ -196,6 +196,7 @@ set(CHECK_TESTS
     robust2_check
     fp16_check
     promote_check
+    timeline_check
     shmbarrier_check
     stencillayout_check
     dynrend_check
@@ -456,6 +457,7 @@ add_custom_target(ci-test
         vkbridge-server
         vulkan_droidbridge
         vkbridge-smoke
+        timeline_check
         bcn_check
         nulldesc_check
         opaque_check
