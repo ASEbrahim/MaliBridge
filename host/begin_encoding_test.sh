@@ -37,6 +37,8 @@ fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
 proto_errors() { tail -n +$(($1+1)) "$log" | grep -cE "command stream:|malformed request|bad batch entry"; }
 
+# The n-th begin / end counted by the server is the app's: the sync mirror's own command buffers off
+export VKBRIDGE_SYNC_MIRROR=0
 l=$(wc -l < "$log")
 timeout 60 "$out/begin_check" ok >$work/r1.log 2>&1 && [ "$(proto_errors $l)" = 0 ]
 step $? "1 asynchronous ends: $(tail -1 $work/r1.log); $(proto_errors $l) protocol errors"

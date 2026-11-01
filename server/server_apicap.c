@@ -51,6 +51,10 @@ static int driver_offers(const vkb_srv_table *t, VkPhysicalDevice pd, const char
 
 /* The first release outside the gate (r54p1). */
 #define BLACK_FIXED_RELEASE 54
+/* CSF GPUs: the oldest release seen drawing it right (r44p1: Galaxy Tab S10+); r38p1 on the Immortalis-G715
+ * is black like the job-manager devices on that driver. r32p1 CSF drivers have neither the
+ * extension nor Vulkan 1.3, so the rest of the gate keeps them out. */
+#define BLACK_FIXED_RELEASE_CSF 44
 
 /* 1 where the gate is on (the first GPU asked decides; *why: for the log). */
 int vkb_black_gate(const vkb_srv_table *t, VkPhysicalDevice pd, const char **why)
@@ -59,15 +63,16 @@ int vkb_black_gate(const vkb_srv_table *t, VkPhysicalDevice pd, const char **why
     if (gate_state < 0 && t && pd) {
         int arm = 0, jm = 0, rel = vkb_errata_arm_release_pd(t, pd, &arm, &jm);
         uint32_t api = apps_api(t, pd);
-        int eds1 = arm && jm ? driver_offers(t, pd, "VK_EXT_extended_dynamic_state") : 0;
-        int old = rel < BLACK_FIXED_RELEASE; /* unknown (-1) counts as old */
-        gate_state = arm && jm && old && (eds1 || VK_API_VERSION_MINOR(api) >= 3);
+        int old = jm ? rel < BLACK_FIXED_RELEASE /* unknown (-1) counts as old */
+                     : rel >= 0 && rel < BLACK_FIXED_RELEASE_CSF; /* CSF: a known release only */
+        int eds1 = arm && old ? driver_offers(t, pd, "VK_EXT_extended_dynamic_state") : 0;
+        gate_state = arm && old && (eds1 || VK_API_VERSION_MINOR(api) >= 3);
         char r[16] = "r?";
         if (rel >= 0) snprintf(r, sizeof(r), "r%d", rel);
         snprintf(gate_why, sizeof(gate_why), "%s driver %s, %s, Vulkan 1.%u to apps, %s%s", arm ? "Arm" : "not Arm's", r,
                  jm ? "job manager" : "CSF", VK_API_VERSION_MINOR(api),
                  eds1 ? "VK_EXT_extended_dynamic_state offered" : "no VK_EXT_extended_dynamic_state",
-                 arm && jm && !old ? ", r54 or later" : "");
+                 arm && !old ? (jm ? ", r54 or later" : rel >= 0 ? ", r44 or later" : ", release unknown") : "");
     }
     int on = gate_state > 0;
     if (why) *why = gate_state >= 0 ? gate_why : "not decided";

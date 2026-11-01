@@ -6,7 +6,7 @@ MaliBridge runs inside **DroidDeck Mali**, a build that works with DroidDeck (th
 Steam client and PC games on Android). Get it only from MaliBridge's
 [Releases page](https://github.com/ASEbrahim/MaliBridge/releases/latest) (or the app's own **Updates**
 page): copies on other sites or sent by message are not ours. It installs as its own app, next to
-the official DroidDeck if you have it.
+the official DroidDeck if you have it. The current version is v0.5.5, built on DroidDeck 0.6.9.
 
 On a Galaxy Tab S10+ or S11 Ultra it works well. On other Mali devices it's still a test, so expect
 rough edges and please report what you find. Not sure about your device? Check the
@@ -27,7 +27,7 @@ game to **Proton Experimental ARM64 (Compatible)**.
 ## Install
 
 1. You can keep the official DroidDeck. DroidDeck Mali installs next to it as a separate app,
-   with its own Steam login and games. If you have an older MaliBridge build (before v0.5.1, shown
+   with its own Steam login and games. If you have an older MaliBridge build (shown
    as plain "DroidDeck"), you can uninstall it once the new one works.
 2. Download the `DroidDeck-MaliBridge-....apk` file from the newest release and open it. Android asks
    you to allow installs from your browser or file manager. Allow it.
@@ -40,7 +40,7 @@ game to **Proton Experimental ARM64 (Compatible)**.
 
 ## Updating
 
-- **v0.5.4 and later:** the app's **Updates** page shows new versions and what's new; tap to
+- **In the app:** the app's **Updates** page shows new versions and what's new; tap to
   install. You can limit it to Wi-Fi.
 - **From an older version:** download the new APK and install it over the old one. Your games,
   settings and Steam login stay.
@@ -79,13 +79,13 @@ Start with something light. These run well:
 
 | Game | Mali-G720 (Tab S10+) | Mali-G925 (Tab S11 Ultra) |
 |---|---|---|
-| Hollow Knight | Excellent, 87-124 fps | Excellent |
+| Hollow Knight | Excellent, 64-66 fps | Excellent |
 | Hollow Knight: Silksong | Excellent, 62-66 fps | Excellent, 72-96 fps |
 | Stardew Valley | Excellent, 60 fps | Excellent, 57-62 fps |
 | Risk of Rain Returns | Excellent, 59-60 fps | Excellent, 59-60 fps |
 | Half-Life 2 | Excellent, 59-74 fps | Excellent, 94-103 fps |
 | Celeste | Excellent, 57-59 fps | Excellent, 60 fps |
-| Portal | Excellent, 80 fps | Excellent, 85-90 fps |
+| Portal | Excellent, about 63 fps | Excellent, 85-90 fps |
 | Inscryption | Excellent, 68-83 fps | Very playable, 55-57 fps |
 
 The [full list](README.md#games-that-run) has every game I've tested.
@@ -100,7 +100,7 @@ A rough guide from my testing, mostly on the Mali-G720. A newer GPU (the G925 ru
 | Easy | Stardew Valley, Celeste, Hollow Knight, Hollow Knight: Silksong, Inscryption, Doki Doki Literature Club, Portal, Hades, Cuphead, Dead Cells | Smooth on default settings. Good first tests. |
 | Medium | Half-Life 2, Portal 2, ULTRAKILL, ENDER LILIES, Lethal Company, Skyrim Special Edition, Dark Souls Remastered, Garry's Mod | Playable, about 40-75 fps on the G720, with some drops (Portal 2 dips to around 30). Portal 2 and Half-Life 2 need the compatibility tool set by hand (see above); Skyrim on Medium. Dark Souls Remastered so far only played on the G925 (median about 54 fps). |
 | Hard | Subnautica, Risk of Rain 2 | Run, about 20-30 fps on the G720. Lower the resolution if needed; 12 GB of RAM or more helps. |
-| Very hard | The Witcher 3 (DX12), Stray, Deep Rock Galactic | Start, but run slowly on the G720. On the G925, Stray runs (with plain colour grading, see the README) and The Witcher 3 plays its intro but stalls after loading a save (a known issue). Expect problems. |
+| Very hard | The Witcher 3 (DX12), Stray, Deep Rock Galactic, Bright Memory: Infinite, Dark Souls III | Start, but run slowly on the G720. On the G925, Stray runs (with plain colour grading, see the README) and The Witcher 3 runs at about 29 fps (one session froze in a cutscene). Bright Memory: Infinite and Dark Souls III barely run on the G720. Expect problems. |
 
 The first time you start Steam, and the first time you start each game, things can feel choppy.
 It gets smoother the more you play.
@@ -122,7 +122,7 @@ try it in safe mode before reporting it, and say which mode you used.
 
 The quickest help is on **[Discord](https://discord.gg/9xC67qTjDq)**: post what happened there with your logs.
 
-**Easiest (v0.5.4 and later):** let the game close, tap **Stop** in the side menu, then tap **Send logs to MaliBridge** (in Setup > Diagnostics, on the session's end
+**Easiest:** let the game close, tap **Stop** in the side menu, then tap **Send logs to MaliBridge** (in Setup > Diagnostics, on the session's end
 screen, or in the side menu). It uploads the session's logs and gives you a short code like `ML-7F3K`: paste
 that code in your GitHub issue or on Discord. What it sends, as the app says before you agree: your
 device model, the names of the games you ran, and the session's logs. Account names, passwords and
@@ -158,8 +158,7 @@ shows the GPU too. Then look up the chip in the
 [Does my device work?](README.md#does-my-device-work) table. On the Galaxy Tab S10+ and S11 Ultra
 it works well. On other Mali devices it is still a test: it depends on the GPU and its driver, so
 try it and send logs (see "If something goes wrong"). Snapdragon chips have Adreno GPUs, which the
-official DroidDeck supports. Recent Exynos chips (Xclipse) and the Pixel 10 (PowerVR) are not Mali,
-but you can try them too: a Galaxy S26+ (Xclipse) runs games, and PowerVR has no reports yet.
+official DroidDeck supports. Wider device support is on the way.
 
 **How much storage does it need?**
 Plan on about **8-10 GB before any games**: the Linux runtime (about 5 GB), the Steam client
@@ -167,14 +166,14 @@ Plan on about **8-10 GB before any games**: the Linux runtime (about 5 GB), the 
 own size, plus about 300-400 MB for its Windows files and a shader cache that grows as you play.
 
 **Can I keep the official DroidDeck installed?**
-Yes. Since v0.5.1 MaliBridge comes in a separate app, **DroidDeck Mali**, and installs next to the
+Yes. MaliBridge comes in a separate app, **DroidDeck Mali**, and installs next to the
 official DroidDeck. Each app has its own Steam login, games and settings.
 
 **Android says the app can't be installed over the one I have.**
 That is a DroidDeck Mali build signed with a different key (an early build, or one from
 somewhere else). Uninstall DroidDeck Mali (not the official DroidDeck) and install again. That
-removes DroidDeck Mali's Steam login and games. Builds before v0.5.1 showed up as plain
-"DroidDeck"; they are not needed any more and can be uninstalled. Later MaliBridge builds
+removes DroidDeck Mali's Steam login and games. Older builds showed up as plain
+"DroidDeck"; they are not needed any more and can be uninstalled. MaliBridge builds
 install over each other as normal.
 
 **Which Proton should I pick?**

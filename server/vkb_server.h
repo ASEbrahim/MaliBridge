@@ -39,6 +39,7 @@ typedef struct vkb_srv_proc {
     uint8_t done[VKB_SEQ_RING];    /* seqs above the watermark that have run */
     int conn_closed;               /* a connection ended (a seq may never arrive) */
     int owaiters;                  /* threads in order_wait */
+    struct vkb_hitch *hitch;       /* server_hitch.c: what the process's frames spent their time on (VKBRIDGE_HITCH_MS), or NULL */
 } vkb_srv_proc;
 
 typedef struct vkb_srv_conn {
@@ -77,6 +78,7 @@ typedef struct vkb_srv_mem {
     void *ahb;               /* AHardwareBuffer* (Android) */
     int export_fd1;          /* VKB_EMU_DMABUF_EXPORT: the dma-buf fd + 1 handed out as the export (0: none) */
     int sync_fd1;            /* cached readback: the shared dma-buf + 1, for DMA_BUF_IOCTL_SYNC (0: not cached) */
+    struct dab_entry *dab;   /* VKB_EMU_DMABUF_AHB: the AHardwareBuffer pages exported or imported (server_dmabuf_ahb.c) */
     uint8_t stat_cls, stat_ded; /* accounting (server_memory.c): strategy class, dedicated to an image (1) / buffer (2) */
     int stat_pid;
     struct vkb_srv_mem *next;
@@ -88,6 +90,7 @@ typedef struct vkb_srv_table {
     uint32_t id;
     int is_device;
     int zink;                                /* instance: its engine is Mesa's Zink (VKB_EMU_BGR10_VTX) */
+    int vkd3d;                               /* instance: its engine is vkd3d-proton (server_emu_sparse.c) */
     int promote_ui;                          /* instance: gamescope's - Vulkan promotion even where untested (server_promote.c) */
     vkb_srv_proc *proc;
     VkInstance instance;
@@ -111,6 +114,8 @@ typedef struct vkb_srv_table {
     struct vkb_report_dev *report;           /* server_report.c */
     struct vkb_async *async;                 /* server_async.c */
     struct vkb_vidyn *vidyn;                 /* server_vidyn.c */
+    struct vkb_timeline *timeline;           /* server_timeline.c (VKB_EMU_TIMELINE) */
+    struct vkb_dab_dev *dab;                 /* server_dmabuf_ahb.c (VKB_EMU_DMABUF_AHB) */
     PFN_vkGetPhysicalDeviceFeatures2 vidyn_f2; /* instance: the feature query beneath server_vidyn.c's */
     /* instance: the queries beneath gs_hide's (server_errata_gs.c), set only for its processes */
     PFN_vkGetPhysicalDeviceFeatures gs_f1;
@@ -208,6 +213,7 @@ void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, Vk
 /* Pipelines the driver built with creation feedback, and how many of them it found in the pipeline cache (server_guard.c). */
 void vkb_report_cache_hits(vkb_srv_table *t, uint64_t built, uint64_t hits);
 int vkb_report_frames(uint64_t *presents, double *t_last); /* busiest live process's presents (frames line) */
+double vkb_srv_running_longest(int pid, const char **name); /* server_conn.c: the process's longest running request (s, 0: none) */
 
 /* server_async.c: graphics pipelines compiled in the background (VKBRIDGE_ASYNC_COMPILE) */
 void vkb_async_device_init(vkb_srv_table *t);
@@ -222,6 +228,7 @@ void vkb_promote_instance_install(vkb_srv_table *t);
 const char **vkb_promote_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci, const char **exts,
                                             uint32_t *n, vkb_arena *a);
 PFN_vkGetDeviceProcAddr vkb_promote_gdpa(PFN_vkGetDeviceProcAddr real); /* VKBRIDGE_FAKE_API: core names a 1.1 driver lacks */
+uint32_t vkb_promote_fake_api(void); /* VKBRIDGE_FAKE_API (host tests) as a version, 0: off */
 void vkb_promote_device_init(vkb_srv_table *t);    /* before t->dt is made: SPIR-V lowered beneath every layer */
 void vkb_promote_device_destroy(vkb_srv_table *t);
 /* The version offered and the driver's for a GPU, and what the next version lacks; 0: not known */
@@ -262,7 +269,7 @@ enum {
     VKB_ERRATUM_FP16_HIDE,       /* MK-20 16-bit float arithmetic wrong (Mali-G715 r54) */
     VKB_ERRATUM_STENCIL_LAYOUT,  /* MK-11 a separate stencil layout in a render pass ignored */
     VKB_ERRATUM_VB_BAKE,         /* MK-05 option B: dynamic strides wrong in single-binding calls too */
-    VKB_ERRATUM_GS_HIDE,         /* issue #11: r38p1 beta segfaults compiling Zink's geometry shaders */
+    VKB_ERRATUM_GS_HIDE,         /* r38p1 beta segfaults compiling Zink's geometry shaders */
     VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };
@@ -309,6 +316,11 @@ const char *vkb_errata_hidden_ext(const vkb_srv_table *inst, VkPhysicalDevice pd
 enum { VKB_VIDYN_OFF = 0, VKB_VIDYN_NATIVE = 1, VKB_VIDYN_EMULATED = 2 };
 int vkb_vidyn_mode(const vkb_srv_table *inst, VkPhysicalDevice pd);
 int vkb_vidyn_variants(const vkb_srv_table *inst, VkPhysicalDevice pd); /* the layer makes pipeline variants there */
+/* Extended dynamic state 1 and 2 for Zink where the driver has no usable ones (Mali Vulkan 1.1
+ * drivers; the Steam-mode fix's): 1 when the server offers its own, made static in the vertex input's
+ * pipeline variants (server_vidyn.c). vkb_vidyn_device_create_info's result has VKB_VIDYN_EDS then. */
+int vkb_eds_mode(const vkb_srv_table *inst, VkPhysicalDevice pd);
+#define VKB_VIDYN_EDS 4
 void vkb_vidyn_instance_install(vkb_srv_table *t);
 /* vkCreateDevice: the extension and its feature off the driver's request where emulated; returns
  * the layer's mode for the device (0: no layer) */
@@ -322,7 +334,7 @@ void vkb_vidyn_device_destroy(vkb_srv_table *t);
 int vkb_errata_fp16_hidden(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
 void vkb_errata_fp16_instance_install(vkb_srv_table *inst); /* the feature and property queries */
 void vkb_errata_fp16_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci); /* strips what an app enables anyway */
-/* gs_hide (issue #11, server_errata_gs.c): 1 when geometry shaders are hidden from this process on
+/* gs_hide (, server_errata_gs.c): 1 when geometry shaders are hidden from this process on
  * this physical device - the erratum's decision for the driver (VKBRIDGE_ERRATA=+/-gs_hide
  * included) and the process one of VKBRIDGE_GS_HIDE_PROCS; why (may be NULL) gets the reason */
 int vkb_errata_gs_hidden(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
@@ -332,6 +344,8 @@ void vkb_errata_gs_instance_install(vkb_srv_table *inst); /* over every other qu
 void vkb_errata_gs_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci);
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
+void vkb_qlock_device_init(vkb_srv_table *t); /* server_qlock.c: per-queue locks, beneath every layer */
+void vkb_qlock_device_destroy(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);
 
 /* server_gpuprof.c */
@@ -385,6 +399,23 @@ VkPipelineCache vkb_pcache_own_open(const vkb_dispatch *r, const VkPhysicalDevic
                                     size_t cap);
 void vkb_pcache_own_close(const vkb_dispatch *r, VkDevice d, VkPipelineCache c, const char *path);
 
+/* server_hitch.c: per-hitch attribution (VKBRIDGE_HITCH_MS). Notes are dropped unless the process
+ * has it on (one pointer test); times are CLOCK_MONOTONIC ns. */
+enum { VKB_HITCH_COMPILE, VKB_HITCH_BC, VKB_HITCH_ALLOC, VKB_HITCH_PCACHE, VKB_HITCH_CLASSES };
+uint64_t vkb_hitch_now(void);
+uint32_t vkb_hitch_ms_setting(void); /* VKBRIDGE_HITCH_MS for this thread's client (presets, <cache dir>/env); 0: off */
+void vkb_hitch_enable(vkb_srv_proc *p, uint32_t ms);
+static inline int vkb_hitch_on(const vkb_srv_proc *p) { return p && __atomic_load_n(&p->hitch, __ATOMIC_RELAXED) != NULL; }
+void vkb_hitch_note(vkb_srv_proc *p, int cls, uint64_t t0, uint64_t t1, uint32_t n, uint64_t bytes);
+void vkb_hitch_compile(vkb_srv_proc *p, const char *what, uint32_t n, uint64_t t0, uint64_t t1, int result);
+void vkb_hitch_proc_gone(vkb_srv_proc *p); /* the summary line, and the ring freed */
+int vkb_test_hitch_delay_ms(void);         /* server_emu_bcn.c: VKBRIDGE_TEST_HITCH_DELAY_MS (host tests) */
+
+/* server_latency.c: the latency log (VKBRIDGE_LATLOG); the lines come from the client's vkbLatency */
+uint32_t vkb_present_wait_setting(void); /* VKBRIDGE_PRESENT_WAIT the same way: 0 unset, VKB_PRESENT_WAIT_ON/OFF */
+uint32_t vkb_frame_queue_setting(void); /* VKBRIDGE_FRAME_QUEUE for this thread's client, the same way: 0 off, 1-8 */
+uint32_t vkb_lat_setting(void); /* for this thread's client (presets, <cache dir>/env, the environment): 1 on */
+
 /* server_conn.c */
 void vkb_srv_serve(int listen_fd);
 void vkb_srv_stats_reload(void); /* VKBRIDGE_STATS read again (after vkb_srv_env_reload) */
@@ -398,6 +429,18 @@ void vkb_cbfail_device_init(vkb_srv_table *t); /* server_conn.c */
 void vkb_cbfail_device_destroy(vkb_srv_table *t);
 void vkb_syncfd_device_init(vkb_srv_table *t);   /* server_syncfd.c: sync-fd exports with a deadline */
 int vkb_syncfd_device_destroy(vkb_srv_table *t); /* 1: an export is still in the driver, leave the device alive */
+int vkb_syncfd_order_ms(uint32_t table, uint32_t cmd); /* the order wait's deadline for that request, 0: none */
+uint32_t vkb_syncfd_client_knobs(uint32_t driver_id);  /* VKB_KNOB_SYNCFD_SIDE_SHIFT bits for vkbQueryServer's reply */
+/* server_conn.c: the current request's order wait ran out (vkb_syncfd_order_ms); finish: wait the
+ * rest of it now; done: go on without it */
+int vkb_srv_order_skipped(void);
+void vkb_srv_order_finish(void);
+void vkb_srv_order_done(void);
+void vkb_sparse_instance_install(vkb_srv_table *t); /* server_emu_sparse.c */
+void vkb_sparse_device_init(vkb_srv_table *t);
+void vkb_sparse_device_destroy(vkb_srv_table *t);
+void vkb_syncfb_device_init(vkb_srv_table *t); /* server_syncfb.c */
+void vkb_syncfb_device_destroy(vkb_srv_table *t);
 void vkb_srv_set_current_table(vkb_srv_table *t);
 void vkb_proc_cleanup(vkb_srv_proc *p);
 vkb_srv_proc *vkb_srv_current_proc(void); /* the client process this connection thread serves, or NULL */
@@ -414,6 +457,12 @@ const char *vkb_preset_note(const vkb_srv_proc *p, char *out, size_t cap);
 uint32_t vkb_preset_client_knobs(void);  /* vkb_server_pd_info.client_knobs for this thread's client */
 void vkb_preset_client_values(vkb_server_pd_info *info); /* its .heap_max_mb, .spoof_gpu and .present_timeout_s, the same way */
 uint64_t vkb_memtotal_mb(void); /* RAM in MB (MemTotal; VKBRIDGE_FAKE_MEMTOTAL_MB for tests), 0: unknown */
+/* server_compile_gate.c: at most VKBRIDGE_COMPILE_THREADS pipeline compiles in the driver at once (1 while
+ * memory is low). enter waits for a slot and returns whether it took one; leave gives back what enter took. */
+int vkb_compile_gate_enter(VkPipelineCreateFlags flags);
+void vkb_compile_gate_leave(int took);
+int vkb_compile_gate_default(int cores);
+void vkb_compile_gate_stats(int *limit, int *peak, uint64_t *waits, uint64_t *tight_waits, double *wait_s, double *wait_max_s);
 uint64_t vkb_memavail_kb(void); /* MemAvailable in KB (VKBRIDGE_FAKE_MEMAVAIL_MB for tests), 0: unknown */
 uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb); /* the safe-mode heap cap for 8 and 12 GB devices, 0: none */
 

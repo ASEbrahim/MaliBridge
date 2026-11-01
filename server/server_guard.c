@@ -117,7 +117,7 @@ static void guard_env(void)
         /* =spin: marked pipelines spin instead (compile watchdog); =spinfc2: only until their
          * float_controls2 is stripped (the first fallback then compiles); =slow: they take
          * VKBRIDGE_TEST_SLOW_S (3) seconds, then compile (the compute retry); =gs: every pipeline
-         * with a geometry stage faults, marked or not (issue #11's r38p1 beta: server_errata_gs.c) */
+         * with a geometry stage faults, marked or not ('s r38p1 beta: server_errata_gs.c) */
         s = getenv("VKBRIDGE_TEST_CRASH_PIPELINE");
         test_crash = s && *s && *s != '0' ? (!strcmp(s, "spin") ? 2 : !strcmp(s, "spinfc2") ? 3 : !strcmp(s, "slow") ? 4 : !strcmp(s, "gs") ? 5 : 1) : 0;
         if (guard_off) VKB_INFO("driver crash containment off (VKBRIDGE_NO_CRASH_GUARD)");
@@ -487,9 +487,57 @@ static int stuck_tries_take(const uint64_t *key, uint32_t n, int mode)
 
 /* key: per stage, SPIR-V hash ^ entry/specialization hash. note: a comment for the file (NULL:
  * not written, as when loading it). */
+/* Stuck graphics pipelines that no fallback built, asked of the driver again this run (once each) */
+#define RETRIED_MAX 256
+static uint64_t retried[RETRIED_MAX];
+static uint32_t nretried;
+static pthread_mutex_t retried_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t tried_key(const uint64_t *key, uint32_t nh)
+{
+    uint64_t k = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < nh; i++) k = (k ^ key[i]) * 0x100000001b3ull;
+    return k;
+}
+/* Stuck pipelines the driver built when asked again: the rest of this run, the driver as usual */
+static uint64_t healed[RETRIED_MAX];
+static uint32_t nhealed;
+static int is_healed(const uint64_t *key, uint32_t nh)
+{
+    uint64_t k = tried_key(key, nh);
+    int found = 0;
+    pthread_mutex_lock(&retried_lock);
+    for (uint32_t i = 0; i < nhealed && !found; i++) found = healed[i] == k;
+    pthread_mutex_unlock(&retried_lock);
+    return found;
+}
+static void heal(const uint64_t *key, uint32_t nh)
+{
+    uint64_t k = tried_key(key, nh);
+    pthread_mutex_lock(&retried_lock);
+    if (nhealed < RETRIED_MAX) healed[nhealed++] = k;
+    pthread_mutex_unlock(&retried_lock);
+}
+static __thread int tls_retrying; /* inside the one retry: the stuck list is not read */
+
+/* 1: not tried this run (now marked); a pipeline that got stuck in this run counts as tried */
+static int retry_once(const uint64_t *key, uint32_t nh)
+{
+    uint64_t k = tried_key(key, nh);
+    int fresh = 1;
+    pthread_mutex_lock(&retried_lock);
+    for (uint32_t i = 0; i < nretried && fresh; i++) fresh = retried[i] != k;
+    if (fresh) {
+        if (nretried < RETRIED_MAX) retried[nretried++] = k;
+        else fresh = 0; /* past the cap: the fallbacks' answer stands */
+    }
+    pthread_mutex_unlock(&retried_lock);
+    return fresh;
+}
+
 static void add_stuck(const uint64_t *key, uint32_t n, int mode, int tries, const char *note)
 {
     if (!n) return;
+    if (note) retry_once(key, n); /* stuck in this run: not asked again before the next */
     pthread_mutex_lock(&watch_lock);
     int k;
     for (k = 0; k < (int)nstuck; k++) {
@@ -626,7 +674,7 @@ static uint32_t *spv_relax_fc2(const uint32_t *code, size_t size, size_t *out_si
     return o;
 }
 
-/* glslc -O: layout(location = 0) out vec4 o; void main() { o = vec4(0.5, 0.5, 0.5, 1.0); } */
+/* glslc -O: layout(location = 0) out vec4 o; void main { o = vec4(0.5, 0.5, 0.5, 1.0); } */
 static const uint32_t standin_fs[] = {
     0x07230203, 0x00010000, 0x000d000a, 0x0000000d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b, 0x00000001, 0x4c534c47,
     0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000004, 0x00000004, 0x6e69616d,
@@ -1031,14 +1079,28 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
     uint32_t nh = gfx_hashes(infos, n, h, stg, key);
     int timed = 0;
     VkResult r;
-    int known = is_stuck(key, nh);
+    int known = tls_retrying || is_healed(key, nh) ? 0 : is_stuck(key, nh);
     if (known) {
         int mode = known - 1;
         VKB_ONCE(VKB_LOG_WARN, "a pipeline the driver never finished compiling was asked for again: its fallback at once (logged once)");
         r = VK_ERROR_INITIALIZATION_FAILED;
         if (mode != FB_FAIL && n == 1) r = try_fallback(g, device, cache, infos, a, out, h, stg, nh, mode, &timed);
-        if (r != VK_SUCCESS)
-            for (uint32_t i = 0; out && i < n; i++) out[i] = VK_NULL_HANDLE;
+        if (r == VK_SUCCESS) return r;
+        for (uint32_t i = 0; out && i < n; i++) out[i] = VK_NULL_HANDLE;
+        /* No fallback built it: a failed pipeline is worse than a slow one (Zink in Xwayland binds the
+         * missing pipeline and the driver faults - the Pixel 6 Pro's G78 at every Steam start, after
+         * one hang while Half-Life 2's shaders were pre-compiled beside it). The driver gets it again
+         * under the watchdog, once per run: a hang that does not repeat is gone, one that does costs
+         * one timeout and the fallbacks below. */
+        if (!retry_once(key, nh)) return r;
+        VKB_WARN("a pipeline the driver never finished compiling got no fallback: the driver is asked again (once this run)");
+        tls_retrying = 1;
+        r = gfx_guarded(device, cache, n, infos, a, out);
+        tls_retrying = 0;
+        if (r == VK_SUCCESS) {
+            heal(key, nh);
+            VKB_WARN("  the driver built it this time");
+        }
         return r;
     }
     /* The startup probe saw this driver's compiler spin on the LUT's shape (server_probe.c): its
@@ -1211,8 +1273,7 @@ static VkResult compute_guarded(VkDevice device, VkPipelineCache cache, uint32_t
     return VK_ERROR_INITIALIZATION_FAILED;
 }
 
-static VkResult VKAPI_CALL gd_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a,
-                                                VkShaderModule *out)
+static VkResult module_guarded(VkDevice device, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out)
 {
     vkb_guard *g = find(device);
     if (!g) return VK_ERROR_INITIALIZATION_FAILED;
@@ -1292,6 +1353,10 @@ static void account(VkDevice device, int compute, uint32_t n, const void *infos,
         stages_text(h, stg, nh, st, sizeof(st));
     }
     vkb_report_compile(g ? g->t : NULL, compute, n, ms, r, st);
+    if (g && vkb_hitch_on(g->t->proc)) {
+        uint64_t a = (uint64_t)(t0 * 1e9);
+        vkb_hitch_compile(g->t->proc, compute ? "compute pipelines" : "graphics pipelines", n, a, a + (uint64_t)(ms * 1e6), r);
+    }
     if (compute && r < 0 && g) vkb_spvfix_compute_failed(g->t, n, infos, r); /* once per device */
 }
 
@@ -1377,15 +1442,31 @@ static void fb_count(vkb_guard *g, const fb_batch *b, const VkPipeline *out, VkR
     if (built) vkb_report_cache_hits(g->t, built, hits);
 }
 
+/* Timed for the hitch line only when the process has it on (VKBRIDGE_HITCH_MS, server_hitch.c):
+ * a module is cheap to make in most drivers, the server's SPIR-V rewrites are not always. */
+static VkResult VKAPI_CALL gd_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                VkShaderModule *out)
+{
+    vkb_guard *g = find(device);
+    vkb_srv_proc *p = g ? g->t->proc : NULL;
+    if (!vkb_hitch_on(p)) return module_guarded(device, ci, a, out);
+    uint64_t t0 = vkb_hitch_now();
+    VkResult r = module_guarded(device, ci, a, out);
+    vkb_hitch_compile(p, "shader module", 1, t0, vkb_hitch_now(), r);
+    return r;
+}
+
 static VkResult VKAPI_CALL gd_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
                                                      const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *a,
                                                      VkPipeline *out)
 {
+    int gate = vkb_compile_gate_enter(n ? infos[0].flags : 0); /* server_compile_gate.c: waits before the driver, not timed */
     double t0 = mono_s();
     vkb_guard *g = find(device);
     fb_batch b;
     VkGraphicsPipelineCreateInfo *w = fb_wrap(g, &b, n, infos, sizeof(*infos));
     VkResult r = gfx_guarded(device, cache, n, w ? w : infos, a, out);
+    vkb_compile_gate_leave(gate);
     fb_count(g, &b, out, r);
     account(device, 0, n, infos, t0, r);
     free(w);
@@ -1396,11 +1477,13 @@ static VkResult VKAPI_CALL gd_CreateComputePipelines(VkDevice device, VkPipeline
                                                     const VkComputePipelineCreateInfo *infos, const VkAllocationCallbacks *a,
                                                     VkPipeline *out)
 {
+    int gate = vkb_compile_gate_enter(n ? infos[0].flags : 0);
     double t0 = mono_s();
     vkb_guard *g = find(device);
     fb_batch b;
     VkComputePipelineCreateInfo *w = fb_wrap(g, &b, n, infos, sizeof(*infos));
     VkResult r = compute_guarded(device, cache, n, w ? w : infos, a, out);
+    vkb_compile_gate_leave(gate);
     fb_count(g, &b, out, r);
     account(device, 1, n, infos, t0, r);
     free(w);

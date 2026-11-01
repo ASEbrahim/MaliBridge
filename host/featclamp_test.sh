@@ -15,7 +15,7 @@
 #   4. drawparams, the clamp off: refused -8, and the server's one line names what the driver lacks
 #   5. geomstreams+drawparams (the #32 suspects together), the clamp off: refused, the line names both
 #   6. geomstreams+drawparams, the default: both taken off, the device made; DXVK 1.10.3's d3d11_check
-#      refuses on its own (it checks shaderDrawParameters), so #32's driver must report it
+#      refuses on its own (it checks shaderDrawParameters), so driver must report it
 #   7. drawparams asked in VkPhysicalDeviceVulkan11Features: taken off (only it; multiview kept), and
 #      refused + named with the clamp off
 #   8. the desktop driver as it is, shaderDrawParameters asked: nothing taken off, the device made
@@ -46,7 +46,7 @@ check "the client sees transformFeedback 1, geometryStreams 0 ($(grep -m1 '^feat
   "grep -q '^features: transformFeedback=1 geometryStreams=0' out/t-fc-off.log"
 check "a device made as DXVK 1.x makes it is refused -8, as on the Tab S10+ ($(grep -m1 '^device' out/t-fc-off.log))" \
   "grep -q '^device: -8' out/t-fc-off.log && grep -q 'imitated transform feedback: device refused' $VKB_SERVER_LOG"
-check "the server's one line names geometryStreams, as #32's log would have ($(grep -m1 'the driver lacks:' $VKB_SERVER_LOG | sed 's/.*lacks: //'))" \
+check "the server's one line names geometryStreams, as a player's log would have ($(grep -m1 'the driver lacks:' $VKB_SERVER_LOG | sed 's/.*lacks: //'))" \
   "grep 'vkCreateDevice failed: the driver lacks:' $VKB_SERVER_LOG | grep -q 'VkPhysicalDeviceTransformFeedbackFeaturesEXT.geometryStreams\$'"
 if dxvk1_ok; then
   d3d11 out/t-fc-d3d11-off.log
@@ -114,7 +114,7 @@ if dxvk1_ok; then
   : >"$VKB_SERVER_LOG"
   d3d11 out/t-fc-d3d11-both.log
   # DXVK 1.10.3 checks shaderDrawParameters itself: without it, it refuses the feature level and never
-  # calls vkCreateDevice. So #32's DXVK devices, which did reach vkCreateDevice with the structure,
+  # calls vkCreateDevice. So DXVK devices, which did reach vkCreateDevice with the structure,
   # came from a driver that reports shaderDrawParameters: geometryStreams is what the G78 r38p0 lacks.
   check "DXVK 1.10.3 itself refuses without shaderDrawParameters, before any vkCreateDevice ($(grep -m1 'Requested feature level' out/t-fc-d3d11-both.log | sed 's/^ *//'))" \
     "grep -q 'Requested feature level not supported' out/t-fc-d3d11-both.log && ! grep -q 'vkCreateDevice' $VKB_SERVER_LOG"

@@ -3171,7 +3171,7 @@ static void beat_start(void)
 
 /* Every client process has left (1) or one is connected (0). A session's end looks so: the guest
  * goes, its processes' connections close, and the app kills the server (SIGKILL, no mark) a few ms
- * later. On the Retroid Pocket 4 Pro (MaliBridge#10) every gamescope start ended within 800 ms, the
+ * later. On the Retroid Pocket 4 Pro every gamescope start ended within 800 ms, the
  * kill came inside the background "bc_transcoders" probe three times, and it was recorded as died:
  * BC transcoding off and its MK-20 line wrong. A probe ended so is run again instead. Only after a
  * client has been: a process that dies before any client connects is judged as before. */
@@ -3557,6 +3557,7 @@ static uint32_t emu_possible(const pctx *c)
     if (!c->feat.depthClamp) m &= ~VKB_EMU_DEPTH_CLIP;
     if (!vkb_emu_bcn_supported(c->idt, c->pd)) m &= ~VKB_EMU_BCN;
     if (!vkb_mem_export_backing()) m &= ~VKB_EMU_DMABUF_EXPORT;
+    if (vkb_dab_on()) m &= ~VKB_EMU_DMABUF_EXPORT; /* dma-bufs over AHardwareBuffers instead */
     return m;
 }
 

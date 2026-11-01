@@ -80,6 +80,7 @@ static const char *const keys[] = {
     "VKBRIDGE_MODE", "VKBRIDGE_ERRATA", "VKBRIDGE_COMPILE_TIMEOUT_S", "VKBRIDGE_COMPILE_FALLBACKS", "VKBRIDGE_EMU_OFF",
     /* textures, descriptors, shaders */
     "VKBRIDGE_BC_TRANSCODE", "VKBRIDGE_BC_TRANSCODE_QUALITY", "VKBRIDGE_BC_ASTC_BLOCK", "VKBRIDGE_TEX_MAXDIM",
+    "VKBRIDGE_BC_TX_BUDGET", "VKBRIDGE_BC_TX_FALLBACK_MB",
     "VKBRIDGE_DESC_CUT", "VKBRIDGE_VIEW_QUARANTINE", "VKBRIDGE_SPIRV_FIX", "VKBRIDGE_SHARED_BARRIER", "VKBRIDGE_SHARED_BARRIER_DUMP",
     "VKBRIDGE_SHARED_BARRIER_DUMP_MAX", "VKBRIDGE_SHARED_BARRIER_ONLY", "VKBRIDGE_SHARED_BARRIER_SKIP", "VKBRIDGE_SHARED_BARRIER_LOCKSTEP",
     "VKBRIDGE_WAVE32",
@@ -93,11 +94,18 @@ static const char *const keys[] = {
     /* hangs */
     "VKBRIDGE_HANG_DETECT", "VKBRIDGE_HANG_AFTER_MS", "VKBRIDGE_SKIP_SHADERS",
     /* the client's (vkb_preset_client_knobs) */
-    "VKBRIDGE_DESC_BATCH", "VKBRIDGE_NO_DESC_BATCH", "VKBRIDGE_QUERY_MIRROR",
+    "VKBRIDGE_DESC_BATCH", "VKBRIDGE_NO_DESC_BATCH", "VKBRIDGE_QUERY_MIRROR", "VKBRIDGE_SYNC_MIRROR",
+    "VKBRIDGE_DMABUF_SYNC_MS", "VKBRIDGE_DMABUF_SYNC_FAKE_OLD",
     /* what the app is shown (vkb_preset_client_values) */
     "VKBRIDGE_HEAP_MAX_MB", "VKBRIDGE_SPOOF_GPU",
     /* the client's frame wait (vkb_preset_client_values) */
     "VKBRIDGE_PRESENT_TIMEOUT_S",
+    /* the per-hitch line (server_hitch.c, sent to the client in vkbQueryServer) */
+    "VKBRIDGE_HITCH_MS",
+    /* the latency log (server_latency.c, the same way) */
+    "VKBRIDGE_LATLOG",
+    /* present ids and waits offered by the client (server_latency.c, the same way) */
+    "VKBRIDGE_PRESENT_WAIT",
 };
 
 static int allowed(const char *k)
@@ -382,6 +390,13 @@ uint32_t vkb_preset_client_knobs(void)
     else if (on && *on) w |= knob(on) << VKB_KNOB_DESC_BATCH_SHIFT;
     const char *qm = vkb_srv_env("VKBRIDGE_QUERY_MIRROR");
     if (qm && *qm) w |= knob(qm) << VKB_KNOB_QUERY_MIRROR_SHIFT;
+    const char *sy = vkb_srv_env("VKBRIDGE_SYNC_MIRROR");
+    if (sy && *sy) w |= knob(sy) << VKB_KNOB_SYNC_MIRROR_SHIFT;
+    /* the client's implicit sync for dma-bufs (client/dmabuf_sync.c): 0 turns it off; the bound itself is the guest's */
+    const char *ds = vkb_srv_env("VKBRIDGE_DMABUF_SYNC_MS");
+    if (ds && *ds) w |= (strtol(ds, NULL, 10) > 0 ? VKB_KNOB_ON : VKB_KNOB_OFF) << VKB_KNOB_DMABUF_SYNC_SHIFT;
+    const char *fo = vkb_srv_env("VKBRIDGE_DMABUF_SYNC_FAKE_OLD");
+    if (fo && *fo) w |= knob(fo) << VKB_KNOB_DMABUF_SYNC_FAKE_SHIFT;
     return w;
 }
 
@@ -431,7 +446,7 @@ uint64_t vkb_memavail_kb(void) { return meminfo_kb("MemAvailable", "VKBRIDGE_FAK
  * and get killed for it. 12 GB devices were left out at first, and an XRing O3 with 11377 MB
  * showed Titanfall 2 about 11 GB: its textures grew to 2.4 GB without ever coming down, the
  * server to 4 GB, and the system's low-memory killer closed it within 3-5 minutes in each of three
- * runs, with the system's other apps taking the rest (MaliBridge#18). 0: none. */
+ * runs, with the system's other apps taking the rest. 0: none. */
 #define VKB_HEAP_DEFAULT_RAM_MAX_MB 12800u
 uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb)
 {

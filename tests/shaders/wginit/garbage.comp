@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+struct S { uint a; uint b; };
+shared uint arr[100];
+shared S sarr[64];
+shared uint single;
+layout(set = 0, binding = 0) buffer Out { uint o[]; };
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    arr[i] = 0xdeadbeefu;
+    if (i < 36u) arr[64u + i] = 0xdeadbeefu;
+    sarr[i].a = 0xdeadbeefu;
+    sarr[i].b = 0xcafef00du;
+    if (i == 0u) single = 0xdeadbeefu;
+    barrier();
+    o[i] = arr[i] ^ sarr[i].a; /* keeps the stores */
+}

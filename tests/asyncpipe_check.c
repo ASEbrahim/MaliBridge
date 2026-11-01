@@ -18,6 +18,10 @@
  *          draw is drawn;
  *   quick  (a compile within VKBRIDGE_ASYNC_COMPILE_WAIT_MS): the real pipeline comes back, the
  *          first draw is drawn.
+ *   defer  (VKBRIDGE_ASYNC_COMPILE=3): the colour, depth-only and no-vertex-input pipelines all come
+ *          back at once and each one's first frame is drawn (the replay waits for the compile); the
+ *          modules and layout destroyed right after the create; a pipeline destroyed while it
+ *          compiles, and one left compiling at vkDestroyDevice.
  * Shaders: cullmode_check's vertex shader and dynstate_check's fragment shader.
  */
 #define VK_NO_PROTOTYPES
@@ -313,6 +317,42 @@ int main(int argc, char **argv)
         check(p && v == RED && (slow ? ms >= DELAY_MS * 0.9 : 1),
               slow ? "synchronous: the create takes the compile, the first draw is drawn" : "compiled within the wait: the first draw is drawn", msg);
         if (p) vkDestroyPipeline(dev, p, NULL);
+        goto out;
+    }
+
+    if (!strcmp(mode, "defer")) {
+        static const int kinds[3] = {P_COLOR, P_DEPTH, P_NO_VERTEX_INPUT};
+        static const char *const names[3] = {"colour pipeline", "depth-only pipeline", "colour pipeline without vertex input"};
+        for (int k = 0; k < 3; k++) {
+            VkPipeline q = pipeline(&o, kinds[k], &ms);
+            double t0 = now_ms();
+            long got = q ? frame(q, kinds[k]) : -1, want = kinds[k] == P_DEPTH ? 500 : RED;
+            double fms = now_ms() - t0;
+            snprintf(msg, sizeof(msg), "create %.0f ms, first frame %.0f ms, %s 0x%08lx", ms, fms, kinds[k] == P_DEPTH ? "depth*1000" : "pixel", got);
+            char what[160];
+            snprintf(what, sizeof(what), "deferred: %s back at once, its first draw there (the frame waits for the compile)", names[k]);
+            check(q && ms < DELAY_MS / 2 && got == want && fms >= DELAY_MS * 0.6, what, msg);
+            if (q) vkDestroyPipeline(dev, q, NULL);
+        }
+        objs o3;
+        if (make_objs(&o3)) { check(0, "setup", "modules"); goto out; }
+        VkPipeline q = pipeline(&o3, P_COLOR, &ms);
+        free_objs(&o3); /* while it compiles */
+        long got = q ? frame(q, P_COLOR) : -1;
+        snprintf(msg, sizeof(msg), "create %.0f ms, pixel 0x%08lx", ms, got);
+        check(q && got == RED, "deferred: modules and layout destroyed right after the create, the first draw there", msg);
+        if (q) vkDestroyPipeline(dev, q, NULL);
+        q = pipeline(&o, P_COLOR, &ms);
+        if (q) vkDestroyPipeline(dev, q, NULL); /* still compiling */
+        q = pipeline(&o, P_COLOR, &ms);
+        got = q ? frame(q, P_COLOR) : -1;
+        snprintf(msg, sizeof(msg), "pixel 0x%08lx", got);
+        check(q && got == RED, "deferred: a pipeline destroyed while it compiled, the next one drawn", msg);
+        if (q) vkDestroyPipeline(dev, q, NULL);
+        q = pipeline(&o, P_COLOR, &ms); /* left compiling at vkDestroyDevice */
+        vkDestroyDevice(dev, NULL);
+        dev = VK_NULL_HANDLE;
+        check(1, "deferred: vkDestroyDevice with a pipeline still compiling", "");
         goto out;
     }
 

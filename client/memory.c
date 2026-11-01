@@ -9,6 +9,7 @@
 #include "vkb_client.h"
 #include "gen/vkb_client_gen.h"
 #include "emu.h"
+#include "vkb_emu_formats.h"
 
 #include <errno.h>
 #include <string.h>
@@ -38,11 +39,30 @@ typedef struct rq_entry {
     struct rq_entry *next;
 } rq_entry;
 
+/* Images the same way (also maintenance4's: vkGetDeviceImageMemoryRequirements): optimal tiling,
+ * no pNext and exclusive sharing once the client has changed the create info, and no BC formats -
+ * the server may make one of those transcoded or decoded (VKBRIDGE_BC_TX_BUDGET) from the same
+ * create info, at different sizes. Dark Souls III asks for each texture it streams in. */
+typedef struct irq_entry {
+    rq_entry a;                   /* the answers (its key fields unused) */
+    VkImageCreateFlags flags;
+    VkImageType type;
+    VkFormat format;
+    VkExtent3D extent;
+    uint32_t mips, layers;
+    VkSampleCountFlagBits samples;
+    VkImageUsageFlags usage;
+    struct irq_entry *next;
+} irq_entry;
+
 typedef struct vkb_rq_cache {
     pthread_mutex_t lock;
     vkb_map buffers;              /* VkBuffer -> rq_entry* (entries live as long as the device) */
     rq_entry *buckets[RQ_HB];
     uint32_t count;
+    vkb_map images;               /* VkImage -> rq_entry* (the irq_entry's) */
+    irq_entry *ibuckets[RQ_HB];
+    uint32_t icount;
     /* the dedicated-allocation hint (ded_hint below) */
     int ded_clear;                /* clear prefersDedicatedAllocation where safe */
     int ded_imitate;              /* VKBRIDGE_TEST_PREFER_DEDICATED: report it set, as Mali does (host tests) */
@@ -86,6 +106,7 @@ void vkb_memory_init_device(vkb_device *d)
     if (c) {
         pthread_mutex_init(&c->lock, NULL);
         vkb_map_init(&c->buffers);
+        vkb_map_init(&c->images);
         vkb_map_init(&c->ded_keep);
         const char *e = getenv("VKBRIDGE_DEDICATED_HINT");
         c->ded_clear = e && *e ? atoi(e) != 0 : arm_driver(d->pd);
@@ -164,7 +185,13 @@ void vkb_memory_destroy_device(vkb_device *d)
             nx = e->next;
             free(e);
         }
+    for (unsigned b = 0; b < RQ_HB; b++)
+        for (irq_entry *e = c->ibuckets[b], *nx; e; e = nx) {
+            nx = e->next;
+            free(e);
+        }
     vkb_map_destroy(&c->buffers);
+    vkb_map_destroy(&c->images);
     vkb_map_destroy(&c->ded_keep);
     pthread_mutex_destroy(&c->lock);
     free(c);
@@ -195,11 +222,47 @@ static void rq_buffer_created(vkb_device *dev, const VkBufferCreateInfo *ci, VkB
     if (e) vkb_map_put(&c->buffers, (uint64_t)buffer, e);
 }
 
-/* The kept answer for buffer, if any: 1 = filled in. dedicated may be NULL. */
-static int rq_lookup(vkb_device *dev, VkBuffer buffer, VkMemoryRequirements *req, VkMemoryDedicatedRequirements *dedicated)
+static void rq_image_created(vkb_device *dev, const VkImageCreateInfo *ci, VkFormat app_format, VkImage image)
 {
     vkb_rq_cache *c = dev->buf_reqs;
-    rq_entry *e = c ? vkb_map_get(&c->buffers, (uint64_t)buffer) : NULL;
+    if (!c || ci->pNext || ci->sharingMode != VK_SHARING_MODE_EXCLUSIVE || ci->tiling != VK_IMAGE_TILING_OPTIMAL || vkb_is_bc(app_format) ||
+        vkb_is_bc(ci->format) || (ci->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_DISJOINT_BIT)))
+        return;
+    uint64_t h = (uint64_t)ci->format * 0x9e3779b97f4a7c15ull ^ (uint64_t)ci->extent.width << 8 ^ (uint64_t)ci->extent.height << 24 ^
+                 (uint64_t)ci->extent.depth << 40 ^ (uint64_t)ci->mipLevels << 48 ^ (uint64_t)ci->arrayLayers << 54 ^ (uint64_t)ci->usage << 4 ^
+                 (uint64_t)ci->flags << 33 ^ (uint64_t)ci->samples << 60 ^ (uint64_t)ci->imageType << 62;
+    h ^= h >> 31;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 29;
+    pthread_mutex_lock(&c->lock);
+    irq_entry **head = &c->ibuckets[h & (RQ_HB - 1)], *e = *head;
+    while (e && !(e->flags == ci->flags && e->type == ci->imageType && e->format == ci->format && e->extent.width == ci->extent.width &&
+                  e->extent.height == ci->extent.height && e->extent.depth == ci->extent.depth && e->mips == ci->mipLevels &&
+                  e->layers == ci->arrayLayers && e->samples == ci->samples && e->usage == ci->usage))
+        e = e->next;
+    if (!e && c->icount < RQ_MAX && (e = calloc(1, sizeof(*e)))) {
+        e->flags = ci->flags;
+        e->type = ci->imageType;
+        e->format = ci->format;
+        e->extent = ci->extent;
+        e->mips = ci->mipLevels;
+        e->layers = ci->arrayLayers;
+        e->samples = ci->samples;
+        e->usage = ci->usage;
+        e->next = *head;
+        *head = e;
+        c->icount++;
+    }
+    pthread_mutex_unlock(&c->lock);
+    if (e) vkb_map_put(&c->images, (uint64_t)image, &e->a);
+}
+
+/* The kept answer for a buffer or image (map: the cache's buffers or images), if any: 1 = filled
+ * in. dedicated may be NULL. */
+static int rq_lookup_in(vkb_device *dev, int images, uint64_t handle, VkMemoryRequirements *req, VkMemoryDedicatedRequirements *dedicated)
+{
+    vkb_rq_cache *c = dev->buf_reqs;
+    rq_entry *e = c ? vkb_map_get(images ? &c->images : &c->buffers, handle) : NULL;
     if (!e) return 0;
     int hit = 0;
     pthread_mutex_lock(&c->lock);
@@ -215,10 +278,11 @@ static int rq_lookup(vkb_device *dev, VkBuffer buffer, VkMemoryRequirements *req
     return hit;
 }
 
-static void rq_store(vkb_device *dev, VkBuffer buffer, const VkMemoryRequirements *req, const VkMemoryDedicatedRequirements *dedicated)
+static void rq_store_in(vkb_device *dev, int images, uint64_t handle, const VkMemoryRequirements *req,
+                        const VkMemoryDedicatedRequirements *dedicated)
 {
     vkb_rq_cache *c = dev->buf_reqs;
-    rq_entry *e = c ? vkb_map_get(&c->buffers, (uint64_t)buffer) : NULL;
+    rq_entry *e = c ? vkb_map_get(images ? &c->images : &c->buffers, handle) : NULL;
     if (!e) return;
     pthread_mutex_lock(&c->lock);
     e->req = *req;
@@ -229,6 +293,16 @@ static void rq_store(vkb_device *dev, VkBuffer buffer, const VkMemoryRequirement
         e->have_dedicated = 1;
     }
     pthread_mutex_unlock(&c->lock);
+}
+
+static int rq_lookup(vkb_device *dev, VkBuffer buffer, VkMemoryRequirements *req, VkMemoryDedicatedRequirements *dedicated)
+{
+    return rq_lookup_in(dev, 0, (uint64_t)buffer, req, dedicated);
+}
+
+static void rq_store(vkb_device *dev, VkBuffer buffer, const VkMemoryRequirements *req, const VkMemoryDedicatedRequirements *dedicated)
+{
+    rq_store_in(dev, 0, (uint64_t)buffer, req, dedicated);
 }
 
 void vkb_memory_unmap_free(vkb_memory *m)
@@ -370,6 +444,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateImage(VkDevice device, const VkIma
     }
     VkResult r = vkb_wire_vkCreateImage(device, &ci, pAllocator, pImage);
     if (r == VK_SUCCESS) {
+        rq_image_created(dev, &ci, pCreateInfo->format, *pImage);
         vkb_emu_image_created(dev, pCreateInfo, *pImage);
         ded_track(dev, (uint64_t)*pImage, pCreateInfo->pNext, pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
     }
@@ -381,6 +456,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyImage(VkDevice device, VkImage image,
     if (!image) return;
     vkb_device *dev = vkb_dev(device);
     vkb_map_remove(&dev->shared_images, (uint64_t)image);
+    if (dev->buf_reqs) vkb_map_remove(&dev->buf_reqs->images, (uint64_t)image);
     ded_forget(dev, (uint64_t)image);
     vkb_emu_image_destroyed(dev, image);
     vkb_wire_vkDestroyImage(device, image, pAllocator);
@@ -394,7 +470,7 @@ static void fix_reqs(vkb_device *dev, VkMemoryRequirements *r, int allow_shared)
 }
 
 /* Buffers: vkb_mem_buffer_bits_to_client (physdev.c) adds the shared types where the driver's
- * mask has host-visible types but none of those (the XRing O3, issue #1). */
+ * mask has host-visible types but none of those (the XRing O3). */
 static void fix_buf_reqs(vkb_device *dev, VkMemoryRequirements *r, int allow_shared)
 {
     r->memoryTypeBits = vkb_mem_buffer_bits_to_client(dev->pd, r->memoryTypeBits, allow_shared);
@@ -441,16 +517,29 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetBufferMemoryRequirements2(VkDevice device
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetImageMemoryRequirements(VkDevice device, VkImage image, VkMemoryRequirements *pReq)
 {
+    vkb_device *dev = vkb_dev(device);
+    if (rq_lookup_in(dev, 1, (uint64_t)image, pReq, NULL)) return;
     vkb_wire_vkGetImageMemoryRequirements(device, image, pReq);
-    fix_reqs(vkb_dev(device), pReq, image_shareable(vkb_dev(device), image));
+    fix_reqs(dev, pReq, image_shareable(dev, image));
+    rq_store_in(dev, 1, (uint64_t)image, pReq, NULL);
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetImageMemoryRequirements2(VkDevice device, const VkImageMemoryRequirementsInfo2 *pInfo,
                                                                 VkMemoryRequirements2 *pReq)
 {
     vkb_device *dev = vkb_dev(device);
-    vkb_wire_vkGetImageMemoryRequirements2(device, pInfo, pReq);
-    fix_reqs(dev, &pReq->memoryRequirements, image_shareable(dev, pInfo->image));
+    /* As for buffers: kept answers cover VkMemoryDedicatedRequirements only, and not planes. */
+    VkMemoryDedicatedRequirements *ded = NULL;
+    int plain = !pInfo->pNext;
+    for (VkBaseOutStructure *b = pReq->pNext; b && plain; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS && !ded) ded = (VkMemoryDedicatedRequirements *)b;
+        else plain = 0;
+    }
+    if (!(plain && rq_lookup_in(dev, 1, (uint64_t)pInfo->image, &pReq->memoryRequirements, ded))) {
+        vkb_wire_vkGetImageMemoryRequirements2(device, pInfo, pReq);
+        fix_reqs(dev, &pReq->memoryRequirements, image_shareable(dev, pInfo->image));
+        if (plain) rq_store_in(dev, 1, (uint64_t)pInfo->image, &pReq->memoryRequirements, ded);
+    }
     /* A plane of a disjoint image (VkImagePlaneMemoryRequirementsInfo) is treated alike. */
     ded_hint(dev, pReq, ded_kept(dev, (uint64_t)pInfo->image));
 }

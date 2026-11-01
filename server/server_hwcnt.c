@@ -667,13 +667,29 @@ static void report(hw_state *h)
     VKB_INFO("  verdict: %s", v);
 }
 
+/* VKBRIDGE_GPU_PROF_MS=<ms> under 1000 (a diagnostic): a sample that often, each logged as one
+ * line - how busy the GPU and its queues were - for finding short stalls the 5 s summary hides. */
+static void quick_report(hw_state *h)
+{
+    double secs = h->ts_end > h->ts_start ? (h->ts_end - h->ts_start) / 1e9 : NAN;
+    double act = V(h, C_GPU_ACTIVE);
+    double busy = h->top_cycles ? 100.0 * act / h->top_cycles : NAN;
+    double mhz = h->top_cycles && secs > 0 ? h->top_cycles / secs / 1e6 : NAN;
+    VKB_INFO("gpu q %.0f ms: busy %.0f%% at %.0f MHz; fragment %.0f%%, vertex/tiler %.0f%%, compute %.0f%% of active", secs * 1e3, busy, mhz,
+             pct(V(h, C_ITER_FRAG_ACTIVE), act), pct(V(h, C_ITER_TILER_ACTIVE), act), pct(V(h, C_ITER_COMP_ACTIVE), act));
+}
+
 static void *hw_main(void *arg)
 {
     hw_state *h = arg;
     uint64_t seq = 1;
     int fails = 0;
+    const char *qv = vkb_srv_env("VKBRIDGE_GPU_PROF_MS");
+    long qms = qv ? atol(qv) : 0;
+    int quick = qms > 0 && qms < 1000;
     for (;;) {
         struct timespec ts = {PERIOD_S, 0};
+        if (quick) ts = (struct timespec){0, qms * 1000000L};
         while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
         int r = take_sample(h, ++seq);
         if (r) {
@@ -686,7 +702,8 @@ static void *hw_main(void *arg)
             continue;
         }
         fails = 0;
-        report(h);
+        if (quick) quick_report(h);
+        else report(h);
     }
     cmd(h, PC_CMD_STOP, 0);
     munmap((void *)h->map, h->map_size);

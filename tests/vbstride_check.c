@@ -17,6 +17,11 @@
  *
  * Host imitation (server): VKBRIDGE_ERRATA_IMITATE=vb_split (multi-binding calls),
  * VKBRIDGE_ERRATA_IMITATE_VB=single (single calls too).
+ *
+ * VBSTRIDE_DXVK=1: the pipeline is created the way DXVK makes one it draws with dynamic strides,
+ * every binding's stride 0, and two draws are added: first, before the three cases, the tightly
+ * packed strides (4 / 4 / 4, each binding's vertex size); last, after them, a second pipeline of
+ * the same shape drawn as case 1 (vb_bake guesses its strides from the ones drawn before).
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -100,6 +105,7 @@ static VkShaderModule shader(const uint32_t *code, size_t size)
 /* Where each binding's data starts (bytes) and the strides the cases bind */
 static const VkDeviceSize OFF[4] = {0, 1024, 2048, 3072};
 static const VkDeviceSize STRIDE[4] = {16, 4, 32, 8};
+static const VkDeviceSize TIGHT[4] = {4, 4, 4, 4};
 
 int main(void)
 {
@@ -208,7 +214,11 @@ int main(void)
     VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 1, &dyn};
     VkGraphicsPipelineCreateInfo gpci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms,
                                          NULL, &cbs, &ds, pl, rp, 0, VK_NULL_HANDLE, -1};
-    VkPipeline pipe;
+    const char *dxe = getenv("VBSTRIDE_DXVK");
+    int dx = dxe && *dxe && strcmp(dxe, "0");
+    if (dx)
+        for (int i = 0; i < 3; i++) bd[i].stride = 0;
+    VkPipeline pipe, pipe2 = VK_NULL_HANDLE;
     r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe);
     snprintf(msg, sizeof(msg), "VkResult %d", r);
     if (!check(r == VK_SUCCESS, "pipeline: bindings 0, 2, 3, dynamic strides", msg)) goto out;
@@ -216,12 +226,21 @@ int main(void)
     VkCommandPool cpool;
     vkCreateCommandPool(dev, &cpci, NULL, &cpool);
 
-    static const char *const what[3] = {"one call from binding 0, 4 bindings (strides 16, 4, 32, 8)",
-                                        "binding 0 alone, then one call from binding 1, 3 bindings (strides 4, 32, 8)",
-                                        "single-binding calls (binding 2: stride 12, then 32 alone)"};
-    int ok[3];
+    static const char *const whats[5] = {"DXVK's shape: tightly packed (strides 4, 4, 4, 4), one call",
+                                         "one call from binding 0, 4 bindings (strides 16, 4, 32, 8)",
+                                         "binding 0 alone, then one call from binding 1, 3 bindings (strides 4, 32, 8)",
+                                         "single-binding calls (binding 2: stride 12, then 32 alone)",
+                                         "DXVK's shape: a second pipeline, one call (strides 16, 4, 32, 8)"};
+    const char *const *what = whats + 1;
+    int ok[4];
     const VkBuffer bufs[4] = {vbuf, vbuf, vbuf, vbuf};
-    for (int k = 0; k < 3; k++) {
+    for (int k = dx ? -1 : 0; k < (dx ? 4 : 3); k++) {
+        const VkDeviceSize *SD = k < 0 ? TIGHT : STRIDE;
+        if (k == 3) {
+            r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe2);
+            snprintf(msg, sizeof(msg), "VkResult %d", r);
+            if (!check(r == VK_SUCCESS, "second pipeline, same shape", msg)) goto out;
+        }
         VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         VkCommandBuffer cb;
         vkAllocateCommandBuffers(dev, &cbai, &cb);
@@ -230,11 +249,11 @@ int main(void)
         VkClearValue clear = {.color = {.uint32 = {0, 0, 0, 0}}};
         VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {N, 1}}, 1, &clear};
         vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, k == 3 ? pipe2 : pipe);
         uint32_t pc = N;
         vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &pc);
-        if (k == 0) {
-            vkCmdBindVertexBuffers2(cb, 0, 4, bufs, OFF, NULL, STRIDE);
+        if (k < 0 || k == 0 || k == 3) {
+            vkCmdBindVertexBuffers2(cb, 0, 4, bufs, OFF, NULL, SD);
         } else if (k == 1) {
             vkCmdBindVertexBuffers2(cb, 0, 1, bufs, &OFF[0], NULL, &STRIDE[0]);
             vkCmdBindVertexBuffers2(cb, 1, 3, bufs, &OFF[1], NULL, &STRIDE[1]);
@@ -260,18 +279,20 @@ int main(void)
         for (uint32_t i = 0; i < N; i++) {
             const uint32_t *p = rb + i * 4;
             /* the word index each binding's attribute reads at instance i */
-            uint32_t want[4] = {(uint32_t)(OFF[0] + i * STRIDE[0]) / 4, (uint32_t)(OFF[2] + i * STRIDE[2]) / 4,
-                                (uint32_t)(OFF[3] + i * STRIDE[3]) / 4, i};
+            uint32_t want[4] = {(uint32_t)(OFF[0] + i * SD[0]) / 4, (uint32_t)(OFF[2] + i * SD[2]) / 4,
+                                (uint32_t)(OFF[3] + i * SD[3]) / 4, i};
             if (memcmp(p, want, 16)) bad++;
         }
         /* the stride shows from instance 1 on: that instance is reported */
         if (bad) {
             const uint32_t *p = rb + 4;
-            snprintf(msg, sizeof(msg), "instance 1 read words (%u %u %u), wanted (%u %u %u): strides seen %d / %d / %d, wanted 16 / 32 / 8",
-                     p[0], p[1], p[2], (uint32_t)(OFF[0] + STRIDE[0]) / 4, (uint32_t)(OFF[2] + STRIDE[2]) / 4, (uint32_t)(OFF[3] + STRIDE[3]) / 4,
-                     (int)(p[0] * 4 - (uint32_t)OFF[0]), (int)(p[1] * 4 - (uint32_t)OFF[2]), (int)(p[2] * 4 - (uint32_t)OFF[3]));
+            snprintf(msg, sizeof(msg), "instance 1 read words (%u %u %u), wanted (%u %u %u): strides seen %d / %d / %d, wanted %d / %d / %d",
+                     p[0], p[1], p[2], (uint32_t)(OFF[0] + SD[0]) / 4, (uint32_t)(OFF[2] + SD[2]) / 4, (uint32_t)(OFF[3] + SD[3]) / 4,
+                     (int)(p[0] * 4 - (uint32_t)OFF[0]), (int)(p[1] * 4 - (uint32_t)OFF[2]), (int)(p[2] * 4 - (uint32_t)OFF[3]),
+                     (int)SD[0], (int)SD[2], (int)SD[3]);
         }
-        ok[k] = check(!bad, what[k], msg);
+        int good = check(!bad, what[k], msg);
+        if (k >= 0) ok[k] = good;
     }
     if (ok[0] && ok[1] && ok[2])
         printf("shape: strides right\n");

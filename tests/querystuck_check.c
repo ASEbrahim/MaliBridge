@@ -20,6 +20,36 @@
  *                                flight; another thread spins on each frame's queries as UE4's
  *                                render thread does. Every result must come exact, in time, and
  *                                (mirror on) with no vkGetQueryPoolResults round trip at all
+ *   querystuck_check burst [n]   the first frame after Deep Rock Galactic's loading bar, as the Ultra
+ *                                stalled on it (2026-10-27): DXVK 3.1.1's 16384-query occlusion pool,
+ *                                n (default 640) queries from 1100 on reset one by one from the host,
+ *                                each begun and ended around a draw inside a render-pass secondary
+ *                                (inheritance zero-filled: occlusionQueryEnable FALSE, as DXVK's
+ *                                tiler mode records it), 8 passes each executing its secondary, in
+ *                                ONE primary, submitted with no wait; then polled without WAIT from
+ *                                the highest down as UE4 does. Every result must come exact within
+ *                                3 s: what the bridge hands the driver is the app's pattern, intact
+ *   querystuck_check burst-never   the same with the Ultra's driver imitated (the upper half never
+ *                                available, VKBRIDGE_TEST_QUERY_NEVER_FROM) and the fallback too slow
+ *                                to answer: they must stay not ready
+ *   querystuck_check burst-visible the same with VKBRIDGE_QUERY_VISIBLE_MS=300 (client/qvisible.c): the
+ *                                lower half exact, the upper half answered 1 sample (the first after
+ *                                300 ms, its siblings at once); a query reset and never ended, and one
+ *                                ended in a primary never submitted, stay not ready
+ *
+ *   querystuck_check stale       Batman: Arkham Asylum on the Galaxy Tab S12+ (, UE3 through
+ *                                DXVK): a query slot whose last use counted 0 samples is reset and
+ *                                reused for a draw that counts many, and the second command buffer's
+ *                                values reach the host late (imitated, VKBRIDGE_TEST_QUERY_LOSE_VALUE=2:
+ *                                the GPU's writes seen out of order, the "ready" before the value). The
+ *                                mirror must never answer "ready" with the slot's old value: late is
+ *                                allowed, wrong is not
+ *   querystuck_check batman [frames]  UE3's occlusion pattern on the drg model: every slot alternates
+ *                                between 0 samples and a full count from one use to the next, and every
+ *                                third frame resets its queries in the command buffer
+ *                                (vkCmdResetQueryPool) instead of from the host (read after its fence:
+ *                                until the reset runs the old result is still the query's); every
+ *                                answer exact, no round trips with the mirror on
  *
  * Round trips are counted from the client's VKBRIDGE_TRACE output, as in query_check.
  */
@@ -57,7 +87,7 @@ I(vkCreateFramebuffer); I(vkCreateGraphicsPipelines); I(vkCmdBeginRenderPass); I
 I(vkCmdBindPipeline); I(vkCmdPushConstants); I(vkCmdSetViewport); I(vkCmdSetScissor); I(vkCreateFence); I(vkWaitForFences);
 I(vkResetFences); I(vkDestroyDevice); I(vkCreateQueryPool); I(vkDestroyQueryPool); I(vkResetQueryPool); I(vkCmdBeginQuery);
 I(vkCmdEndQuery); I(vkGetQueryPoolResults); I(vkCmdExecuteCommands); I(vkResetCommandPool); I(vkDeviceWaitIdle);
-I(vkDestroyCommandPool);
+I(vkDestroyCommandPool); I(vkCmdResetQueryPool);
 #undef I
 
 static void check(int ok, const char *what, const char *detail)
@@ -331,6 +361,62 @@ static void case_lost(void)
     vkDestroyQueryPool(dev, pool, NULL);
 }
 
+/* ------------------------------------------------------------------ a stale value */
+
+static void case_stale(void)
+{
+    char d[300];
+    VkFence f;
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(dev, &fci, NULL, &f);
+    VkQueryPool pool = make_pool(8);
+    /* Round 0: 0 samples (a hidden object). Round 1: the same slots, now a large occluder, with its
+     * values late (the imitation). Round 2: the same again, nothing imitated. */
+    static const uint32_t ws[3][4] = {{0, 0, 0, 0}, {64, 48, 40, 32}, {0, 64, 0, 24}};
+    int bad = -1, late = 0;
+    long wire_late = 0;
+    double worst = 0;
+    for (int it = 0; it < 3 && bad < 0; it++) {
+        vkResetQueryPool(dev, pool, 0, 4);
+        VkCommandBuffer cb = alloc_cb(cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+        begin_primary(cb);
+        begin_pass(cb, &plain, VK_SUBPASS_CONTENTS_INLINE);
+        for (uint32_t q = 0; q < 4; q++) counted_draw(cb, &plain, pool, q, ws[it][q], ws[it][q]);
+        vkCmdEndRenderPass(cb);
+        if (!submit_wait(cb, f)) {
+            snprintf(d, sizeof(d), "round %d: submit", it);
+            bad = it;
+            break;
+        }
+        long w0 = wire_polls();
+        for (uint32_t q = 0; q < 4 && bad < 0; q++) {
+            uint64_t v = ~0ull;
+            double took = 0;
+            VkResult r = spin(pool, q, &v, 3.0, &took, NULL);
+            uint64_t want = (uint64_t)ws[it][q] * ws[it][q];
+            if (took > worst) worst = took;
+            if (it == 1 && took > 0.05) late++;
+            if (r != VK_SUCCESS || (precise ? v != want : (v != 0) != (want != 0))) {
+                snprintf(d, sizeof(d), "round %d query %u: %d after %.0f ms, %llu samples (want %llu)%s", it, q, r, took * 1e3,
+                         (unsigned long long)v, (unsigned long long)want,
+                         r == VK_SUCCESS && v == (uint64_t)ws[0][q] * ws[0][q] ? ": the slot's previous value" : "");
+                bad = it;
+            }
+        }
+        if (it == 1) wire_late = wire_polls() - w0;
+        if (bad < 0 && it == 2 && mirror && wire_polls() - w0) {
+            snprintf(d, sizeof(d), "round 2: %ld round trips with nothing imitated", wire_polls() - w0);
+            bad = it;
+        }
+    }
+    long told = trace_count("values are left out (VKBRIDGE_TEST_QUERY_LOSE_VALUE)");
+    if (bad < 0)
+        snprintf(d, sizeof(d), "3 rounds exact, slowest %.0f ms, %d late answer(s) and %ld round trip(s) in the imitated round, imitation %s",
+                 worst * 1e3, late, wire_late, told ? "on" : mirror ? "NOT ON (this client has no VKBRIDGE_TEST_QUERY_LOSE_VALUE)" : "not needed (mirror off)");
+    check(bad < 0 && (told > 0 || !mirror), "a reused slot whose new value reaches the host late: never its old value", d);
+    vkDestroyQueryPool(dev, pool, NULL);
+}
+
 /* ------------------------------------------------------------------ Deep Rock Galactic's pattern */
 
 #define DRG_POOL 256
@@ -355,6 +441,10 @@ static double drg_worst;
 static drg_frame drg_fr[DRG_INFLIGHT];
 static char drg_why[200];
 
+/* batman: UE3's pattern: 0 samples and full counts alternating per slot, every third
+ * frame reset in the command buffer */
+static int drg_batman;
+
 static void *drg_spinner(void *arg)
 {
     long frames = (long)(intptr_t)arg;
@@ -364,6 +454,9 @@ static void *drg_spinner(void *arg)
         pthread_mutex_unlock(&drg_lock);
         drg_frame *fr = &drg_fr[f % DRG_INFLIGHT];
         long polls = 0;
+        /* A query reset in a command buffer stays available, with its old result, until the reset
+         * executes (the driver says so too): those frames are read once their work is done. */
+        if (drg_batman && f % 3 == 2) vkWaitForFences(dev, 1, &fr->fence, VK_TRUE, 10000000000ull);
         for (int i = 0; i < DRG_PER_FRAME; i++) {
             uint64_t v = 0;
             double took = 0;
@@ -371,7 +464,7 @@ static void *drg_spinner(void *arg)
             if (took > drg_worst) drg_worst = took;
             if (r == VK_NOT_READY) {
                 if (!drg_stuck++) snprintf(drg_why, sizeof(drg_why), "frame %ld query %u not ready after 3 s", f, fr->q[i]);
-            } else if (r != VK_SUCCESS || (precise ? v != fr->want[i] : v == 0)) {
+            } else if (r != VK_SUCCESS || (precise ? v != fr->want[i] : (v != 0) != (fr->want[i] != 0))) {
                 if (!drg_wrong++)
                     snprintf(drg_why, sizeof(drg_why), "frame %ld query %u: %d, %llu (want %llu)", f, fr->q[i], r, (unsigned long long)v,
                              (unsigned long long)fr->want[i]);
@@ -420,6 +513,7 @@ static void case_drg(long frames)
             for (int i = DRG_PER_FRAME; i-- > 0;) drg_free[drg_nfree++] = fr->q[i];
         vkResetCommandPool(dev, fr->pool, 0);
         begin_primary(fr->prim);
+        int cmd_reset = drg_batman && f % 3 == 2;
         /* Four render passes, each recorded into a secondary (DXVK's tiler mode); queries handed
          * out LIFO and reset from the host as DXVK's restartQueries does. */
         int qi = 0;
@@ -430,8 +524,12 @@ static void case_drg(long frames)
             vkBeginCommandBuffer(fr->sec[s], &bi);
             for (int k = 0; k < DRG_PER_FRAME / 4; k++, qi++) {
                 uint32_t q = drg_free[--drg_nfree];
-                vkResetQueryPool(dev, drg_pool, q, 1);
+                if (cmd_reset) vkCmdResetQueryPool(fr->prim, drg_pool, q, 1); /* in the primary, before its passes */
+                else vkResetQueryPool(dev, drg_pool, q, 1);
                 uint32_t w = 1 + (uint32_t)((f * 7 + qi * 13) % W), h = 1 + (uint32_t)((f * 3 + qi * 5) % H);
+                static uint32_t uses[DRG_POOL];
+                if (drg_batman && uses[q]++ % 2) w = h = 0;          /* hidden this use, counted the next */
+                else if (drg_batman) w = W, h = H - (uint32_t)(q % 7); /* a large occluder */
                 fr->q[qi] = q;
                 fr->want[qi] = (uint64_t)w * h;
                 counted_draw(fr->sec[s], &plain, drg_pool, q, w, h);
@@ -458,9 +556,122 @@ static void case_drg(long frames)
     snprintf(d, sizeof(d), "%ld frames x %d queries in %.1f s, %ld polls, slowest %.1f ms, %ld round trips%s%s", frames, DRG_PER_FRAME, secs,
              drg_polls, drg_worst * 1e3, wire, *drg_why ? "; " : "", drg_why);
     check(!bad && !drg_stuck && !drg_wrong && (!mirror || wire == 0),
-          "Deep Rock Galactic's pattern (host resets, secondaries, a spinning thread)", d);
+          drg_batman ? "UE3's pattern (slots alternating 0 and full counts, host and command-buffer resets, a spinning thread)"
+                     : "Deep Rock Galactic's pattern (host resets, secondaries, a spinning thread)",
+          d);
     for (int i = 0; i < DRG_INFLIGHT; i++) vkDestroyCommandPool(dev, drg_fr[i].pool, NULL);
     vkDestroyQueryPool(dev, drg_pool, NULL);
+}
+
+
+/* ------------------------------------------------------------------ the first frame after the loading bar */
+
+#define BURST_POOL 16384
+#define BURST_BASE 1100
+#define BURST_PASSES 8
+
+/* mode 0: burst, 1: burst-never, 2: burst-visible */
+static void case_burst(int mode, uint32_t n)
+{
+    char d[400];
+    if (n < BURST_PASSES) n = BURST_PASSES;
+    if (n > BURST_POOL - BURST_BASE - 8) n = BURST_POOL - BURST_BASE - 8;
+    uint32_t per = n / BURST_PASSES;
+    n = per * BURST_PASSES;
+    VkQueryPool pool = make_pool(BURST_POOL);
+    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, qfam};
+    VkCommandPool cp;
+    vkCreateCommandPool(dev, &pci, NULL, &cp);
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence f;
+    vkCreateFence(dev, &fci, NULL, &f);
+    uint64_t *want = calloc(n, sizeof(*want));
+    VkCommandBuffer prim = alloc_cb(cp, VK_COMMAND_BUFFER_LEVEL_PRIMARY), sec[BURST_PASSES];
+    begin_primary(prim);
+    for (int s = 0; s < BURST_PASSES; s++) {
+        sec[s] = alloc_cb(cp, VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+        /* DXVK: VkCommandBufferInheritanceInfo zero-initialised but for the rendering formats */
+        VkCommandBufferInheritanceInfo inh = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, NULL, plain.rp, 0, plain.fb, VK_FALSE, 0, 0};
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                       VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT | VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, &inh};
+        vkBeginCommandBuffer(sec[s], &bi);
+        for (uint32_t k = 0; k < per; k++) {
+            uint32_t i = s * per + k, q = BURST_BASE + i;
+            vkResetQueryPool(dev, pool, q, 1); /* DXVK: at record time, one by one */
+            uint32_t w = 1 + (i * 7) % W, h = 1 + (i * 5) % H;
+            want[i] = (uint64_t)w * h;
+            counted_draw(sec[s], &plain, pool, q, w, h);
+        }
+        vkEndCommandBuffer(sec[s]);
+        begin_pass(prim, &plain, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+        vkCmdExecuteCommands(prim, 1, &sec[s]);
+        vkCmdEndRenderPass(prim);
+    }
+    vkEndCommandBuffer(prim);
+    /* Two that must never be answered by the fallback: reset and never ended; ended in a primary
+     * that is never submitted. */
+    uint32_t q_noend = BURST_BASE + n + 1, q_nosub = BURST_BASE + n + 2;
+    vkResetQueryPool(dev, pool, q_noend, 2);
+    VkCommandBuffer lone = alloc_cb(cp, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+    begin_primary(lone);
+    begin_pass(lone, &plain, VK_SUBPASS_CONTENTS_INLINE);
+    counted_draw(lone, &plain, pool, q_nosub, 4, 4);
+    vkCmdEndRenderPass(lone);
+    vkEndCommandBuffer(lone);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &prim, 0, NULL};
+    double t0 = now_s();
+    VkResult sr = vkQueueSubmit(queue, 1, &si, f);
+    uint32_t never = mode ? BURST_BASE + n / 2 : UINT32_MAX; /* the imitation's first query */
+    uint32_t exact = 0, visible = 0, stuck = 0, wrong = 0, first_wrong = UINT32_MAX;
+    double worst = 0, first_visible = 0, last_visible = 0;
+    long polls = 0;
+    for (uint32_t i = n; i-- > 0;) {
+        uint32_t q = BURST_BASE + i;
+        uint64_t v = 0;
+        double took = 0;
+        /* burst-never: the imitated ones are only checked to stay not ready for a moment */
+        double limit = mode == 1 && q >= never ? (i == n - 1 || i == n / 2 ? 0.5 : 0.002) : 3.0;
+        VkResult r = spin(pool, q, &v, limit, &took, &polls);
+        if (took > worst) worst = took;
+        int imitated = q >= never, ok = r == VK_SUCCESS && (precise ? v == want[i] : v != 0), good;
+        if (!imitated) good = ok, exact += ok;
+        else if (mode == 1) good = r == VK_NOT_READY, stuck += good;
+        else good = r == VK_SUCCESS && v == 1, visible += good;
+        if (good && imitated && mode == 2) {
+            double at = now_s() - t0;
+            if (!first_visible) first_visible = at;
+            last_visible = at;
+        }
+        if (!good && !wrong++) first_wrong = q;
+    }
+    uint64_t v = 0;
+    double tn = 0, ts = 0;
+    VkResult rn = spin(pool, q_noend, &v, mode == 2 ? 0.8 : 0.05, &tn, NULL);
+    VkResult rs = spin(pool, q_nosub, &v, mode == 2 ? 0.8 : 0.05, &ts, NULL);
+    int fence_ok = vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ull) == VK_SUCCESS;
+    long told = trace_count("query visible #");
+    uint32_t half = n - n / 2;
+    if (mode == 0) {
+        snprintf(d, sizeof(d), "%u queries in %d secondaries of one primary: %u exact, %u not, slowest %.1f ms, %ld polls%s", n, BURST_PASSES,
+                 exact, wrong, worst * 1e3, polls, wrong ? " (first wrong below)" : told ? " (FALLBACK ANSWERED)" : "");
+        check(sr == VK_SUCCESS && fence_ok && exact == n && !wrong && !told, "DRG's first frame after the loading bar: every query exact", d);
+        if (wrong) printf("  first wrong query %u\n", first_wrong);
+    } else if (mode == 1) {
+        snprintf(d, sizeof(d), "%u exact, %u stay not ready (imitated), %u other", exact, stuck, wrong);
+        check(sr == VK_SUCCESS && fence_ok && exact == n / 2 && stuck == half && !wrong,
+              "the imitated driver leaves the upper half not ready (VKBRIDGE_TEST_QUERY_NEVER_FROM)", d);
+    } else {
+        snprintf(d, sizeof(d), "%u exact, %u answered visible (first at %.0f ms, last at %.0f ms after the submit), %u other; "
+                 "never ended: %s, never submitted: %s; %ld line(s)",
+                 exact, visible, first_visible * 1e3, last_visible * 1e3, wrong, rn == VK_NOT_READY ? "not ready" : "ANSWERED",
+                 rs == VK_NOT_READY ? "not ready" : "ANSWERED", told);
+        check(sr == VK_SUCCESS && fence_ok && exact == n / 2 && visible == half && !wrong && first_visible >= 0.3 &&
+                  last_visible - first_visible < 1.0 && rn == VK_NOT_READY && rs == VK_NOT_READY && told >= 1,
+              "VKBRIDGE_QUERY_VISIBLE_MS answers a done submission's stuck queries visible, nothing else", d);
+    }
+    free(want);
+    vkDestroyCommandPool(dev, cp, NULL);
+    vkDestroyQueryPool(dev, pool, NULL);
 }
 
 int main(int argc, char **argv)
@@ -470,7 +681,24 @@ int main(int argc, char **argv)
     int all = !strcmp(what, "all");
     const char *mv = getenv("VKBRIDGE_QUERY_MIRROR");
     mirror = !(mv && !strcmp(mv, "0"));
+    /* occlusion from the server: its round trips are expected (timestamps' are not counted then) */
+    const char *mo = getenv("VKBRIDGE_QUERY_MIRROR_OCCLUSION");
+    if (mo && !strcmp(mo, "0")) mirror = 0;
     if (!strcmp(what, "lost")) setenv("VKBRIDGE_TEST_QUERY_LOSE_READY", "1", 1);
+    if (!strcmp(what, "stale")) setenv("VKBRIDGE_TEST_QUERY_LOSE_VALUE", "2", 1);
+    drg_batman = !strcmp(what, "batman");
+    int burst = !strcmp(what, "burst") ? 0 : !strcmp(what, "burst-never") ? 1 : !strcmp(what, "burst-visible") ? 2 : -1;
+    uint32_t burst_n = argc > 2 ? (uint32_t)atol(argv[2]) : 640;
+    if (burst > 0) {
+        /* The imitation sits on the server's answers: the mirror would answer first */
+        char from[16];
+        snprintf(from, sizeof(from), "%u", BURST_BASE + (burst_n / BURST_PASSES * BURST_PASSES) / 2);
+        setenv("VKBRIDGE_TEST_QUERY_NEVER_FROM", from, 1);
+        setenv("VKBRIDGE_QUERY_MIRROR", "0", 1);
+        /* burst-never: the fallback's tracking on (the imitation needs the pool types) but too slow to answer */
+        setenv("VKBRIDGE_QUERY_VISIBLE_MS", burst == 2 ? "300" : "600000", 1);
+        mirror = 0;
+    }
     int saved_err = dup(2);
     trace = tmpfile();
     if (trace) {
@@ -538,6 +766,7 @@ int main(int argc, char **argv)
     G(vkCmdPushConstants); G(vkCmdSetViewport); G(vkCmdSetScissor); G(vkCreateFence); G(vkWaitForFences); G(vkResetFences);
     G(vkDestroyDevice); G(vkCreateQueryPool); G(vkDestroyQueryPool); G(vkResetQueryPool); G(vkCmdBeginQuery); G(vkCmdEndQuery);
     G(vkGetQueryPoolResults); G(vkCmdExecuteCommands); G(vkResetCommandPool); G(vkDeviceWaitIdle); G(vkDestroyCommandPool);
+    G(vkCmdResetQueryPool);
 #undef G
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, qfam};
@@ -548,7 +777,9 @@ int main(int argc, char **argv)
     }
     if (!strcmp(what, "lost")) case_lost();
     if (all || !strcmp(what, "multiview")) case_multiview();
-    if (all || !strcmp(what, "drg")) case_drg(frames);
+    if (all || !strcmp(what, "drg") || drg_batman) case_drg(frames);
+    if (!strcmp(what, "stale")) case_stale();
+    if (burst >= 0) case_burst(burst, burst_n);
 
     vkDeviceWaitIdle(dev);
     vkDestroyDevice(dev, NULL);

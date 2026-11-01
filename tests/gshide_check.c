@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
- * gshide_check: what the first GPU offers of geometry shaders (gs_hide, issue #11:
- * server_errata_gs.c), printed for host/gshide_test.sh to compare:
+ * gshide_check: what the first GPU offers of geometry shaders (gs_hide, * server_errata_gs.c), printed for host/gshide_test.sh to compare:
  *   features: geometryShader (1.0 and Features2), transform feedback's geometryStreams
  *   limits: maxGeometryOutputVertices, maxGeometryShaderInvocations (1.0 and Properties2)
  *   stages: whether the subgroup stages list the geometry stage (Vulkan 1.1 properties)

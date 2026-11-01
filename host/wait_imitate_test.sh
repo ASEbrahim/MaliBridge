@@ -50,8 +50,8 @@ start() {
   for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
 }
 trap 'kill $srv 2>/dev/null; rm -f "$sock"; [ -n "$KEEP" ] || rm -rf "$work"' EXIT
-# The query wait must reach the server, not the client's mirror
-export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES= VKBRIDGE_QUERY_MIRROR=0
+# The query wait and the fence polls must reach the server, not the client's mirrors
+export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES= VKBRIDGE_QUERY_MIRROR=0 VKBRIDGE_SYNC_MIRROR=0
 unset VKBRIDGE_HIDE_EXTS
 fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
@@ -151,7 +151,7 @@ r=$?
   grep -q "vkWaitForFences returned VK_TIMEOUT after .*before the app's deadline (no timeout" "$log"
 step $? "the old behaviour (VKBRIDGE_ERRATA=-wait_retry): the app gets VK_TIMEOUT early (sem $(grep -o 'sem-late.*ms' $work/12.log | grep -o ': [0-9-]* after [0-9]* ms' | cut -c3-), fence $(grep -o 'fence-late.*ms' $work/12.log | grep -o ': [0-9-]* after [0-9]* ms' | cut -c3-)), logged by the client and the server ($(tail -1 $work/12.log))"
 # 13
-grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 # 14
 start

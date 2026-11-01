@@ -58,3 +58,12 @@
  "Resident Evil 7: RE Engine, subgroup-size quirk in vkd3d-proton like RE2's; untested here"},
 {"601150", "", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_WAVE32=1",
  "Devil May Cry 5: RE Engine (DXVK groups it with RE2/RE3); untested here"},
+
+/* The BC conversion budget (server_emu_bcn.c), off by default since v0.5.5: walking Firelink ->
+ * High Wall, DS3 streams BC textures in and their transcodes froze 300-1000 ms on the G925 (GPU 98%
+ * in compute); the budget decodes the ones over it instead. Off elsewhere: in Stray it decoded
+ * 511 MB of textures and its mixed copies were skipped (sky and water; fixed by the copy fix,
+ * a fix of the copy itself), and only a same-spot A/B shows what the decoded textures cost a GPU-bound
+ * game. The S10+'s DS3 A/B ran with the old per-second budget. */
+{"374320", "Mali-G925,Mali-G720", "VKBRIDGE_BC_TX_BUDGET=32:4",
+ "DARK SOULS III: BC transcodes froze 300-1000 ms while walking (G925); the conversion budget spreads them out"},

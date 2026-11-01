@@ -158,9 +158,10 @@ step $? "imitated results: push_descriptor error -> emulated in safe mode only (
 # 6
 start client
 msgs() { VKBRIDGE_STATS=100000 timeout 120 env "$@" "$out/desc_traffic_check" 2>&1 | grep -o '[0-9]* messages' | head -1; }
-ms=$(msgs VKBRIDGE_MODE=safe); mp=$(msgs VKBRIDGE_MODE=performance); mb=$(msgs VKBRIDGE_MODE=performance VKBRIDGE_DESC_BATCH=1)
-[ -n "$ms" ] && [ "$ms" = "$mp" ] && [ "$mb" != "$mp" ]
-step $? "client: descriptor batching off in both modes (safe $ms, performance $mp, VKBRIDGE_DESC_BATCH=1 $mb)"
+ms=$(msgs VKBRIDGE_MODE=safe); mp=$(msgs VKBRIDGE_MODE=performance); mo=$(msgs VKBRIDGE_MODE=performance VKBRIDGE_DESC_BATCH=0)
+# batched: a few hundred messages (not always the same count), unbatched: tens of thousands
+[ -n "$ms" ] && [ -n "$mp" ] && [ -n "$mo" ] && [ $(( ${ms% *} * 10 )) -lt ${mo% *} ] && [ $(( ${mp% *} * 10 )) -lt ${mo% *} ]
+step $? "client: descriptor batching (framing) on in both modes (safe $ms, performance $mp, VKBRIDGE_DESC_BATCH=0 $mo)"
 
 # 7
 stop
@@ -172,7 +173,7 @@ d2=$(python3 ../tools/malibridge_report_diff.py $work/defer/s/malibridge-report.
 step $? "the diff tool: $(echo "$d2" | grep -m1 '^WARNING' | cut -c1-90)"
 
 # 8
-grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

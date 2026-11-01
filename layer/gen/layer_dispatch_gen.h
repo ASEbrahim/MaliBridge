@@ -65,13 +65,18 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdResolveImage(VkCommandBuffer commandBuffer
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2* pResolveImageInfo);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetConservativeRasterizationModeEXT(VkCommandBuffer commandBuffer, VkConservativeRasterizationModeEXT conservativeRasterizationMode);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetCullMode(VkCommandBuffer commandBuffer, VkCullModeFlags cullMode);
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthBiasEnable(VkCommandBuffer commandBuffer, VkBool32 depthBiasEnable);
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthBoundsTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthBoundsTestEnable);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthCompareOp(VkCommandBuffer commandBuffer, VkCompareOp depthCompareOp);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthTestEnable);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthWriteEnable(VkCommandBuffer commandBuffer, VkBool32 depthWriteEnable);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event, const VkDependencyInfo* pDependencyInfo);
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetLineRasterizationModeEXT(VkCommandBuffer commandBuffer, VkLineRasterizationModeEXT lineRasterizationMode);
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer, VkBool32 primitiveRestartEnable);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopology primitiveTopology);
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer, VkBool32 rasterizerDiscardEnable);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetSampleMaskEXT(VkCommandBuffer commandBuffer, VkSampleCountFlagBits samples, const VkSampleMask* pSampleMask);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const VkRect2D* pScissors);
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t scissorCount, const VkRect2D* pScissors);
@@ -101,6 +106,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreatePipelineCache(VkDevice device, cons
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPipelineLayout* pPipelineLayout);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkRenderPass* pRenderPass);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSampler* pSampler);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkShaderModule* pShaderModule);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyBufferView(VkDevice device, VkBufferView bufferView, const VkAllocationCallbacks* pAllocator);
@@ -132,6 +138,8 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkFreeCommandBuffers(VkDevice device, VkCommand
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descriptorPool, uint32_t descriptorSetCount, const VkDescriptorSet* pDescriptorSets);
 VKAPI_ATTR void VKAPI_CALL Layer_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR VkDeviceAddress VKAPI_CALL Layer_vkGetBufferDeviceAddress(VkDevice device, const VkBufferDeviceAddressInfo* pInfo);
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements* pMemoryRequirements);
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetBufferMemoryRequirements2(VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo, VkMemoryRequirements2* pMemoryRequirements);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptorSetLayoutCreateInfo* pCreateInfo, VkDescriptorSetLayoutSupport* pSupport);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceImageMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDeviceImageSparseMemoryRequirements(VkDevice device, const VkDeviceImageMemoryRequirements* pInfo, uint32_t* pSparseMemoryRequirementCount, VkSparseImageMemoryRequirements2* pSparseMemoryRequirements);
@@ -158,15 +166,22 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceMemoryProperties(VkPhysicalD
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2* pMemoryProperties);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties* pProperties);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties);
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties* pQueueFamilyProperties);
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties2* pQueueFamilyProperties);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, size_t dataSize, void* pData, VkDeviceSize stride, VkQueryResultFlags flags);
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetRenderingAreaGranularity(VkDevice device, const VkRenderingAreaInfo* pRenderingAreaInfo, VkExtent2D* pGranularity);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore, uint64_t* pValue);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkImportSemaphoreFdKHR(VkDevice device, const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueBindSparse(VkQueue queue, uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueWaitIdle(VkQueue queue);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences);
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo* pSignalInfo);
 VKAPI_ATTR void VKAPI_CALL Layer_vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet descriptorSet, VkDescriptorUpdateTemplate descriptorUpdateTemplate, const void* pData);
 VKAPI_ATTR void VKAPI_CALL Layer_vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites, uint32_t descriptorCopyCount, const VkCopyDescriptorSet* pDescriptorCopies);
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout);
@@ -316,6 +331,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdBindVertexBuffers2(VkCommandBuffer command
     // server_errata_vbbake.c (bk_CmdBindVertexBuffers2)
     // server_errata_vbbake.c (im_CmdBindVertexBuffers2)
     // server_nulldesc.c (nd_CmdBindVertexBuffers2)
+    // server_vidyn.c (vi_CmdBindVertexBuffers2Plain)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdBindVertexBuffers2(commandBuffer, firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
 }
@@ -680,13 +696,29 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetCullMode(VkCommandBuffer commandBuffer,
     // server_errata_cmd.c (ci_CmdSetCullMode)
     // server_errata_cmd.c (cu_CmdSetCullMode)
     // server_errata_cmd.c (f_vkCmdSetCullMode)
+    // server_vidyn.c (vi_CmdSetCullMode)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetCullMode(commandBuffer, cullMode);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthBiasEnable(VkCommandBuffer commandBuffer, VkBool32 depthBiasEnable)
+{
+    // server_vidyn.c (vi_CmdSetDepthBiasEnable)
+    auto ctx = get_scoped_ctx(commandBuffer);
+    ctx->t->dt.vkCmdSetDepthBiasEnable(commandBuffer, depthBiasEnable);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthBoundsTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthBoundsTestEnable)
+{
+    // server_vidyn.c (vi_CmdSetDepthBoundsTestEnable)
+    auto ctx = get_scoped_ctx(commandBuffer);
+    ctx->t->dt.vkCmdSetDepthBoundsTestEnable(commandBuffer, depthBoundsTestEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthCompareOp(VkCommandBuffer commandBuffer, VkCompareOp depthCompareOp)
 {
     // server_errata_cmd.c (f_vkCmdSetDepthCompareOp)
+    // server_vidyn.c (vi_CmdSetDepthCompareOp)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetDepthCompareOp(commandBuffer, depthCompareOp);
 }
@@ -694,6 +726,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthCompareOp(VkCommandBuffer commandB
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthTestEnable)
 {
     // server_errata_cmd.c (f_vkCmdSetDepthTestEnable)
+    // server_vidyn.c (vi_CmdSetDepthTestEnable)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetDepthTestEnable(commandBuffer, depthTestEnable);
 }
@@ -701,6 +734,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthTestEnable(VkCommandBuffer command
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetDepthWriteEnable(VkCommandBuffer commandBuffer, VkBool32 depthWriteEnable)
 {
     // server_errata_cmd.c (f_vkCmdSetDepthWriteEnable)
+    // server_vidyn.c (vi_CmdSetDepthWriteEnable)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetDepthWriteEnable(commandBuffer, depthWriteEnable);
 }
@@ -719,6 +753,13 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetEvent2(VkCommandBuffer commandBuffer, V
     ctx->t->dt.vkCmdSetEvent2(commandBuffer, event, pDependencyInfo);
 }
 
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace)
+{
+    // server_vidyn.c (vi_CmdSetFrontFace)
+    auto ctx = get_scoped_ctx(commandBuffer);
+    ctx->t->dt.vkCmdSetFrontFace(commandBuffer, frontFace);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetLineRasterizationModeEXT(VkCommandBuffer commandBuffer, VkLineRasterizationModeEXT lineRasterizationMode)
 {
     // server_errata_cmd.c (f_vkCmdSetLineRasterizationModeEXT)
@@ -727,12 +768,27 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetLineRasterizationModeEXT(VkCommandBuffe
     ctx->t->dt.vkCmdSetLineRasterizationModeEXT(commandBuffer, lineRasterizationMode);
 }
 
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer, VkBool32 primitiveRestartEnable)
+{
+    // server_vidyn.c (vi_CmdSetPrimitiveRestartEnable)
+    auto ctx = get_scoped_ctx(commandBuffer);
+    ctx->t->dt.vkCmdSetPrimitiveRestartEnable(commandBuffer, primitiveRestartEnable);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopology primitiveTopology)
 {
     // server_errata_cmd.c (ci_CmdSetPrimitiveTopology)
     // server_errata_cmd.c (cu_CmdSetPrimitiveTopology)
+    // server_vidyn.c (vi_CmdSetPrimitiveTopology)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetPrimitiveTopology(commandBuffer, primitiveTopology);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer, VkBool32 rasterizerDiscardEnable)
+{
+    // server_vidyn.c (vi_CmdSetRasterizerDiscardEnable)
+    auto ctx = get_scoped_ctx(commandBuffer);
+    ctx->t->dt.vkCmdSetRasterizerDiscardEnable(commandBuffer, rasterizerDiscardEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetSampleMaskEXT(VkCommandBuffer commandBuffer, VkSampleCountFlagBits samples, const VkSampleMask* pSampleMask)
@@ -753,6 +809,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetScissor(VkCommandBuffer commandBuffer, 
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t scissorCount, const VkRect2D* pScissors)
 {
     // server_emu_compat.c (c_CmdSetScissorWithCount)
+    // server_vidyn.c (vi_CmdSetScissorWithCount)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetScissorWithCount(commandBuffer, scissorCount, pScissors);
 }
@@ -767,6 +824,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetStencilCompareMask(VkCommandBuffer comm
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetStencilOp(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, VkStencilOp failOp, VkStencilOp passOp, VkStencilOp depthFailOp, VkCompareOp compareOp)
 {
     // server_errata_cmd.c (f_vkCmdSetStencilOp)
+    // server_vidyn.c (vi_CmdSetStencilOp)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetStencilOp(commandBuffer, faceMask, failOp, passOp, depthFailOp, compareOp);
 }
@@ -781,6 +839,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetStencilReference(VkCommandBuffer comman
 VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetStencilTestEnable(VkCommandBuffer commandBuffer, VkBool32 stencilTestEnable)
 {
     // server_errata_cmd.c (f_vkCmdSetStencilTestEnable)
+    // server_vidyn.c (vi_CmdSetStencilTestEnable)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetStencilTestEnable(commandBuffer, stencilTestEnable);
 }
@@ -814,6 +873,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdSetViewportWithCount(VkCommandBuffer comma
     // server_emu_compat.c (c_CmdSetViewportWithCount)
     // server_errata_flip.c (fl_CmdSetViewportWithCount)
     // server_errata_flip.c (fli_CmdSetViewportWithCount)
+    // server_vidyn.c (vi_CmdSetViewportWithCount)
     auto ctx = get_scoped_ctx(commandBuffer);
     ctx->t->dt.vkCmdSetViewportWithCount(commandBuffer, viewportCount, pViewports);
 }
@@ -845,6 +905,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkCmdWaitEvents2(VkCommandBuffer commandBuffer,
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer)
 {
     // server_emu_layer.c (emu_CreateBuffer)
+    // server_emu_sparse.c (sp_CreateBuffer)
     // server_errata_mem.c (l_CreateBuffer)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkCreateBuffer(device, pCreateInfo, pAllocator, pBuffer);
@@ -987,6 +1048,13 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateSampler(VkDevice device, const VkSa
     return ctx->t->dt.vkCreateSampler(device, pCreateInfo, pAllocator, pSampler);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore)
+{
+    // server_timeline.c (tl_CreateSemaphore)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkCreateSemaphore(device, pCreateInfo, pAllocator, pSemaphore);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkShaderModule* pShaderModule)
 {
     // server_emu_shader.c (emu_CreateShaderModule)
@@ -1012,6 +1080,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateShaderModule(VkDevice device, const
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator)
 {
     // server_emu_layer.c (emu_DestroyBuffer)
+    // server_emu_sparse.c (sp_DestroyBuffer)
     // server_errata_mem.c (l_DestroyBuffer)
     // server_hang.c (hg_DestroyBuffer)
     auto ctx = get_scoped_ctx(device);
@@ -1063,6 +1132,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyDescriptorUpdateTemplate(VkDevice devi
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator)
 {
+    // server_syncfb.c (fb_DestroyFence)
     // server_syncfd.c (sx_DestroyFence)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroyFence(device, fence, pAllocator);
@@ -1139,6 +1209,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySampler(VkDevice device, VkSampler sam
 VKAPI_ATTR void VKAPI_CALL Layer_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator)
 {
     // server_syncfd.c (sx_DestroySemaphore)
+    // server_timeline.c (tl_DestroySemaphore)
     // server_wait.c (w_DestroySemaphore)
     auto ctx = get_scoped_ctx(device);
     ctx->t->dt.vkDestroySemaphore(device, semaphore, pAllocator);
@@ -1195,6 +1266,20 @@ VKAPI_ATTR VkDeviceAddress VKAPI_CALL Layer_vkGetBufferDeviceAddress(VkDevice de
     return ctx->t->dt.vkGetBufferDeviceAddress(device, pInfo);
 }
 
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements* pMemoryRequirements)
+{
+    // server_emu_sparse.c (sp_GetBufferMemoryRequirements)
+    auto ctx = get_scoped_ctx(device);
+    ctx->t->dt.vkGetBufferMemoryRequirements(device, buffer, pMemoryRequirements);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetBufferMemoryRequirements2(VkDevice device, const VkBufferMemoryRequirementsInfo2* pInfo, VkMemoryRequirements2* pMemoryRequirements)
+{
+    // server_emu_sparse.c (sp_GetBufferMemoryRequirements2)
+    auto ctx = get_scoped_ctx(device);
+    ctx->t->dt.vkGetBufferMemoryRequirements2(device, pInfo, pMemoryRequirements);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptorSetLayoutCreateInfo* pCreateInfo, VkDescriptorSetLayoutSupport* pSupport)
 {
     // server_emu_desc.c (d_GetDescriptorSetLayoutSupport)
@@ -1232,6 +1317,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceFdKHR(VkDevice device, const VkFe
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetFenceStatus(VkDevice device, VkFence fence)
 {
+    // server_syncfb.c (fb_GetFenceStatus)
     // server_wait.c (imi_GetFenceStatus)
     // server_wait.c (w_GetFenceStatus)
     auto ctx = get_scoped_ctx(device);
@@ -1296,6 +1382,20 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetPhysicalDeviceImageFormatProperties2(V
     return ctx->t->dt.vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, pImageFormatInfo, pImageFormatProperties);
 }
 
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties* pQueueFamilyProperties)
+{
+    // server_emu_sparse.c (sp_GetPhysicalDeviceQueueFamilyProperties)
+    auto ctx = get_scoped_ctx(physicalDevice);
+    ctx->t->dt.vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties2* pQueueFamilyProperties)
+{
+    // server_emu_sparse.c (sp_GetPhysicalDeviceQueueFamilyProperties2)
+    auto ctx = get_scoped_ctx(physicalDevice);
+    ctx->t->dt.vkGetPhysicalDeviceQueueFamilyProperties2(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, size_t dataSize, void* pData, VkDeviceSize stride, VkQueryResultFlags flags)
 {
     // server_wait.c (imi_GetQueryPoolResults)
@@ -1311,11 +1411,35 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetRenderingAreaGranularity(VkDevice device, 
     ctx->t->dt.vkGetRenderingAreaGranularity(device, pRenderingAreaInfo, pGranularity);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore, uint64_t* pValue)
+{
+    // server_timeline.c (tl_GetSemaphoreCounterValue)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkGetSemaphoreCounterValue(device, semaphore, pValue);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd)
 {
     // server_syncfd.c (sx_GetSemaphoreFdKHR)
+    // server_timeline.c (tl_GetSemaphoreFdKHR)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkGetSemaphoreFdKHR(device, pGetFdInfo, pFd);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkImportSemaphoreFdKHR(VkDevice device, const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo)
+{
+    // server_timeline.c (tl_ImportSemaphoreFdKHR)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkImportSemaphoreFdKHR(device, pImportSemaphoreFdInfo);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueBindSparse(VkQueue queue, uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence)
+{
+    // server_emu_sparse.c (sp_QueueBindSparse)
+    // server_qlock.c (ql_QueueBindSparse)
+    // server_syncfb.c (fb_QueueBindSparse)
+    auto ctx = get_scoped_ctx(queue);
+    return ctx->t->dt.vkQueueBindSparse(queue, bindInfoCount, pBindInfo, fence);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence)
@@ -1323,7 +1447,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit(VkQueue queue, uint32_t submi
     // server_conn.c (cf_QueueSubmit)
     // server_hang.c (hg_QueueSubmit)
     // server_nulldesc.c (nd_QueueSubmit)
+    // server_qlock.c (ql_QueueSubmit)
     // server_report.c (rp_QueueSubmit)
+    // server_syncfb.c (fb_QueueSubmit)
+    // server_timeline.c (tl_QueueSubmit)
     // server_trace.c (tr_QueueSubmit)
     // server_wait.c (w_QueueSubmit)
     auto ctx = get_scoped_ctx(queue);
@@ -1335,7 +1462,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit2(VkQueue queue, uint32_t subm
     // server_conn.c (cf_QueueSubmit2)
     // server_hang.c (hg_QueueSubmit2)
     // server_nulldesc.c (nd_QueueSubmit2)
+    // server_qlock.c (ql_QueueSubmit2)
     // server_report.c (rp_QueueSubmit2)
+    // server_syncfb.c (fb_QueueSubmit2)
+    // server_timeline.c (tl_QueueSubmit2)
     // server_trace.c (tr_QueueSubmit2)
     // server_wait.c (w_QueueSubmit2)
     auto ctx = get_scoped_ctx(queue);
@@ -1344,6 +1474,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueSubmit2(VkQueue queue, uint32_t subm
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkQueueWaitIdle(VkQueue queue)
 {
+    // server_qlock.c (ql_QueueWaitIdle)
     // server_report.c (rp_QueueWaitIdle)
     // server_wait.c (imi_QueueWaitIdle)
     // server_wait.c (w_QueueWaitIdle)
@@ -1375,6 +1506,20 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkResetDescriptorPool(VkDevice device, VkDe
     return ctx->t->dt.vkResetDescriptorPool(device, descriptorPool, flags);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences)
+{
+    // server_syncfb.c (fb_ResetFences)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkResetFences(device, fenceCount, pFences);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Layer_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo* pSignalInfo)
+{
+    // server_timeline.c (tl_SignalSemaphore)
+    auto ctx = get_scoped_ctx(device);
+    return ctx->t->dt.vkSignalSemaphore(device, pSignalInfo);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet descriptorSet, VkDescriptorUpdateTemplate descriptorUpdateTemplate, const void* pData)
 {
     // server_bvmap.c (bv_UpdateDescriptorSetWithTemplate)
@@ -1398,7 +1543,9 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkUpdateDescriptorSets(VkDevice device, uint32_
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout)
 {
+    // server_conn.c (sl_WaitForFences)
     // server_report.c (rp_WaitForFences)
+    // server_syncfb.c (fb_WaitForFences)
     // server_wait.c (imi_WaitForFences)
     // server_wait.c (w_WaitForFences)
     auto ctx = get_scoped_ctx(device);
@@ -1407,7 +1554,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkWaitForFences(VkDevice device, uint32_t f
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo, uint64_t timeout)
 {
+    // server_conn.c (sl_WaitSemaphores)
     // server_report.c (rp_WaitSemaphores)
+    // server_timeline.c (tl_WaitSemaphores)
     // server_wait.c (imi_WaitSemaphores)
     // server_wait.c (w_WaitSemaphores)
     auto ctx = get_scoped_ctx(device);
@@ -1496,6 +1645,10 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkCmdSetConservativeRasterizationModeEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetConservativeRasterizationModeEXT);
     if (strcmp(pName, "vkCmdSetCullMode") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetCullMode);
     if (strcmp(pName, "vkCmdSetCullModeEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetCullMode);
+    if (strcmp(pName, "vkCmdSetDepthBiasEnable") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetDepthBiasEnable);
+    if (strcmp(pName, "vkCmdSetDepthBiasEnableEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetDepthBiasEnable);
+    if (strcmp(pName, "vkCmdSetDepthBoundsTestEnable") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetDepthBoundsTestEnable);
+    if (strcmp(pName, "vkCmdSetDepthBoundsTestEnableEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetDepthBoundsTestEnable);
     if (strcmp(pName, "vkCmdSetDepthCompareOp") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetDepthCompareOp);
     if (strcmp(pName, "vkCmdSetDepthCompareOpEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetDepthCompareOp);
     if (strcmp(pName, "vkCmdSetDepthTestEnable") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetDepthTestEnable);
@@ -1505,9 +1658,15 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkCmdSetEvent") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetEvent);
     if (strcmp(pName, "vkCmdSetEvent2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetEvent2);
     if (strcmp(pName, "vkCmdSetEvent2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetEvent2);
+    if (strcmp(pName, "vkCmdSetFrontFace") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetFrontFace);
+    if (strcmp(pName, "vkCmdSetFrontFaceEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetFrontFace);
     if (strcmp(pName, "vkCmdSetLineRasterizationModeEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetLineRasterizationModeEXT);
+    if (strcmp(pName, "vkCmdSetPrimitiveRestartEnable") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetPrimitiveRestartEnable);
+    if (strcmp(pName, "vkCmdSetPrimitiveRestartEnableEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetPrimitiveRestartEnable);
     if (strcmp(pName, "vkCmdSetPrimitiveTopology") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetPrimitiveTopology);
     if (strcmp(pName, "vkCmdSetPrimitiveTopologyEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetPrimitiveTopology);
+    if (strcmp(pName, "vkCmdSetRasterizerDiscardEnable") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetRasterizerDiscardEnable);
+    if (strcmp(pName, "vkCmdSetRasterizerDiscardEnableEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetRasterizerDiscardEnable);
     if (strcmp(pName, "vkCmdSetSampleMaskEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetSampleMaskEXT);
     if (strcmp(pName, "vkCmdSetScissor") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetScissor);
     if (strcmp(pName, "vkCmdSetScissorWithCount") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCmdSetScissorWithCount);
@@ -1542,6 +1701,7 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkCreateRenderPass2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateRenderPass2);
     if (strcmp(pName, "vkCreateRenderPass2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateRenderPass2);
     if (strcmp(pName, "vkCreateSampler") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateSampler);
+    if (strcmp(pName, "vkCreateSemaphore") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateSemaphore);
     if (strcmp(pName, "vkCreateShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkCreateShaderModule);
     if (strcmp(pName, "vkDestroyBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyBuffer);
     if (strcmp(pName, "vkDestroyBufferView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkDestroyBufferView);
@@ -1569,6 +1729,9 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkGetBufferDeviceAddress") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetBufferDeviceAddress);
     if (strcmp(pName, "vkGetBufferDeviceAddressEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetBufferDeviceAddress);
     if (strcmp(pName, "vkGetBufferDeviceAddressKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetBufferDeviceAddress);
+    if (strcmp(pName, "vkGetBufferMemoryRequirements") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetBufferMemoryRequirements);
+    if (strcmp(pName, "vkGetBufferMemoryRequirements2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetBufferMemoryRequirements2);
+    if (strcmp(pName, "vkGetBufferMemoryRequirements2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetBufferMemoryRequirements2);
     if (strcmp(pName, "vkGetDescriptorSetLayoutSupport") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDescriptorSetLayoutSupport);
     if (strcmp(pName, "vkGetDescriptorSetLayoutSupportKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDescriptorSetLayoutSupport);
     if (strcmp(pName, "vkGetDeviceImageMemoryRequirements") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetDeviceImageMemoryRequirements);
@@ -1592,7 +1755,11 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkGetQueryPoolResults") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetQueryPoolResults);
     if (strcmp(pName, "vkGetRenderingAreaGranularity") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetRenderingAreaGranularity);
     if (strcmp(pName, "vkGetRenderingAreaGranularityKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetRenderingAreaGranularity);
+    if (strcmp(pName, "vkGetSemaphoreCounterValue") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetSemaphoreCounterValue);
+    if (strcmp(pName, "vkGetSemaphoreCounterValueKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetSemaphoreCounterValue);
     if (strcmp(pName, "vkGetSemaphoreFdKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetSemaphoreFdKHR);
+    if (strcmp(pName, "vkImportSemaphoreFdKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkImportSemaphoreFdKHR);
+    if (strcmp(pName, "vkQueueBindSparse") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkQueueBindSparse);
     if (strcmp(pName, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkQueueSubmit);
     if (strcmp(pName, "vkQueueSubmit2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkQueueSubmit2);
     if (strcmp(pName, "vkQueueSubmit2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkQueueSubmit2);
@@ -1600,6 +1767,9 @@ PFN_vkVoidFunction layer_lookup_device_proc(const char *pName)
     if (strcmp(pName, "vkResetCommandBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkResetCommandBuffer);
     if (strcmp(pName, "vkResetCommandPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkResetCommandPool);
     if (strcmp(pName, "vkResetDescriptorPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkResetDescriptorPool);
+    if (strcmp(pName, "vkResetFences") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkResetFences);
+    if (strcmp(pName, "vkSignalSemaphore") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkSignalSemaphore);
+    if (strcmp(pName, "vkSignalSemaphoreKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkSignalSemaphore);
     if (strcmp(pName, "vkUpdateDescriptorSetWithTemplate") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkUpdateDescriptorSetWithTemplate);
     if (strcmp(pName, "vkUpdateDescriptorSetWithTemplateKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkUpdateDescriptorSetWithTemplate);
     if (strcmp(pName, "vkUpdateDescriptorSets") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkUpdateDescriptorSets);
@@ -1635,6 +1805,10 @@ PFN_vkVoidFunction layer_lookup_instance_proc(const char *pName)
     if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetPhysicalDeviceMemoryProperties2);
     if (strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetPhysicalDeviceProperties);
     if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetPhysicalDeviceProperties2);
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetPhysicalDeviceQueueFamilyProperties);
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetPhysicalDeviceQueueFamilyProperties);
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetPhysicalDeviceQueueFamilyProperties2);
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(Layer_vkGetPhysicalDeviceQueueFamilyProperties2);
     return nullptr;
 }
 

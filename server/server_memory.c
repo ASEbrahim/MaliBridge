@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -78,7 +79,7 @@ static const vkb_native_handle *(*p_AHardwareBuffer_getNativeHandle)(const struc
 
 /* AHB pages uncached (CPU usage "rarely"): -1 until decided, VKBRIDGE_AHB_RARELY forcing it. The
  * memory self-test turns it on when cached AHBs share no coherent type: Huawei's Kirin 985
- * (Mali-G77 r34p0, MaliBridge#10) lets a cached AHB into its cached type 1 only, and that phone has
+ * (Mali-G77 r34p0) lets a cached AHB into its cached type 1 only, and that phone has
  * no dma-heaps, so no method worked and Linux programs got no host-visible memory. */
 static int ahb_rarely = -1;
 static int ahb_uncached(void)
@@ -189,7 +190,7 @@ static unsigned mem_hash(VkDeviceMemory m)
  * BC-emulated images: 4.7 GB decoded from 0.97 GB of BC (BC3 sRGB 2.5 GB, BC1 sRGB 1.3 GB at 8x,
  * BC3 0.6 GB), the driver within 2% of the decoded texels. The heap (~2.2 GB) stayed flat.
  *
- * Titanfall 2 on a 12 GB XRing O3 (MaliBridge#18): the system closed the server within 3-5 minutes,
+ * Titanfall 2 on a 12 GB XRing O3: the system closed the server within 3-5 minutes,
  * 4 GB of RSS, 2.4 GB of images, and the heap from 0.8 to 1.9 GB in the last minute - which part of
  * the heap the line could not say. So it also has the memory free and the swap free, the
  * pipelines made since the last line and what the persistent pipeline caches hold in the driver
@@ -487,6 +488,7 @@ static void mem_release_backing(vkb_srv_mem *m)
 #endif
     if (m->export_fd1) close(m->export_fd1 - 1);
     if (m->sync_fd1) close(m->sync_fd1 - 1);
+    vkb_dab_mem_release(m);
     free(m);
 }
 
@@ -514,7 +516,7 @@ void vkb_mem_free_all(vkb_srv_table *dev)
 /* The dma-heap the dmaheap strategy allocates from, opened once: system-uncached first (the GPU
  * and the client both write through it without cache maintenance), else the cached system heap.
  * VKBRIDGE_FAKE_MISSING=dmaheap (device tests): none, as on the phones without /dev/dma_heap
- * (Retroid Pocket 4 Pro, Kirin 985; MaliBridge#10). Read once per server start. */
+ * (Retroid Pocket 4 Pro, Kirin 985;). Read once per server start. */
 static int dmaheap_fd(void)
 {
     static int fd = -2;
@@ -844,7 +846,7 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
  * driver keeps choosing the image's layout; the importer learns it from the modifier as usual.
  *
  * Phones without /dev/dma_heap (Retroid Pocket 4 Pro's Dimensity 1100 and Huawei's Kirin 985,
- * Mali-G77 r32p1/r34p0; MaliBridge#10: gamescope stopped at "no exportable modifier"): the pages
+ * Mali-G77 r32p1/r34p0; gamescope stopped at "no exportable modifier"): the pages
  * come from a BLOB AHardwareBuffer instead, its dma-buf imported as any other. The buffer is kept
  * with the memory (m->ahb) and released after it. Offered only once a real one has been allocated,
  * imported and mapped at start (ahb_export_check): a gralloc that refuses any of it leaves the
@@ -1218,7 +1220,7 @@ void vkb_mem_instance_install(vkb_srv_table *t)
  * g720mem: the Mali-G720's and G925's four types (0:0x7 1:0xb 2:0x11 3:0x21/h1). Images and
  * buffers allow 0x3 (their self-tests: "images allow types 0x3, plain buffers 0x3").
  *
- * xringmem: Mali-G2-Ultra on the XRing O3 (driver r56p0, issue #1), 22 types: 0,3..8 0x7; 1,9..14
+ * xringmem: Mali-G2-Ultra on the XRing O3 (driver r56p0), 22 types: 0,3..8 0x7; 1,9..14
  * 0xb; 2,15..20 0x11 (lazily allocated); 21 0x21 (heap 1). As measured there (the tester's v0.5.1
  * logs): images allow 0x1040 (types 6 and 12), plain buffers 0x4100 (8 and 14); with the client's
  * handle types (it makes every buffer so) indirect buffers allow 0x1040 like images, staging
@@ -1230,7 +1232,7 @@ void vkb_mem_instance_install(vkb_srv_table *t)
  * allowed)", gamescope's "findMemoryType failed"). Unshared staging buffers allow 0x3 too (the
  * self-test's "resource masks 0x4100->8 0x3->0").
  *
- * o1mem: Mali-G925 on the XRing O1 (driver r49p1, Xiaomi Pad 7S Pro, issues #6 and #8), 6 types:
+ * o1mem: Mali-G925 on the XRing O1 (driver r49p1, Xiaomi Pad 7S Pro), 6 types:
  * 0 0x1 (device-local, no host access, not lazily allocated), 1 0x7, 2 0xb, 3 and 4 0x11 (lazily
  * allocated), 5 0x21 (heap 1). Images and buffers allow 0x6 ("images allow types 0x6, plain buffers
  * 0x6"): never type 0, the one a client takes for its device-local type when a driver has such a type.
@@ -1905,8 +1907,63 @@ out:
 }
 #endif
 
+#ifndef __ANDROID__
+/* Host tests only (VKBRIDGE_TEST_SCANOUT=1): a stand-in for the gralloc buffer, so the client's paths
+ * for it (banner_ahb_v1 attach and offer) run on a desktop. The driver's own linear dma-buf (rows of
+ * 256 bytes, as gralloc pads them) is the "buffer", and the stand-in for its handle, written into the
+ * client's socket, is that dma-buf's fd itself (SCM_RIGHTS): a test compositor reads it and can tell
+ * it is the same buffer as the dma-buf it is later given. */
+static VkResult test_scanout_alloc(vkb_srv_table *t, uint32_t w, uint32_t h, uint32_t vkformat, int sock, int *out_fd,
+                                   uint32_t *pitch, uint64_t *size, uint32_t *ahb_format)
+{
+    const char *on = vkb_srv_env_global("VKBRIDGE_TEST_SCANOUT");
+    if (!on || strcmp(on, "1")) return VK_ERROR_FEATURE_NOT_PRESENT;
+    uint32_t f;
+    switch (vkformat) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB: f = 1u; break;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB: f = 5u; break;
+    default: return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    if (!w || !h || w > 16384 || h > 16384) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    uint32_t p = (w * 4u + 255u) & ~255u;
+    uint64_t len = ((uint64_t)p * h + 4095u) & ~4095ull;
+    VkPhysicalDeviceMemoryProperties mp;
+    t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+    int fd = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && fd < 0; i++)
+        if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) fd = driver_pages(t, len, i);
+    if (fd < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    char one = 'h', cb[CMSG_SPACE(sizeof(int))];
+    memset(cb, 0, sizeof(cb));
+    struct iovec io = {&one, 1};
+    struct msghdr msg = {0};
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cb;
+    msg.msg_controllen = sizeof(cb);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+    if (sendmsg(sock, &msg, MSG_NOSIGNAL) != 1) {
+        close(fd);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *out_fd = fd;
+    *pitch = p;
+    *size = len;
+    *ahb_format = f;
+    VKB_ONCE(VKB_LOG_INFO, "scanout: %ux%u stand-in gralloc buffers from the driver's own dma-bufs (VKBRIDGE_TEST_SCANOUT=1, host test)", w, h);
+    return VK_SUCCESS;
+}
+#endif
+
 /* vkbAllocScanout: device, width, height, VkFormat, socket -> result, dma-buf, row pitch (bytes),
- * dma-buf size, AHARDWAREBUFFER_FORMAT_*. Not available off Android (VK_ERROR_FEATURE_NOT_PRESENT). */
+ * dma-buf size, AHARDWAREBUFFER_FORMAT_*. Off Android only the host tests' stand-in
+ * (VKBRIDGE_TEST_SCANOUT=1); otherwise VK_ERROR_FEATURE_NOT_PRESENT. */
 void vkb_sv_vkbAllocScanout(vkb_srv_call *c)
 {
     VkDevice dev = (VkDevice)(uintptr_t)vkb_dec_u64(&c->d);
@@ -1925,9 +1982,7 @@ void vkb_sv_vkbAllocScanout(vkb_srv_call *c)
 #ifdef __ANDROID__
     if (sock >= 0) r = scanout_alloc(w, h, format, sock, &out_fd, &pitch, &size, &ahb_format);
 #else
-    (void)w;
-    (void)h;
-    (void)format;
+    if (sock >= 0) r = test_scanout_alloc(t, w, h, format, sock, &out_fd, &pitch, &size, &ahb_format);
 #endif
     if (sock >= 0) close(sock);
     vkb_enc_u32(&c->r, (uint32_t)r);
@@ -1987,6 +2042,39 @@ static void fit_import_type(vkb_srv_table *t, VkMemoryAllocateInfo *ai, int fd)
     if (bits) ai->memoryTypeIndex = (uint32_t)__builtin_ctz(bits);
 }
 
+/* An allocation of BIG_ALLOC or more is logged with how long it took and where (BIG_LINES per
+ * server run): Mali zeroes new pages, Android may have to reclaim memory for them, and a 256 MB
+ * one inside a frame is a stall to look for (the stutter plan's S3). Every allocation goes into
+ * the hitch line's count when the process has VKBRIDGE_HITCH_MS on (server_hitch.c). */
+#define BIG_ALLOC ((VkDeviceSize)64 << 20)
+#define BIG_LINES 200
+
+static void alloc_timed(vkb_srv_table *t, VkDeviceSize size, uint32_t type, uint8_t ded, uint64_t t0, VkResult r)
+{
+    int big = size >= BIG_ALLOC;
+    if (big && vkb_test_hitch_delay_ms() > 0) {
+        int d = vkb_test_hitch_delay_ms();
+        struct timespec ts = {d / 1000, (long)(d % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    if (!t0) return;
+    uint64_t t1 = vkb_hitch_now();
+    vkb_hitch_note(t->proc, VKB_HITCH_ALLOC, t0, t1, 1, size);
+    static int lines;
+    if (!big || r != VK_SUCCESS) return;
+    int k = __atomic_fetch_add(&lines, 1, __ATOMIC_RELAXED);
+    if (k > BIG_LINES) return;
+    if (k == BIG_LINES) {
+        VKB_INFO("allocations of 64 MB or more: %d logged, no more", BIG_LINES);
+        return;
+    }
+    VkPhysicalDeviceMemoryProperties mp;
+    t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
+    uint32_t heap = type < mp.memoryTypeCount ? mp.memoryTypes[type].heapIndex : 0;
+    VKB_INFO("device %u: %llu MB allocated in memory type %u (heap %u%s) in %.1f ms", t->id, (unsigned long long)(size >> 20), type, heap,
+             ded == 1 ? ", dedicated to an image" : ded == 2 ? ", dedicated to a buffer" : "", (t1 - t0) / 1e6);
+}
+
 void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
 {
     VkDevice dev = (VkDevice)(uintptr_t)vkb_dec_u64(&c->d);
@@ -2004,6 +2092,10 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
     VkResult r;
     vkb_srv_mem *m = NULL;
     int out_fd = -1;
+    VkDeviceSize asked = ai.allocationSize;
+    /* alloc_timed: big ones are logged with their time; with the hitch line on, every one counted */
+    uint64_t t0 = asked >= BIG_ALLOC || vkb_hitch_on(t->proc) ? vkb_hitch_now() : 0;
+    uint32_t asked_type = ai.memoryTypeIndex;
     uint8_t ded = vkb_memstat_dedicated(&ai); /* before the strategies drop the struct from the chain */
     if (mode == VKB_ALLOC_SHARED || mode == VKB_ALLOC_SHARED_CACHED) {
         uint32_t s = t->pd ? t->pd->info.strategy : VKB_MEM_NONE;
@@ -2028,6 +2120,17 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
          * export info on) keeps the imported pages: export emulation here would hand it fresh ones,
          * and everything drawn to the import would land where nobody looks (tablet run 24: every
          * buffer Xwayland presented was black). Its later exports give back the imported dma-buf. */
+        /* dma-buf memory over AHardwareBuffers (server_dmabuf_ahb.c): its own path, whole */
+        int dab = t->dab ? vkb_dab_allocate(t, &ai, m, &r) : 0;
+        if (dab) {
+            log_alloc(t, &ai, ai.memoryTypeIndex, ded, dab == 1 ? "dma-buf export over an AHardwareBuffer" : "dma-buf import of an AHardwareBuffer", r);
+            if (r != VK_SUCCESS) {
+                close_import_fds(ai.pNext);
+                free(m);
+                m = NULL;
+            }
+            goto allocated;
+        }
         int opaque = vkb_opaque_alloc_info(t, &ai); /* OPAQUE_FD as dma-bufs (server_opaque.c) */
         int import_fd = -1;
         for (const VkBaseInStructure *b = ai.pNext; b; b = b->pNext)
@@ -2102,10 +2205,12 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             m = NULL;
         }
     }
+allocated:
     if (m) {
         m->stat_ded = ded;
         vkb_mem_track(t, m);
     }
+    alloc_timed(t, asked, asked_type, ded, t0, r);
     vkb_enc_u32(&c->r, (uint32_t)r);
     vkb_enc_u64(&c->r, m ? (uint64_t)(uintptr_t)m->mem : 0);
     vkb_enc_fd(&c->r, out_fd);
@@ -2572,7 +2677,7 @@ void vkb_mem_cached_gate(vkb_server_pd_info *info, int mode)
  * optimal-tiling images (colour, depth, storage) and a plain buffer. The client backs its
  * device-local type (where images and GPU-only buffers go) with an ordinary device-local type from
  * these. Picking just the driver's first such type left every image without a type on a driver
- * whose images do not list that one (Mali-G2-Ultra, XRing O3, driver 56: issue #1).
+ * whose images do not list that one (Mali-G2-Ultra, XRing O3, driver 56:).
  */
 static int ordinary_dl(VkMemoryPropertyFlags f)
 {
@@ -2662,7 +2767,7 @@ static uint32_t ordinary_dl_bits(selftest *st, uint32_t bits)
  * The client's device-local types without host access (vkb_server_pd_info.dl_types): one is
  * enough where every image and buffer allows the one the client backs it with (the first ordinary
  * device-local type images allow, as the client picks it from image_types): then 0, and nothing
- * changes. On the XRing O3 (issue #1) images allow type 6 and buffers only 0x3: every buffer's
+ * changes. On the XRing O3 images allow type 6 and buffers only 0x3: every buffer's
  * mask came out without a device-local type. Then one more for each probed resource kind that
  * allows none of those chosen (its first ordinary device-local type), at most 4. `handles`: the
  * external handle types the client puts on its buffers (they change the masks), 0: none.
@@ -2902,6 +3007,16 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
             if (!dup && nx < 16 && has_ext(ex, ne, ext_dmabuf[j])) exts[nx++] = ext_dmabuf[j];
         }
 #endif
+    {
+        /* dma-buf over AHardwareBuffers: its start's check runs on this device (vkb_dab_selfcheck) */
+        uint32_t dn;
+        const char *const *de = vkb_dab_selftest_exts(&dn);
+        for (uint32_t j = 0; j < dn; j++) {
+            int dup = 0;
+            for (uint32_t q = 0; q < nx; q++) dup |= !strcmp(exts[q], de[j]);
+            if (!dup && nx < 16 && has_ext(ex, ne, de[j])) exts[nx++] = de[j];
+        }
+    }
     free(ex);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, st.qf, 1, &prio};
@@ -3019,6 +3134,7 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
 #ifdef __ANDROID__
     ahb_export_check(&st);
 #endif
+    vkb_dab_selfcheck(idt, pd, st.dev, &st.dt, st.queue, st.qf);
 
     st.dt.vkDestroyCommandPool(st.dev, st.pool, NULL);
     st.dt.vkDestroyDevice(st.dev, NULL);

@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -178,7 +179,8 @@ static void conn_thread_exit(void *p)
  * (command | table << 16), a u32 size and its payload padded to 8 bytes. DXVK sends ~100k small
  * requests a second (a descriptor set allocation and an update per draw, Subnautica 2026-10-12);
  * as messages of their own, each cost both sides a header, an ordering wait and a wake-up.
- * Off unless VKBRIDGE_DESC_BATCH=1 (vkb_desc_batch): otherwise one message per request, as before. */
+ * On by default (vkb_desc_batch); VKBRIDGE_DESC_BATCH=0, VKBRIDGE_NO_DESC_BATCH=1 or
+ * VKBRIDGE_DESC_BATCH_NOFRAME=1 send one message per request, as before v0.5.5. */
 static pthread_mutex_t aq_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *aq_buf;
 static size_t aq_len, aq_cap;
@@ -217,6 +219,7 @@ static int aq_flush_locked(vkb_conn *conn)
  * waiting for). It sends what is queued ~100 us after it was queued, batching what follows. */
 static pthread_cond_t aq_cond = PTHREAD_COND_INITIALIZER;
 static int aq_flusher_started;
+static int aq_flusher_gone; /* it could not connect, or lost its connection */
 static uint64_t aq_first_ns;
 
 static uint64_t now_ns(void)
@@ -232,8 +235,12 @@ static void *aq_flusher(void *arg)
 {
     (void)arg;
     vkb_conn *conn = get_conn();
-    if (!conn) return NULL;
     pthread_mutex_lock(&aq_lock);
+    if (!conn) {
+        aq_flusher_gone = 1;
+        pthread_mutex_unlock(&aq_lock);
+        return NULL;
+    }
     for (;;) {
         while (!aq_len) pthread_cond_wait(&aq_cond, &aq_lock);
         uint64_t due = aq_first_ns + 100000, now = now_ns();
@@ -246,6 +253,7 @@ static void *aq_flusher(void *arg)
         }
         if (aq_flush_locked(conn) < 0) {
             conn->dead = 1;
+            aq_flusher_gone = 1;
             break;
         }
     }
@@ -291,6 +299,7 @@ static void atfork_child(void)
 {
     aq_len = 0;
     aq_flusher_started = 0;
+    aq_flusher_gone = 0;
     pthread_cond_init(&aq_cond, NULL);
     pthread_mutex_init(&aq_lock, NULL);
     /* The child must not talk on the parent's sockets: new token, new connections. */
@@ -489,11 +498,23 @@ int vkb_connected(void)
     return get_conn() != NULL;
 }
 
+/* Status polls (vkb_call_poll_next): sent with no barrier and without flushing the queue first.
+ * synced_seq: the highest barrier a finished synchronous call carried (every async request up to
+ * it has run); last_async_seq: the seq this thread's last async request went out under. */
+static __thread int poll_next;
+static __thread uint64_t last_async_seq;
+static uint64_t synced_seq;
+
+void vkb_call_poll_next(void) { poll_next = 1; }
+uint64_t vkb_async_seq_last(void) { return last_async_seq; }
+int vkb_async_ran(uint64_t seq) { return __atomic_load_n(&synced_seq, __ATOMIC_ACQUIRE) >= seq; }
+
 void vkb_call_begin(vkb_call *c, uint32_t cmd, uint32_t table)
 {
     memset(c, 0, sizeof(*c));
     c->cmd = cmd;
     c->table = table;
+    if (poll_next) c->flags |= VKB_CALL_POLL, poll_next = 0;
     c->conn = get_conn();
     if (c->conn && !c->conn->busy) {
         c->conn->busy = 1;
@@ -543,7 +564,88 @@ static int trace_on(void)
     return v;
 }
 
+static int knob(int shift, int *known);
+
+/* The server's VKB_KNOB_SYNCFD_SIDE_SHIFT; VKBRIDGE_SYNCFD_SIDE in the guest wins (0 off, else on). */
+static int syncfd_side(void)
+{
+    static int env = -2;
+    if (env == -2) {
+        const char *v = getenv("VKBRIDGE_SYNCFD_SIDE");
+        env = v && *v ? strcmp(v, "0") != 0 : -1;
+    }
+    if (env >= 0) return env;
+    int known;
+    return knob(VKB_KNOB_SYNCFD_SIDE_SHIFT, &known) == 1;
+}
+
+/* VKBRIDGE_SLOW_MS=<ms>: a round trip that kept its thread longer than that is logged with the
+ * command and the thread, for finding what a game waits on when its frames stall. */
+static int slow_ms = -1;
+
+static int exec(vkb_call *c);
+
+/* VKBRIDGE_WAIT_STATS=<seconds> (a diagnostic): each thread logs, that often, the time it spent
+ * in round trips (waiting for the server's reply, ordering included) by command, under its own
+ * name (DXVK names its threads), to tell which thread pays for the bridge's waits. */
+static int wait_period = -1;
+static __thread struct {
+    uint64_t ns[VKB_CMD_COUNT];
+    uint32_t n[VKB_CMD_COUNT];
+    uint64_t start;
+} *tw;
+
+static void wait_note(uint32_t cmd, uint64_t ns)
+{
+    if (!tw && !(tw = calloc(1, sizeof(*tw)))) return;
+    uint64_t now = now_ns();
+    if (!tw->start) tw->start = now;
+    tw->ns[cmd] += ns;
+    tw->n[cmd]++;
+    if (now - tw->start < (uint64_t)wait_period * 1000000000ull) return;
+    char name[17] = "";
+    prctl(PR_GET_NAME, name, 0, 0, 0);
+    uint64_t total = 0, n = 0;
+    for (uint32_t i = 0; i < VKB_CMD_COUNT; i++) total += tw->ns[i], n += tw->n[i];
+    char line[512];
+    int o = snprintf(line, sizeof(line), "waits over %.1fs, thread %s (%ld): %.1f ms in %llu round trips;", (now - tw->start) / 1e9, name,
+                     (long)syscall(SYS_gettid), total / 1e6, (unsigned long long)n);
+    for (int k = 0; k < 5; k++) {
+        uint32_t best = 0;
+        for (uint32_t i = 1; i < VKB_CMD_COUNT; i++)
+            if (tw->ns[i] > tw->ns[best]) best = i;
+        if (!tw->ns[best] || o >= (int)sizeof(line) - 64) break;
+        o += snprintf(line + o, sizeof(line) - (size_t)o, " %s %.1f ms (%u)", vkb_cmd_names[best], tw->ns[best] / 1e6, tw->n[best]);
+        tw->ns[best] = 0;
+    }
+    vkb_log(VKB_LOG_ERROR, "%s", line);
+    memset(tw, 0, sizeof(*tw));
+    tw->start = now;
+}
+
 int vkb_call_exec(vkb_call *c)
+{
+    if (slow_ms < 0) {
+        const char *v = getenv("VKBRIDGE_SLOW_MS");
+        slow_ms = v ? atoi(v) : 0;
+        v = getenv("VKBRIDGE_WAIT_STATS");
+        wait_period = v ? atoi(v) : 0;
+    }
+    if ((!slow_ms && wait_period <= 0) || (c->flags & VKB_F_NOREPLY)) return exec(c);
+    uint64_t t0 = now_ns();
+    int r = exec(c);
+    uint64_t ns = now_ns() - t0, us = ns / 1000;
+    if (wait_period > 0) wait_note(c->cmd, ns);
+    if (slow_ms && us >= (uint64_t)slow_ms * 1000) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        vkb_log(VKB_LOG_ERROR, "slow %ld.%03ld: %s %llu us (thread %ld)", (long)ts.tv_sec, ts.tv_nsec / 1000000, vkb_cmd_names[c->cmd],
+                (unsigned long long)us, (long)syscall(SYS_gettid));
+    }
+    return r;
+}
+
+static int exec(vkb_call *c)
 {
     vkb_conn *conn = c->conn;
     if (trace_on()) {
@@ -565,7 +667,17 @@ int vkb_call_exec(vkb_call *c)
     vkb_stats_count(c->cmd, (c->flags & VKB_F_NOREPLY) != 0, c->e.len);
     pthread_mutex_lock(&aq_lock);
     if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds && vkb_async_framed()) {
-        /* Appended to the open vkbBatch (or opening it) under the lock that orders the seqs. */
+        /* Appended to the open vkbBatch (or opening it) under the lock that orders the seqs. Requests
+         * queued as messages of their own before the server's switches came in (the first
+         * vkbQueryServer) go out first: appending to them would rewrite the first one's header. */
+        if (aq_len && ((const vkb_msg_hdr *)aq_buf)->cmd != VKB_CMD_vkbBatch && aq_flush_locked(conn) < 0) {
+            pthread_mutex_unlock(&aq_lock);
+            VKB_ERR("lost the bridge server (%s)", strerror(errno));
+            conn->dead = 1;
+            release_enc(c);
+            c->conn = NULL;
+            return 0;
+        }
         size_t pad = (8 - (c->e.len & 7)) & 7;
         size_t need = (aq_len ? aq_len : sizeof(h)) + 8 + c->e.len + pad;
         if (need > aq_cap && aq_grow(need) < 0) {
@@ -583,6 +695,7 @@ int vkb_call_exec(vkb_call *c)
             aq_first_ns = now_ns();
             stat_wire_add(1, sizeof(bh));
         }
+        last_async_seq = ((vkb_msg_hdr *)aq_buf)->seq;
         uint32_t sub[2] = {c->cmd | c->table << 16, (uint32_t)c->e.len};
         memcpy(aq_buf + aq_len, sub, 8);
         memcpy(aq_buf + aq_len + 8, c->e.buf, c->e.len);
@@ -605,7 +718,7 @@ int vkb_call_exec(vkb_call *c)
     }
     if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds) {
         /* Queued as a message of its own: header and payload appended. */
-        h.seq = ++async_seq;
+        h.seq = last_async_seq = ++async_seq;
         h.barrier = h.seq - 1;
         size_t need = aq_len + sizeof(h) + c->e.len;
         if (need > aq_cap && aq_grow(need) < 0) {
@@ -632,14 +745,28 @@ int vkb_call_exec(vkb_call *c)
         }
         return 1;
     }
-    /* Everything queued goes first, on this connection. */
-    int qr = aq_flush_locked(conn);
+    /* Everything queued goes first, on this connection; a poll leaves it to the flusher and
+     * overtakes it (its answer may be one the GPU had a little earlier). Ahead of a sync-fd export
+     * with the server's order deadline on (Samsung's driver), on the flusher's instead: there a
+     * submit the driver holds does not keep the export unread behind it, and the server's
+     * deadline applies. A round trip is timed from here when the per-hitch line is on (hitch.c). */
+    uint64_t ht0 = vkb_hitch_active && !(c->flags & VKB_F_NOREPLY) ? now_ns() : 0;
+    int qr = 0;
+    if (c->flags & VKB_CALL_POLL) {
+        /* the poll overtakes the queue */
+    } else if (aq_len && aq_flusher_started && !aq_flusher_gone &&
+               (c->cmd == VKB_CMD_vkGetSemaphoreFdKHR || c->cmd == VKB_CMD_vkGetFenceFdKHR) && syncfd_side()) {
+        aq_first_ns = 0; /* due now */
+        pthread_cond_signal(&aq_cond);
+    } else {
+        qr = aq_flush_locked(conn);
+    }
     stat_wire_add(1, sizeof(h) + c->e.len);
     if (c->flags & VKB_F_NOREPLY) {
-        h.seq = ++async_seq;
+        h.seq = last_async_seq = ++async_seq;
         h.barrier = h.seq - 1;
     } else {
-        h.barrier = async_seq;
+        h.barrier = c->flags & VKB_CALL_POLL ? 0 : async_seq;
     }
     pthread_mutex_unlock(&aq_lock);
     if (qr < 0 || vkb_send_msg(conn->sock, &h, c->e.buf, c->e.fds, c->e.nfds) < 0) {
@@ -662,6 +789,8 @@ int vkb_call_exec(vkb_call *c)
         c->conn = NULL;
         return 0;
     }
+    for (uint64_t o = __atomic_load_n(&synced_seq, __ATOMIC_RELAXED);
+         o < h.barrier && !__atomic_compare_exchange_n(&synced_seq, &o, h.barrier, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);) {}
     if (rh.cmd != VKB_ST_OK) {
         static const char *const why[] = {"ok", "malformed request", "the driver lacks this command", "unknown object"};
         VKB_ERR("%s: the server refused the call (%s)", vkb_cmd_names[c->cmd], rh.cmd < 4 ? why[rh.cmd] : "?");
@@ -669,6 +798,7 @@ int vkb_call_exec(vkb_call *c)
         c->conn = NULL;
         return 0;
     }
+    if (ht0) vkb_hitch_rt(c->cmd, now_ns() - ht0);
     /* The decoder keeps fds in a per-call array. */
     static __thread int call_fds[VKB_MAX_FDS];
     memcpy(call_fds, fds, sizeof(int) * (size_t)nfds);
@@ -733,17 +863,27 @@ static int knob(int shift, int *known)
     return k == VKB_KNOB_ON ? 1 : k == VKB_KNOB_OFF ? 0 : -1;
 }
 
+int vkb_client_knob(int shift, int *known)
+{
+    return knob(shift, known);
+}
+
 /* *final: 0 while the server's switches are not in yet (the answer may change once) */
 static int desc_batch(int *final)
 {
     static int v = -1;
     *final = 1;
     if (v >= 0) return v;
-    /* Off by default in both modes: Risk of Rain 2 showed black flickering with it on
-     * (2026-10-14, Mali-G720, v0.2) and no game measured faster. Performance mode turns it on
-     * here once that is fixed. VKBRIDGE_DESC_BATCH=1 turns it on, =0 off; VKBRIDGE_NO_DESC_BATCH=1
-     * still wins. Neither in the guest: the server's switch (a game's preset), else the mode's. */
-    static const int by_mode[2] = {[VKB_CLIENT_MODE_SAFE] = 0, [VKB_CLIENT_MODE_PERFORMANCE] = 0};
+    /* On by default in both modes, for the framing only (vkb_desc_packed keeps the packing off
+     * unless asked). Risk of Rain 2's black flickering (2026-10-14, Mali-G720, v0.2) and Elden
+     * Ring's garbage textures (2026-10-28, S11 Ultra) followed the packing; the framing alone was
+     * clean in Elden Ring, DS3, Balatro, Celeste, Resident Evil 2 and Bright Memory: Infinite
+     * (2026-10-28, both tablets) and gave Elden Ring +27%, RE2 +6%, Bright Memory +5%.
+     * VKBRIDGE_DESC_BATCH=1 turns it on, =0 off; VKBRIDGE_NO_DESC_BATCH=1 still wins. Neither in
+     * the guest: the server's switch (a game's preset, <cache dir>/env), else the mode's. Until
+     * the server's switches come in (the first vkbQueryServer) the mode's default is used; a later
+     * "off" from the server only sends what follows as messages of their own. */
+    static const int by_mode[2] = {[VKB_CLIENT_MODE_SAFE] = 1, [VKB_CLIENT_MODE_PERFORMANCE] = 1};
     const char *on = getenv("VKBRIDGE_DESC_BATCH"), *off = getenv("VKBRIDGE_NO_DESC_BATCH");
     int r, known = 1;
     if (on && *on) r = strcmp(on, "0") != 0;
@@ -766,10 +906,10 @@ static int env_set(const char *name)
     return e && *e && strcmp(e, "0");
 }
 
-/* The two halves of VKBRIDGE_DESC_BATCH=1, to bisect the Risk of Rain 2 flicker on the device:
- * VKBRIDGE_DESC_BATCH_NOFRAME=1 keeps the packed vkUpdateDescriptorSets but sends every
- * asynchronous request as a message of its own; VKBRIDGE_DESC_BATCH_NOPACK=1 keeps the vkbBatch
- * framing but sends vkUpdateDescriptorSets the generic way. */
+/* The two halves of descriptor batching. Framing (vkbBatch) is on with it;
+ * VKBRIDGE_DESC_BATCH_NOFRAME=1 sends every asynchronous request as a message of its own.
+ * Packing (vkbUpdateDescSets) is off unless VKBRIDGE_DESC_PACK=1 in the guest (it needs batching
+ * on too); VKBRIDGE_DESC_BATCH_NOPACK=1 still turns it off. */
 int vkb_async_framed(void)
 {
     static int v = -1;
@@ -783,7 +923,7 @@ int vkb_desc_packed(void)
 {
     static int v = -1;
     if (v >= 0) return v;
-    int final, r = desc_batch(&final) && !env_set("VKBRIDGE_DESC_BATCH_NOPACK");
+    int final, r = desc_batch(&final) && env_set("VKBRIDGE_DESC_PACK") && !env_set("VKBRIDGE_DESC_BATCH_NOPACK");
     if (final) v = r;
     return r;
 }
@@ -794,6 +934,14 @@ int vkb_query_mirror_wanted(void)
     const char *e = getenv("VKBRIDGE_QUERY_MIRROR");
     if (e && *e) return strcmp(e, "0") != 0;
     int known, k = knob(VKB_KNOB_QUERY_MIRROR_SHIFT, &known);
+    return k < 0 ? 1 : k;
+}
+
+int vkb_sync_mirror_wanted(void)
+{
+    const char *e = getenv("VKBRIDGE_SYNC_MIRROR");
+    if (e && *e) return strcmp(e, "0") != 0;
+    int known, k = knob(VKB_KNOB_SYNC_MIRROR_SHIFT, &known);
     return k < 0 ? 1 : k;
 }
 

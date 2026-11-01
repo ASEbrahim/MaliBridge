@@ -16,6 +16,12 @@
  * HDR (BC6H), and write the blocks to the scratch buffer in order (rows of blocks, layer after
  * layer): the image stays compressed on a GPU without BC (etc2_enc.glsl, astc_enc.glsl,
  * eac_enc.glsl, astc_hdr_enc.glsl). BC_QUALITY (below) trades their search for time.
+ *
+ * SRC_RAW variants encode texels instead of BC blocks: those of a decoded BC image, copied out to a
+ * buffer, for a copy from it into a transcoded one (server_emu_bcn.c copy_mixed). FMT_* then names
+ * what the texels are: RGBA8 or 16-bit (FMT_BC1 / FMT_BC3), R8 (FMT_BC4), RG8 (FMT_BC5) or RGBA16F
+ * (FMT_BC6H). The encoder is the transcoder's, so the image gets what an upload of the same
+ * colours would have.
  */
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -46,7 +52,8 @@ layout(push_constant) uniform PC {
     uint row_blocks;   /* blocks per row in the buffer */
     uint layer_blocks; /* blocks per layer in the buffer */
     uint flags;        /* 1: BC1 without alpha (alpha forced to 1; R5G6B5 with PACK16); 2: signed (BC4/5/6H);
-                        * 4: ETC2 RGB8A1 (punch-through alpha) */
+                        * 4: ETC2 RGB8A1 (punch-through alpha); SRC_RAW: 8: R5G6B5 texels, 16: A1R5G5B5 texels,
+                        * 32: BC7's finer ASTC search */
     uint dst_word;     /* where the region's texels start in the scratch buffer, in 32-bit words */
     uint pad;
     uvec2 extent;      /* texels to decode (ENC_ASTCN: the piece's, from the first ASTC block's corner) */
@@ -434,6 +441,81 @@ void bc7(uvec4 blk)
     }
 }
 
+/* ------------------------------------------------------------------ SRC_RAW */
+
+#if defined(SRC_RAW)
+/* The source holds texels, rows of 4 * row_blocks of them and 4 * (rows of tiles) rows a layer
+ * (row_blocks, layer_blocks: in 4x4 tiles). The first word of row ty of tile (bx, by) in layer z. */
+uint raw_row_words()
+{
+#if defined(FMT_BC4)
+    return 1u;
+#elif defined(FMT_BC5)
+    return 2u;
+#elif defined(FMT_BC6H)
+    return 8u;
+#else
+    return (pc.flags & 24u) != 0u ? 2u : 4u;
+#endif
+}
+
+uint raw_word(uint z, uint bx, uint by, uint ty)
+{
+    uint rw = raw_row_words();
+    return pc.src_word + (z * pc.layer_blocks + by * pc.row_blocks) * 4u * rw + ty * pc.row_blocks * rw + bx * rw;
+}
+
+#if defined(FMT_BC4) || defined(FMT_BC5)
+/* Channel ch of a tile, in EAC R11 units (bc4_exact's) */
+void raw_eac(uint z, uint bx, uint by, uint ch, bool sgn, out float v[16])
+{
+    for (uint ty = 0u; ty < 4u; ty++) {
+        uint w0 = raw_word(z, bx, by, ty);
+        for (uint tx = 0u; tx < 4u; tx++) {
+#if defined(FMT_BC4)
+            uint b = (src.w[w0] >> (tx * 8u)) & 0xffu;
+#else
+            uint b = (src.w[w0 + (tx >> 1)] >> ((tx & 1u) * 16u + ch * 8u)) & 0xffu;
+#endif
+            v[ty * 4u + tx] = sgn ? float(max(sext(int(b), 8), -127)) * (1023.0 / 127.0) : float(b) * (2047.0 / 255.0);
+        }
+    }
+}
+#elif defined(FMT_BC6H)
+void raw_half(uint z, uint bx, uint by)
+{
+    for (uint ty = 0u; ty < 4u; ty++) {
+        uint w0 = raw_word(z, bx, by, ty);
+        for (uint tx = 0u; tx < 4u; tx++) {
+            uint a = src.w[w0 + tx * 2u], b = src.w[w0 + tx * 2u + 1u];
+            put_half(tx, ty, uvec3(a & 0xffffu, a >> 16, b & 0xffffu));
+        }
+    }
+}
+#else
+void raw_rgba(uint z, uint bx, uint by)
+{
+    for (uint ty = 0u; ty < 4u; ty++) {
+        uint w0 = raw_word(z, bx, by, ty);
+        for (uint tx = 0u; tx < 4u; tx++) {
+            uvec4 c;
+            if ((pc.flags & 24u) != 0u) {
+                uint p = (src.w[w0 + (tx >> 1)] >> ((tx & 1u) * 16u)) & 0xffffu;
+                if ((pc.flags & 8u) != 0u) c = rgb565(p);
+                else c = uvec4((((p >> 10) & 31u) * 527u + 23u) >> 6, (((p >> 5) & 31u) * 527u + 23u) >> 6, ((p & 31u) * 527u + 23u) >> 6,
+                               (p >> 15) * 255u);
+            } else {
+                uint w = src.w[w0 + tx];
+                c = uvec4(w & 0xffu, (w >> 8) & 0xffu, (w >> 16) & 0xffu, w >> 24);
+            }
+            if ((pc.flags & 1u) != 0u) c.w = 255u;
+            put(tx, ty, vec4(c) / 255.0);
+        }
+    }
+}
+#endif
+#endif
+
 /* ------------------------------------------------------------------ main */
 
 /* Texel t, or where it lies past the region's edge (a small mip's), the nearest one inside: the
@@ -495,8 +577,12 @@ void main()
     smin = min(smin, smax);
     for (uint by = smin.y / 4u; by <= smax.y / 4u; by++)
         for (uint bx = smin.x / 4u; bx <= smax.x / 4u; bx++) {
+#if defined(SRC_RAW)
+            raw_rgba(gl_GlobalInvocationID.z, bx, by - r0);
+#else
             uint base = pc.src_word + (gl_GlobalInvocationID.z * pc.layer_blocks + (by - r0) * pc.row_blocks + bx) * words;
             decode_rgba(uvec4(src.w[base], src.w[base + 1u], words > 2u ? src.w[base + 2u] : 0u, words > 2u ? src.w[base + 3u] : 0u));
+#endif
             for (uint j = 0u; j < N; j++)
                 for (uint i = 0u; i < N; i++) {
                     uint u = u0 + min(i, lim.x - 1u), v = v0 + min(j, lim.y - 1u);
@@ -512,6 +598,62 @@ void main()
     for (uint k = 0u; k < 4u; k++) dst.w[o + k] = enc[k];
 }
 #else
+#if defined(FMT_BC1) && defined(ENC_ASTC)
+/* BC1 -> ASTC 4x4 without a search (VKBRIDGE_BC1_ASTC): a BC1 block is two colours and a 2-bit
+ * index a texel, which an ASTC block of one partition holds as they are, endpoints at 8 bits. Four
+ * colours: 2-bit weights (ASTC's 0, 21, 43, 64 against BC1's thirds: within a step). Three colours:
+ * the midpoint is weight 1 of 3 levels (0, 32, 64), exact. A three-colour block that uses its
+ * fourth index (black, transparent in BC1 with alpha) is off the line: false, and the block goes
+ * through astc_encode() - ASTC has no punch-through, so a transparent texel's colour is fitted. */
+bool bc1_astc(uint lo, uint idx, out uvec4 blk)
+{
+    blk = uvec4(0u);
+    uint c0 = lo & 0xffffu, c1 = lo >> 16;
+    bool four = c0 > c1;
+    if (!four)
+        for (uint t = 0u; t < 16u; t++)
+            if (((idx >> (2u * t)) & 3u) == 3u) return false;
+    uvec4 e0 = rgb565(c0), e1 = rgb565(c1);
+    /* the decoder swaps (and blue-contracts) endpoints whose second colour sums lower */
+    bool swap = e1.r + e1.g + e1.b < e0.r + e0.g + e0.b;
+    if (swap) { uvec4 x = e0; e0 = e1; e1 = x; }
+    /* weights from the top of the block down: 2 bits each, or trits in groups of 5 (astc_ise's
+     * layout with no bits besides) */
+    uvec4 w = uvec4(0u);
+    if (four) {
+        for (uint t = 0u; t < 16u; t++) {
+            uint k = (idx >> (2u * t)) & 3u, q = k == 0u ? 0u : (k == 1u ? 3u : (k == 2u ? 1u : 2u));
+            astc_put(w, 2u * t, 2u, swap ? 3u - q : q);
+        }
+    } else {
+        uint pos = 0u;
+        for (uint g = 0u; g < 16u; g += 5u) {
+            uint x[5];
+            for (uint j = 0u; j < 5u; j++) {
+                uint k = g + j < 16u ? (idx >> (2u * (g + j))) & 3u : 0u, q = k == 1u ? 2u : (k == 2u ? 1u : 0u);
+                x[j] = swap ? 2u - q : q;
+            }
+            uint tq = astc_trits(x[0], x[1], x[2], x[3], x[4]);
+            for (uint j = 0u; j < 5u && g + j < 16u; j++) {
+                uint k = j == 2u || j == 4u ? 1u : 2u, sh = 2u * j - (j >= 3u ? 1u : 0u);
+                astc_put(w, pos, k, tq >> sh);
+                pos += k;
+            }
+        }
+    }
+    /* block mode: 4x4 weights, range R 4 (2 bits) or 3 (trits); one partition, CEM 8 (RGB direct) */
+    uint r = four ? 4u : 3u;
+    astc_put(blk, 0u, 11u, ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5));
+    astc_put(blk, 13u, 4u, 8u);
+    for (uint c = 0u; c < 3u; c++) {
+        astc_put(blk, 17u + 16u * c, 8u, e0[c]);
+        astc_put(blk, 25u + 16u * c, 8u, e1[c]);
+    }
+    blk |= uvec4(bitfieldReverse(w.w), bitfieldReverse(w.z), bitfieldReverse(w.y), bitfieldReverse(w.x));
+    return true;
+}
+#endif
+
 void main()
 {
     uvec2 blk = gl_GlobalInvocationID.xy;
@@ -525,10 +667,30 @@ void main()
 #if !defined(TRANSCODE)
     for (uint i = 0u; i < 4u * ROW_WORDS; i++) outw[i] = 0u;
 #endif
+#if !defined(SRC_RAW)
     uint base = pc.src_word + (gl_GlobalInvocationID.z * pc.layer_blocks + blk.y * pc.row_blocks + blk.x) * words;
     uvec4 b = uvec4(src.w[base], src.w[base + 1u], words > 2u ? src.w[base + 2u] : 0u, words > 2u ? src.w[base + 3u] : 0u);
+#endif
     bool sgn = (pc.flags & 2u) != 0u;
-#if defined(FMT_BC1)
+#if defined(SRC_RAW) && defined(FMT_BC4)
+    float v[16];
+    raw_eac(gl_GlobalInvocationID.z, blk.x, blk.y, 0u, sgn, v);
+    for (uint t = 0u; t < 16u; t++) v[t] = v[seen(t, blk)];
+    uvec4 enc = uvec4(eac_encode(v, sgn), 0u, 0u);
+#elif defined(SRC_RAW) && defined(FMT_BC5)
+    float r[16], g[16];
+    raw_eac(gl_GlobalInvocationID.z, blk.x, blk.y, 0u, sgn, r);
+    raw_eac(gl_GlobalInvocationID.z, blk.x, blk.y, 1u, sgn, g);
+    for (uint t = 0u; t < 16u; t++) {
+        r[t] = r[seen(t, blk)];
+        g[t] = g[seen(t, blk)];
+    }
+    uvec4 enc = uvec4(eac_encode(r, sgn), eac_encode(g, sgn));
+#elif defined(SRC_RAW) && defined(FMT_BC6H)
+    raw_half(gl_GlobalInvocationID.z, blk.x, blk.y);
+#elif defined(SRC_RAW)
+    raw_rgba(gl_GlobalInvocationID.z, blk.x, blk.y);
+#elif defined(FMT_BC1)
     uvec4 tex[16];
     color_block(b.x, b.y, false, tex);
     for (uint t = 0u; t < 16u; t++) {
@@ -582,6 +744,8 @@ void main()
 #if defined(TRANSCODE)
 #if defined(ENC_ETC2)
     uvec4 enc = uvec4(etc2_encode((pc.flags & 4u) != 0u), 0u, 0u);
+#elif defined(ENC_ASTC) && defined(SRC_RAW)
+    uvec4 enc = astc_encode(~0u, (pc.flags & 32u) != 0u);
 #elif defined(ENC_ASTC) && defined(FMT_BC7)
     /* BC7's partition, as the nearest ASTC one; of 3 subsets, the two closest in colour merged (one
      * lookup: a table indexed at run time may be copied whole each time) */
@@ -606,6 +770,9 @@ void main()
     uvec4 enc = astc_encode(part, true);
 #elif defined(ENC_ASTC_HDR)
     uvec4 enc = astc_hdr_encode();
+#elif defined(ENC_ASTC) && defined(FMT_BC1) && !defined(SRC_RAW)
+    uvec4 enc;
+    if (!bc1_astc(b.x, b.y, enc)) enc = astc_encode(~0u, false);
 #elif defined(ENC_ASTC)
     uvec4 enc = astc_encode(~0u, false);
 #endif

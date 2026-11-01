@@ -91,6 +91,14 @@ const VkExtensionProperties *vkb_caps_emu_extensions(const vkb_pd_caps *caps, ui
         list[c++] = (VkExtensionProperties){"VK_KHR_push_descriptor", 2};
     if (CAP_EMU(caps, VKB_EMU_DYN_RENDER))
         list[c++] = (VkExtensionProperties){"VK_KHR_dynamic_rendering", 1};
+    if (CAP_EMU(caps, VKB_EMU_TIMELINE))
+        list[c++] = (VkExtensionProperties){"VK_KHR_timeline_semaphore", 2};
+    if (CAP_EMU(caps, VKB_EMU_DMABUF_AHB)) {
+        list[c++] = (VkExtensionProperties){"VK_KHR_external_memory_fd", 1};
+        list[c++] = (VkExtensionProperties){"VK_EXT_external_memory_dma_buf", 1};
+        /* the LINEAR modifier only (server_dmabuf_ahb.c): Zink exports Xwayland's pixmaps only through it */
+        list[c++] = (VkExtensionProperties){"VK_EXT_image_drm_format_modifier", 1};
+    }
     *n = c;
     return list;
 }
@@ -252,6 +260,13 @@ void vkb_caps_patch_properties_chain(const vkb_pd_caps *caps, VkPhysicalDevice p
         ((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT *)b)->minPlacedMemoryMapAlignment =
             (VkDeviceSize)sysconf(_SC_PAGESIZE);
 
+    /* the bridge's timelines are 64-bit counters with no limit on how far a signal runs ahead */
+    if (CAP_EMU(caps, VKB_EMU_TIMELINE)) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES)
+            ((VkPhysicalDeviceTimelineSemaphoreProperties *)b)->maxTimelineSemaphoreValueDifference = UINT64_MAX;
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES)
+            ((VkPhysicalDeviceVulkan12Properties *)b)->maxTimelineSemaphoreValueDifference = UINT64_MAX;
+    }
     if (CAP_EMU(caps, VKB_EMU_DESC_LIMITS)) {
         if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES)
             raise_uab((VkPhysicalDeviceVulkan12Properties *)b);
@@ -361,6 +376,13 @@ void vkb_caps_patch_features_chain(const vkb_pd_caps *caps, VkBaseOutStructure *
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
         set_feature(caps, VKB_EMU_DYN_RENDER,
                     &((VkPhysicalDeviceVulkan13Features *)b)->dynamicRendering);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+        set_feature(caps, VKB_EMU_TIMELINE, &((VkPhysicalDeviceTimelineSemaphoreFeatures *)b)->timelineSemaphore);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+        if (CAP_EMU(caps, VKB_EMU_TIMELINE))
+            ((VkPhysicalDeviceVulkan12Features *)b)->timelineSemaphore = VK_TRUE;
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
         set_feature(caps, VKB_EMU_DEPTH_CLIP,

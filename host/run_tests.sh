@@ -21,10 +21,12 @@ bitwise shlbarrier promote shmbarrier wave32 clampzero views cmdstate vbbake cul
 stencillayout dynrend probe_mk viewport_test mode presets calts robust2 fp16 begin_encoding cached
 heapcap asyncpipe fossilize viewport_check view3d viewchurn dynstate vbstride dedhint cullmode_check
 divisor polygon polygon_off vkcube_wayland_dmabuf vkcube_wayland_shm vkcube_x11 gamescope
-divisor_g925 divisor_khr report_stall report_cpu report_gpumem present_timeout server_hup gshide
+divisor_g925 divisor_khr report_stall report_stuck report_cpu report_gpumem present_timeout zerocopy_nested server_hup gshide
 featclamp envfile unflagged eventstatus query querystuck gsexport vtxlayout beginfail endfail secfail
-submitfail waitlost apicap ycbcr_swap driverid vidyn a1zink envswitch poolfull lowmem xclipse_zink syncfd
-xfb xfb_nofold hotpath"
+submitfail waitlost apicap ycbcr_swap driverid vidyn eds compilegate sparse a1zink envswitch poolfull lowmem xclipse_zink syncfd dmabufsync timeline dabreg dmabufahb
+xfb xfb_nofold hotpath
+poll reqcache syncmirror stale_frames bcn_budget bcn_mixcopy hitch bcbudget latency lagprobe framequeue
+presentwait present_block compileburst querystuck_burst"
 if [ "${1:-}" = --list ]; then
   printf '%s\n' $VKB_TEST_NAMES
   exit 0
@@ -86,7 +88,7 @@ run_mode() {
         ! grep -q "no ordinary device-local type" out/t-smoke.log
       result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' "$VKB_SERVER_LOG"))"
     fi
-    # The XRing O3's memory table (xringmem, issue #1), as measured on r56p0: 22 types; images
+    # The XRing O3's memory table (xringmem), as measured on r56p0: 22 types; images
     # allow 0x1040, buffers 0x4100, shareable indirect buffers 0x1040 and staging buffers 0x3;
     # dma-heap pages only in type 14. v0.5 had one device-local type (type 6's) and one shared
     # type (14): texel buffers had no type at all. v0.5.1 added a device-local type for each
@@ -106,7 +108,7 @@ run_mode() {
         result $? "memclass_check, XRing O3's memory table: every image and buffer kind has a type ($(tail -1 out/t-memclass-xring.log))"
       fi
     fi
-    # The XRing O1's memory table (o1mem, issues #6 and #8): a plain device-local type 0 (0x1)
+    # The XRing O1's memory table (o1mem): a plain device-local type 0 (0x1)
     # that images and buffers never allow (0x6). v0.5.2 backed the client's device-local type by
     # type 0, and every image's mask was empty (gamescope's flat texture). Without lazymem: the
     # O1's type 0 is not lazily allocated.
@@ -163,7 +165,8 @@ run_mode() {
     # check's work and passes the ones after it.
     if want beginfail; then
       VKB_SERVER_ENV=VKBRIDGE_TEST_BEGIN_FAIL=2 . ./mali_env.sh >/dev/null
-      timeout 120 ./out/vkbridge-smoke >out/t-beginfail.log 2>&1
+      # the n-th begin / end is the app's: the sync mirror's own command buffers would count too
+      VKBRIDGE_SYNC_MIRROR=0 timeout 120 ./out/vkbridge-smoke >out/t-beginfail.log 2>&1
       kill -0 "$VKB_SERVER_PID" 2>/dev/null && grep -q "did not record left out" "$VKB_SERVER_LOG" &&
         grep -q "12 of 13 checks passed" out/t-beginfail.log
       result $? "a refused vkBeginCommandBuffer: server alive, submit leaves it out ($(tail -1 out/t-beginfail.log))"
@@ -172,7 +175,8 @@ run_mode() {
     # The driver's vkEndCommandBuffer failing: the command buffer is left out of submits the same way.
     if want endfail; then
       VKB_SERVER_ENV=VKBRIDGE_TEST_END_FAIL=2 . ./mali_env.sh >/dev/null
-      timeout 120 ./out/vkbridge-smoke >out/t-endfail.log 2>&1
+      # the n-th begin / end is the app's: the sync mirror's own command buffers would count too
+      VKBRIDGE_SYNC_MIRROR=0 timeout 120 ./out/vkbridge-smoke >out/t-endfail.log 2>&1
       kill -0 "$VKB_SERVER_PID" 2>/dev/null && grep -q "did not record left out" "$VKB_SERVER_LOG" &&
         grep -q "12 of 13 checks passed" out/t-endfail.log
       result $? "a failed vkEndCommandBuffer: server alive, submit leaves it out ($(tail -1 out/t-endfail.log))"
@@ -233,9 +237,42 @@ run_mode() {
       result $? "smoke, native push descriptors without robustness2, no multiDrawIndirect ($(tail -1 out/t-smoke-push.log))"
       . ./mali_env.sh >/dev/null
     fi
-    # BC transcoded to ETC2/EAC/ASTC (compared by PSNR), then decoded as the fallback does (exact)
+    # BC transcoded to ETC2/EAC/ASTC (compared by PSNR), then decoded as the fallback does (exact).
+    # Without the conversion budget (the default), so that every image goes through its transcoder;
+    # then with the budget DS3's preset sets (32:4: some images decoded over it), the same floors
     if want bcn_transcode; then
+      VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
       timeout 180 ./out/bcn_check transcode >out/t-bcn.log 2>&1; result $? "bcn_check, BC transcoded ($(tail -1 out/t-bcn.log))"
+    fi
+    if want bcn_budget; then
+      VKB_BC_TX_BUDGET=32:4 . ./mali_env.sh >/dev/null
+      timeout 180 ./out/bcn_check transcode >out/t-bcn-budget.log 2>&1 && grep -q "BC budget: transcoding" "$VKB_SERVER_LOG"
+      result $? "bcn_check, BC transcoded under a 32:4 conversion budget ($(tail -1 out/t-bcn-budget.log); $(grep -o 'so far [0-9]* image(s) ([0-9.]* Mtexels) transcoded, [0-9]* ([0-9.]*) decoded' "$VKB_SERVER_LOG" | tail -1))"
+    fi
+    # Copies between a decoded and a transcoded image of one BC format (the budget leaves both, and
+    # UE4 copies a streamed texture's levels between its old and new image): every copy done (from
+    # the transcoded one by a blit, from the decoded one re-encoded), none skipped. Decided by size
+    # (VKBRIDGE_BC_TRANSCODE_MAX=256: the 512x512 images decoded), in ASTC 6x6 and 8x8 too, then by
+    # the budget itself (a bucket that lets one image through)
+    if want bcn_mixcopy; then
+      mixed_copies() { # mixed_copies <log from line> <name> <bcn_check args...>
+        local from=$1 name=$2 r line; shift 2
+        timeout 300 ./out/bcn_check "$@" >out/t-bcn-$name.log 2>&1; r=$?
+        for _ in $(seq 50); do tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC copies so far" && break; sleep 0.1; done
+        line=$(tail -n +$from "$VKB_SERVER_LOG" | grep -o "BC copies so far: .*" | tail -1)
+        [ $r = 0 ] && echo "$line" | grep -q "so far: [1-9][0-9]* from a transcoded.*, [1-9][0-9]* from a decoded.*; 0 skipped"
+        result $? "bcn_check $*, $name: copies between decoded and transcoded images ($(tail -1 out/t-bcn-$name.log)$([ $r = 0 ] || grep -m3 -E '^(FAIL|error)' out/t-bcn-$name.log | tr '\n' '|'); $(echo "$line" | grep -o '[0-9]* from a transcoded into a decoded image (blit), [0-9]* from a decoded into a transcoded image (re-encoded); [0-9]* skipped'))"
+      }
+      VKB_SERVER_ENV=VKBRIDGE_BC_TRANSCODE_MAX=256 VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
+      mixed_copies $(($(wc -l <"$VKB_SERVER_LOG") + 1)) mixcopy transcode mixcopy
+      for n in 6 8; do
+        VKB_SERVER_ENV=VKBRIDGE_BC_TRANSCODE_MAX=256 VKB_BC_ASTC_BLOCK=${n}x$n VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
+        mixed_copies $(($(wc -l <"$VKB_SERVER_LOG") + 1)) mixcopy-astc$n transcode astc$n mixcopy
+      done
+      unset VKB_SERVER_ENV
+      VKB_BC_TX_BUDGET=0.000001:0.000001 . ./mali_env.sh >/dev/null
+      mixed_copies $(($(wc -l <"$VKB_SERVER_LOG") + 1)) mixcopy-budget transcode mixcopy
+      . ./mali_env.sh >/dev/null
     fi
     if want bcn_decode; then
       VKB_BC_TRANSCODE=0 . ./mali_env.sh >/dev/null
@@ -246,7 +283,7 @@ run_mode() {
     # with those blocks' floors, and the server's images in that format
     if want bcn_astc; then
       for n in 6 8; do
-        VKB_BC_ASTC_BLOCK=${n}x$n . ./mali_env.sh >/dev/null
+        VKB_BC_ASTC_BLOCK=${n}x$n VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
         BCN_NO_LEVELS=1 timeout 300 ./out/bcn_check transcode astc$n >out/t-bcn-astc$n.log 2>&1 &&
           grep -q "ASTC ${n}x$n (VKBRIDGE_BC_ASTC_BLOCK)" "$VKB_SERVER_LOG"
         result $? "bcn_check, BC2/BC3/BC7 transcoded to ASTC ${n}x$n ($(tail -1 out/t-bcn-astc$n.log); BC7 photo $(grep -m1 -o 'BC7 -> ASTC [0-9x]*, photo: PSNR [0-9.]* dB' out/t-bcn-astc$n.log | grep -o '[0-9.]* dB'))"
@@ -256,10 +293,11 @@ run_mode() {
     # The texture cap (VKBRIDGE_TEX_MAXDIM): BC textures over 512 created without their top levels
     # (memory, every level's colour through views at each LOD, barriers, copies, textureSize); with
     # ",all" a sampled-only RGBA8 one too (clears, blits and readbacks across the cut); with
-    # ",strict" none after a shader reads texture sizes
+    # ",strict" none after a shader reads texture sizes. Without the conversion budget: the sizes
+    # compared are of transcoded images, and the budget decodes some of a quick run of images
     if want texcap; then
       for v in "" all strict; do
-        VKB_TEX_MAXDIM=512${v:+,$v} . ./mali_env.sh >/dev/null
+        VKB_TEX_MAXDIM=512${v:+,$v} VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
         timeout 120 ./out/texcap_check $v >out/t-texcap${v:+-$v}.log 2>&1 && grep -q "texture cap: image 2048x2048 (12 mips, format 131) created as 512x512" "$VKB_SERVER_LOG"
         result $? "texcap_check, VKBRIDGE_TEX_MAXDIM=512${v:+,$v} ($(tail -1 out/t-texcap${v:+-$v}.log); $(grep -m1 -o 'uncapped [0-9]* ([0-9.]*%)' out/t-texcap${v:+-$v}.log))"
       done
@@ -278,6 +316,20 @@ run_mode() {
     result $? "nulldesc_check ($(tail -1 out/t-nulldesc.log)$([ "$mode" = mali ] && echo "; $(grep -c 'null descriptor stand-in made' "$VKB_SERVER_LOG") stand-in shapes"))"
   fi
   if want opaque && [ -x out/opaque_check ]; then timeout 60 ./out/opaque_check >out/t-opaque.log 2>&1; result $? "opaque_check ($(tail -1 out/t-opaque.log))"; fi
+  # Status polls sent without the barrier still see the host's own queued sets and resets of the
+  # object polled (and give the old answers with VKBRIDGE_POLL_NOBARRIER=0)
+  if want poll; then
+    timeout 120 ./out/poll_check >out/t-poll.log 2>&1 && VKBRIDGE_POLL_NOBARRIER=0 timeout 120 ./out/poll_check >out/t-poll-off.log 2>&1
+    result $? "poll_check ($(tail -1 out/t-poll.log); $(grep -o '[0-9]* not-ready polls' out/t-poll.log), $(grep -o '[0-9]* not-ready polls' out/t-poll-off.log) with the barrier)"
+    # the same with the sync mirror off (client/syncmirror.c answers most polls before they reach this path)
+    VKBRIDGE_SYNC_MIRROR=0 timeout 120 ./out/poll_check >out/t-poll-nomirror.log 2>&1
+    result $? "poll_check, VKBRIDGE_SYNC_MIRROR=0 ($(tail -1 out/t-poll-nomirror.log); $(grep -o '[0-9]* not-ready polls' out/t-poll-nomirror.log))"
+  fi
+  # Answers the client keeps (image requirements by create info, format and image format
+  # properties) are the server's: same create info same answer, other sizes others, refusals kept
+  if want reqcache; then
+    timeout 120 ./out/reqcache_check >out/t-reqcache.log 2>&1; result $? "reqcache_check ($(tail -1 out/t-reqcache.log))"
+  fi
   # NV12 textures as DXVK makes them (MUTABLE | EXTENDED_USAGE): on mali the refusal is imitated
   # (planarext) and the client makes them without the flag; VKBRIDGE_PLANAR_EXT_FIX=0 is the negative
   # control (the refusal reaches the app). 77: the driver has no NV12.
@@ -304,9 +356,9 @@ run_mode() {
   if want gsexport && [ -x out/gsexport_check ]; then
     timeout 60 ./out/gsexport_check >out/t-gsexport.log 2>&1; result $? "gsexport_check ($(tail -1 out/t-gsexport.log))"
     if [ "$mode" = mali ]; then
-      # Mali-G77 r32p1 (MaliBridge#10): the export emulation on (dmabufexport; the host's pages are
+      # Mali-G77 r32p1: the export emulation on (dmabufexport; the host's pages are
       # the driver's own dma-bufs) and the driver refusing gamescope's modifier queries (dmabufmod).
-      # gamescope aborted on "modifiers.size() > 0": the client answers from plain LINEAR tiling,
+      # gamescope aborted on "modifiers.size > 0": the client answers from plain LINEAR tiling,
       # the server makes the image plain LINEAR and reports the LINEAR modifier. gamescope's imports
       # of its clients' LINEAR dma-bufs (sampled, MUTABLE_FORMAT, the explicit LINEAR modifier) are
       # answered importable and made plain LINEAR at the dma-buf's layout too: answered without
@@ -376,26 +428,46 @@ run_mode() {
     . ./mali_env.sh >/dev/null
   fi
   if want recycle && [ -x out/recycle_check ]; then timeout 120 ./out/recycle_check >out/t-recycle.log 2>&1; result $? "recycle_check ($(tail -1 out/t-recycle.log))"; fi
-  # Descriptor traffic, batched (vkbBatch, packed updates) and not; the client's totals in the line
+  # Descriptor traffic: the default (vkbBatch framing, updates not packed), framing + packing
+  # (VKBRIDGE_DESC_PACK=1) and batching off; the client's totals in the line
+  desc_modes="default: pack:VKBRIDGE_DESC_PACK=1 off:VKBRIDGE_NO_DESC_BATCH=1"
   if want desc_traffic && [ -x out/desc_traffic_check ]; then
-    for nb in 0 1; do
-      VKBRIDGE_DESC_BATCH=$((1-nb)) VKBRIDGE_STATS=100000 timeout 120 ./out/desc_traffic_check >out/t-desc-$nb.log 2>&1
-      result $? "desc_traffic_check, VKBRIDGE_NO_DESC_BATCH=$nb ($(tail -1 out/t-desc-$nb.log | grep -o '^[A-Z]*'); $(grep -o '[0-9]* messages, [0-9]* KB on the wire' out/t-desc-$nb.log))"
+    for m in $desc_modes; do
+      n=${m%%:*}; e=${m#*:}
+      env $e VKBRIDGE_STATS=100000 timeout 120 ./out/desc_traffic_check >out/t-desc-$n.log 2>&1
+      result $? "desc_traffic_check, $n ($(tail -1 out/t-desc-$n.log | grep -o '^[A-Z]*'); $(grep -o '[0-9]* messages, [0-9]* KB on the wire' out/t-desc-$n.log))"
     done
+    # framing is on by default: at least 5x fewer messages than with batching off
+    md=$(grep -o '[0-9]* messages' out/t-desc-default.log | tail -1 | grep -o '[0-9]*'); mo=$(grep -o '[0-9]* messages' out/t-desc-off.log | tail -1 | grep -o '[0-9]*')
+    [ -n "$md" ] && [ -n "$mo" ] && [ $((md * 5)) -lt "$mo" ]
+    result $? "descriptor batching on by default ($md messages vs $mo with VKBRIDGE_NO_DESC_BATCH=1)"
   fi
   # DXVK's frame structure (frames in flight, pools reset per frame, submits from another thread)
   if want flicker && [ -x out/flicker_check ]; then
+    for m in $desc_modes; do
+      n=${m%%:*}; e=${m#*:}
+      env $e timeout 180 ./out/flicker_check >out/t-flicker-$n.log 2>&1
+      result $? "flicker_check, $n ($(grep -o '[0-9]* draws wrong in [0-9]* frames' out/t-flicker-$n.log))"
+    done
+  fi
+  # What the compositor receives is the frame presented (Elden Ring's back-and-forth pan, 2026-10-28):
+  # vkd3d-proton's swapchain pattern, a slow GPU job before each frame, the compositor reading each
+  # committed dma-buf at once and again at its release (needs libwayland-server; exit 3 = skipped)
+  if want stale_frames && [ -x out/stale_frames_check ]; then
     for nb in 0 1; do
-      VKBRIDGE_DESC_BATCH=$((1-nb)) timeout 180 ./out/flicker_check >out/t-flicker-$nb.log 2>&1
-      result $? "flicker_check, VKBRIDGE_NO_DESC_BATCH=$nb ($(grep -o '[0-9]* draws wrong in [0-9]* frames' out/t-flicker-$nb.log))"
+      VKBRIDGE_DESC_BATCH=$((1-nb)) timeout 180 ./out/stale_frames_check --frames 200 --hold-ms 40 >out/t-stale-$nb.log 2>&1; r=$?
+      if [ $r = 3 ]; then echo "  skip stale_frames_check ($(tail -1 out/t-stale-$nb.log))"
+      else result $r "stale_frames_check, VKBRIDGE_NO_DESC_BATCH=$nb ($(grep -E '^(OK|FAILED)' out/t-stale-$nb.log))"; fi
     done
   fi
   if want d3d11 && [ -n "${VKB_WINE_DIR:-}" ] && [ -d "$VKB_WINE_DIR/app" ]; then
     ./d3d11_test.sh >out/t-d3d11.log 2>&1; grep -q "^OK:" out/t-d3d11.log; result $? "d3d11_check via DXVK ($(grep -E '^(OK|FAILED)' out/t-d3d11.log))"
     # Every frame read back, through DXVK, with batching on (needs d3d11_flicker.exe in the prefix)
     if want d3d11_flicker && [ -f "$VKB_WINE_DIR/app/d3d11_flicker.exe" ]; then
-      VKBRIDGE_DESC_BATCH=1 ./d3d11_test.sh d3d11_flicker.exe >out/t-d3d11-flicker.log 2>&1; grep -q "^OK" out/t-d3d11-flicker.log
-      result $? "d3d11_flicker via DXVK, batched ($(grep -o '[0-9]* cells wrong in [0-9]* frames' out/t-d3d11-flicker.log))"
+      ./d3d11_test.sh d3d11_flicker.exe >out/t-d3d11-flicker.log 2>&1; grep -q "^OK" out/t-d3d11-flicker.log
+      result $? "d3d11_flicker via DXVK, batched by default ($(grep -o '[0-9]* cells wrong in [0-9]* frames' out/t-d3d11-flicker.log))"
+      VKBRIDGE_DESC_PACK=1 ./d3d11_test.sh d3d11_flicker.exe >out/t-d3d11-flicker-pack.log 2>&1; grep -q "^OK" out/t-d3d11-flicker-pack.log
+      result $? "d3d11_flicker via DXVK, batched + packed ($(grep -o '[0-9]* cells wrong in [0-9]* frames' out/t-d3d11-flicker-pack.log))"
     fi
   fi
   # Persistent pipeline cache: Steam app keys, pre-caching taken in, killed games, shared files
@@ -431,6 +503,10 @@ run_mode() {
     if want report_stall; then
       timeout 120 ./report_stall_test.sh >out/t-stall.log 2>&1; result $? "report_stall_test ($(tail -1 out/t-stall.log))"
     fi
+    # A request the driver has not returned from, named in the report while it runs
+    if want report_stuck; then
+      timeout 150 ./report_stuck_test.sh >out/t-stuck.log 2>&1; result $? "report_stuck_test ($(tail -1 out/t-stuck.log))"
+    fi
     if want report_cpu; then
       timeout 120 ./report_cpu_test.sh >out/t-cpu.log 2>&1; result $? "report_cpu_test ($(tail -1 out/t-cpu.log))"
     fi
@@ -442,6 +518,47 @@ run_mode() {
     # on a Dimensity 8300); the limit from the guest and from <cache dir>/env (a server of its own; once)
     if want present_timeout; then
       timeout 300 ./present_timeout_test.sh >out/t-ptimeout.log 2>&1; result $? "present_timeout_test ($(tail -1 out/t-ptimeout.log))"
+    fi
+    # The per-hitch line (VKBRIDGE_HITCH_MS): a slow compile, BC conversion, allocation, held queue
+    # and CPU sleep each named by their cause; the switch from <cache dir>/env, the server, the
+    # guest; off by default; the DXVK config check (a server of its own; once)
+    if want hitch; then
+      timeout 300 ./hitch_test.sh >out/t-hitch.log 2>&1; result $? "hitch_test ($(tail -1 out/t-hitch.log))"
+    fi
+    # The conversion budget (VKBRIDGE_BC_TX_BUDGET): a burst of BC uploads on a GPU slowed to a
+    # Mali's, without it, with 32:4 (DS3's preset), decoded and unset (off); the contents, the memory cap, query pins
+    if want bcbudget; then
+      timeout 900 ./bcbudget_test.sh >out/t-bcbudget.log 2>&1; result $? "bcbudget_test ($(tail -1 out/t-bcbudget.log))"
+    fi
+    # The latency log (VKBRIDGE_LATLOG): one line a frame with every stage, from <cache dir>/env, the
+    # server, the guest, a path of its own; off by default; tools/latency_report.py reads it; and
+    # tools/lagprobe.exe through DXVK followed press by press (with VKB_WINE_DIR; a server of its own; once)
+    if want latency; then
+      timeout 120 ./latency_test.sh >out/t-latency.log 2>&1; result $? "latency_test ($(tail -1 out/t-latency.log))"
+    fi
+    if want lagprobe; then
+      timeout 240 ./lagprobe_test.sh >out/t-lagprobe.log 2>&1; result $? "lagprobe_test ($(tail -1 out/t-lagprobe.log))"
+    fi
+    # The frame queue cap (VKBRIDGE_FRAME_QUEUE): a present on the presenting thread's path returns once
+    # at most N-1 earlier frames are rendering; from the guest and <cache dir>/env; off by default and by 0
+    if want framequeue; then
+      timeout 200 ./framequeue_test.sh >out/t-framequeue.log 2>&1; result $? "framequeue_test ($(tail -1 out/t-framequeue.log))"
+    fi
+    # Present ids and waits (VK_KHR_present_id/present_wait and id2/wait2, client/wsi.c): a wait returns
+    # once that frame is shown, times out, ends on retire and destroy; off with VKBRIDGE_PRESENT_WAIT=0
+    if want presentwait; then
+      timeout 200 ./presentwait_test.sh >out/t-presentwait.log 2>&1; result $? "presentwait_test ($(tail -1 out/t-presentwait.log))"
+    fi
+    # A copy present (X11, wl_shm, headless) waits for its frame at most VKBRIDGE_PRESENT_HOLD_MS, then the
+    # swapchain's thread shows it: a frame waiting for the presenting thread's own later signal no longer
+    # holds that thread until the present timeout; the dma-buf path's presenting thread named its own
+    if want present_block; then
+      timeout 200 ./present_block_test.sh >out/t-pblock.log 2>&1; result $? "present_block_test ($(tail -1 out/t-pblock.log))"
+    fi
+    # Under a nested gamescope the gralloc images are offered to the app's compositor, which pairs them
+    # with the same dma-bufs gamescope passes on; every off case keeps ordinary dma-bufs
+    if want zerocopy_nested; then
+      timeout 300 ./zerocopy_nested_test.sh >out/t-zcnested.log 2>&1; result $? "zerocopy_nested_test ($(tail -1 out/t-zcnested.log))"
     fi
     # A hangup does not end the separate server: the app stops it last, after the session's programs
     if want server_hup; then
@@ -494,7 +611,7 @@ run_mode() {
     if want wave32; then
       timeout 600 ./wave32_test.sh >out/t-wave32.log 2>&1; result $? "wave32_test ($(tail -1 out/t-wave32.log))"
     fi
-    # The YCbCr sampler swap in compute layouts (Mali, Samsung's Xclipse; MaliBridge#20): the
+    # The YCbCr sampler swap in compute layouts (Mali, Samsung's Xclipse;): the
     # driver's refusal imitated, pipelines refused with the swap off and built with it on, the
     # first failure logged with its layout's YCbCr samplers; gamescope's composite pipelines too
     if want ycbcr_swap; then
@@ -530,6 +647,10 @@ run_mode() {
     # extension and the packed formats imitated missing), one layout after another and in a secondary
     if want vidyn; then
       timeout 600 ./vidyn_test.sh >out/t-vidyn.log 2>&1; result $? "vidyn_test ($(tail -1 out/t-vidyn.log))"
+    fi
+    # eds_test.sh: extended dynamic state 1 and 2 made static in vertex-input variants where the driver has neither
+    if want eds; then
+      timeout 600 ./eds_test.sh >out/t-eds.log 2>&1; result $? "eds_test ($(tail -1 out/t-eds.log))"
     fi
     # MK-16 cull_nontri (a dynamic cull mode culls points and lines): failing with its bug imitated
     # and the fix off, passing with the fix; the version gate (a server of its own; once)
@@ -625,10 +746,18 @@ run_mode() {
     if want poolfull; then
       timeout 120 ./poolfull_test.sh >out/t-poolfull.log 2>&1; result $? "poolfull_test ($(tail -1 out/t-poolfull.log))"
     fi
-    # Low memory (MaliBridge#18): said once with what the server holds, its memory line marked, idle
+    # Low memory: said once with what the server holds, its memory line marked, idle
     # descriptor overflow pools freed at resets and made again when needed (a server of its own; once)
     if want lowmem; then
       timeout 120 ./lowmem_test.sh >out/t-lowmem.log 2>&1; result $? "lowmem_test ($(tail -1 out/t-lowmem.log))"
+    fi
+    # the compile gate on its own (server_compile_gate.c): its limit, one at a time while memory is low
+    if want compilegate; then
+      timeout 120 ./out/compilegate_unit >out/t-compilegate.log 2>&1; result $? "compilegate_unit ($(tail -1 out/t-compilegate.log))"
+    fi
+    # DX12 reserved buffers (server_emu_sparse.c): an address for vkd3d-proton's sparse buffers on a driver without sparse binding
+    if want sparse; then
+      timeout 120 ./sparse_test.sh >out/t-sparse.log 2>&1; result $? "sparse_test ($(tail -1 out/t-sparse.log))"
     fi
     # Cached readback: the self-test's cached pages, offered per VKBRIDGE_CACHED_READBACK and the
     # mode; the client's frame readback (vkcube's X11 path) and an app's non-coherent cached type
@@ -663,11 +792,33 @@ run_mode() {
     if want syncfd; then
       timeout 300 ./syncfd_test.sh >out/t-syncfd.log 2>&1; result $? "syncfd_test ($(tail -1 out/t-syncfd.log))"
     fi
+    # dmabufsync_test.sh: a frame handed to another process is finished first on kernels without dma-buf sync files
+    if want dmabufsync; then
+      timeout 300 ./dmabufsync_test.sh >out/t-dmabufsync.log 2>&1; result $? "dmabufsync_test ($(tail -1 out/t-dmabufsync.log))"
+    fi
+    # timeline_test.sh: timeline semaphores kept by the bridge where the driver has none (Mali r18/r19)
+    if want timeline; then
+      timeout 300 ./timeline_test.sh >out/t-timeline.log 2>&1; result $? "timeline_test ($(tail -1 out/t-timeline.log))"
+    fi
+    # dma-buf memory over AHardwareBuffers where the driver has none (Kirin, Maleoon, Venus): the register alone,
+    # then gamescope's and Zink's exports and imports with the desktop driver's dma-bufs standing in for the buffers
+    if want dabreg; then
+      timeout 60 ./out/dabreg_unit >out/t-dabreg.log 2>&1; result $? "dabreg_unit ($(tail -1 out/t-dabreg.log))"
+    fi
+    if want dmabufahb; then
+      timeout 400 ./dmabufahb_test.sh >out/t-dmabufahb.log 2>&1; result $? "dmabufahb_test ($(tail -1 out/t-dmabufahb.log))"
+    fi
     # Asynchronous pipeline compiles (VKBRIDGE_ASYNC_COMPILE) with a slow compiler imitated: draws
     # skipped until the pipeline is there, depth-only and full-screen pipelines synchronous, objects
     # destroyed during a compile; off by default; the other checks unchanged through the layer
     if want asyncpipe; then
       timeout 300 ./asyncpipe_test.sh >out/t-asyncpipe.log 2>&1; result $? "asyncpipe_test ($(tail -1 out/t-asyncpipe.log))"
+    fi
+    # Compile hitches: frames with new pipelines at their draws, a slow compiler imitated, off, =1
+    # (draws skipped) and =3 (deferred: none skipped, shorter frames, fewer compile hitch lines);
+    # warm runs the same in both (a server of its own; once)
+    if want compileburst; then
+      timeout 300 ./compileburst_test.sh >out/t-compileburst.log 2>&1; result $? "compileburst_test ($(tail -1 out/t-compileburst.log))"
     fi
     # Steam's shader pre-caching end to end: Steam's fossilize_replay on an archive recorded through
     # the bridge and on one recorded with GPL on the desktop driver, then the game finds those
@@ -777,6 +928,32 @@ run_mode() {
     timeout 60 ./out/eventstatus_check 2000 >out/t-eventstatus.log 2>&1 && grep -q "^OK" out/t-eventstatus.log
     result $? "eventstatus_check ($(tail -1 out/t-eventstatus.log))"
   fi
+  if want eventstatus; then
+    # the same with the sync mirror off: the quiet window's own answers (the mirror answers most polls)
+    timeout 60 env VKBRIDGE_SYNC_MIRROR=0 ./out/eventstatus_check 2000 >out/t-eventstatus-off.log 2>&1 && grep -q "^OK" out/t-eventstatus-off.log
+    result $? "eventstatus_check, VKBRIDGE_SYNC_MIRROR=0 ($(tail -1 out/t-eventstatus-off.log))"
+  fi
+  # Fence and event status from shared memory (client/syncmirror.c): every answer as the app must
+  # see it, a held submit kept not ready, and 2000 polls each of a done fence, a set event and a timeline value with
+  # under 100 round trips between them; the same checks with the mirror off, all on the wire
+  if want syncmirror; then
+    timeout 60 env VKBRIDGE_STATS=100000 VKBRIDGE_LOG_LEVEL=2 ./out/syncmirror_check 2000 >out/t-syncmirror.log 2>&1 && grep -q "^OK" out/t-syncmirror.log &&
+      ! grep -qE "vk(Get(Fence|Event)Status|GetSemaphoreCounterValue) +[0-9]+ sync" out/t-syncmirror.log
+    result $? "syncmirror_check ($(tail -1 out/t-syncmirror.log | grep -o 'OK.*\|FAILED.*'); $(grep -o '[0-9]* round trips' out/t-syncmirror.log))"
+    timeout 60 env VKBRIDGE_SYNC_MIRROR=0 VKBRIDGE_STATS=100000 ./out/syncmirror_check 2000 >out/t-syncmirror-off.log 2>&1 &&
+      grep -q "^OK" out/t-syncmirror-off.log && grep -qE "vkGetFenceStatus +[0-9]{4,} sync" out/t-syncmirror-off.log
+    result $? "syncmirror_check, VKBRIDGE_SYNC_MIRROR=0: the same answers from the server ($(grep -o '[0-9]* round trips' out/t-syncmirror-off.log))"
+    # The mirror's cost only where it answers something (Portal on the S10+, 2026-11-01: DXVK's fence and submission
+    # timeline got 2-3 extra batches on each of ~5 submits a frame and the mirror answered none of its waits): asked
+    # about only while held -> mirrored for short tries only; asked about once done (Balatro, vkcube) -> stays mirrored
+    VKBRIDGE_LOG_LEVEL=2 timeout 120 ./out/syncmirror_check 1000 unmet >out/t-syncmirror-unmet.log 2>&1 && grep -q "^OK" out/t-syncmirror-unmet.log &&
+      n=$(grep -oE "sync mirror: 1000 submits, [0-9]+ of them" out/t-syncmirror-unmet.log | grep -oE "[0-9]+ of them" | grep -oE "^[0-9]+") && [ "${n:-9999}" -le 200 ]
+    result $? "syncmirror_check: fences and semaphores the mirror cannot answer stop getting batches ($(grep -o 'sync mirror: [0-9]* submits, [0-9]* of them' out/t-syncmirror-unmet.log | head -1); v0.5.5: all of them)"
+    VKBRIDGE_LOG_LEVEL=2 timeout 120 ./out/syncmirror_check 1000 met >out/t-syncmirror-met.log 2>&1 && grep -q "^OK" out/t-syncmirror-met.log &&
+      n=$(grep -oE "sync mirror: 1000 submits, [0-9]+ of them" out/t-syncmirror-met.log | grep -oE "[0-9]+ of them" | grep -oE "^[0-9]+") && [ "${n:-0}" -ge 950 ] &&
+      grep -qE "sync mirror: [0-9]+ fence, [0-9]+ event and [0-9]{3,} semaphore answers from shared memory" out/t-syncmirror-met.log
+    result $? "syncmirror_check: fences and semaphores waited for once done stay mirrored ($(grep -o 'sync mirror: [0-9]* submits, [0-9]* of them' out/t-syncmirror-met.log | head -1); $(grep -o '[0-9]* fence, [0-9]* event and [0-9]* semaphore answers from shared memory' out/t-syncmirror-met.log | head -1))"
+  fi
   # Query results answered from the client's mirror (client/query.c), and the mirror never saying
   # "not ready" forever for a query the GPU has done (Deep Rock Galactic's stall on the S11 Ultra,
   # 2026-10-27): a multiview pass's second query, a lost ready-word update (imitated), and DRG's
@@ -784,15 +961,41 @@ run_mode() {
   if want query; then
     timeout 120 ./out/query_check >out/t-query.log 2>&1; result $? "query_check ($(tail -1 out/t-query.log))"
     VKBRIDGE_QUERY_MIRROR=0 timeout 120 ./out/query_check >out/t-query-off.log 2>&1; result $? "query_check, mirror off ($(tail -1 out/t-query-off.log))"
+    # occlusion from the server (VKBRIDGE_QUERY_MIRROR_OCCLUSION=0, a per-game fallback), timestamps still mirrored
+    VKBRIDGE_QUERY_MIRROR_OCCLUSION=0 timeout 120 ./out/query_check >out/t-query-occ0.log 2>&1
+    result $? "query_check, VKBRIDGE_QUERY_MIRROR_OCCLUSION=0 ($(tail -1 out/t-query-occ0.log))"
   fi
   if want querystuck; then
-    for c in multiview lost drg; do
+    # stale, batman: a reused slot's new value reaching the host late must be answered late, never as the slot's old value
+    for c in multiview lost drg stale batman; do
       timeout 60 ./out/querystuck_check $c >out/t-qstuck-$c.log 2>&1
-      result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (multiview|lost|Deep)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
+      result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (multiview|lost|Deep|a reused|UE3)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
+    done
+  fi
+  if want querystuck_burst; then
+    # DRG's first frame after the loading bar (640 queries in render-pass secondaries of one primary)
+    # forwarded intact and never answered by the default fallback; the Ultra's never-available queries
+    # imitated, and VKBRIDGE_QUERY_VISIBLE_MS answering only those (client/qvisible.c)
+    for c in burst burst-never burst-visible; do
+      timeout 60 ./out/querystuck_check $c >out/t-qstuck-$c.log 2>&1
+      result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (DRG|the imitated|VKBRIDGE)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
+    done
+    # v0.5.5's lite-mode query switches with v0.5.4.1's stuck-query check and the fallback: copies after
+    # each render pass (VKBRIDGE_QUERY_EARLY=1), and every not-ready poll asked of the server with local
+    # timeline waits (VKBRIDGE_QUERY_NOTREADY_WIRE=1 + VKBRIDGE_SEM_WAIT_LOCAL=1; query_check's round-trip
+    # counts are not for that arm, so only the stuck cases run there)
+    VKBRIDGE_QUERY_EARLY=1 timeout 120 ./out/query_check >out/t-query-early.log 2>&1; result $? "query_check, VKBRIDGE_QUERY_EARLY=1 ($(tail -1 out/t-query-early.log))"
+    for c in multiview lost drg burst; do
+      VKBRIDGE_QUERY_EARLY=1 timeout 60 ./out/querystuck_check $c >out/t-qstuck-early-$c.log 2>&1
+      result $? "querystuck_check $c, VKBRIDGE_QUERY_EARLY=1 ($(tail -1 out/t-qstuck-early-$c.log))"
+    done
+    for c in multiview lost burst; do
+      VKBRIDGE_QUERY_NOTREADY_WIRE=1 VKBRIDGE_SEM_WAIT_LOCAL=1 timeout 60 ./out/querystuck_check $c >out/t-qstuck-nrw-$c.log 2>&1
+      result $? "querystuck_check $c, VKBRIDGE_QUERY_NOTREADY_WIRE=1 VKBRIDGE_SEM_WAIT_LOCAL=1 ($(tail -1 out/t-qstuck-nrw-$c.log))"
     done
   fi
   if want vkcube_wayland_dmabuf; then
-    timeout 60 $VKCUBE_WAYLAND --c 120 >out/t-vkcube.log 2>&1; result $? "vkcube-wayland (dma-buf)"
+    timeout 60 $VKCUBE_WAYLAND --c 120 >out/t-vkcube.log 2>&1; r=$?; result $r "vkcube-wayland (dma-buf)$([ $r = 0 ] || echo " exit $r: $(tail -2 out/t-vkcube.log | tr '\n' '|')")"
   fi
   if want vkcube_wayland_shm; then
     VKBRIDGE_WSI_SHM=1 timeout 60 $VKCUBE_WAYLAND --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube-wayland (wl_shm)"
@@ -801,10 +1004,23 @@ run_mode() {
     timeout 60 vkcube --c 120 >>out/t-vkcube.log 2>&1; result $? "vkcube (X11)"
   fi
   if want gamescope && docker image inspect vkb-arch-gamescope >/dev/null 2>&1; then
-    VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
-      "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames'" \
+    # The FPS comes from gamescope's headless backend at a fixed 1000 Hz: a nested window runs at the
+    # refresh of the monitor under the pointer (60 or 144 Hz on the same desk), so its FPS said more
+    # about the desk than the build. The last of glxgears' three 5 s readings (the first holds startup).
+    VKB_GS_HEADLESS=1 VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
+      "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 16 glxgears 2>&1 | grep frames'" \
       >out/t-gamescope-$mode.log 2>&1
-    grep -q "frames in" out/t-gamescope-$mode.log; result $? "gamescope + Zink glxgears ($(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-$mode.log))"
+    grep -q "frames in" out/t-gamescope-$mode.log
+    result $? "gamescope + Zink glxgears, headless 1000 Hz ($(grep -o '[0-9.]* FPS' out/t-gamescope-$mode.log | tail -1))"
+    # The nested window on the desktop, a smoke test only (VKB_GS_VISIBLE=1): it passes on its first
+    # frames, and its FPS is the monitor's
+    if [ "${VKB_GS_VISIBLE:-0}" = 1 ]; then
+      VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
+        "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames'" \
+        >out/t-gamescope-window-$mode.log 2>&1
+      grep -q "frames in" out/t-gamescope-window-$mode.log
+      result $? "gamescope + Zink glxgears, nested window (smoke; $(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-window-$mode.log) is the monitor's refresh)"
+    fi
   fi
 }
 # Drivers with VK_KHR_vertex_attribute_divisor only (vkb_ext_alias.h): Mali-G925 on Android 16 also
@@ -845,5 +1061,11 @@ if want_any divisor_g925 divisor_khr; then divisor_variants; fi
 server_errors; result $? "no protocol errors in the server log (plain)"
 run_mode mali
 server_errors; result $? "no protocol errors in the server log (mali)"
+# wg_init: compute shaders' shared memory zeroed by the shader instead of through its initializers
+# (a server of its own with the pass forced on: it is for Arm GPUs); every value reads as zero
+: > "$VKB_SERVER_LOG"
+vkb_server_start VKBRIDGE_WG_INIT=1
+timeout 60 ./out/wginit_check >out/t-wginit.log 2>&1 && { grep -q "^SKIP" out/t-wginit.log || grep -q "wg_init: workgroup memory zeroed" "$VKB_SERVER_LOG"; }
+result $? "wginit_check, wg_init forced on ($(tail -1 out/t-wginit.log))"
 echo "== $pass passed, $fail failed"
 [ "$fail" = 0 ]

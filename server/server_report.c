@@ -951,6 +951,31 @@ static double stall_s(void)
     return v && *v ? atof(v) : 30.0;
 }
 
+/* VKBRIDGE_REPORT_STUCK_S: how long a request may run before the report names it (10 s; 0: never). */
+static double stuck_s(void)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_REPORT_STUCK_S");
+    return v && *v ? atof(v) : 10.0;
+}
+
+/* A wait for the GPU (work submitted earlier not finished), not a call the driver sits in. */
+static int waits_for_gpu(const char *call)
+{
+    return call && (!strncmp(call, "vkWait", 6) || !strncmp(call, "vkAcquireNextImage", 18) || !strcmp(call, "vkQueueWaitIdle") ||
+                    !strcmp(call, "vkDeviceWaitIdle"));
+}
+
+/* The process's request that has run at least VKBRIDGE_REPORT_STUCK_S and not returned: its seconds
+ * (0: none) and name. Read when the report is written, so it says what runs now. */
+static double running_stuck(const rp_proc *p, const char **call)
+{
+    *call = NULL;
+    double lim = stuck_s();
+    if (!p->alive || lim <= 0) return 0;
+    double s = vkb_srv_running_longest(p->pid, call);
+    return s >= lim ? s : 0;
+}
+
 /* Everything that should be looked at, one line each (the report's head). */
 static int list_issues(FILE *f, int json)
 {
@@ -972,6 +997,12 @@ static int list_issues(FILE *f, int json)
         proc_name(p, nm, sizeof(nm));
         if (p->lost) issue(&is, "%s: device lost %u time(s), first in %s", nm, p->lost, p->lost_first);
         if (p->long_waits) issue(&is, "%s: %u GPU wait(s) longer than 2 s (longest %.1f s)", nm, p->long_waits, p->long_wait_max_ms / 1000.0);
+        const char *call;
+        double stuck = running_stuck(p, &call);
+        if (stuck > 0)
+            issue(&is, waits_for_gpu(call) ? "%s: %s has waited %.0f s for the GPU and not returned (still waiting)"
+                                           : "%s: %s has run %.0f s in the GPU driver and not returned (still running)",
+                  nm, call, stuck);
         if (p->compile_fail) issue(&is, "%s: %llu pipeline(s) failed to build", nm, (unsigned long long)p->compile_fail);
         if (p->fps_p50 > 0 && p->fps_p50 < 20) issue(&is, "%s: low frame rate, median %.1f fps", nm, p->fps_p50);
         if (p->devices && p->first_frame_s < 0 && p->t_device > 0 && !presents_elsewhere(p) &&
@@ -1094,6 +1125,15 @@ static void write_md(FILE *f, int final)
     const char *tw;
     double to = vkb_guard_timeout_s(mode, &tw);
     fprintf(f, "Mode: %s (%s) - %s; compile watchdog %.0f s (%s).\n\n", vkb_mode_name(mode), vkb_mode_source_name(), vkb_mode_summary(mode), to, tw);
+    {
+        int glimit = 0, gpeak = 0;
+        uint64_t gwaits = 0, gtight = 0;
+        double gwait = 0, gmax = 0;
+        vkb_compile_gate_stats(&glimit, &gpeak, &gwaits, &gtight, &gwait, &gmax);
+        if (glimit && gwaits)
+            fprintf(f, "Compile gate: %d at once, %d reached; %llu compiles waited (%llu while memory was low), %.1f s in all, longest %.0f ms.\n\n",
+                    glimit, gpeak, (unsigned long long)gwaits, (unsigned long long)gtight, gwait, gmax * 1000.0);
+    }
     fprintf(f, "# MaliBridge session report\n\n");
     fprintf(f, "Session started %s, report written %s (%.0f s in)%s. Machine-readable: `malibridge-report.json`.\n\n", ts0, ts, now_s(),
             final ? ", final" : "; rewritten every 5 s");
@@ -1337,6 +1377,18 @@ static void write_json(FILE *f, int final)
                 p->devices_failed);
         js(f, p->frames);
         fprintf(f, ", \"presents_elsewhere\": %s", presents_elsewhere(p) ? "true" : "false");
+        {
+            const char *call;
+            double stuck = running_stuck(p, &call);
+            fprintf(f, ", \"stuck_call\": ");
+            if (stuck > 0) {
+                fprintf(f, "{\"call\": ");
+                js(f, call);
+                fprintf(f, ", \"s\": %.1f, \"gpu_wait\": %s}", stuck, waits_for_gpu(call) ? "true" : "false");
+            } else {
+                fprintf(f, "null");
+            }
+        }
         fprintf(f, ", \"fps_p50\": %.1f,\n     \"compiles\": %llu, \"compile_ms\": %.1f, \"compile_max_ms\": %.1f, \"compile_failed\": %llu, "
                    "\"compile_hist\": [%u, %u, %u, %u, %u, %u, %u, %u], \"feedback_built\": %llu, \"cache_hits\": %llu, \"slow_compiles\": [",
                 p->fps_p50, (unsigned long long)p->compiles, p->compile_ms, p->compile_max_ms, (unsigned long long)p->compile_fail, p->hist[0],
@@ -1437,6 +1489,16 @@ static void *report_main(void *arg)
         if (tick % 2 == 0) sample();
         if (tick % 5 == 0) {
             read_frames();
+            /* a request still running past the limit: rewritten so the app sees it now (its
+             * loading screen says which stage stalled) */
+            if (!dirty) {
+                pthread_mutex_lock(&rlock);
+                for (int i = 0; i < nprocs && !dirty; i++) {
+                    const char *call;
+                    if (running_stuck(&procs[i], &call) > 0) dirty = 1;
+                }
+                pthread_mutex_unlock(&rlock);
+            }
             if (dirty) write_report(0);
         }
     }

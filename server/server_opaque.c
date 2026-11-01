@@ -145,12 +145,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL op_GetPhysicalDeviceImageFormatProperties2
      * and the external answer are ours. */
     VkPhysicalDeviceImageFormatInfo2 *ii = (VkPhysicalDeviceImageFormatInfo2 *)info;
     vkb_emu_chain_take(ii, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
-    VkExternalImageFormatProperties *ep = vkb_emu_chain_take(props, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+    vkb_emu_taken tep = vkb_emu_chain_take_at(props, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+    VkExternalImageFormatProperties *ep = (void *)tep.s;
     int ded;
     int way = image_way(real, pd, ii->format, ii->type, ii->tiling, ii->usage, ii->flags, ii->pNext, props, &ded);
     if (ep) {
-        ep->pNext = props->pNext;
-        props->pNext = ep;
+        vkb_emu_chain_put_back(tep); /* in its place: the client reads the answer in order */
         memset(&ep->externalMemoryProperties, 0, sizeof(ep->externalMemoryProperties));
         if (way != IMG_NO) answer(&ep->externalMemoryProperties, ded ? VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT : 0);
     }

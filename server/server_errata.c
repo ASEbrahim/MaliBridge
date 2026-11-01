@@ -49,7 +49,7 @@
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
  * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16),
- * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), gs_hide (issue #11), and example: a no-op on
+ * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), gs_hide, and example: a no-op on
  * vkCreateImageView that counts the calls reaching it (and its imitation the calls beneath it),
  * the pattern a fix follows.
  */

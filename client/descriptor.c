@@ -12,6 +12,7 @@
 #include "gen/vkb_client_gen.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct vkb_template {
@@ -147,7 +148,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSetWithTemplate(VkDevice dev
  * UDS_RANGE explicit element and count | binding << 8), the set when it changes, element and
  * count unless 0 and 1, then per descriptor only what its type reads (a sampled image: view and
  * layout). Copies, pNext chains and types beyond the core ones go the generic way, as does
- * everything with VKBRIDGE_NO_DESC_BATCH=1.
+ * everything unless VKBRIDGE_DESC_PACK=1 (off by default, conn.c vkb_desc_packed).
  */
 #define UDS_SET 0x10u
 #define UDS_RANGE 0x20u
@@ -175,6 +176,24 @@ static size_t uds_desc_size(VkDescriptorType t)
     }
 }
 
+/* Packed updates are capped at VKBRIDGE_DESC_PACK_MAX bytes (4096 by default, 0: no cap); bigger
+ * ones go the generic way. Elden Ring (vkd3d-proton) fills its descriptor heaps at start with a
+ * handful of updates of up to a million descriptors each; packed, those left the picture with
+ * garbage textures on the S11 Ultra (2026-10-28: wrong-colour blocks, speckled floors, broken
+ * glyphs), the same updates sent the generic way do not. The packed bytes were checked against the
+ * app's writes for 8.4M calls and matched. DXVK's per-draw updates, what packing is for, are well
+ * under 4 KB. */
+static size_t pack_max(void)
+{
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_DESC_PACK_MAX");
+        v = e && *e ? atol(e) : 4096;
+        if (v < 0) v = 0;
+    }
+    return (size_t)v;
+}
+
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSets(VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc,
                                                          const VkCopyDescriptorSet *cp)
 {
@@ -193,6 +212,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkUpdateDescriptorSets(VkDevice device, uint32
                 ds * w[i].descriptorCount;
         prev = w[i].dstSet;
     }
+    if (packable && pack_max() && size > pack_max()) packable = 0;
     if (!packable) {
         vkb_wire_vkUpdateDescriptorSets(device, nw, w, nc, cp);
         return;

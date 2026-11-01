@@ -233,11 +233,34 @@ void vkb_enc_append(vkb_enc *e, const vkb_enc *src)
     vkb_enc_bytes(e, src->buf, src->len);
 }
 
+/* Structures the client answers itself, never sent and not worth a warning: present ids and waits
+ * (client/wsi.c; their features in vkGetPhysicalDeviceFeatures2 and vkCreateDevice chains, the
+ * ids in vkQueuePresentKHR's). */
+static int client_side(VkStructureType t)
+{
+    switch ((int)t) {
+    case VK_STRUCTURE_TYPE_PRESENT_ID_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR:
+    case VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR: return 1;
+    default: return 0;
+    }
+}
+
 static const VkBaseInStructure *next_known(const void *p)
 {
     const VkBaseInStructure *b = p;
     while (b) {
         if (vkb_struct_size(b->sType)) return b;
+        if (client_side(b->sType)) {
+            b = b->pNext;
+            continue;
+        }
         VKB_ONCE(VKB_LOG_WARN, "pNext: structure type %d is not bridged; dropped (logged once)", (int)b->sType);
         b = b->pNext;
     }
@@ -293,6 +316,10 @@ static const VkBaseInStructure *next_known_out(const void *p)
     const VkBaseInStructure *b = p;
     while (b) {
         if (vkb_struct_size(b->sType)) return b;
+        if (client_side(b->sType)) {
+            b = b->pNext;
+            continue;
+        }
         VKB_ONCE(VKB_LOG_WARN, "output pNext: structure type %d is not bridged; left unfilled (logged once)", (int)b->sType);
         b = b->pNext;
     }

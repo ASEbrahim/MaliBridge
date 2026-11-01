@@ -34,6 +34,31 @@ run() {
   kill $srv 2>/dev/null; wait $srv 2>/dev/null; rm -f "$sock"; rm -rf "$work"
   [ $r = 0 ] || fails=$((fails+1))
 }
+# again: a vertex compile that hung in run 1 (no fallback builds it: failed, m=0) and does not hang
+# in run 2 (the same cache directory): run 2 asks the driver again once and builds it (the Pixel 6
+# Pro's Xwayland pipelines failed at every Steam start after one hang); within run 1 the second ask
+# fails at once (remembered).
+again() {
+  local work sock srv run res want spin
+  work=$(mktemp -d)
+  sock=${XDG_RUNTIME_DIR:-/tmp}/vkbridge-again-$$.sock
+  for run in 1 2; do
+    spin=$([ $run = 1 ] && echo spin)
+    VKBRIDGE_TEST_CRASH_PIPELINE=$spin VKBRIDGE_COMPILE_WARN_S=1 VKBRIDGE_COMPILE_TIMEOUT_S=3 \
+      VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
+      "$out/vkbridge-server" --socket "$sock" --log "$work/server$run.log" --cache-dir "$work/c" >/dev/null 2>&1 &
+    srv=$!
+    for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
+    VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES= timeout 120 "$out/crash_contain_check" --again >"$work/t$run.log" 2>&1
+    kill $srv 2>/dev/null; wait $srv 2>/dev/null; rm -f "$sock"
+    res=$(grep -o 'RESULT [01] [a-z]*' "$work/t$run.log" | awk '{print $3}' | tr '\n' ' ')
+    case $run in 1) want="failed failed " ;; *) want="built built " ;; esac
+    echo "  again run $run: $res(want $want)$([ $run = 2 ] && grep -q 'driver is asked again' "$work/server2.log" && echo '; asked the driver again')"
+    [ "$res" = "$want" ] || fails=$((fails+1))
+  done
+  grep -q "driver is asked again" "$work/server2.log" || { echo "  again: no 'asked again' line"; fails=$((fails+1)); }
+  rm -rf "$work"
+}
 # slow: a compute compile of 3 s under a 2 s limit, three runs sharing the cache directory. The
 # first is interrupted (no fallback helps: "fails", t=1); the next run tries it again with 4 s and
 # it builds (kept as "built with a longer limit"), and asked again it builds again; the third run
@@ -61,4 +86,5 @@ slow() {
 run spin
 run spinfc2
 slow
-if [ $fails = 0 ]; then echo "OK: spin, spinfc2 and slow (interrupted, fallbacks built, remembered, a slow compute pipeline retried)"; else echo "FAILED: $fails run(s)"; exit 1; fi
+again
+if [ $fails = 0 ]; then echo "OK: spin, spinfc2, slow and again (interrupted, fallbacks built, remembered, a slow compute pipeline retried, a stuck graphics pipeline with no fallback asked again in a later run)"; else echo "FAILED: $fails run(s)"; exit 1; fi

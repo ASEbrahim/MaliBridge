@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
- * syncfd_check direct|bounded|stall|any: a sync-fd export of a semaphore whose batch is held, with and without the server's deadline.
+ * syncfd_check direct|bounded|stall|order|orderoff|any: a sync-fd export of a semaphore whose batch is held, with and without the server's deadlines.
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -162,6 +162,44 @@ int main(int argc, char **argv)
         vkDestroyDevice(dev, NULL);
         printf(r == VK_SUCCESS ? "OK: done\n" : "FAILED: %d\n", r);
         return r == VK_SUCCESS ? 0 : 1;
+    }
+
+    /* order / orderoff: the held submit is the first; an async call before it starts the client's flusher */
+    if (!strcmp(expect, "order") || !strcmp(expect, "orderoff")) {
+        VkSemaphore warm = exportable();
+        vkDestroySemaphore(dev, warm, NULL);
+        struct timespec ts = {0, 200000000L};
+        nanosleep(&ts, NULL);
+        VkSemaphore b0 = exportable();
+        VkResult r = submit_signal(b0, VK_NULL_HANDLE);
+        double t0 = now_ms();
+        int fd = r == VK_SUCCESS ? export_fd(b0, &r) : -2;
+        double took = now_ms() - t0;
+        printf("  a held submit, then its export on the same thread: export %d, fd %d, %.0f ms\n", r, fd, took);
+        if (!strcmp(expect, "order"))
+            check(r == VK_SUCCESS && fd == -1 && took < 2000, "the export is answered at the order deadline with fd -1");
+        else
+            check(r == VK_SUCCESS && fd >= 0 && took >= 3000, "the export waits for the held submit and gives a sync fd");
+        if (fd >= 0) close(fd);
+        t0 = now_ms();
+        r = vkQueueWaitIdle(queue);
+        printf("  vkQueueWaitIdle: %d after %.0f ms more\n", r, now_ms() - t0);
+        check(r == VK_SUCCESS, "the queue goes idle once the submit is out");
+        vkDestroySemaphore(dev, b0, NULL);
+        b0 = exportable();
+        submit_signal(b0, VK_NULL_HANDLE);
+        t0 = now_ms();
+        fd = export_fd(b0, &r);
+        took = now_ms() - t0;
+        printf("  ordinary batch: export %d, fd %d, %.1f ms\n", r, fd, took);
+        check(r == VK_SUCCESS && fd >= 0 && took < 500, "an ordinary export is quick and real");
+        if (fd >= 0) close(fd);
+        vkDeviceWaitIdle(dev);
+        vkDestroySemaphore(dev, b0, NULL);
+        vkDestroyDevice(dev, NULL);
+        if (failures) printf("FAILED: %d of %d checks\n", failures, checks);
+        else printf("OK: %d checks\n", checks);
+        return failures ? 1 : 0;
     }
 
     /* 1: the held batch */

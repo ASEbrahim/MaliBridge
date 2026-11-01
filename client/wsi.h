@@ -52,6 +52,9 @@ typedef struct vkb_wsi_backend {
     /* Optional, dma-buf images only: present without waiting for the rendering. The backend
      * submits the waits itself and shows the image from its own thread once the GPU is done. */
     VkResult (*present_async)(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait);
+    /* Optional, with present_async: wait (bounded) until at most `max` of the frames given to
+     * present_async are still rendering (VKBRIDGE_FRAME_QUEUE, wsi.c). */
+    void (*wait_queue)(vkb_swapchain *sc, uint32_t max);
 } vkb_wsi_backend;
 
 struct vkb_swapchain {
@@ -81,6 +84,26 @@ struct vkb_swapchain {
     pthread_mutex_t lock;
     uint64_t presents;
     int retired;
+    uint32_t lat_n;           /* the latency log's number of the present being made by the app's call (latency.c), 0 */
+    /* Present ids (VK_KHR_present_id/id2) and their waits (present_wait/wait2), wsi.c. With `lock`. */
+    pthread_cond_t pw_cond;   /* (CLOCK_MONOTONIC) a frame with an id shown; the chain retired or being destroyed */
+    uint64_t pw_cur;          /* the id of the present being made by the app's call (0: none); the backend's from there */
+    uint64_t pw_queued;       /* the highest id presented */
+    uint64_t pw_done;         /* the highest id shown (vkb_wsi_pw_committed) */
+    uint64_t pw_commits;      /* frames with an id handed to the compositor */
+    struct { uint64_t id, t, commit; } pw_pending[16]; /* handed over, the compositor's word on them awaited */
+    uint32_t pw_npending;
+    uint32_t pw_waiters;      /* threads in vkWaitForPresent(2)KHR */
+    int pw_closing;           /* vkDestroySwapchainKHR has begun: waits end (out of date) */
+    uint64_t pw_waits, pw_timeouts, pw_wait_ns, pw_wait_max_ns, pw_unanswered; /* for the line at the end */
+    /* Copy presents (X11, wl_shm, headless) whose frame was not rendered within VKBRIDGE_PRESENT_HOLD_MS:
+     * shown by the swapchain's own thread once it is (wsi.c late_*). With `lock`. */
+    pthread_cond_t late_cond; /* (CLOCK_MONOTONIC) a late frame shown, or one handed over */
+    pthread_t late_thread;
+    int late_on, late_quit, late_pending;
+    uint32_t late_index, late_lat;
+    uint64_t late_pid, late_t0;
+    uint64_t late_frames, late_max_ns; /* for the line at the end */
 };
 
 /* Formats every surface offers. */
@@ -109,6 +132,16 @@ uint32_t vkb_drm_format(VkFormat f);
 /* A frame's fence waited for in 10 s steps, a slow frame warned about once, VK_ERROR_DEVICE_LOST
  * only on the server's loss or past VKBRIDGE_PRESENT_TIMEOUT_S (default 120 s); reset after. */
 VkResult vkb_wsi_wait_frame(vkb_swapchain *sc, VkFence fence);
-VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait);
+/* A present with id `id` (0: none) was handed to the compositor (or the window system). feedback: the
+ * compositor was asked when it is shown (wp_presentation): vkb_wsi_pw_shown then, else the frame
+ * counts as shown now. */
+void vkb_wsi_pw_committed(vkb_swapchain *sc, uint64_t id, int feedback);
+/* The compositor showed the frame with that id (or dropped it for a later one). */
+void vkb_wsi_pw_shown(vkb_swapchain *sc, uint64_t id);
+/* A copy present's GPU part: the waits and the read-back submitted, then the frame waited for on the
+ * CPU up to VKBRIDGE_PRESENT_HOLD_MS. *late = 1: not rendered by then, handed to the swapchain's
+ * thread, which shows it once it is (the caller is done with it); else rendered (or an error). */
+VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait,
+                                uint64_t pid, int *late);
 
 #endif

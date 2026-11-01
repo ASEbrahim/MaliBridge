@@ -15,7 +15,7 @@
 #   4  bad lines (not KEY=VALUE, a switch that is not per-game, too long) ignored with a warning,
 #      the good lines around them taken;
 #   5  the client's switch (VKBRIDGE_DESC_BATCH) from a preset reaches the client through
-#      vkbQueryServer (fewer messages), and the guest's own VKBRIDGE_DESC_BATCH=0 still wins;
+#      vkbQueryServer (=0: more messages), and the guest's own VKBRIDGE_DESC_BATCH=1 still wins;
 #   6  a built-in preset applied only on a GPU it was tested on: on another GPU, or with no GPU
 #      listed, it is not, said once per game in the log and in the session report with the lines
 #      to copy into <cache dir>/presets/<appid>.env;
@@ -42,7 +42,7 @@ start() {
   env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_ERRATA -u VKBRIDGE_ERRATA_IMITATE -u VKBRIDGE_ERRATA_IMITATE_VB \
       -u VKBRIDGE_MODE -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_ERRATA_PROBE -u VKBRIDGE_PROBE_FAKE -u VKBRIDGE_WAIT_FAKE_ERROR \
       -u VKBRIDGE_COMPILE_TIMEOUT_S -u VKBRIDGE_COMPILE_WARN_S -u VKBRIDGE_EMULATE -u VKBRIDGE_PROBE -u VKBRIDGE_NO_PCACHE \
-      -u VKBRIDGE_DESC_BATCH -u VKBRIDGE_NO_DESC_BATCH -u VKBRIDGE_QUERY_MIRROR -u VKBRIDGE_PRESET_FAKE_BUILTIN \
+      -u VKBRIDGE_DESC_BATCH -u VKBRIDGE_NO_DESC_BATCH -u VKBRIDGE_QUERY_MIRROR -u VKBRIDGE_SYNC_MIRROR -u VKBRIDGE_PRESET_FAKE_BUILTIN \
       VKBRIDGE_PROBE_BUDGET_S=0 "$@" VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
       "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$d/c" >/dev/null 2>&1 &
   srv=$!
@@ -62,7 +62,7 @@ report() { # report <name>: waits for the session report's Markdown; prints its 
 limit_of() { echo "$new" | grep -o 'compile watchdog: device [0-9]* interrupts after [0-9]* s ([^)]*)' | tail -1 | sed 's/.*after //'; }
 trap 'stop; rm -f "$sock"; [ -n "$KEEP" ] && echo "kept $work" || rm -rf "$work"' EXIT
 export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES=
-unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API VKBRIDGE_FAKE_MISSING VKBRIDGE_MODE VKBRIDGE_DESC_BATCH VKBRIDGE_NO_DESC_BATCH VKBRIDGE_QUERY_MIRROR
+unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API VKBRIDGE_FAKE_MISSING VKBRIDGE_MODE VKBRIDGE_DESC_BATCH VKBRIDGE_NO_DESC_BATCH VKBRIDGE_QUERY_MIRROR VKBRIDGE_SYNC_MIRROR
 unset SteamAppId SteamGameId VKBRIDGE_PCACHE_KEY
 fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
@@ -189,13 +189,13 @@ step $? "bad lines: $(grep -c "^.*preset: $f line" $log) warnings, the good line
 
 # 5
 mkdir -p $work/client/c/presets
-echo "VKBRIDGE_DESC_BATCH=1" > $work/client/c/presets/444.env
+echo "VKBRIDGE_DESC_BATCH=0" > $work/client/c/presets/444.env
 start client
 msgs() { VKBRIDGE_STATS=100000 timeout 120 env "$@" "$out/desc_traffic_check" 2>&1 | grep -o '[0-9]* messages' | head -1; }
-mp=$(msgs SteamAppId=444); mn=$(msgs SteamAppId=445); mg=$(msgs SteamAppId=444 VKBRIDGE_DESC_BATCH=0); mb=$(msgs SteamAppId=445 VKBRIDGE_DESC_BATCH=1)
-# batched: a few hundred messages (not always the same count), unbatched: tens of thousands
-[ -n "$mp" ] && [ -n "$mn" ] && [ -n "$mb" ] && [ $(( ${mp% *} * 10 )) -lt ${mn% *} ] && [ $(( ${mb% *} * 10 )) -lt ${mn% *} ] && [ "$mg" = "$mn" ]
-step $? "client switch: VKBRIDGE_DESC_BATCH=1 in 444's preset $mp (guest's =1: $mb), none $mn, guest's =0 wins $mg"
+mp=$(msgs SteamAppId=444); mn=$(msgs SteamAppId=445); mg=$(msgs SteamAppId=444 VKBRIDGE_DESC_BATCH=1); mb=$(msgs SteamAppId=445 VKBRIDGE_DESC_BATCH=0)
+# batched (the default): a few hundred messages (not always the same count), unbatched: tens of thousands
+[ -n "$mp" ] && [ -n "$mn" ] && [ -n "$mg" ] && [ -n "$mb" ] && [ $(( ${mn% *} * 10 )) -lt ${mp% *} ] && [ $(( ${mg% *} * 10 )) -lt ${mp% *} ] && [ "$mb" = "$mp" ]
+step $? "client switch: VKBRIDGE_DESC_BATCH=0 in 444's preset $mp (guest's =0: $mb), none $mn, guest's =1 wins $mg"
 
 # 6
 start gpu "VKBRIDGE_PRESET_FAKE_BUILTIN=600@Mali-G925,RADV:VKBRIDGE_COMPILE_TIMEOUT_S=61;601@Mali-G720,Mali-G925:VKBRIDGE_COMPILE_TIMEOUT_S=62 VKBRIDGE_NO_PCACHE=1;602:VKBRIDGE_COMPILE_TIMEOUT_S=63"
@@ -225,7 +225,7 @@ step $? "built-in on the GPUs tested: on $gpu 600 ${g1%% (*}, 601 (Mali only) an
 
 # 7
 stop
-grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

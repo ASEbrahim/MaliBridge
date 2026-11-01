@@ -26,15 +26,21 @@
  * BC aliasing) takes the source's texels as blocks: they are copied to a staging buffer and decoded
  * (or transcoded) from there like an upload (idea from bcn_layer f3cb7e9, Pipetto-crypto / Lee Gao, MIT).
  *
- * Not emulated (logged once): reading a BC image back to a buffer, and copies from a BC image into
- * an uncompressed one (the image holds decoded or transcoded texels; giving BC blocks back would need
- * a BC encoder), and copies between a transcoded and a decoded image.
+ * A copy between a transcoded and a decoded image of one BC format (the conversion budget decodes
+ * some images and transcodes others; UE4 copies the levels a streamed texture already has from its
+ * old image into its new one) goes from the transcoded one by a blit (the GPU decodes its blocks) and
+ * from the decoded one by re-encoding its texels with the transcoder (copy_mixed); both counted.
+ *
+ * Not emulated (logged once, counted): reading a BC image back to a buffer, copies from a BC image
+ * into an uncompressed one (the image holds decoded or transcoded texels; giving BC blocks back would
+ * need a BC encoder), and copies between transcoded images of different block sizes.
  */
 #define _GNU_SOURCE
 #include "server_emu.h"
 #include "vkb_emu_formats.h"
 #include "bc_spv.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,7 +49,9 @@
 /* FAM_BC1_16: BC1 UNORM decoded to 16 bits (vkb_bc_packed_format), a decoder variant, not a family;
  * TX_*: the transcoders (TX_BC1 + family); TX6_* / TX8_*: into ASTC 6x6 / 8x8 (VKBRIDGE_BC_ASTC_BLOCK). */
 enum { FAM_BC1, FAM_BC2, FAM_BC3, FAM_BC4, FAM_BC5, FAM_BC6H, FAM_BC7, FAM_BC1_16, TX_BC1, TX_BC2, TX_BC3, TX_BC4, TX_BC5,
-       TX_BC6H, TX_BC7, TX6_BC2, TX6_BC3, TX6_BC7, TX8_BC2, TX8_BC3, TX8_BC7, FAM_COUNT };
+       TX_BC6H, TX_BC7, TX6_BC2, TX6_BC3, TX6_BC7, TX8_BC2, TX8_BC3, TX8_BC7, TX_BC1_ASTC,
+       /* re-encoders (bc_decode.comp SRC_RAW): a decoded image's texels into a transcoded format */
+       RAW_ETC2, RAW_ASTC, RAW_EAC_R, RAW_EAC_RG, RAW_ASTC_HDR, RAW6_ASTC, RAW8_ASTC, FAM_COUNT };
 #define BC_INDEX(f) ((f) - VK_FORMAT_BC1_RGB_UNORM_BLOCK)
 
 /* Scratch: chunks of 1-16 MiB; one command buffer holds up to CB_MAX before it reuses its own
@@ -104,6 +112,9 @@ typedef struct bcn_state {
     int nwarm, warm_stop, warm_all;
     chunk *idle;             /* scratch no pending command buffer uses (bytes in g_idle) */
     uint32_t nidle, capidle;
+    uint64_t *pin;           /* shapes whose memory requirements were asked before an image (budget_take), PIN_SLOTS */
+    uint32_t npin;
+    int pin_full;
 } bcn_state;
 
 typedef struct pc_t {
@@ -114,6 +125,7 @@ typedef struct pc_t {
 } pc_t;
 
 static void prebuild(vkb_emu_device *e, int fam);
+static void prebuild_later(vkb_emu_device *e, int fam);
 
 static int family(VkFormat f)
 {
@@ -143,8 +155,20 @@ static uint32_t family_flags(const vkb_emu_image *img)
  * BC1's 4 bits a texel), BC2 / BC3 / BC7 -> ASTC 4x4 (8 bits like them, and better than ETC2
  * RGBA8 at BC7's colours), BC4 -> EAC R11, BC5 -> EAC RG11 (BC4/BC5's sizes, 11-bit), BC6H (UFLOAT
  * and SFLOAT) -> ASTC 4x4 HDR (8 bits, half floats; no negative values, which SFLOAT loses). */
+/* VKBRIDGE_BC1_ASTC=1: BC1 to ASTC 4x4 (bc_decode.comp bc1_astc: its colours and indices as they
+ * are, no search; twice ETC2's memory) instead of ETC2, whose search took hundreds of ms a large
+ * texture: Dark Souls III froze 300-700 ms streaming BC1 textures on the G925. */
+static int bc1_astc(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_BC1_ASTC"); /* <cache dir>/env too */
+    return v && strcmp(v, "0");
+}
+
 static VkFormat tx_target(VkFormat f, uint32_t n)
 {
+    if (bc1_astc() && f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK)
+        return f == VK_FORMAT_BC1_RGB_SRGB_BLOCK || f == VK_FORMAT_BC1_RGBA_SRGB_BLOCK ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK
+                                                                                     : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
     int srgb = f == VK_FORMAT_BC2_SRGB_BLOCK || f == VK_FORMAT_BC3_SRGB_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
     int astc = (f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC3_SRGB_BLOCK) || f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
     if ((n == 6 || n == 8) && astc)
@@ -225,9 +249,43 @@ static uint32_t astc_block(void)
 static int tx_family(int fam, VkFormat target)
 {
     uint32_t n = vkb_tx_block_dim(target);
+    if (fam == FAM_BC1 && (target == VK_FORMAT_ASTC_4x4_UNORM_BLOCK || target == VK_FORMAT_ASTC_4x4_SRGB_BLOCK)) return TX_BC1_ASTC;
     if (n == 4) return TX_BC1 + fam;
     int base = n == 6 ? TX6_BC2 : TX8_BC2;
     return fam == FAM_BC2 ? base : fam == FAM_BC3 ? base + 1 : base + 2;
+}
+
+/* The re-encoder into a transcoded format (copy_mixed), -1 for none. */
+static int raw_family(VkFormat target)
+{
+    switch (tx_class(target)) {
+    case 1: case 2: return RAW_ETC2;
+    case 3: return RAW_ASTC;
+    case 4: return RAW_EAC_R;
+    case 5: return RAW_EAC_RG;
+    case 6: return RAW_ASTC_HDR;
+    case 7: return RAW6_ASTC;
+    case 8: return RAW8_ASTC;
+    default: return -1;
+    }
+}
+
+/* Bytes of a texel of a decoded image the re-encoder raw takes (0: it takes no such texels), and
+ * the flags that say how they are packed (bc_decode.comp SRC_RAW). */
+static uint32_t raw_texel(int raw, VkFormat decoded, uint32_t *flags)
+{
+    *flags = 0;
+    switch (raw) {
+    case RAW_ETC2: case RAW_ASTC: case RAW6_ASTC: case RAW8_ASTC:
+        if (decoded == VK_FORMAT_R8G8B8A8_UNORM || decoded == VK_FORMAT_R8G8B8A8_SRGB) return 4;
+        if (decoded == VK_FORMAT_R5G6B5_UNORM_PACK16) return *flags = 8, 2;
+        if (decoded == VK_FORMAT_A1R5G5B5_UNORM_PACK16) return *flags = 16, 2;
+        return 0;
+    case RAW_EAC_R: return decoded == VK_FORMAT_R8_UNORM || decoded == VK_FORMAT_R8_SNORM;
+    case RAW_EAC_RG: return decoded == VK_FORMAT_R8G8_UNORM || decoded == VK_FORMAT_R8G8_SNORM ? 2 : 0;
+    case RAW_ASTC_HDR: return decoded == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 0;
+    default: return 0;
+    }
 }
 
 /* auto: mip levels of AUTO_FAST_TEXELS texels or more (1024x1024, 2048x512, ...) are encoded fast,
@@ -382,13 +440,298 @@ static VkFormat packed_format(const bcn_state *s, const VkImageCreateInfo *ci, c
  * be viewed in is a BC format whose target shares the class (DXVK: UNORM + SRGB of one BC format),
  * and the driver takes the image in the target format. Views in uncompressed formats
  * (BLOCK_TEXEL_VIEW_COMPATIBLE) see the image's format as when decoded (emu_CreateImageView). */
-static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl)
+/* ------------------------------------------------------------------ the conversion budget */
+
+/* VKBRIDGE_BC_TX_BUDGET=<rate>[:<burst>] (the game's preset, <cache dir>/env, the server's
+ * environment; 0 or off: no budget). A game streaming textures in creates them just before it
+ * uploads them, and their transcodes run on the GPU in the frame that uploads them: Dark Souls III
+ * froze 300-1000 ms while walking on the G925 with the GPU 98% in compute. With a budget, the
+ * transcodes the GPU is given are spread out: a bucket of `burst` million texels refills at `rate`
+ * million texels a second, each image to transcode takes its texels (every level and layer,
+ * weighted by its transcoder's cost, BC7 -> ASTC 4x4 = 1), and an image that finds the bucket short
+ * is decoded instead - a plain copy of its colours, 2-4x the memory of the transcoded image and a
+ * fraction of the GPU time, at the original's exact colours. An image of more than the whole burst
+ * is transcoded when the bucket is full (VKBRIDGE_BC_TRANSCODE_MAX sends big ones to the decoder
+ * always). The decoded images' extra memory is capped (VKBRIDGE_BC_TX_FALLBACK_MB; past it images
+ * are transcoded as without a budget). Images of a shape the app asked memory requirements for
+ * before making one (vkGetDeviceImageMemoryRequirements: vkd3d's placed resources) are always
+ * transcoded: the size it was told is the size it gets. BC1 -> ASTC direct (VKBRIDGE_BC1_ASTC) counts
+ * at its low cost but is never decoded. */
+/* Off unless asked for: on in Dark Souls III's built-in preset (presets_builtin.inc), where the
+ * transcode freezes were seen; anywhere else from a preset file, <cache dir>/env or the server's
+ * environment. 32:4 is the value to ask for: host, G720-calibrated (FEAT-bc-budget.md), a
+ * 32-texture burst 313 -> 86 ms. */
+#define BUDGET_DEFAULT "0"
+#define PIN_SLOTS 4096 /* per device; full: no more decoding over the budget on it */
+
+typedef struct budget_cfg {
+    double rate, burst; /* million texels a second, million texels */
+} budget_cfg;
+
+static int budget_get(budget_cfg *c)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_BC_TX_BUDGET");
+    if (!v || !*v) v = BUDGET_DEFAULT;
+    char *end;
+    double r = strtod(v, &end), b = 0;
+    if (*end == ':' || *end == ',') b = strtod(end + 1, NULL);
+    if (!(r > 0)) return 0;
+    c->rate = r;
+    c->burst = b > 0 ? b : r / 8; /* 125 ms of the rate */
+    return 1;
+}
+
+/* A transcoder's GPU time a texel against BC7 -> ASTC 4x4's: the G720's bcn_check 4096x4096x2
+ * uploads, warm, auto quality (2026-10-15, bcn_check-v04): BC7 139-165 ms, BC1 -> ETC2 182-191,
+ * BC3 124-155, BC4 54-56, BC5 104-107. BC1 -> ASTC direct (VKBRIDGE_BC1_ASTC) has no search. */
+static double tx_weight(int txfam)
+{
+    switch (txfam) {
+    case TX_BC1: return 1.25;
+    case TX_BC2: case TX_BC3: case TX6_BC2: case TX6_BC3: case TX8_BC2: case TX8_BC3: return 0.9;
+    case TX_BC4: return 0.4;
+    case TX_BC5: return 0.7;
+    case TX_BC1_ASTC: return 0.25;
+    default: return 1.0;
+    }
+}
+
+/* Texels of every level and layer. */
+static uint64_t image_texels(const VkImageCreateInfo *ci)
+{
+    uint64_t n = 0;
+    for (uint32_t m = 0; m < ci->mipLevels && m < 32; m++) {
+        uint64_t w = ci->extent.width >> m, h = ci->extent.height >> m, d = ci->extent.depth >> m;
+        n += (w ? w : 1) * (h ? h : 1) * (ci->imageType == VK_IMAGE_TYPE_3D ? (d ? d : 1) : 1);
+    }
+    return n * (ci->imageType == VK_IMAGE_TYPE_3D ? 1 : ci->arrayLayers);
+}
+
+/* What decoding an image costs in memory over transcoding it to t, in bytes. */
+static int64_t fallback_bytes(const bcn_state *s, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl, VkFormat t)
+{
+    double dec;
+    if (packed_format(s, ci, fl)) dec = 2;
+    else switch (vkb_bc_view_format(ci->format)) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: dec = 1; break;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: dec = 2; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: dec = 8; break;
+    default: dec = 4;
+    }
+    uint32_t n = vkb_tx_block_dim(t);
+    double txb = (double)vkb_tx_block_bytes(t) / (n * n);
+    return (int64_t)((dec - txb) * (double)image_texels(ci));
+}
+
+/* VKBRIDGE_BC_TX_FALLBACK_MB: the most decoded-over-the-budget images may cost over transcoded
+ * ones, all devices; by default a 16th of the largest device-local heap, 128-512 MB. */
+static int64_t fallback_cap(const bcn_state *s)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_BC_TX_FALLBACK_MB");
+    if (v && *v) return (int64_t)atol(v) << 20;
+    VkDeviceSize heap = 0;
+    for (uint32_t i = 0; i < s->mp.memoryHeapCount; i++)
+        if ((s->mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && s->mp.memoryHeaps[i].size > heap) heap = s->mp.memoryHeaps[i].size;
+    int64_t cap = (int64_t)(heap / 16);
+    if (cap < (128ll << 20)) cap = 128ll << 20;
+    if (cap > (512ll << 20)) cap = 512ll << 20;
+    return cap;
+}
+
+/* An image's shape, as memory requirements depend on it. */
+static uint64_t shape_key(const VkImageCreateInfo *ci)
+{
+    const uint32_t f[] = {(uint32_t)ci->format, (uint32_t)ci->imageType, ci->extent.width, ci->extent.height, ci->extent.depth,
+                          ci->mipLevels, ci->arrayLayers, (uint32_t)ci->samples, (uint32_t)ci->tiling, ci->usage, ci->flags};
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) h = (h ^ f[i]) * 1099511628211ull;
+    return h | 1;
+}
+
+/* The shape is pinned (always transcoded); add: pin it. */
+static int pinned(bcn_state *s, uint64_t key, int add)
+{
+    int hit = 0;
+    pthread_mutex_lock(&s->lock);
+    if (!s->pin && add) s->pin = calloc(PIN_SLOTS, sizeof(*s->pin));
+    if (s->pin) {
+        uint32_t i = (uint32_t)(key >> 20) % PIN_SLOTS, k = 0;
+        while (k < PIN_SLOTS && s->pin[i] && s->pin[i] != key) i = (i + 1) % PIN_SLOTS, k++;
+        hit = k < PIN_SLOTS && s->pin[i] == key;
+        if (!hit && add) {
+            if (k < PIN_SLOTS && s->npin < PIN_SLOTS * 3 / 4) s->pin[i] = key, s->npin++;
+            else if (!s->pin_full) {
+                s->pin_full = 1;
+                VKB_WARN("BC budget: memory requirements asked for %u image shapes before they were made; no image of this device "
+                         "is decoded over VKBRIDGE_BC_TX_BUDGET any more", s->npin);
+            }
+        }
+    }
+    hit = hit || s->pin_full;
+    pthread_mutex_unlock(&s->lock);
+    return hit;
+}
+
+static struct {
+    pthread_mutex_t lock;
+    int started;
+    double tokens;          /* million texels (BC7 -> ASTC equivalents) in the bucket */
+    uint64_t t_ns, win_ns;  /* the last refill; the start of the per-second line's window */
+    uint32_t n_tx, n_fb, n_cap, n_pin;
+    double mtex_tx, mtex_fb;
+    uint64_t fb_total, tx_total, cap_total;
+    double mtex_fb_total, mtex_tx_total;
+} g_bud = {PTHREAD_MUTEX_INITIALIZER};
+static int64_t g_fb_live;     /* bytes decoded images over the budget cost over transcoded ones, all devices (atomic) */
+static __thread int64_t tls_fb; /* ... of the image being created, for vkb_emu_bcn_image_made */
+
+/* 1: transcode the image to t; 0: decode it (over the budget). */
+static int budget_take(vkb_emu_device *e, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl, VkFormat t, int query)
+{
+    bcn_state *s = e->bcn;
+    budget_cfg c;
+    if (!budget_get(&c)) return 1;
+    uint64_t key = shape_key(ci);
+    if (query) {
+        pinned(s, key, 1);
+        return 1;
+    }
+    int txfam = tx_family(family(ci->format), t);
+    /* BC1 -> ASTC direct has no search: it counts, but is never decoded (that would cost 2x its memory for little) */
+    int pin = txfam == TX_BC1_ASTC || pinned(s, key, 0);
+    double cost = (double)image_texels(ci) * tx_weight(txfam) / 1e6;
+    int64_t extra = fallback_bytes(s, ci, fl, t), cap = fallback_cap(s);
+    uint64_t now = vkb_hitch_now();
+    int tx = 1;
+    pthread_mutex_lock(&g_bud.lock);
+    if (!g_bud.started) {
+        g_bud.started = 1, g_bud.tokens = c.burst, g_bud.t_ns = g_bud.win_ns = now;
+        VKB_INFO("BC budget: transcoding %.1f million texels a second, %.1f at once (BC7 -> ASTC 4x4 equivalents); images over it are "
+                 "decoded, up to %lld MB more memory (VKBRIDGE_BC_TX_BUDGET, VKBRIDGE_BC_TX_FALLBACK_MB)", c.rate, c.burst, (long long)(cap >> 20));
+    }
+    g_bud.tokens += c.rate * (double)(now - g_bud.t_ns) / 1e9;
+    if (g_bud.tokens > c.burst) g_bud.tokens = c.burst;
+    g_bud.t_ns = now;
+    if (now - g_bud.win_ns >= 1000000000ull) {
+        if (g_bud.n_fb || g_bud.n_cap)
+            VKB_INFO("BC budget: in the last %.1f s %u image(s) (%.1f Mtexels) decoded over VKBRIDGE_BC_TX_BUDGET, %u (%.1f) transcoded; "
+                     "%u transcoded past the decoded images' memory cap, %u of shapes the app asked memory requirements for; "
+                     "decoded images cost %lld MB of %lld more",
+                     (double)(now - g_bud.win_ns) / 1e9, g_bud.n_fb, g_bud.mtex_fb, g_bud.n_tx, g_bud.mtex_tx, g_bud.n_cap, g_bud.n_pin,
+                     (long long)(__atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) >> 20), (long long)(cap >> 20));
+        g_bud.win_ns = now, g_bud.n_tx = g_bud.n_fb = g_bud.n_cap = g_bud.n_pin = 0, g_bud.mtex_tx = g_bud.mtex_fb = 0;
+    }
+    if (pin) g_bud.n_pin += txfam != TX_BC1_ASTC;
+    else if (g_bud.tokens >= cost || g_bud.tokens >= c.burst * 0.999) {
+    } else if (extra <= 0 || __atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) + extra > cap) g_bud.n_cap++, g_bud.cap_total++;
+    else tx = 0;
+    if (tx) {
+        g_bud.tokens -= cost;
+        if (g_bud.tokens < -c.burst) g_bud.tokens = -c.burst;
+        g_bud.n_tx++, g_bud.mtex_tx += cost, g_bud.tx_total++, g_bud.mtex_tx_total += cost;
+    } else {
+        g_bud.n_fb++, g_bud.mtex_fb += cost, g_bud.fb_total++, g_bud.mtex_fb_total += cost;
+        __atomic_add_fetch(&g_fb_live, extra, __ATOMIC_RELAXED);
+        tls_fb += extra;
+    }
+    pthread_mutex_unlock(&g_bud.lock);
+    return tx;
+}
+
+/* At a device's end: what the budget did since the server started (all devices). */
+static void budget_totals(void)
+{
+    pthread_mutex_lock(&g_bud.lock);
+    if (g_bud.started)
+        VKB_INFO("BC budget: so far %llu image(s) (%.1f Mtexels) transcoded, %llu (%.1f) decoded over VKBRIDGE_BC_TX_BUDGET, %llu transcoded "
+                 "past the decoded images' memory cap; decoded images alive cost %lld MB more",
+                 (unsigned long long)g_bud.tx_total, g_bud.mtex_tx_total, (unsigned long long)g_bud.fb_total, g_bud.mtex_fb_total,
+                 (unsigned long long)g_bud.cap_total, (long long)(__atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) >> 20));
+    pthread_mutex_unlock(&g_bud.lock);
+}
+
+/* A transcode done outside budget_take (a copy re-encoding a decoded image's texels): its texels
+ * come off the bucket all the same. */
+static void budget_charge(int txfam, uint64_t texels)
+{
+    budget_cfg c;
+    if (!budget_get(&c)) return;
+    double cost = (double)texels * tx_weight(txfam) / 1e6;
+    pthread_mutex_lock(&g_bud.lock);
+    if (g_bud.started) {
+        g_bud.tokens -= cost;
+        if (g_bud.tokens < -c.burst) g_bud.tokens = -c.burst;
+        g_bud.mtex_tx += cost, g_bud.mtex_tx_total += cost;
+    }
+    pthread_mutex_unlock(&g_bud.lock);
+}
+
+/* ------------------------------------------------------------------ copies, counted */
+
+/* Copies between BC images held differently (copy_mixed), and BC copies (commands) not done, all
+ * devices: a line every 10 s while they change, and at each device's end. */
+enum { CP_BLIT, CP_ENC, CP_SKIP_MIXED, CP_SKIP_BLOCKS, CP_SKIP_OTHER, CP_SKIP_EDGE, CP_SKIP_IN, CP_SKIP_READBACK, CP_COUNT };
+static uint64_t g_cp[CP_COUNT], g_cp_told[CP_COUNT], g_cp_ns;
+
+static void copies_line(int end)
+{
+    uint64_t v[CP_COUNT], skip = 0;
+    int changed = 0;
+    for (int i = 0; i < CP_COUNT; i++) {
+        v[i] = __atomic_load_n(&g_cp[i], __ATOMIC_RELAXED);
+        changed |= v[i] != __atomic_load_n(&g_cp_told[i], __ATOMIC_RELAXED);
+        if (i >= CP_SKIP_MIXED) skip += v[i];
+    }
+    if (!changed && !(end && (v[CP_BLIT] || v[CP_ENC] || skip))) return;
+    for (int i = 0; i < CP_COUNT; i++) __atomic_store_n(&g_cp_told[i], v[i], __ATOMIC_RELAXED);
+    VKB_INFO("BC copies%s: %llu from a transcoded into a decoded image (blit), %llu from a decoded into a transcoded image (re-encoded); "
+             "%llu skipped (%llu transcoded-decoded that could not be done, %llu between transcoded images of other block sizes, "
+             "%llu BC-uncompressed or 16-bit-sRGB, %llu off ASTC block edges, %llu into BC from other formats, %llu BC readbacks)",
+             end ? " so far" : " (running totals)", (unsigned long long)v[CP_BLIT], (unsigned long long)v[CP_ENC],
+             (unsigned long long)skip, (unsigned long long)v[CP_SKIP_MIXED], (unsigned long long)v[CP_SKIP_BLOCKS],
+             (unsigned long long)v[CP_SKIP_OTHER], (unsigned long long)v[CP_SKIP_EDGE], (unsigned long long)v[CP_SKIP_IN],
+             (unsigned long long)v[CP_SKIP_READBACK]);
+}
+
+static void copy_count(int what)
+{
+    __atomic_add_fetch(&g_cp[what], 1, __ATOMIC_RELAXED);
+    uint64_t now = vkb_hitch_now(), last = __atomic_load_n(&g_cp_ns, __ATOMIC_RELAXED);
+    if ((!last || now - last >= 10000000000ull) && __atomic_compare_exchange_n(&g_cp_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        copies_line(0);
+}
+
+void vkb_emu_bcn_image_made(vkb_emu_device *e, vkb_emu_image *r)
+{
+    (void)e;
+    int64_t b = tls_fb;
+    tls_fb = 0;
+    if (!b) return;
+    if (r) r->bc_fallback += b;
+    else __atomic_sub_fetch(&g_fb_live, b, __ATOMIC_RELAXED);
+}
+
+static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl, int query)
 {
     const bcn_state *s = e->bcn;
     if (!s) return VK_FORMAT_UNDEFINED;
     VkFormat t = s->tx[BC_INDEX(ci->format)];
     const VkImageUsageFlags texture = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!t || (ci->usage & ~texture)) return VK_FORMAT_UNDEFINED;
+    /* VKBRIDGE_BC_TRANSCODE_MAX=<texels>: images wider or taller than that are decoded. A large
+     * texture streamed in mid-game is one transcode of hundreds of ms in the frame's command
+     * stream (Dark Souls III froze 300-700 ms while walking on the G925); decoding it is cheap,
+     * at 2-4x its memory. Small images, most of a game's count, stay transcoded. */
+    const char *mx = vkb_srv_env("VKBRIDGE_BC_TRANSCODE_MAX"); /* <cache dir>/env and presets too */
+    long max = mx ? atol(mx) : 0;
+    if (max > 0 && (ci->extent.width > (uint32_t)max || ci->extent.height > (uint32_t)max)) return VK_FORMAT_UNDEFINED;
+    /* VKBRIDGE_BC_DECODE=<VkFormat>[,...] (a diagnostic): these BC formats decoded, the rest transcoded */
+    const char *dv = vkb_srv_env("VKBRIDGE_BC_DECODE");
+    for (const char *p = dv; p && *p;) {
+        if (atol(p) == (long)ci->format) return VK_FORMAT_UNDEFINED;
+        p = strchr(p, ',');
+        if (p) p++;
+    }
     if ((ci->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && fl)
         for (uint32_t i = 0; i < fl->viewFormatCount; i++) {
             VkFormat v = fl->pViewFormats[i];
@@ -406,10 +749,10 @@ static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const 
                  "(logged once)", ci->extent.width, ci->extent.height, ci->extent.depth, ci->imageType, t);
         return VK_FORMAT_UNDEFINED;
     }
-    return t;
+    return budget_take(e, ci, fl, t, query) ? t : VK_FORMAT_UNDEFINED;
 }
 
-void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci)
+void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci, int query)
 {
     if (!(e->flags & VKB_EMU_BCN) || !vkb_is_bc(ci->format)) return;
     const VkFormat client = ci->format;
@@ -422,7 +765,7 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci)
     VkImageFormatListCreateInfo *fl = NULL;
     for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) fl = (VkImageFormatListCreateInfo *)b;
-    VkFormat tx = tx_format(e, ci, fl);
+    VkFormat tx = tx_format(e, ci, fl, query);
     VkFormat packed = tx ? VK_FORMAT_UNDEFINED : packed_format(e->bcn, ci, fl);
     VkFormat view = tx ? tx : packed ? packed : vkb_bc_view_format(ci->format);
     uint32_t n = 0;
@@ -440,7 +783,12 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci)
             if (k == n && n < sizeof(list) / sizeof(list[0])) list[n++] = f;
         }
     }
-    if (e->bcn) prebuild(e, tx ? tx_family(family(client), tx) : packed ? FAM_BC1_16 : family(client));
+    if (e->bcn) {
+        prebuild(e, tx ? tx_family(family(client), tx) : packed ? FAM_BC1_16 : family(client));
+        /* decoded where its format is transcoded: a copy between it and a transcoded image re-encodes */
+        VkFormat t = ((bcn_state *)e->bcn)->tx[BC_INDEX(client)];
+        if (!tx && t && !query && raw_family(t) >= 0) prebuild_later(e, raw_family(t));
+    }
     ci->format = view;
     ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
     if (n == 1) ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -462,7 +810,7 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci)
 void vkb_emu_image_release(vkb_emu_device *e, vkb_emu_image *img)
 {
     (void)e;
-    (void)img; /* nothing kept per image */
+    if (img->bc_fallback) __atomic_sub_fetch(&g_fb_live, img->bc_fallback, __ATOMIC_RELAXED);
 }
 
 VkFormat vkb_emu_bcn_view_format(vkb_emu_device *e, VkImage image, VkFormat requested)
@@ -638,12 +986,15 @@ void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch)
 static const uint32_t *const fam_code[FAM_COUNT] = {spv_bc1, spv_bc2, spv_bc3, spv_bc4, spv_bc5, spv_bc6h, spv_bc7, spv_bc1_16,
                                                     spv_bc1_etc2, spv_bc2_astc, spv_bc3_astc, spv_bc4_eac, spv_bc5_eac, spv_bc6h_astc,
                                                     spv_bc7_astc, spv_bc2_astc6, spv_bc3_astc6, spv_bc7_astc6, spv_bc2_astc8,
-                                                    spv_bc3_astc8, spv_bc7_astc8};
+                                                    spv_bc3_astc8, spv_bc7_astc8, spv_bc1_astc, spv_raw_etc2, spv_raw_astc,
+                                                    spv_raw_eac_r, spv_raw_eac_rg, spv_raw_astc_hdr, spv_raw_astc6, spv_raw_astc8};
 static const size_t fam_size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), sizeof(spv_bc3), sizeof(spv_bc4), sizeof(spv_bc5),
                                            sizeof(spv_bc6h), sizeof(spv_bc7), sizeof(spv_bc1_16), sizeof(spv_bc1_etc2),
                                            sizeof(spv_bc2_astc), sizeof(spv_bc3_astc), sizeof(spv_bc4_eac), sizeof(spv_bc5_eac),
                                            sizeof(spv_bc6h_astc), sizeof(spv_bc7_astc), sizeof(spv_bc2_astc6), sizeof(spv_bc3_astc6),
-                                           sizeof(spv_bc7_astc6), sizeof(spv_bc2_astc8), sizeof(spv_bc3_astc8), sizeof(spv_bc7_astc8)};
+                                           sizeof(spv_bc7_astc6), sizeof(spv_bc2_astc8), sizeof(spv_bc3_astc8), sizeof(spv_bc7_astc8), sizeof(spv_bc1_astc),
+                                           sizeof(spv_raw_etc2), sizeof(spv_raw_astc), sizeof(spv_raw_eac_r), sizeof(spv_raw_eac_rg),
+                                           sizeof(spv_raw_astc_hdr), sizeof(spv_raw_astc6), sizeof(spv_raw_astc8)};
 
 /* Builds the decoder or transcoder for fam at quality q, through the device's persistent pipeline
  * cache (server_pcache.c): Mali takes hundreds of ms over some transcoders, and without the cache
@@ -767,6 +1118,20 @@ static void prebuild(vkb_emu_device *e, int fam)
     pthread_mutex_unlock(&s->plock);
 }
 
+/* fam built by the warm threads when they have nothing more urgent (the re-encoders: only a copy
+ * between a transcoded and a decoded image uses them). */
+static void prebuild_later(vkb_emu_device *e, int fam)
+{
+    bcn_state *s = e->bcn;
+    uint32_t q[2], n = qualities(s, fam, q);
+    int ready = 1;
+    for (uint32_t i = 0; i < n && ready; i++) ready = __atomic_load_n(&s->pipes[q[i]][fam], __ATOMIC_ACQUIRE) != VK_NULL_HANDLE;
+    if (ready) return;
+    pthread_mutex_lock(&s->plock);
+    queue_family(e, fam, 0);
+    pthread_mutex_unlock(&s->plock);
+}
+
 /* Stores what a build of fam at q gave. plock held. */
 static void publish(bcn_state *s, int fam, uint32_t q, VkPipeline p)
 {
@@ -886,6 +1251,7 @@ typedef struct upload {
     VkImageLayout layout;
     uint32_t ob, block_bytes;  /* bytes of a block in the scratch (decoded or transcoded), in the source */
     uint32_t n_dim;          /* texels a side of an output block: 4, or 6 / 8 for ASTC 6x6 / 8x8 */
+    uint32_t xflags;         /* more flags for the shader (a re-encoder's, bc_decode.comp SRC_RAW) */
     VkDeviceSize left;       /* scratch the rest of the upload needs (sizes new chunks) */
     VkBuffer *bufs;          /* decoded, waiting to be copied into the image */
     VkBufferImageCopy *copies;
@@ -973,6 +1339,37 @@ static int slot(upload *u, VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
 
 static void queue_copy(upload *u, VkBuffer buf, const VkBufferImageCopy *c);
 
+/* VKBRIDGE_TEST_BC_SLOW=<n>[,<m>] (host tests, tests/bcburst_check.c): every transcoder dispatch
+ * recorded n times and every decoder dispatch m times (default n), so a desktop GPU spends on a
+ * conversion what a Mali GPU does (the G720 transcodes 20-30x slower than an RX 7900 XTX). The
+ * repeats write the same blocks. Read once, from the server's environment only. */
+static uint32_t test_slow(int transcode)
+{
+    static int n = -1, m = -1;
+    if (n < 0) {
+        const char *v = getenv("VKBRIDGE_TEST_BC_SLOW");
+        char *end = NULL;
+        int a = v && *v ? (int)strtol(v, &end, 10) : 0, b = end && *end == ',' ? atoi(end + 1) : a;
+        if (a > 1 || b > 1) VKB_WARN("VKBRIDGE_TEST_BC_SLOW: transcoder dispatches recorded %d times, decoder dispatches %d times, on purpose", a, b);
+        m = b > 1 ? b : 1;
+        __atomic_store_n(&n, a > 1 ? a : 1, __ATOMIC_RELEASE);
+    }
+    return (uint32_t)(transcode ? __atomic_load_n(&n, __ATOMIC_ACQUIRE) : m);
+}
+
+static void dispatch(upload *u, uint32_t x, uint32_t y, uint32_t z)
+{
+    const vkb_dispatch *r = &u->e->dev->real;
+    uint32_t rep = test_slow(vkb_tx_block_bytes(u->img->format) != 0);
+    for (uint32_t i = 0; i < rep; i++) {
+        if (i) {
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT};
+            r->vkCmdPipelineBarrier(u->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        }
+        r->vkCmdDispatch(u->cb, x, y, z);
+    }
+}
+
 /* Decodes slices [slice0, slice0 + nslices) x block rows [row0, row0 + nrows) of a region into
  * scratch and queues its copy into the image. */
 static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices, uint32_t row0, uint32_t nrows)
@@ -1010,10 +1407,10 @@ static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices,
         r->vkCmdBindDescriptorSets(u->cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout, 0, 1, &set, 0, NULL);
     }
     uint32_t y0 = row0 * 4, h = g->iext.height - y0 < nrows * 4 ? g->iext.height - y0 : nrows * 4;
-    pc_t pc = {(uint32_t)((first - aligned) / 4), row_blocks, layer_blocks, family_flags(u->img),
+    pc_t pc = {(uint32_t)((first - aligned) / 4), row_blocks, layer_blocks, family_flags(u->img) | u->xflags,
                (uint32_t)(off / 4), 0, {g->iext.width, h}};
     r->vkCmdPushConstants(u->cb, s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    r->vkCmdDispatch(u->cb, (bw + 7) / 8, (nrows + 7) / 8, nslices);
+    dispatch(u, (bw + 7) / 8, (nrows + 7) / 8, nslices);
 
     VkBufferImageCopy c = {off, bw * 4, nrows * 4, g->sub, {g->ioff.x, g->ioff.y + (int32_t)y0, g->ioff.z}, {g->iext.width, h, 1}};
     if (u->img->type == VK_IMAGE_TYPE_3D) {
@@ -1103,10 +1500,10 @@ static void piece_n(upload *u, const region *g, uint32_t slice0, uint32_t nslice
         r->vkUpdateDescriptorSets(u->e->dev->device, 2, w, 0, NULL);
         r->vkCmdBindDescriptorSets(u->cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout, 0, 1, &set, 0, NULL);
     }
-    pc_t pc = {(uint32_t)((first - aligned) / 4), row_blocks, layer_blocks, family_flags(u->img), (uint32_t)(off / 4), 0,
+    pc_t pc = {(uint32_t)((first - aligned) / 4), row_blocks, layer_blocks, family_flags(u->img) | u->xflags, (uint32_t)(off / 4), 0,
                {sx + g->iext.width, h}, {sx | (sy << 4) | (r0 << 8), y0, g->iext.width, g->iext.height}};
     r->vkCmdPushConstants(u->cb, s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    r->vkCmdDispatch(u->cb, (bw + 7) / 8, (nrows + 7) / 8, nslices);
+    dispatch(u, (bw + 7) / 8, (nrows + 7) / 8, nslices);
     if (sx || sy || ((g->ioff.x + g->iext.width) % n && g->ioff.x + g->iext.width < (u->img->extent.width >> g->sub.mipLevel)) ||
         ((g->ioff.y + g->iext.height) % n && g->ioff.y + g->iext.height < (u->img->extent.height >> g->sub.mipLevel)))
         VKB_ONCE(VKB_LOG_INFO, "BC emulation: an upload not on ASTC %ux%u block edges (at %d,%d, %ux%u): the texels around it in its edge "
@@ -1133,19 +1530,67 @@ static VkDeviceSize region_bytes(const upload *u, const region *g, uint32_t slic
     return (VkDeviceSize)((g->iext.width + 3) / 4) * ((g->iext.height + 3) / 4) * u->ob * slices;
 }
 
+/* VKBRIDGE_TEST_HITCH_DELAY_MS=<ms> (host tests, tests/hitch_check.c): each BC upload recorded and
+ * each allocation of 64 MB or more (server_memory.c) takes that much longer on purpose, so that it
+ * makes a hitch of its own. Read once, from the server's environment only. */
+int vkb_test_hitch_delay_ms(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("VKBRIDGE_TEST_HITCH_DELAY_MS");
+        v = s && *s ? atoi(s) : 0;
+        if (v > 0) VKB_WARN("VKBRIDGE_TEST_HITCH_DELAY_MS: BC uploads and allocations of 64 MB or more take %d ms longer on purpose", v);
+    }
+    return v;
+}
+
+static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_image *img, VkImageLayout layout, uint32_t n,
+                       const region *regs, const vkb_emu_image *raw);
+
+/* A conversion recorded: timed and counted for the hitch line when the process has it on
+ * (VKBRIDGE_HITCH_MS, server_hitch.c); its GPU time shows as the waits that follow it. */
+/* raw: the source holds texels of that decoded image (copy_mixed), not BC blocks. */
 static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_image *img, VkImageLayout layout,
-                   uint32_t n, const region *regs)
+                   uint32_t n, const region *regs, const vkb_emu_image *raw)
+{
+    vkb_srv_proc *p = e->dev ? e->dev->proc : NULL;
+    int delay = vkb_test_hitch_delay_ms();
+    if (!vkb_hitch_on(p) && delay <= 0) {
+        decode_now(e, cb, src, img, layout, n, regs, raw);
+        return;
+    }
+    uint64_t t0 = vkb_hitch_now(), texels = 0;
+    if (delay > 0) {
+        struct timespec ts = {delay / 1000, (long)(delay % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    decode_now(e, cb, src, img, layout, n, regs, raw);
+    for (uint32_t i = 0; i < n; i++)
+        texels += (uint64_t)regs[i].iext.width * regs[i].iext.height *
+                  (img->type == VK_IMAGE_TYPE_3D ? regs[i].iext.depth : regs[i].sub.layerCount);
+    vkb_hitch_note(p, VKB_HITCH_BC, t0, vkb_hitch_now(), 1, texels);
+}
+
+static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_image *img, VkImageLayout layout, uint32_t n,
+                       const region *regs, const vkb_emu_image *raw)
 {
     bcn_state *s = e->bcn;
     int fam = family(img->client_format);
     fam = vkb_tx_block_bytes(img->format) ? tx_family(fam, img->format) : vkb_bc_is_packed(img->format) ? FAM_BC1_16 : fam;
+    uint32_t xflags = 0, in_bytes = vkb_bc_block_bytes(img->client_format);
+    if (raw) {
+        /* texels: a 4x4 tile of them counts as the source's block */
+        fam = raw_family(img->format);
+        in_bytes = 16 * raw_texel(fam, raw->format, &xflags);
+        if (family(img->client_format) == FAM_BC7) xflags |= 32;
+    }
     /* in auto per region (level_quality): the first region's, before anything is recorded (or the
      * other quality while this one is still being built) */
     uint32_t q0 = fam >= TX_BC1 ? level_quality(s, img, n ? regs[0].sub.mipLevel : 0) : 1;
     VkPipeline pipe = pipeline(e, fam, q0), bound = VK_NULL_HANDLE;
     if (!pipe) return;
-    upload u = {e, cb, vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)), src, img, layout, out_block_bytes(img),
-                vkb_bc_block_bytes(img->client_format), vkb_tx_block_dim(img->format)};
+    upload u = {e, cb, vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)), src, img, layout, out_block_bytes(img), in_bytes,
+                vkb_tx_block_dim(img->format), .xflags = xflags};
     if (!u.sc) return;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     for (uint32_t i = 0; i < n; i++) u.left += region_bytes(&u, &regs[i], is3d ? regs[i].iext.depth : regs[i].sub.layerCount);
@@ -1158,6 +1603,18 @@ static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_
             if (u.sc->held[i].size > lim && u.sc->held[i].size <= CHUNK_MAX) lim = u.sc->held[i].size;
     }
     to_compute(&u);
+    /* VKBRIDGE_BC_LOG=<texels> (a diagnostic): uploads of that many texels or more logged with
+     * their BC format, target and size, to tell which transcoders a stall in the frame comes from. */
+    const char *lv = vkb_srv_env("VKBRIDGE_BC_LOG");
+    long log_min = lv ? atol(lv) : 0;
+    if (log_min > 0) {
+        uint64_t tex = 0;
+        for (uint32_t i = 0; i < n; i++)
+            tex += (uint64_t)regs[i].iext.width * regs[i].iext.height * (is3d ? regs[i].iext.depth : regs[i].sub.layerCount);
+        if (tex >= (uint64_t)log_min)
+            VKB_INFO("BC upload: format %d -> %d (family %d), %llu texels in %u region(s), first %ux%u mip %u", img->client_format, img->format, fam,
+                     (unsigned long long)tex, n, n ? regs[0].iext.width : 0, n ? regs[0].iext.height : 0, n ? regs[0].sub.mipLevel : 0);
+    }
     for (uint32_t i = 0; i < n; i++) {
         const region *g = &regs[i];
         uint32_t slices = is3d ? g->iext.depth : g->sub.layerCount;
@@ -1220,7 +1677,7 @@ int vkb_emu_copy_buffer_to_image(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer
     for (uint32_t i = 0; i < n; i++)
         g[i] = (region){regions[i].bufferOffset, regions[i].bufferRowLength, regions[i].bufferImageHeight, regions[i].imageSubresource,
                         regions[i].imageOffset, regions[i].imageExtent};
-    decode(e, cb, src, img, dl, n, g);
+    decode(e, cb, src, img, dl, n, g, NULL);
     free(g);
     return 1;
 }
@@ -1234,7 +1691,7 @@ int vkb_emu_copy_buffer_to_image2(vkb_emu_device *e, VkCommandBuffer cb, const V
         const VkBufferImageCopy2 *r = &info->pRegions[i];
         g[i] = (region){r->bufferOffset, r->bufferRowLength, r->bufferImageHeight, r->imageSubresource, r->imageOffset, r->imageExtent};
     }
-    decode(e, cb, info->srcBuffer, img, info->dstImageLayout, info->regionCount, g);
+    decode(e, cb, info->srcBuffer, img, info->dstImageLayout, info->regionCount, g, NULL);
     free(g);
     return 1;
 }
@@ -1259,17 +1716,20 @@ static void clamp_region(const vkb_emu_image *s, const vkb_emu_image *d, const V
 
 /* How a copy between BC images goes: 0 as a copy (the decoded formats are size-compatible, or both
  * transcoded to blocks of one size), 1 as an unscaled blit (one side decoded to 16 bits, the other
- * to RGBA8 UNORM or the other 16-bit format: the same texels, converted), -1 not at all (a BC and
- * an uncompressed image, a 16-bit and an sRGB image, which a blit would convert out of sRGB, or a
- * transcoded and a decoded image, or transcoded ones of different block sizes: re-encoding a
- * copy is not done). */
+ * to RGBA8 UNORM or the other 16-bit format: the same texels, converted), 2 from a transcoded into
+ * a decoded image and 3 the other way (copy_mixed), -1 not at all (a BC and an uncompressed image,
+ * a 16-bit and an sRGB image, which a blit would convert out of sRGB), -2 not at all (transcoded
+ * images of different block sizes). */
 static int copy_kind(const vkb_emu_image *s, const vkb_emu_image *d)
 {
     if (!s || !d) return -1;
     uint32_t st = vkb_tx_block_bytes(s->format), dt = vkb_tx_block_bytes(d->format);
+    if (st && !dt) return 2;
+    if (dt && !st) return 3;
     if (st || dt) {
         if (st == dt && vkb_tx_block_dim(s->format) == vkb_tx_block_dim(d->format)) return 0;
-        VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy between BC images held as formats %d and %d is skipped (logged once)", s->format, d->format);
+        VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy between BC images transcoded to formats %d and %d (other block sizes) is skipped "
+                 "(logged once, counted in the BC copies line)", s->format, d->format);
         return -2;
     }
     int sp = vkb_bc_is_packed(s->format), dp = vkb_bc_is_packed(d->format);
@@ -1311,8 +1771,9 @@ static int blit_region(const vkb_emu_image *s, const VkImageSubresourceLayers *s
 
 static void skipped_copy(void)
 {
+    copy_count(CP_SKIP_OTHER);
     VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy from a BC image into an uncompressed one (it would need an encoder) or into an "
-                           "incompatible BC format is skipped (logged once)");
+                           "incompatible BC format is skipped (logged once, counted in the BC copies line)");
 }
 
 /* Bytes of one texel of the uncompressed formats a BC block can be copied from (64 and 128 bits),
@@ -1360,6 +1821,7 @@ static void copy_blocks_in(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, V
     vkb_emu_image *s = vkb_emu_find_image(e, src);
     uint32_t bb = vkb_bc_block_bytes(d->client_format);
     if (!s || block_texel_bytes(s->format) != bb) {
+        copy_count(CP_SKIP_IN);
         VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy into a BC image from format %d (not %u bytes a texel) is skipped (logged once)",
                  s ? s->format : VK_FORMAT_UNDEFINED, bb);
         return;
@@ -1390,7 +1852,7 @@ static void copy_blocks_in(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, V
         goto done;
     }
     e->dev->real.vkCmdCopyImageToBuffer(cb, src, sl, buf, k, out);
-    decode(e, cb, buf, d, dl, k, g);
+    decode(e, cb, buf, d, dl, k, g, NULL);
     static int told;
     if (!__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED))
         VKB_INFO("BC emulation: copy into a BC image (format %d) from format %d decoded through staging (logged once)", d->client_format,
@@ -1398,6 +1860,125 @@ static void copy_blocks_in(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, V
 done:
     free(out);
     free(g);
+}
+
+static int is_srgb(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK: case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SRGB_BLOCK: case VK_FORMAT_ASTC_6x6_SRGB_BLOCK: case VK_FORMAT_ASTC_8x8_SRGB_BLOCK: return 1;
+    default: return 0;
+    }
+}
+
+static void mixed_skip(const char *why, const vkb_emu_image *s, const vkb_emu_image *d)
+{
+    copy_count(CP_SKIP_MIXED);
+    VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy between BC images held as formats %d and %d is skipped: %s (logged once, counted in "
+             "the BC copies line)", s->format, d->format, why);
+}
+
+/* A copy between a transcoded and a decoded image of one BC format (copy_kind 2 and 3), regions
+ * already cut to the levels (clamp_region). The budget decides per image, so the two images UE4
+ * streams a texture's levels between (the old one, the new one) can be held differently; skipping
+ * the copy left the new image with whatever its memory held (Stray's sky and water, 2026-10-26).
+ * From the transcoded one: an unscaled blit, the GPU decoding its blocks into the decoded image's
+ * texels (what the source showed). From the decoded one: its texels go to staging, and the
+ * transcoder's encoder (bc_decode.comp SRC_RAW) makes the blocks an upload of those colours would
+ * have; its texels count against the budget like a transcode's. */
+static void copy_mixed(vkb_emu_device *e, VkCommandBuffer cb, vkb_emu_image *s, VkImageLayout sl, vkb_emu_image *d,
+                       VkImageLayout dl, int kind, uint32_t n, const VkImageCopy *c)
+{
+    bcn_state *st = e->bcn;
+    const vkb_dispatch *r = &e->dev->real;
+    const char *why = !st ? "no BC state" : s->type != d->type ? "images of different types" : NULL;
+    if (!why && kind == 2) {
+        VkFormatProperties fs, fd;
+        r->vkGetPhysicalDeviceFormatProperties(e->dev->physical, s->format, &fs);
+        r->vkGetPhysicalDeviceFormatProperties(e->dev->physical, d->format, &fd);
+        VkImageBlit *b = NULL;
+        if (is_srgb(s->format) != is_srgb(d->format)) why = "one is sRGB, the other not (a blit would convert)";
+        else if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT))
+            why = "the GPU cannot blit between the two formats";
+        else if (!(b = malloc((n ? n : 1) * sizeof(*b)))) why = "out of memory";
+        if (why) {
+            mixed_skip(why, s, d);
+            return;
+        }
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < n; i++)
+            k += blit_region(s, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent, &b[k]);
+        if (k) r->vkCmdBlitImage(cb, s->image, sl, d->image, dl, k, b, VK_FILTER_NEAREST);
+        free(b);
+        copy_count(CP_BLIT);
+        VKB_ONCE(VKB_LOG_INFO, "BC emulation: a copy from a transcoded BC image (format %d) into a decoded one (format %d) done as a blit "
+                 "(logged once, counted in the BC copies line)", s->format, d->format);
+        return;
+    }
+    int raw = raw_family(d->format);
+    uint32_t xf, tb = raw >= 0 ? raw_texel(raw, s->format, &xf) : 0;
+    bcn_cb *bc = NULL;
+    VkBufferImageCopy *out = NULL;
+    region *g = NULL;
+    if (!why && !tb) why = "no re-encoder from the decoded format into the transcoded one";
+    if (!why && !pipeline(e, raw, level_quality(st, d, c[0].dstSubresource.mipLevel))) why = "the re-encoder did not build";
+    if (!why && (!(bc = vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb))) || !(out = malloc((n ? n : 1) * sizeof(*out))) ||
+                 !(g = malloc((n ? n : 1) * sizeof(*g)))))
+        why = "out of memory";
+    if (why) {
+        free(out);
+        free(g);
+        mixed_skip(why, s, d);
+        return;
+    }
+    int is3d = s->type == VK_IMAGE_TYPE_3D;
+    VkDeviceSize total = 0;
+    uint64_t texels = 0;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t w = c[i].extent.width, h = c[i].extent.height, slices = is3d ? c[i].extent.depth : c[i].srcSubresource.layerCount;
+        if (!w || !h || !slices) continue;
+        uint32_t rl = (w + 3) & ~3u, ih = (h + 3) & ~3u;
+        out[k] = (VkBufferImageCopy){total, rl, ih, c[i].srcSubresource, c[i].srcOffset, {w, h, is3d ? slices : 1}};
+        VkImageSubresourceLayers ds = c[i].dstSubresource;
+        if (!is3d) ds.layerCount = slices;
+        g[k++] = (region){total, rl, ih, ds, c[i].dstOffset, {w, h, is3d ? slices : 1}};
+        total += (VkDeviceSize)rl * ih * slices * tb;
+        total = (total + SLOT_ALIGN - 1) & ~(VkDeviceSize)(SLOT_ALIGN - 1);
+        texels += (uint64_t)w * h * slices;
+    }
+    VkBuffer buf = k ? stage_buffer(e, cb, bc, total) : VK_NULL_HANDLE;
+    if (k && !buf) {
+        free(out);
+        free(g);
+        mixed_skip("no memory to stage the texels", s, d);
+        return;
+    }
+    if (k) {
+        r->vkCmdCopyImageToBuffer(cb, s->image, sl, buf, k, out);
+        decode(e, cb, buf, d, dl, k, g, s);
+        budget_charge(tx_family(family(d->client_format), d->format), texels);
+    }
+    free(out);
+    free(g);
+    copy_count(CP_ENC);
+    VKB_ONCE(VKB_LOG_INFO, "BC emulation: a copy from a decoded BC image (format %d) into a transcoded one (format %d) re-encoded "
+             "(logged once, counted in the BC copies line)", s->format, d->format);
+}
+
+/* Regions cut to the levels and, between ASTC 6x6 / 8x8 images, to block edges: how many are left. */
+static uint32_t cut_regions(const vkb_emu_image *s, const vkb_emu_image *d, int kind, VkImageCopy *c, uint32_t n)
+{
+    uint32_t k = 0, dropped = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        clamp_region(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent);
+        if (!c[i].extent.width || !c[i].extent.height || !c[i].extent.depth) continue;
+        /* a re-encoded copy encodes what it covers, like an upload; a blit has no block edges */
+        if (kind >= 2 || on_blocks(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent)) c[k++] = c[i];
+        else dropped++;
+    }
+    if (dropped) copy_count(CP_SKIP_EDGE);
+    return k;
 }
 
 int vkb_emu_copy_image(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n,
@@ -1412,16 +1993,16 @@ int vkb_emu_copy_image(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkIma
     int kind = copy_kind(s, d);
     if (kind < 0) {
         if (kind == -1) skipped_copy();
+        else copy_count(CP_SKIP_BLOCKS);
         return 1;
     }
     VkImageCopy *c = (VkImageCopy *)regions;
-    uint32_t k0 = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        clamp_region(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent);
-        if (on_blocks(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent)) c[k0++] = c[i];
-    }
-    n = k0;
+    n = cut_regions(s, d, kind, c, n);
     if (!n) return 1;
+    if (kind >= 2) {
+        copy_mixed(e, cb, s, sl, d, dl, kind, n, c);
+        return 1;
+    }
     if (!kind) {
         e->dev->real.vkCmdCopyImage(cb, src, sl, dst, dl, n, regions);
         return 1;
@@ -1439,45 +2020,37 @@ int vkb_emu_copy_image2(vkb_emu_device *e, VkCommandBuffer cb, const VkCopyImage
 {
     vkb_emu_image *s = bc_image(e, info->srcImage), *d = bc_image(e, info->dstImage);
     if (!s && !d) return 0;
-    if (!s) {
-        VkImageCopy *r = malloc((info->regionCount ? info->regionCount : 1) * sizeof(*r));
-        for (uint32_t i = 0; r && i < info->regionCount; i++) {
-            const VkImageCopy2 *q = &info->pRegions[i];
-            r[i] = (VkImageCopy){q->srcSubresource, q->srcOffset, q->dstSubresource, q->dstOffset, q->extent};
-        }
-        if (r) copy_blocks_in(e, cb, info->srcImage, info->srcImageLayout, d, info->dstImageLayout, info->regionCount, r);
-        free(r);
-        return 1;
-    }
-    int kind = copy_kind(s, d);
-    if (kind < 0) {
-        if (kind == -1) skipped_copy();
-        return 1;
-    }
-    VkImageCopy2 *c = (VkImageCopy2 *)info->pRegions;
-    uint32_t k0 = 0;
+    VkImageCopy *r = malloc((info->regionCount ? info->regionCount : 1) * sizeof(*r));
+    if (!r) return 1;
     for (uint32_t i = 0; i < info->regionCount; i++) {
-        clamp_region(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent);
-        if (on_blocks(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent)) c[k0++] = c[i];
+        const VkImageCopy2 *q = &info->pRegions[i];
+        r[i] = (VkImageCopy){q->srcSubresource, q->srcOffset, q->dstSubresource, q->dstOffset, q->extent};
     }
-    ((VkCopyImageInfo2 *)info)->regionCount = k0;
-    if (!k0) return 1;
-    if (!kind) {
-        e->dev->real.vkCmdCopyImage2(cb, info);
-        return 1;
+    int kind = s ? copy_kind(s, d) : -3;
+    if (kind == 0) {
+        /* as recorded (the regions' pNext kept), cut to the levels and block edges */
+        VkImageCopy2 *c = (VkImageCopy2 *)info->pRegions;
+        uint32_t k = 0, dropped = 0;
+        for (uint32_t i = 0; i < info->regionCount; i++) {
+            clamp_region(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent);
+            if (!c[i].extent.width || !c[i].extent.height || !c[i].extent.depth) continue;
+            if (on_blocks(s, d, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent)) c[k++] = c[i];
+            else dropped++;
+        }
+        if (dropped) copy_count(CP_SKIP_EDGE);
+        ((VkCopyImageInfo2 *)info)->regionCount = k;
+        if (k) e->dev->real.vkCmdCopyImage2(cb, info);
+    } else {
+        vkb_emu_copy_image(e, cb, info->srcImage, info->srcImageLayout, info->dstImage, info->dstImageLayout, info->regionCount, r);
     }
-    VkImageBlit *b = malloc((info->regionCount ? info->regionCount : 1) * sizeof(*b));
-    uint32_t k = 0;
-    for (uint32_t i = 0; b && i < info->regionCount; i++)
-        k += blit_region(s, &c[i].srcSubresource, &c[i].dstSubresource, &c[i].srcOffset, &c[i].dstOffset, &c[i].extent, &b[k]);
-    if (k) e->dev->real.vkCmdBlitImage(cb, info->srcImage, info->srcImageLayout, info->dstImage, info->dstImageLayout, k, b, VK_FILTER_NEAREST);
-    free(b);
+    free(r);
     return 1;
 }
 
 int vkb_emu_bcn_blocks_readback(vkb_emu_device *e, VkImage img)
 {
     if (!bc_image(e, img)) return 0;
+    copy_count(CP_SKIP_READBACK);
     VKB_ONCE(VKB_LOG_WARN, "BC emulation: reading a BC image back to a buffer is not supported (logged once)");
     return 1;
 }
@@ -1574,6 +2147,8 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
 {
     bcn_state *s = dev->emu->bcn;
     if (!s) return;
+    budget_totals();
+    copies_line(1);
     vkb_emu_bcn_quiesce(dev);
     for (int q = 0; q < 3; q++)
         for (int i = 0; i < FAM_COUNT; i++)
@@ -1587,6 +2162,7 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
         chunk_destroy(dev->emu, &s->idle[i]);
     }
     free(s->idle);
+    free(s->pin);
     pthread_cond_destroy(&s->pcond);
     pthread_mutex_destroy(&s->plock);
     pthread_mutex_destroy(&s->lock);

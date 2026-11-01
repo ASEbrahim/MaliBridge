@@ -1,5 +1,5 @@
 #!/bin/bash
-# Low memory on the server (server_memory.c vkb_mem_low; MaliBridge#18), a server of its own per step:
+# Low memory on the server (server_memory.c vkb_mem_low;), a server of its own per step:
 #   1  told 500 MB are free of 8000 (VKBRIDGE_FAKE_MEMAVAIL_MB / _MEMTOTAL_MB): poolfull_check lowmem
 #      passes (the pool fills to 8 pools' worth before and after), the server says "memory low"
 #      once, its memory line has the free memory, "(low)" and the overflow pool count, and the idle

@@ -6,7 +6,7 @@
  * vkGetPhysicalDeviceImageFormatProperties2 at DRM-modifier tiling, the LINEAR modifier (the only one
  * DroidDeck's compositor advertises), DMA_BUF external memory, the image's usage and MUTABLE_FORMAT
  * with its UNORM / SRGB view list, and keeps the modifier only when the answer is VK_SUCCESS with
- * EXPORTABLE; with none kept it aborts on "modifiers.size() > 0" (MaliBridge#10, Mali-G77 r32p1,
+ * EXPORTABLE; with none kept it aborts on "modifiers.size > 0" (, Mali-G77 r32p1,
  * where the export emulation was on). Then it creates the image with that modifier list, gives it
  * dedicated memory that exports a dma-buf, reads the modifier and plane 0's layout, and exports.
  *
@@ -144,7 +144,7 @@ static int submit(ctx *c, VkCommandBuffer cb)
 
 /* gamescope's import of a client's LINEAR dma-buf (BInit with a wlr_dmabuf_attributes): its query
  * at the LINEAR modifier (sampled, MUTABLE_FORMAT with the view list) must be IMPORTABLE, or it makes
- * an OPTIMAL image with an implicit layout (MaliBridge#10 on the S10+ under dmabufmod: 3993600 bytes
+ * an OPTIMAL image with an implicit layout (on the S10+ under dmabufmod: 3993600 bytes
  * asked of a 3719168-byte dma-buf, VK_ERROR_INVALID_EXTERNAL_HANDLE). Then the image at the explicit
  * LINEAR modifier with the exporter's plane layout: its memory requirement must fit in the dma-buf,
  * the import must bind, and a copy out of it must read red at the exporter's layout. */
@@ -398,7 +398,7 @@ int main(void)
     query(c, "flat texture", VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     made(c, 64, 48);
     made(c, 333, 1); /* one row: the driver's single-row pitch (Mali answers 0) */
-    made(c, 1280, 720); /* Steam's windows on the S10+ (MaliBridge#10 under dmabufmod) */
+    made(c, 1280, 720); /* Steam's windows on the S10+ (under dmabufmod) */
     made(c, 1279, 721); /* odd sizes: the row pitch and size alignment */
     D(vkDestroyCommandPool)(c->dev, c->pool, NULL);
     D(vkDestroyDevice)(c->dev, NULL);

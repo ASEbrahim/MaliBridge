@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #define SX_SAMSUNG_DEFAULT_MS 1000
+#define SX_ORDER_SAMSUNG_DEFAULT_MS 1000
 #define SX_DEVICE_END_WAIT_MS 2000
 
 typedef struct sx_job {
@@ -53,6 +54,8 @@ static sx_destroy *sx_held;
 static uint64_t sx_timeouts, sx_late;
 
 static int sx_ms[VKB_MAX_TABLES]; /* per device: the deadline, 0 off */
+static int so_ms[VKB_MAX_TABLES]; /* per device: the order wait's deadline for an export, 0 off */
+static uint64_t so_skipped;
 static PFN_vkGetSemaphoreFdKHR next_sem_fd[VKB_MAX_TABLES];
 static PFN_vkGetFenceFdKHR next_fence_fd[VKB_MAX_TABLES];
 static PFN_vkDestroySemaphore next_sem_destroy[VKB_MAX_TABLES];
@@ -183,12 +186,57 @@ static VkResult sx_run(sx_job *j, int ms, int *pFd)
     return VK_SUCCESS;
 }
 
+/* VKBRIDGE_SYNCFD_ORDER_MS for a device of that driver: 0 off. */
+static int so_setting(uint32_t driver_id, int *from_env)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_SYNCFD_ORDER_MS");
+    *from_env = v && *v;
+    int ms = *from_env ? atoi(v) : (driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ? SX_ORDER_SAMSUNG_DEFAULT_MS : 0);
+    return ms < 0 ? 0 : ms;
+}
+
+int vkb_syncfd_order_ms(uint32_t table, uint32_t cmd)
+{
+    if (cmd != VKB_CMD_vkGetSemaphoreFdKHR && cmd != VKB_CMD_vkGetFenceFdKHR) return 0;
+    if (!table || table >= VKB_MAX_TABLES) return 0;
+    return __atomic_load_n(&so_ms[table], __ATOMIC_RELAXED);
+}
+
+uint32_t vkb_syncfd_client_knobs(uint32_t driver_id)
+{
+    int from_env;
+    int ms = so_setting(driver_id, &from_env);
+    if (!ms && !from_env) return 0;
+    return (ms ? VKB_KNOB_ON : VKB_KNOB_OFF) << VKB_KNOB_SYNCFD_SIDE_SHIFT;
+}
+
+/* The order wait ran out for this export (server_conn.c): a sync-fd one is answered with fd -1, the
+ * driver not called (its signal may not be in the driver yet); anything else waits on. 1: answered. */
+static int so_answer(int sync_fd, const char *what, int *pFd)
+{
+    if (!vkb_srv_order_skipped()) return 0;
+    if (!sync_fd) {
+        vkb_srv_order_finish();
+        return 0;
+    }
+    vkb_srv_order_done();
+    uint64_t n = __atomic_add_fetch(&so_skipped, 1, __ATOMIC_RELAXED);
+    vkb_srv_proc *p = vkb_srv_current_proc();
+    if (n <= 8 || (n & (n - 1)) == 0)
+        VKB_WARN("sync-fd export: %s answered with fd -1 after the order wait's deadline, the driver not called (pid %d %s; "
+                 "%llu so far; VKBRIDGE_SYNCFD_ORDER_MS)",
+                 what, p ? p->pid : 0, p ? p->comm : "?", (unsigned long long)n);
+    *pFd = -1;
+    return 1;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL sx_GetSemaphoreFdKHR(VkDevice d, const VkSemaphoreGetFdInfoKHR *gi, int *pFd)
 {
     vkb_srv_table *t = vkb_srv_current_table();
     uint32_t id = t ? t->id : 0;
     PFN_vkGetSemaphoreFdKHR next = t ? next_sem_fd[id] : NULL;
     if (!next) return VK_ERROR_DEVICE_LOST;
+    if (so_answer(gi && gi->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, "vkGetSemaphoreFdKHR", pFd)) return VK_SUCCESS;
     sx_job *j;
     if (!gi || gi->handleType != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT || !sx_ms[id] || !(j = calloc(1, sizeof(*j))))
         return next(d, gi, pFd);
@@ -208,6 +256,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sx_GetFenceFdKHR(VkDevice d, const VkFence
     uint32_t id = t ? t->id : 0;
     PFN_vkGetFenceFdKHR next = t ? next_fence_fd[id] : NULL;
     if (!next) return VK_ERROR_DEVICE_LOST;
+    if (so_answer(gi && gi->handleType == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT, "vkGetFenceFdKHR", pFd)) return VK_SUCCESS;
     sx_job *j;
     if (!gi || gi->handleType != VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT || !sx_ms[id] || !(j = calloc(1, sizeof(*j))))
         return next(d, gi, pFd);
@@ -264,13 +313,14 @@ void vkb_syncfd_device_init(vkb_srv_table *t)
 {
     if (!t || t->id >= VKB_MAX_TABLES) return;
     const char *v = vkb_srv_env("VKBRIDGE_SYNCFD_EXPORT_MS");
-    int ms = v && *v ? atoi(v) : (t->pd && t->pd->info.driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ? SX_SAMSUNG_DEFAULT_MS : 0);
+    uint32_t drv = t->pd ? t->pd->info.driver_id : 0;
+    int ms = v && *v ? atoi(v) : (drv == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ? SX_SAMSUNG_DEFAULT_MS : 0);
+    int oenv, oms = so_setting(drv, &oenv);
     if (ms < 0) ms = 0;
+    sx_ms[t->id] = 0;
+    so_ms[t->id] = 0;
+    if ((!ms && !oms) || !t->dt.vkDestroySemaphore || !t->dt.vkDestroyFence) return;
     sx_ms[t->id] = ms;
-    if (!ms || !t->dt.vkDestroySemaphore || !t->dt.vkDestroyFence) {
-        sx_ms[t->id] = 0;
-        return;
-    }
     next_sem_fd[t->id] = t->dt.vkGetSemaphoreFdKHR;
     next_fence_fd[t->id] = t->dt.vkGetFenceFdKHR;
     next_sem_destroy[t->id] = t->dt.vkDestroySemaphore;
@@ -279,14 +329,21 @@ void vkb_syncfd_device_init(vkb_srv_table *t)
     if (t->dt.vkGetFenceFdKHR) t->dt.vkGetFenceFdKHR = sx_GetFenceFdKHR;
     t->dt.vkDestroySemaphore = sx_DestroySemaphore;
     t->dt.vkDestroyFence = sx_DestroyFence;
-    VKB_ONCE(VKB_LOG_INFO, "sync-fd export: answered within %d ms (VKBRIDGE_SYNCFD_EXPORT_MS%s)", ms,
-             v && *v ? "" : "; Samsung's driver's default");
+    __atomic_store_n(&so_ms[t->id], oms, __ATOMIC_RELAXED); /* last: the layer is in place before the order wait relies on it */
+    if (ms)
+        VKB_ONCE(VKB_LOG_INFO, "sync-fd export: answered within %d ms (VKBRIDGE_SYNCFD_EXPORT_MS%s)", ms,
+                 v && *v ? "" : "; Samsung's driver's default");
+    if (oms)
+        VKB_ONCE(VKB_LOG_INFO, "sync-fd export: waits at most %d ms for the process's earlier requests (VKBRIDGE_SYNCFD_ORDER_MS%s)",
+                 oms, oenv ? "" : "; Samsung's driver's default");
 }
 
 /* Before the device goes: its exports still in the driver are waited for, then their held-back destroys done; 1 when one is still in the driver. */
 int vkb_syncfd_device_destroy(vkb_srv_table *t)
 {
-    if (!t || t->id >= VKB_MAX_TABLES || !sx_ms[t->id]) return 0;
+    if (!t || t->id >= VKB_MAX_TABLES) return 0;
+    __atomic_store_n(&so_ms[t->id], 0, __ATOMIC_RELAXED);
+    if (!sx_ms[t->id]) return 0;
     uint32_t id = t->id;
     uint64_t until = sx_now() + SX_DEVICE_END_WAIT_MS * 1000000ull;
     pthread_mutex_lock(&sx_lock);

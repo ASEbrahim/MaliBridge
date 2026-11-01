@@ -74,7 +74,7 @@ start VKBRIDGE_FAKE_DRIVER_VERSION=r38p1-01bet0:jm VKBRIDGE_FAKE_API=1.1
 r=$(all)
 case "$r" in "Xwayland 1.1 steam 1.1 steamwebhelper 1.1 gamescope "*" game 1.1") true ;; *) false ;; esac &&
   grep -q "a1: .*(Arm driver r38, job manager, Vulkan 1.1 to apps, VK_EXT_extended_dynamic_state offered; " "$log"
-step $? "r38p1 beta job manager as a Vulkan 1.1 driver with the extension (#11's S10 / Note10+): gate on: $r"
+step $? "r38p1 beta job manager as a Vulkan 1.1 driver with the extension (S10 / Note10+): gate on: $r"
 # 6
 start VKBRIDGE_FAKE_DRIVER_VERSION=r40p0:jm VKBRIDGE_STEAM_API_CAP=1.x9
 r=$(all)
@@ -94,5 +94,23 @@ for v in r54p1 r49p1:csf r54p1:jm; do
   [ "$r" = "Xwayland $drv steam $drv steamwebhelper $drv gamescope $drv game $drv" ] && [ "$(caps)" = 0 ]
   step $? "$v: nothing capped: $r"
 done
+
+# 9
+for v in r38p1:csf r43p0:csf; do
+  start VKBRIDGE_FAKE_DRIVER_VERSION=$v
+  r=$(all)
+  [ "$r" = "Xwayland 1.1 steam 1.1 steamwebhelper 1.1 gamescope 1.2 game $drv" ] &&
+    grep -q "api cap: .*(Arm driver r${v:1:2}, CSF, Vulkan $drv to apps, VK_EXT_extended_dynamic_state offered; " "$log" && [ "$(caps)" = 1 ]
+  step $? "$v (G715 on r38p1), by default: $r"
+done
+start VKBRIDGE_FAKE_DRIVER_VERSION=unknown:csf
+r=$(all)
+[ "$r" = "Xwayland $drv steam $drv steamwebhelper $drv gamescope $drv game $drv" ] && [ "$(caps)" = 0 ]
+step $? "unknown:csf: nothing capped: $r"
+start VKBRIDGE_FAKE_DRIVER_VERSION=r32p1:csf VKBRIDGE_FAKE_API=1.1 VKBRIDGE_SERVER_HIDE_EXTS=VK_EXT_extended_dynamic_state
+r=$(all)
+case "$r" in "Xwayland 1.1 steam 1.1 steamwebhelper 1.1 gamescope "*" game 1.1") true ;; *) false ;; esac && [ "$(caps)" = 0 ] &&
+  ! grep -q "a1: " "$log"
+step $? "r32p1:csf as a Vulkan 1.1 driver without the extension (G610/G710 phones): gate off: $r"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

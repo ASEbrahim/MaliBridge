@@ -1,5 +1,5 @@
 #!/bin/bash
-# gs_hide (issue #11: server_errata_gs.c) on the desktop driver, with a server of its own per step
+# gs_hide (server_errata_gs.c) on the desktop driver, with a server of its own per step
 # (socket, cache directory, session folder). The Galaxy S10+'s r38p1 beta driver is imitated:
 # VKBRIDGE_FAKE_DRIVER_VERSION=v1.r38p1-01bet0 puts the desktop driver in the erratum's range,
 # VKBRIDGE_TEST_CRASH_PIPELINE=gs faults inside every pipeline creation with a geometry stage (the

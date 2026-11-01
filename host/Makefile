@@ -18,10 +18,18 @@ COMMON_SRC := $(VKB)/common/vkb_wire.c $(VKB)/common/gen/vkb_gen_structs.c
 SERVER_SRC := $(wildcard $(SRV)/*.c) $(VKB)/common/gen/vkb_gen_server.c $(COMMON_SRC) $(VKB)/common/vkb_caps.c
 CLIENT_SRC := $(wildcard $(VKB)/client/*.c) $(VKB)/common/gen/vkb_gen_client.c $(COMMON_SRC) $(VKB)/common/vkb_caps.c
 
-TESTS := vkbridge-smoke poolfull_check bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus dynstate_check vbstride_check viewport_check flip_corpus clampzero_check clampzero_corpus begin_check shlbarrier_corpus cullmode_check dedimport_check cached_check polygon_check gpuview_check dedhint_check planar_check fdprops_check memclass_check procaddr_check exitclean_check effects_corpus asyncpipe_check texcap_check robust2_check fp16_check gshide_check featclamp_check promote_check downgrade_corpus xfb_check shmbarrier_check shmbarrier_corpus stencillayout_check dynrend_check wave32_check wave32_corpus vidyn_check ycbcr_compute_check gsexport_check present_late_check hotpath_bench hotpath_bench_old syncfd_check layer-app
+TESTS := vkbridge-smoke poll_check reqcache_check wginit_check hitch_check syncmirror_check poolfull_check bcn_check opaque_check dmabuf_image_check recycle_check desc_traffic_check query_check placed_check crash_contain_check desc_limits_check flicker_check nulldesc_check pcache_check divisor_check gsfold_check view3d_check viewchurn_check wait_check bitwise_check bitwise_corpus dynstate_check vbstride_check viewport_check flip_corpus clampzero_check clampzero_corpus begin_check shlbarrier_corpus cullmode_check dedimport_check cached_check polygon_check gpuview_check dedhint_check planar_check fdprops_check memclass_check procaddr_check exitclean_check effects_corpus asyncpipe_check texcap_check robust2_check fp16_check gshide_check featclamp_check promote_check downgrade_corpus xfb_check shmbarrier_check shmbarrier_corpus stencillayout_check dynrend_check wave32_check wave32_corpus vidyn_check ycbcr_compute_check gsexport_check present_late_check hotpath_bench hotpath_bench_old syncfd_check dmabufsync_check timeline_check layer-app
 
 TESTS += eventstatus_check
+TESTS += compilegate_unit
+TESTS += bcburst_check
+TESTS += compileburst_check
+TESTS += presentwait_check
+TESTS += dabreg_unit dmabufahb_check
 TESTS += querystuck_check
+TESTS += sparse_check
+TESTS += present_block_check
+TESTS += stale_frames_check
 
 all: $(OUT)/vkbridge-server $(OUT)/libvulkan_droidbridge.so $(OUT)/vkbridge_icd.json $(addprefix $(OUT)/,$(TESTS))
 
@@ -56,6 +64,16 @@ $(OUT)/layer-app: $(VKB)/tests/layer_app.c
 
 $(OUT)/bcn_check: $(VKB)/server/bc_spv.h
 
+# dabreg_unit: the register of dma-bufs over AHardwareBuffers (server_dab_reg.c) on its own.
+$(OUT)/dabreg_unit: $(VKB)/tests/dabreg_unit.c $(SRV)/server_dab_reg.c $(SRV)/server_dab.h $(VKB)/common/vkb_dmabuf_ahb.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) -I$(VKB)/common -I$(SRV) -o $@ $(VKB)/tests/dabreg_unit.c $(SRV)/server_dab_reg.c -lpthread
+
+# compilegate_unit: server_compile_gate.c on its own, the server's functions stubbed in the test.
+$(OUT)/compilegate_unit: $(VKB)/tests/compilegate_unit.c $(SRV)/server_compile_gate.c $(SRV)/vkb_server.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) $(INC) -I$(SRV) -o $@ $(VKB)/tests/compilegate_unit.c -lpthread
+
 # hotpath_bench_old: the same with the arena and the null-descriptor set map as before 2026-10-21.
 $(OUT)/hotpath_bench: $(VKB)/tests/hotpath_bench.c $(COMMON_SRC) $(VKB)/server/nd_map.h
 	@mkdir -p $(OUT)
@@ -84,6 +102,7 @@ $(OUT)/ycbcr_compute_check: $(VKB)/tests/ycbcr_comp.inc
 $(OUT)/xfb_check: $(VKB)/tests/xfb_xfb_vert.inc $(VKB)/tests/xfb_plain_vert.inc $(VKB)/tests/xfb_so_geom.inc
 
 $(OUT)/asyncpipe_check: $(VKB)/tests/cullmode_vert.inc $(VKB)/tests/dynstate_frag.inc
+$(OUT)/compileburst_check: $(VKB)/tests/cullmode_vert.inc $(VKB)/tests/dynstate_frag.inc
 
 $(OUT)/polygon_check: $(VKB)/tests/polygon_vert.inc $(VKB)/tests/polygon_frag.inc
 

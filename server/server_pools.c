@@ -10,7 +10,7 @@
  * Installed beneath the set-name map (server_dsmap.c), so named and plain allocations both grow.
  *
  * Overflow pools are kept through resets for the next frame, so an app pool that once grew stays
- * that big in the driver (DXVK's pools on the XRing O3 grew to 8 times their size, MaliBridge#16,
+ * that big in the driver (DXVK's pools on the XRing O3 grew to 8 times their size,
  * in the same game whose server the system closed for lack of memory, #18). While memory is low
  * (vkb_mem_low), a reset frees the overflow pools nothing was allocated from since the last one.
  */

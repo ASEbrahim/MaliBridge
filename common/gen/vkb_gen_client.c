@@ -5568,11 +5568,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdBeginRenderPass2(VkCommandBuffer c
     vkb_wire_vkCmdBeginRenderPass2(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
 }
 
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
-{
-    vkb_wire_vkCmdBeginRendering(commandBuffer, pRenderingInfo);
-}
-
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer, uint32_t counterBufferCount, const VkBuffer* pCounterBuffers, const VkDeviceSize* pCounterBufferOffsets)
 {
     vkb_wire_vkCmdBeginTransformFeedbackEXT(commandBuffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets);
@@ -5758,26 +5753,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndConditionalRenderingEXT(VkComma
     vkb_wire_vkCmdEndConditionalRenderingEXT(commandBuffer);
 }
 
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRenderPass(VkCommandBuffer commandBuffer)
-{
-    vkb_wire_vkCmdEndRenderPass(commandBuffer);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
-{
-    vkb_wire_vkCmdEndRenderPass2(commandBuffer, pSubpassEndInfo);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRendering(VkCommandBuffer commandBuffer)
-{
-    vkb_wire_vkCmdEndRendering(commandBuffer);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRendering2KHR(VkCommandBuffer commandBuffer, const VkRenderingEndInfoKHR* pRenderingEndInfo)
-{
-    vkb_wire_vkCmdEndRendering2KHR(commandBuffer, pRenderingEndInfo);
-}
-
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer, uint32_t counterBufferCount, const VkBuffer* pCounterBuffers, const VkDeviceSize* pCounterBufferOffsets)
 {
     vkb_wire_vkCmdEndTransformFeedbackEXT(commandBuffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets);
@@ -5826,16 +5801,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdPushDescriptorSet(VkCommandBuffer 
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdPushDescriptorSet2(VkCommandBuffer commandBuffer, const VkPushDescriptorSetInfo* pPushDescriptorSetInfo)
 {
     vkb_wire_vkCmdPushDescriptorSet2(commandBuffer, pPushDescriptorSetInfo);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdResetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask)
-{
-    vkb_wire_vkCmdResetEvent(commandBuffer, event, stageMask);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags2 stageMask)
-{
-    vkb_wire_vkCmdResetEvent2(commandBuffer, event, stageMask);
 }
 
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageResolve* pRegions)
@@ -5981,16 +5946,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdSetDiscardRectangleEnableEXT(VkCom
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdSetDiscardRectangleModeEXT(VkCommandBuffer commandBuffer, VkDiscardRectangleModeEXT discardRectangleMode)
 {
     vkb_wire_vkCmdSetDiscardRectangleModeEXT(commandBuffer, discardRectangleMode);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdSetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask)
-{
-    vkb_wire_vkCmdSetEvent(commandBuffer, event, stageMask);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event, const VkDependencyInfo* pDependencyInfo)
-{
-    vkb_wire_vkCmdSetEvent2(commandBuffer, event, pDependencyInfo);
 }
 
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdSetExtraPrimitiveOverestimationSizeEXT(VkCommandBuffer commandBuffer, float extraPrimitiveOverestimationSize)
@@ -6178,16 +6133,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateComputePipelines(VkDevice d
     return vkb_wire_vkCreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkEvent* pEvent)
-{
-    return vkb_wire_vkCreateEvent(device, pCreateInfo, pAllocator, pEvent);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFence* pFence)
-{
-    return vkb_wire_vkCreateFence(device, pCreateInfo, pAllocator, pFence);
-}
-
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFramebuffer* pFramebuffer)
 {
     return vkb_wire_vkCreateFramebuffer(device, pCreateInfo, pAllocator, pFramebuffer);
@@ -6233,11 +6178,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateSamplerYcbcrConversion(VkDe
     return vkb_wire_vkCreateSamplerYcbcrConversion(device, pCreateInfo, pAllocator, pYcbcrConversion);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore)
-{
-    return vkb_wire_vkCreateSemaphore(device, pCreateInfo, pAllocator, pSemaphore);
-}
-
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkShaderModule* pShaderModule)
 {
     return vkb_wire_vkCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
@@ -6251,16 +6191,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateTensorARM(VkDevice device, 
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateTensorViewARM(VkDevice device, const VkTensorViewCreateInfoARM* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkTensorViewARM* pView)
 {
     return vkb_wire_vkCreateTensorViewARM(device, pCreateInfo, pAllocator, pView);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyEvent(VkDevice device, VkEvent event, const VkAllocationCallbacks* pAllocator)
-{
-    vkb_wire_vkDestroyEvent(device, event, pAllocator);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator)
-{
-    vkb_wire_vkDestroyFence(device, fence, pAllocator);
 }
 
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer, const VkAllocationCallbacks* pAllocator)
@@ -6301,11 +6231,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroySampler(VkDevice device, VkSam
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroySamplerYcbcrConversion(VkDevice device, VkSamplerYcbcrConversion ycbcrConversion, const VkAllocationCallbacks* pAllocator)
 {
     vkb_wire_vkDestroySamplerYcbcrConversion(device, ycbcrConversion, pAllocator);
-}
-
-static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroySemaphore(VkDevice device, VkSemaphore semaphore, const VkAllocationCallbacks* pAllocator)
-{
-    vkb_wire_vkDestroySemaphore(device, semaphore, pAllocator);
 }
 
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks* pAllocator)
@@ -6397,11 +6322,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetImageSubresourceLayout2(VkDevice d
     vkb_wire_vkGetImageSubresourceLayout2(device, image, pSubresource, pLayout);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR* pGetFdInfo, int* pFd)
-{
-    return vkb_wire_vkGetMemoryFdKHR(device, pGetFdInfo, pFd);
-}
-
 static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice physicalDevice, uint32_t* pTimeDomainCount, VkTimeDomainKHR* pTimeDomains)
 {
     if (!vkb_physdev_has_ext(physicalDevice, "VK_EXT_calibrated_timestamps|VK_KHR_calibrated_timestamps")) {
@@ -6453,11 +6373,6 @@ static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetRenderingAreaGranularity(VkDevice 
     vkb_wire_vkGetRenderingAreaGranularity(device, pRenderingAreaInfo, pGranularity);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd)
-{
-    return vkb_wire_vkGetSemaphoreFdKHR(device, pGetFdInfo, pFd);
-}
-
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetShaderModuleCreateInfoIdentifierEXT(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, VkShaderModuleIdentifierEXT* pIdentifier)
 {
     vkb_wire_vkGetShaderModuleCreateInfoIdentifierEXT(device, pCreateInfo, pIdentifier);
@@ -6478,29 +6393,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkMergePipelineCaches(VkDevice devi
     return vkb_wire_vkMergePipelineCaches(device, dstCache, srcCacheCount, pSrcCaches);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueBindSparse(VkQueue queue, uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence)
-{
-    return vkb_wire_vkQueueBindSparse(queue, bindInfoCount, pBindInfo, fence);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkResetEvent(VkDevice device, VkEvent event)
-{
-    return vkb_wire_vkResetEvent(device, event);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences)
-{
-    return vkb_wire_vkResetFences(device, fenceCount, pFences);
-}
-
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkSetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory, float priority)
 {
     vkb_wire_vkSetDeviceMemoryPriorityEXT(device, memory, priority);
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo* pSignalInfo)
-{
-    return vkb_wire_vkSignalSemaphore(device, pSignalInfo);
 }
 
 static VKAPI_ATTR void VKAPI_CALL vkb_ep_vkTrimCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolTrimFlags flags)
@@ -6948,6 +6843,8 @@ const vkb_proc_desc vkb_client_procs[] = {
     {"vkUpdateDescriptorSetWithTemplateKHR", (PFN_vkVoidFunction)vkb_ep_vkUpdateDescriptorSetWithTemplate, VKB_LEVEL_DEVICE, "VK_KHR_descriptor_update_template", 0},
     {"vkUpdateDescriptorSets", (PFN_vkVoidFunction)vkb_ep_vkUpdateDescriptorSets, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 0, 0)},
     {"vkWaitForFences", (PFN_vkVoidFunction)vkb_ep_vkWaitForFences, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 0, 0)},
+    {"vkWaitForPresent2KHR", (PFN_vkVoidFunction)vkb_ep_vkWaitForPresent2KHR, VKB_LEVEL_DEVICE, "VK_KHR_present_wait2", 0},
+    {"vkWaitForPresentKHR", (PFN_vkVoidFunction)vkb_ep_vkWaitForPresentKHR, VKB_LEVEL_DEVICE, "VK_KHR_present_wait", 0},
     {"vkWaitSemaphores", (PFN_vkVoidFunction)vkb_ep_vkWaitSemaphores, VKB_LEVEL_DEVICE, NULL, VK_MAKE_API_VERSION(0, 1, 2, 0)},
     {"vkWaitSemaphoresKHR", (PFN_vkVoidFunction)vkb_ep_vkWaitSemaphores, VKB_LEVEL_DEVICE, "VK_KHR_timeline_semaphore", 0},
 };

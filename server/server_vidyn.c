@@ -4,7 +4,7 @@
  * VK_EXT_vertex_input_dynamic_state for Zink on every Mali: vkCmdSetVertexInputEXT's vertex input
  * made static in pipeline variants.
  *
- * Without the extension Zink (Mesa 26.0 to 26.2.4; the DroidDeck guest has 26.2.3) bakes the vertex
+ * Without the extension Zink (Mesa 26.0 to 26.2.4; the DroidDeck guest has 26.2.3-26.2.4) bakes the vertex
  * input into each pipeline, and when only the vertex elements change between two draws it keeps
  * drawing with the pipeline of the old ones (Mesa 167df22a adds vertex_input_changed to the
  * condition): text in Balatro and other OpenGL games read its vertices with another layout and
@@ -67,6 +67,25 @@
  * Pipeline libraries: on Mali, Zink makes none (no full EDS3); VK_EXT_graphics_pipeline_library is
  * hidden from Zink where this layer makes variants, so a desktop driver behaves the same.
  *
+ * Extended dynamic state 1 and 2 (VKB_VIDYN_EDS, vkb_eds_mode). Zink takes vertex input dynamic
+ * state only together with EDS2, and EDS2 only with EDS1 (zink_screen.c init_driver_workarounds),
+ * so on a driver with neither - Mali's Vulkan 1.1 drivers, r32p1 on the G68 (Galaxy A53), G77
+ * (Retroid Pocket 4 Pro), G610, G710 - it dropped the extension offered here and baked every state
+ * into its pipelines: Balatro's text stayed missing there, and Chromium on Zink (Steam's menus drawn
+ * on the GPU) drew its translucent blurred bars from the wrong content. The same holds where the
+ * Steam-mode fix hides the driver's EDS1 (server_emu.c a1_decide). There the server offers both extensions
+ * itself, to Zink only (VKBRIDGE_EMU_EDS=0: not): the driver gets neither extension nor feature,
+ * vkCmdSetCullMode / FrontFace / PrimitiveTopology / DepthTestEnable / DepthWriteEnable /
+ * DepthCompareOp / DepthBoundsTestEnable / StencilTestEnable / StencilOp / RasterizerDiscardEnable /
+ * DepthBiasEnable / PrimitiveRestartEnable are noted per command buffer and never reach it, and
+ * every pipeline with one of those dynamic is kept like a vertex-input one: its variants have the
+ * noted values static (a state not set yet keeps the create info's value). vkCmdSetViewportWithCount
+ * and vkCmdSetScissorWithCount become vkCmdSetViewport / vkCmdSetScissor at index 0, with the counts
+ * static in the variant (VIEWPORT / SCISSOR dynamic in place of the WITH_COUNT ones). The logic op
+ * and patch control points of EDS2 are reported unsupported, and EDS3 is hidden from Zink beside it.
+ * A pipeline with dynamic vertex strides but no dynamic vertex input is not expected from Zink here
+ * (it always has the vertex input dynamic with EDS2); its strides would be the create info's.
+ *
  * What it costs: one compile per pipeline per vertex input, at the first draw that needs it (as
  * Zink without the extension compiles one pipeline per vertex input at its own draw), and the
  * kept create infos and shader code; the totals are logged at the device's end.
@@ -99,10 +118,21 @@ static int env_off(const char *name)
     return v && !strcmp(v, "0");
 }
 
+int vkb_eds_mode(const vkb_srv_table *inst, VkPhysicalDevice pd)
+{
+    if (inst && inst->is_device) inst = inst->parent;
+    if (!inst || !inst->zink || !inst->real.vkEnumerateDeviceExtensionProperties || !inst->real.vkGetPhysicalDeviceProperties ||
+        env_off("VKBRIDGE_EMU_VIDYN") || env_off("VKBRIDGE_EMU_EDS"))
+        return 0;
+    return !vkb_emu_driver_eds(&inst->real, pd);
+}
+
 int vkb_vidyn_mode(const vkb_srv_table *inst, VkPhysicalDevice pd)
 {
     if (inst && inst->is_device) inst = inst->parent;
     if (!inst || !inst->zink || !inst->real.vkEnumerateDeviceExtensionProperties || env_off("VKBRIDGE_EMU_VIDYN")) return VKB_VIDYN_OFF;
+    /* the server's extended dynamic state is made static in this layer's variants: every pipeline is one */
+    if (vkb_eds_mode(inst, pd)) return VKB_VIDYN_EMULATED;
     const char *erratum = vkb_errata_hidden_ext(inst, pd);
     if (vkb_emu_driver_vi_dyn(&inst->real, pd) && !vkb_emu_ext_hidden(VIDYN_EXT) && !(erratum && !strcmp(erratum, VIDYN_EXT)))
         return VKB_VIDYN_NATIVE;
@@ -126,11 +156,27 @@ int vkb_vidyn_variants(const vkb_srv_table *inst, VkPhysicalDevice pd)
 
 /* ------------------------------------------------------------------ the feature query */
 
-static void feature_on(void *chain)
+static void feature_on(void *chain, int eds)
 {
-    for (VkBaseOutStructure *b = chain; b; b = b->pNext)
+    for (VkBaseOutStructure *b = chain; b; b = b->pNext) {
         if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT)
             ((VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT *)b)->vertexInputDynamicState = VK_TRUE;
+        if (!eds) continue;
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT)
+            ((VkPhysicalDeviceExtendedDynamicStateFeaturesEXT *)b)->extendedDynamicState = VK_TRUE;
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT) {
+            VkPhysicalDeviceExtendedDynamicState2FeaturesEXT *f = (void *)b;
+            f->extendedDynamicState2 = VK_TRUE;
+            f->extendedDynamicState2LogicOp = VK_FALSE;            /* not made static here */
+            f->extendedDynamicState2PatchControlPoints = VK_FALSE; /* likewise */
+        }
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT) {
+            /* hidden in its place (server_emu.c): no feature of it either */
+            void *next = b->pNext;
+            memset((uint8_t *)b + sizeof(VkBaseOutStructure), 0, sizeof(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT) - sizeof(VkBaseOutStructure));
+            b->pNext = next;
+        }
+    }
 }
 
 static const vkb_srv_table *query_inst(void)
@@ -144,7 +190,7 @@ static VKAPI_ATTR void VKAPI_CALL vi_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     const vkb_srv_table *t = query_inst();
     if (!t || !t->vidyn_f2) return;
     t->vidyn_f2(pd, f);
-    if (vkb_vidyn_mode(t, pd) == VKB_VIDYN_EMULATED) feature_on(f->pNext);
+    if (vkb_vidyn_mode(t, pd) == VKB_VIDYN_EMULATED) feature_on(f->pNext, vkb_eds_mode(t, pd));
 }
 
 /* Over the instance's other feature wrappers (server_instance.c: after the promotion's) */
@@ -164,8 +210,37 @@ int vkb_vidyn_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint3
 {
     int mode = vkb_vidyn_mode(inst, pd);
     if (!mode) return 0;
-    int asked = 0;
+    int asked = 0, eds = vkb_eds_mode(inst, pd), eds_asked = 0;
     for (uint32_t i = 0; i < ci->enabledExtensionCount && !asked; i++) asked = !strcmp(ci->ppEnabledExtensionNames[i], VIDYN_EXT);
+    if (eds) {
+        /* the driver gets none of the three extended dynamic states (names and features): the server's
+         * are made static in variants. Vulkan 1.3's core ones (the Steam-mode fix's games) are taken the same way. */
+        /* asked: the client's own list. The driver's (exts) has lost the names already where the
+         * driver lacks them (r32p1, Galaxy A16: Zink's vkCmdSet* calls reached the driver and its
+         * pipelines' dynamic states crashed vkCreateGraphicsPipelines while the server offered them). */
+        for (uint32_t i = 0; i < ci->enabledExtensionCount && !eds_asked; i++)
+            eds_asked = !strncmp(ci->ppEnabledExtensionNames[i], "VK_EXT_extended_dynamic_state", 29) &&
+                        strcmp(ci->ppEnabledExtensionNames[i], "VK_EXT_extended_dynamic_state3");
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < *n; i++) {
+            if (!strncmp(exts[i], "VK_EXT_extended_dynamic_state", 29)) {
+                eds_asked = 1;
+                continue;
+            }
+            exts[k++] = exts[i];
+        }
+        *n = k;
+        vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT);
+        vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT);
+        vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT);
+        VkPhysicalDeviceProperties pp;
+        inst->real.vkGetPhysicalDeviceProperties(pd, &pp);
+        uint32_t fake = vkb_promote_fake_api(); /* host tests: the driver taken as a lower version has no core ones */
+        if (fake && VK_API_VERSION_MINOR(fake) < VK_API_VERSION_MINOR(pp.apiVersion)) pp.apiVersion = fake;
+        if (pp.apiVersion >= VK_API_VERSION_1_3 && inst->api_version >= VK_API_VERSION_1_3) eds_asked = 1; /* core */
+        if (eds_asked)
+            VKB_INFO("vkCreateDevice: extended dynamic state 1 and 2 for Zink: emulated (their states static in pipeline variants)");
+    }
     const VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT *f = NULL;
     for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT) f = (const void *)b;
@@ -177,6 +252,7 @@ int vkb_vidyn_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint3
         *n = k;
         vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT);
     }
+    if (eds && eds_asked) return VKB_VIDYN_EMULATED | VKB_VIDYN_EDS; /* every pipeline a variant, vertex input or not */
     if (!asked || (f && !f->vertexInputDynamicState)) return 0;
     if (mode == VKB_VIDYN_NATIVE && !(emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX))) {
         VKB_INFO("vkCreateDevice: VK_EXT_vertex_input_dynamic_state for Zink: the driver's own");
@@ -190,7 +266,21 @@ int vkb_vidyn_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint3
 
 /* ------------------------------------------------------------------ records */
 
-typedef struct vkey { /* a vertex input as vkCmdSetVertexInputEXT gives it */
+/* The extended dynamic states (1 and 2) a command buffer has set, as the server's own extensions
+ * take them (VKB_VIDYN_EDS). A state not set is left as the pipeline's create info has it. */
+enum {
+    E_CULL = 1u << 0, E_FRONT = 1u << 1, E_TOPO = 1u << 2, E_NVP = 1u << 3, E_NSC = 1u << 4, E_DTE = 1u << 5, E_DWE = 1u << 6,
+    E_DCMP = 1u << 7, E_DBTE = 1u << 8, E_STE = 1u << 9, E_SOPF = 1u << 10, E_SOPB = 1u << 11, E_RDE = 1u << 12, E_DBE = 1u << 13,
+    E_PRE = 1u << 14,
+};
+typedef struct ekey {
+    uint32_t on;  /* the device emulates them: their dynamic states come out of every variant */
+    uint32_t set; /* E_* */
+    uint32_t cull, front, topo, nvp, nsc, dte, dwe, dcmp, dbte, ste, rde, dbe, pre;
+    uint32_t sop[2][4]; /* front, back: failOp, passOp, depthFailOp, compareOp */
+} ekey;
+
+typedef struct vkey { /* a vertex input as vkCmdSetVertexInputEXT gives it, and the extended dynamic states */
     uint32_t nb, na;
     struct {
         uint32_t binding, stride, rate, divisor;
@@ -198,6 +288,7 @@ typedef struct vkey { /* a vertex input as vkCmdSetVertexInputEXT gives it */
     struct {
         uint32_t location, binding, format, offset;
     } a[NB];
+    ekey e;
 } vkey;
 
 typedef struct variant {
@@ -229,6 +320,7 @@ typedef struct cbst {
     int drv_vi_ok;    /* native: the driver's dynamic vertex input is the noted one */
     uint64_t hash;
     vkey vi;
+    ekey eds; /* the extended dynamic states set (VKB_VIDYN_EDS) */
     struct cbst *next;
 } cbst;
 
@@ -236,12 +328,13 @@ typedef struct vkb_vidyn {
     vkb_dispatch next;
     vkb_srv_table *t;
     int mode;
+    int eds;      /* extended dynamic state 1 and 2 emulated (VKB_VIDYN_EDS) */
     uint32_t fmt; /* VKB_EMU_BGR10_VTX / VKB_EMU_UF11_VTX on this device */
     pthread_mutex_t lock;
     vkb_pk *pk;
     vpipe *pipes[HB];
     cbst *cbs[HB];
-    uint64_t kept, unkept, variants, failed, swaps, passed, held, resent, dropped, max_vars;
+    uint64_t kept, unkept, variants, failed, swaps, passed, held, resent, dropped, max_vars, eds_sets;
     uint64_t bytes, peak_bytes; /* kept create infos and shader code (lock) */
     struct vkb_vidyn *gnext;
 } vkb_vidyn;
@@ -279,12 +372,17 @@ static uint64_t key_hash(const vkey *k)
     for (uint32_t i = 0; i < k->nb * 4; i++) h = (h ^ w[i]) * 0x100000001b3ull;
     w = (const uint32_t *)k->a;
     for (uint32_t i = 0; i < k->na * 4; i++) h = (h ^ w[i]) * 0x100000001b3ull;
+    if (k->e.on) {
+        w = (const uint32_t *)&k->e;
+        for (uint32_t i = 0; i < sizeof(k->e) / 4; i++) h = (h ^ w[i]) * 0x100000001b3ull;
+    }
     return h;
 }
 
 static int key_eq(const vkey *x, const vkey *y)
 {
-    return x->nb == y->nb && x->na == y->na && !memcmp(x->b, y->b, x->nb * sizeof(x->b[0])) && !memcmp(x->a, y->a, x->na * sizeof(x->a[0]));
+    return x->nb == y->nb && x->na == y->na && !memcmp(x->b, y->b, x->nb * sizeof(x->b[0])) && !memcmp(x->a, y->a, x->na * sizeof(x->a[0])) &&
+           !memcmp(&x->e, &y->e, sizeof(x->e));
 }
 
 static size_t key_size(void) { return sizeof(vkey); }
@@ -306,6 +404,7 @@ static cbst *cb_get(vkb_vidyn *v, VkCommandBuffer cb, int make)
     cbst *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->cb = cb;
+    s->eds.on = (uint32_t)v->eds;
     s->next = *pp;
     *pp = s;
     return s;
@@ -315,6 +414,9 @@ static void cb_clear(cbst *s)
 {
     s->bound = s->drv = VK_NULL_HANDLE;
     s->dirty = s->skip = s->have_vi = s->vi_emu = s->drv_vi_ok = 0;
+    uint32_t on = s->eds.on;
+    memset(&s->eds, 0, sizeof(s->eds));
+    s->eds.on = on;
 }
 
 static vpipe *pipe_find(vkb_vidyn *v, VkPipeline p)
@@ -335,9 +437,31 @@ static int has_dyn(const VkPipelineDynamicStateCreateInfo *d, VkDynamicState s)
 
 /* A complete pipeline whose vertex input is dynamic (libraries, and pipelines linked from them,
  * are left as they are) */
-static int wants(const VkGraphicsPipelineCreateInfo *ci)
+/* The extended dynamic states the server offers in place of the driver's (VKB_VIDYN_EDS) */
+static int eds_state(VkDynamicState d)
 {
-    if (!has_dyn(ci->pDynamicState, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT)) return 0;
+    switch (d) {
+    case VK_DYNAMIC_STATE_CULL_MODE: case VK_DYNAMIC_STATE_FRONT_FACE: case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY:
+    case VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT: case VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT: case VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE:
+    case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE: case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE: case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP:
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE: case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE: case VK_DYNAMIC_STATE_STENCIL_OP:
+    case VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE: case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE: case VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int wants_eds(const VkGraphicsPipelineCreateInfo *ci)
+{
+    for (uint32_t i = 0; ci->pDynamicState && i < ci->pDynamicState->dynamicStateCount; i++)
+        if (eds_state(ci->pDynamicState->pDynamicStates[i])) return 1;
+    return 0;
+}
+
+static int wants_mode(const VkGraphicsPipelineCreateInfo *ci, int eds)
+{
+    if (!has_dyn(ci->pDynamicState, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT) && !(eds && wants_eds(ci))) return 0;
     if (ci->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) return 0;
     for (const VkBaseInStructure *n = ci->pNext; n; n = n->pNext) {
         if (n->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR || n->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT)
@@ -348,6 +472,8 @@ static int wants(const VkGraphicsPipelineCreateInfo *ci)
     }
     return 1;
 }
+
+#define wants(ci) wants_mode((ci), v->eds)
 
 static vpipe *keep(vkb_vidyn *v, VkDevice dev, const VkGraphicsPipelineCreateInfo *ci)
 {
@@ -514,6 +640,63 @@ static VKAPI_ATTR void VKAPI_CALL vi_DestroyRenderPass(VkDevice dev, VkRenderPas
 
 /* ---- variants */
 
+/* The variant's create info: the extended dynamic states the command buffer set, static. The
+ * states are copied into the arena before they are changed (the kept create info is shared). */
+static VkResult eds_edit(VkGraphicsPipelineCreateInfo *ci, vkb_arena *arena, const ekey *e)
+{
+    const VkPipelineDynamicStateCreateInfo *d = ci->pDynamicState;
+#define DYN(x) has_dyn(d, VK_DYNAMIC_STATE_##x)
+    if (ci->pRasterizationState && (DYN(CULL_MODE) || DYN(FRONT_FACE) || DYN(RASTERIZER_DISCARD_ENABLE) || DYN(DEPTH_BIAS_ENABLE))) {
+        VkPipelineRasterizationStateCreateInfo *r = vkb_arena_alloc(arena, sizeof(*r));
+        if (!r) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *r = *ci->pRasterizationState;
+        if (DYN(CULL_MODE) && (e->set & E_CULL)) r->cullMode = e->cull;
+        if (DYN(FRONT_FACE) && (e->set & E_FRONT)) r->frontFace = (VkFrontFace)e->front;
+        if (DYN(RASTERIZER_DISCARD_ENABLE) && (e->set & E_RDE)) r->rasterizerDiscardEnable = e->rde;
+        if (DYN(DEPTH_BIAS_ENABLE) && (e->set & E_DBE)) r->depthBiasEnable = e->dbe;
+        ci->pRasterizationState = r;
+    }
+    if (ci->pInputAssemblyState && (DYN(PRIMITIVE_TOPOLOGY) || DYN(PRIMITIVE_RESTART_ENABLE))) {
+        VkPipelineInputAssemblyStateCreateInfo *ia = vkb_arena_alloc(arena, sizeof(*ia));
+        if (!ia) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *ia = *ci->pInputAssemblyState;
+        if (DYN(PRIMITIVE_TOPOLOGY) && (e->set & E_TOPO)) ia->topology = (VkPrimitiveTopology)e->topo;
+        if (DYN(PRIMITIVE_RESTART_ENABLE) && (e->set & E_PRE)) ia->primitiveRestartEnable = e->pre;
+        ci->pInputAssemblyState = ia;
+    }
+    if (ci->pDepthStencilState && (DYN(DEPTH_TEST_ENABLE) || DYN(DEPTH_WRITE_ENABLE) || DYN(DEPTH_COMPARE_OP) ||
+                                   DYN(DEPTH_BOUNDS_TEST_ENABLE) || DYN(STENCIL_TEST_ENABLE) || DYN(STENCIL_OP))) {
+        VkPipelineDepthStencilStateCreateInfo *ds = vkb_arena_alloc(arena, sizeof(*ds));
+        if (!ds) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *ds = *ci->pDepthStencilState;
+        if (DYN(DEPTH_TEST_ENABLE) && (e->set & E_DTE)) ds->depthTestEnable = e->dte;
+        if (DYN(DEPTH_WRITE_ENABLE) && (e->set & E_DWE)) ds->depthWriteEnable = e->dwe;
+        if (DYN(DEPTH_COMPARE_OP) && (e->set & E_DCMP)) ds->depthCompareOp = (VkCompareOp)e->dcmp;
+        if (DYN(DEPTH_BOUNDS_TEST_ENABLE) && (e->set & E_DBTE)) ds->depthBoundsTestEnable = e->dbte;
+        if (DYN(STENCIL_TEST_ENABLE) && (e->set & E_STE)) ds->stencilTestEnable = e->ste;
+        for (int f = 0; f < 2 && DYN(STENCIL_OP); f++) {
+            if (!(e->set & (f ? E_SOPB : E_SOPF))) continue;
+            VkStencilOpState *o = f ? &ds->back : &ds->front;
+            o->failOp = (VkStencilOp)e->sop[f][0];
+            o->passOp = (VkStencilOp)e->sop[f][1];
+            o->depthFailOp = (VkStencilOp)e->sop[f][2];
+            o->compareOp = (VkCompareOp)e->sop[f][3];
+        }
+        ci->pDepthStencilState = ds;
+    }
+    if (ci->pViewportState && (DYN(VIEWPORT_WITH_COUNT) || DYN(SCISSOR_WITH_COUNT))) {
+        VkPipelineViewportStateCreateInfo *vp = vkb_arena_alloc(arena, sizeof(*vp));
+        if (!vp) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *vp = *ci->pViewportState;
+        /* the rectangles stay dynamic (vkCmdSetViewport / vkCmdSetScissor): only the counts are static */
+        if (DYN(VIEWPORT_WITH_COUNT)) vp->viewportCount = (e->set & E_NVP) && e->nvp ? e->nvp : 1, vp->pViewports = NULL;
+        if (DYN(SCISSOR_WITH_COUNT)) vp->scissorCount = (e->set & E_NSC) && e->nsc ? e->nsc : 1, vp->pScissors = NULL;
+        ci->pViewportState = vp;
+    }
+#undef DYN
+    return VK_SUCCESS;
+}
+
 /* The variant's create info: the vertex input of the key static */
 static VkResult vi_edit(VkGraphicsPipelineCreateInfo *ci, vkb_arena *arena, void *ctx)
 {
@@ -554,12 +737,29 @@ static VkResult vi_edit(VkGraphicsPipelineCreateInfo *ci, vkb_arena *arena, void
     vi->pVertexBindingDescriptions = bd;
     vi->vertexAttributeDescriptionCount = k->na;
     vi->pVertexAttributeDescriptions = ad;
-    ci->pVertexInputState = vi;
-    /* the vertex input and its strides static */
+    /* a pipeline without dynamic vertex input (only extended dynamic state) keeps its own */
+    if (has_dyn(ci->pDynamicState, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT)) ci->pVertexInputState = vi;
+    /* the vertex input and its strides static; the extended dynamic states too where the server
+     * offers them, the viewport and scissor counts made static and the rectangles plain dynamic state */
+    VkResult er = k->e.on ? eds_edit(ci, arena, &k->e) : VK_SUCCESS;
+    if (er != VK_SUCCESS) return er;
     uint32_t nl = 0;
+    int have_vp = 0, have_sc = 0;
     for (uint32_t i = 0; ci->pDynamicState && i < ci->pDynamicState->dynamicStateCount; i++) {
         VkDynamicState s = ci->pDynamicState->pDynamicStates[i];
-        if (s != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT && s != VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE) list[nl++] = s;
+        if (s == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT || s == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE) continue;
+        if (k->e.on && s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT) s = VK_DYNAMIC_STATE_VIEWPORT;
+        else if (k->e.on && s == VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT) s = VK_DYNAMIC_STATE_SCISSOR;
+        else if (k->e.on && eds_state(s)) continue;
+        if (s == VK_DYNAMIC_STATE_VIEWPORT) {
+            if (have_vp) continue;
+            have_vp = 1;
+        }
+        if (s == VK_DYNAMIC_STATE_SCISSOR) {
+            if (have_sc) continue;
+            have_sc = 1;
+        }
+        list[nl++] = s;
     }
     *dyn = *ci->pDynamicState;
     dyn->dynamicStateCount = nl;
@@ -669,8 +869,12 @@ static int prepare(vkb_vidyn *v, VkCommandBuffer cb)
     if (resend || use_variant) {
         key = malloc(key_size());
         if (!key) s->skip = 1, resend = use_variant = 0;
-        else if (s->have_vi) memcpy(key, &s->vi, key_size());
-        else memset(key, 0, key_size()), hash = key_hash(key); /* no vertex input given: none (the app's mistake) */
+        else {
+            if (s->have_vi) memcpy(key, &s->vi, key_size());
+            else memset(key, 0, key_size()); /* no vertex input given: none (the app's mistake, or a pipeline with its own) */
+            key->e = s->eds;                  /* zero where the extended dynamic states are the driver's */
+            hash = key_hash(key);
+        }
     }
     VkPipeline drv = s->drv;
     int skip = s->skip;
@@ -796,6 +1000,86 @@ static VKAPI_ATTR void VKAPI_CALL vi_CmdBindVertexBuffers2(VkCommandBuffer cb, u
     v->next.vkCmdBindVertexBuffers2(cb, first, n, bufs, off, size, strip ? NULL : st);
 }
 
+/* ---- the server's extended dynamic state 1 and 2 (VKB_VIDYN_EDS): noted per command buffer, made
+ * static in the variant of the next draw; nothing reaches the driver but the viewport and scissor
+ * rectangles, as plain dynamic state */
+
+static void eds_note(vkb_vidyn *v, VkCommandBuffer cb, uint32_t bit, size_t off, uint32_t val)
+{
+    pthread_mutex_lock(&v->lock);
+    cbst *s = cb_get(v, cb, 1);
+    if (s) {
+        uint32_t *f = (uint32_t *)((uint8_t *)&s->eds + off);
+        if (!(s->eds.set & bit) || *f != val) {
+            s->eds.set |= bit;
+            *f = val;
+            s->dirty = 1;
+        }
+    }
+    pthread_mutex_unlock(&v->lock);
+    __atomic_add_fetch(&v->eds_sets, 1, __ATOMIC_RELAXED);
+}
+
+#define EDS_SET(name, type, bit, field)                                         \
+    static VKAPI_ATTR void VKAPI_CALL vi_##name(VkCommandBuffer cb, type val)  \
+    {                                                                           \
+        eds_note(V(), cb, bit, offsetof(ekey, field), (uint32_t)val);           \
+    }
+
+EDS_SET(CmdSetCullMode, VkCullModeFlags, E_CULL, cull)
+EDS_SET(CmdSetFrontFace, VkFrontFace, E_FRONT, front)
+EDS_SET(CmdSetPrimitiveTopology, VkPrimitiveTopology, E_TOPO, topo)
+EDS_SET(CmdSetDepthTestEnable, VkBool32, E_DTE, dte)
+EDS_SET(CmdSetDepthWriteEnable, VkBool32, E_DWE, dwe)
+EDS_SET(CmdSetDepthCompareOp, VkCompareOp, E_DCMP, dcmp)
+EDS_SET(CmdSetDepthBoundsTestEnable, VkBool32, E_DBTE, dbte)
+EDS_SET(CmdSetStencilTestEnable, VkBool32, E_STE, ste)
+EDS_SET(CmdSetRasterizerDiscardEnable, VkBool32, E_RDE, rde)
+EDS_SET(CmdSetDepthBiasEnable, VkBool32, E_DBE, dbe)
+EDS_SET(CmdSetPrimitiveRestartEnable, VkBool32, E_PRE, pre)
+
+static VKAPI_ATTR void VKAPI_CALL vi_CmdSetStencilOp(VkCommandBuffer cb, VkStencilFaceFlags faces, VkStencilOp fail, VkStencilOp pass,
+                                                    VkStencilOp depth_fail, VkCompareOp cmp)
+{
+    vkb_vidyn *v = V();
+    uint32_t op[4] = {(uint32_t)fail, (uint32_t)pass, (uint32_t)depth_fail, (uint32_t)cmp};
+    pthread_mutex_lock(&v->lock);
+    cbst *s = cb_get(v, cb, 1);
+    for (int f = 0; s && f < 2; f++) {
+        uint32_t bit = f ? E_SOPB : E_SOPF;
+        if (!(faces & (f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT))) continue;
+        if ((s->eds.set & bit) && !memcmp(s->eds.sop[f], op, sizeof(op))) continue;
+        s->eds.set |= bit;
+        memcpy(s->eds.sop[f], op, sizeof(op));
+        s->dirty = 1;
+    }
+    pthread_mutex_unlock(&v->lock);
+    __atomic_add_fetch(&v->eds_sets, 1, __ATOMIC_RELAXED);
+}
+
+static VKAPI_ATTR void VKAPI_CALL vi_CmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport *vp)
+{
+    vkb_vidyn *v = V();
+    eds_note(v, cb, E_NVP, offsetof(ekey, nvp), n);
+    if (n) v->next.vkCmdSetViewport(cb, 0, n, vp);
+}
+
+static VKAPI_ATTR void VKAPI_CALL vi_CmdSetScissorWithCount(VkCommandBuffer cb, uint32_t n, const VkRect2D *r)
+{
+    vkb_vidyn *v = V();
+    eds_note(v, cb, E_NSC, offsetof(ekey, nsc), n);
+    if (n) v->next.vkCmdSetScissor(cb, 0, n, r);
+}
+
+/* vkCmdBindVertexBuffers2 where the driver has none (the dynamic rendering emulation usually gives
+ * one first): the sizes only bound the reads; strides are the vertex input's (see vi_CmdBindVertexBuffers2) */
+static VKAPI_ATTR void VKAPI_CALL vi_CmdBindVertexBuffers2Plain(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *bufs,
+                                                               const VkDeviceSize *off, const VkDeviceSize *size, const VkDeviceSize *st)
+{
+    (void)size, (void)st;
+    V()->next.vkCmdBindVertexBuffers(cb, first, n, bufs, off);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL vi_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi)
 {
     vkb_vidyn *v = V();
@@ -876,9 +1160,18 @@ void vkb_vidyn_device_init(vkb_srv_table *t, int mode)
     }
     vkb_vidyn *v = calloc(1, sizeof(*v));
     if (!v) return;
+    int eds = (mode & VKB_VIDYN_EDS) != 0;
+    mode &= ~VKB_VIDYN_EDS;
+    if (eds && (!dt->vkCmdSetViewport || !dt->vkCmdSetScissor || !dt->vkCmdBindVertexBuffers)) {
+        VKB_WARN("vertex input: device %u lacks vkCmdSetViewport/vkCmdSetScissor/vkCmdBindVertexBuffers; extended dynamic state not emulated",
+                 t->id);
+        eds = 0;
+    }
+    if (eds && !dt->vkCmdBindVertexBuffers2) dt->vkCmdBindVertexBuffers2 = vi_CmdBindVertexBuffers2Plain; /* beneath the layer's own */
     v->next = t->dt;
     v->t = t;
     v->mode = mode;
+    v->eds = eds;
     v->fmt = t->emu ? t->emu->flags & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX) : 0;
     pthread_mutex_init(&v->lock, NULL);
     if (!(v->pk = vkb_pk_create(&v->next))) {
@@ -908,13 +1201,31 @@ void vkb_vidyn_device_init(vkb_srv_table *t, int mode)
     HOOK(vkCmdDrawIndirectByteCountEXT, vi_vkCmdDrawIndirectByteCountEXT);
     /* emulated: the client's entry point exists even where the driver has none */
     t->dt.vkCmdSetVertexInputEXT = vi_CmdSetVertexInputEXT;
+    if (eds) {
+        /* likewise: the driver's own, if any, never get a call (its pipelines have none of these dynamic) */
+        dt->vkCmdSetCullMode = vi_CmdSetCullMode;
+        dt->vkCmdSetFrontFace = vi_CmdSetFrontFace;
+        dt->vkCmdSetPrimitiveTopology = vi_CmdSetPrimitiveTopology;
+        dt->vkCmdSetViewportWithCount = vi_CmdSetViewportWithCount;
+        dt->vkCmdSetScissorWithCount = vi_CmdSetScissorWithCount;
+        dt->vkCmdSetDepthTestEnable = vi_CmdSetDepthTestEnable;
+        dt->vkCmdSetDepthWriteEnable = vi_CmdSetDepthWriteEnable;
+        dt->vkCmdSetDepthCompareOp = vi_CmdSetDepthCompareOp;
+        dt->vkCmdSetDepthBoundsTestEnable = vi_CmdSetDepthBoundsTestEnable;
+        dt->vkCmdSetStencilTestEnable = vi_CmdSetStencilTestEnable;
+        dt->vkCmdSetStencilOp = vi_CmdSetStencilOp;
+        dt->vkCmdSetRasterizerDiscardEnable = vi_CmdSetRasterizerDiscardEnable;
+        dt->vkCmdSetDepthBiasEnable = vi_CmdSetDepthBiasEnable;
+        dt->vkCmdSetPrimitiveRestartEnable = vi_CmdSetPrimitiveRestartEnable;
+    }
     t->vidyn = v;
     pthread_mutex_lock(&glock);
     v->gnext = all;
     all = v;
     pthread_mutex_unlock(&glock);
-    VKB_INFO("device %u: vertex input dynamic state for Zink %s%s%s", t->id,
+    VKB_INFO("device %u: vertex input dynamic state for Zink %s%s%s%s", t->id,
              mode == VKB_VIDYN_EMULATED ? "emulated with pipeline variants" : "the driver's, pipeline variants for emulated formats",
+             eds ? ", with extended dynamic state 1 and 2 (their states static in the variants)" : "",
              (v->fmt & VKB_EMU_BGR10_VTX) ? " (BGRA 10-10-10-2 vertex fetch emulated)" : "",
              (v->fmt & VKB_EMU_UF11_VTX) ? " (B10G11R11 vertex fetch emulated)" : "");
 }
@@ -934,11 +1245,11 @@ void vkb_vidyn_device_destroy(vkb_srv_table *t)
     if (v->kept || v->unkept || v->passed || v->held)
         VKB_INFO("vertex input: %llu pipeline(s) kept (at most %llu KB of create infos and shaders at once), %llu variant(s) made (at most "
                  "%llu for one pipeline), %llu failed, %llu variant bind(s), %llu draw(s) dropped; vkCmdSetVertexInputEXT: %llu passed "
-                 "to the driver, %llu held, %llu sent again; %llu pipeline(s) not kept",
+                 "to the driver, %llu held, %llu sent again; %llu pipeline(s) not kept; %llu extended dynamic state call(s)",
                  (unsigned long long)v->kept, (unsigned long long)((v->peak_bytes + 1023) / 1024), (unsigned long long)v->variants,
                  (unsigned long long)v->max_vars, (unsigned long long)v->failed, (unsigned long long)v->swaps,
                  (unsigned long long)v->dropped, (unsigned long long)v->passed, (unsigned long long)v->held,
-                 (unsigned long long)v->resent, (unsigned long long)v->unkept);
+                 (unsigned long long)v->resent, (unsigned long long)v->unkept, (unsigned long long)v->eds_sets);
     for (unsigned h = 0; h < HB; h++) {
         for (vpipe *r = v->pipes[h], *nx; r; r = nx) nx = r->next, pipe_free(v, r, 0);
         for (cbst *s = v->cbs[h], *nx; s; s = nx) nx = s->next, free(s);

@@ -179,7 +179,9 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 vkb_vidyn_device_destroy(t); /* as vkDestroyDevice does */
                 vkb_emu_device_quiesce(t);
                 vkb_cbfail_device_destroy(t);
+                vkb_syncfb_device_destroy(t);
                 if (t->real.vkDeviceWaitIdle) t->real.vkDeviceWaitIdle(t->device);
+                vkb_sparse_device_destroy(t);
                 vkb_bvmap_device_destroy(t);
                 vkb_gprof_device_destroy(t);
                 vkb_trace_device_destroy(t);
@@ -196,6 +198,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
                 vkb_report_device_destroy(t);
                 vkb_mem_free_all(t);
                 t->real.vkDestroyDevice(t->device, NULL);
+                vkb_qlock_device_destroy(t); /* server_qlock.c: the device's queue locks */
             } else {
                 VKB_INFO("process %d exited without destroying instance %u; cleaning up", p->pid, t->id);
                 t->real.vkDestroyInstance(t->instance, NULL);
@@ -243,6 +246,7 @@ static void proc_leave(vkb_srv_proc *p)
     pthread_mutex_unlock(&procs_lock);
     if (last) {
         vkb_proc_cleanup(p);
+        vkb_hitch_proc_gone(p); /* after its devices: no thread of theirs notes into it any more */
         VKB_INFO("client process %d gone", p->pid);
         vkb_report_gone(p);
         pthread_mutex_destroy(&p->olock);
@@ -298,23 +302,68 @@ static void order_stall(vkb_srv_proc *p, uint32_t cmd, int s, uint64_t barrier, 
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %s for %.1f s;", vkb_cmd_names[r - 1], since && now > since ? (now - since) / 1e9 : 0.0);
     }
     pthread_mutex_unlock(&conns_lock);
-    VKB_WARN("process %d (%s): %s has waited %d s for the process's earlier requests (up to %llu, %llu done); running:%s",
-             p->pid, p->comm, cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", s, (unsigned long long)barrier,
-             (unsigned long long)watermark, n ? line : " nothing (a request not yet arrived)");
+    if (s < 0)
+        VKB_WARN("process %d (%s): %s waited %d ms for the process's earlier requests (up to %llu, %llu done), the deadline; "
+                 "running:%s",
+                 p->pid, p->comm, cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", -s, (unsigned long long)barrier,
+                 (unsigned long long)watermark, n ? line : " nothing (a request not yet arrived)");
+    else
+        VKB_WARN("process %d (%s): %s has waited %d s for the process's earlier requests (up to %llu, %llu done); running:%s",
+                 p->pid, p->comm, cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", s, (unsigned long long)barrier,
+                 (unsigned long long)watermark, n ? line : " nothing (a request not yet arrived)");
 }
 
-/* Waits until every async request of the process up to `barrier` has run. */
-static void order_wait(vkb_srv_proc *p, uint64_t barrier, uint32_t cmd)
+/* The request of process `pid` that has been running longest, on any of its connections: its
+ * seconds (0: none running) and its name. The report's line for a call the driver has not
+ * returned from (Xwayland's vkGetSemaphoreFdKHR for 400 s on the Galaxy A55, while the
+ * loading screen said only "Waiting for Steam's first frame"). */
+double vkb_srv_running_longest(int pid, const char **name)
 {
-    if (!p || !barrier) return;
+    double best = 0;
+    *name = NULL;
+    uint64_t now = mono_now_ns();
+    pthread_mutex_lock(&conns_lock);
+    for (int i = 0; i < CONNS_MAX; i++) {
+        vkb_srv_conn *c = conns_all[i];
+        if (!c || !c->proc || c->proc->pid != pid) continue;
+        uint32_t r = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
+        uint64_t since = __atomic_load_n(&c->running_ns, __ATOMIC_RELAXED);
+        if (!r || r - 1 >= VKB_CMD_COUNT || !since || now <= since) continue;
+        double s = (now - since) / 1e9;
+        if (s > best) {
+            best = s;
+            *name = vkb_cmd_names[r - 1];
+        }
+    }
+    pthread_mutex_unlock(&conns_lock);
+    return best;
+}
+
+/* Waits until every async request of the process up to `barrier` has run; with `ms` > 0 at most that
+ * long (0 returned when it ran out). */
+static int order_wait(vkb_srv_proc *p, uint64_t barrier, uint32_t cmd, int ms)
+{
+    if (!p || !barrier) return 1;
     pthread_mutex_lock(&p->olock);
-    int waited = 0, slow = 0;
+    int waited = 0, slow = 0, reached = 1;
+    struct timespec until = {0, 0};
+    if (ms > 0) {
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += ms / 1000;
+        until.tv_nsec += (long)(ms % 1000) * 1000000L;
+        if (until.tv_nsec >= 1000000000L) until.tv_sec++, until.tv_nsec -= 1000000000L;
+    }
     p->owaiters++;
     while (p->watermark < barrier) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
+        if (ms > 0 && (ts.tv_sec > until.tv_sec || (ts.tv_sec == until.tv_sec && ts.tv_nsec >= until.tv_nsec))) {
+            reached = 0;
+            break;
+        }
         ts.tv_sec += 1;
-        int e = pthread_cond_timedwait(&p->ocond, &p->olock, &ts);
+        if (ms > 0 && (ts.tv_sec > until.tv_sec || (ts.tv_sec == until.tv_sec && ts.tv_nsec > until.tv_nsec))) ts = until;
+        int e = pthread_cond_timedwait(&p->ocond, &p->olock, &ts); /* past the deadline: the loop's top ends it */
         if (e != 0 && p->watermark < barrier && (++slow == 5 || (slow > 5 && slow % 60 == 0))) {
             uint64_t wm = p->watermark;
             pthread_mutex_unlock(&p->olock); /* conns_lock is never taken with olock held */
@@ -330,7 +379,38 @@ static void order_wait(vkb_srv_proc *p, uint64_t barrier, uint32_t cmd)
         }
     }
     p->owaiters--;
+    uint64_t wm = p->watermark;
     pthread_mutex_unlock(&p->olock);
+    if (!reached) {
+        static uint64_t ran_out;
+        uint64_t n = __atomic_add_fetch(&ran_out, 1, __ATOMIC_RELAXED);
+        if (n <= 8 || (n & (n - 1)) == 0) order_stall(p, cmd, -ms, barrier, wm);
+    }
+    return reached;
+}
+
+/* A request whose order wait ran out (vkb_syncfd_order_ms): what is still owed, for its handler. */
+static __thread struct {
+    vkb_srv_proc *p;
+    uint64_t barrier;
+    uint32_t cmd;
+} order_owed;
+
+int vkb_srv_order_skipped(void)
+{
+    return order_owed.p != NULL;
+}
+
+void vkb_srv_order_finish(void)
+{
+    vkb_srv_proc *p = order_owed.p;
+    order_owed.p = NULL;
+    if (p) order_wait(p, order_owed.barrier, order_owed.cmd, 0);
+}
+
+void vkb_srv_order_done(void)
+{
+    order_owed.p = NULL;
 }
 
 static void order_done(vkb_srv_proc *p, uint64_t seq)
@@ -484,7 +564,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL cf_QueueSubmit(VkQueue q, uint32_t n, cons
     return r;
 }
 
+static void slow_record(vkb_srv_table *t, VkQueue q, const VkSubmitInfo2 *si, VkFence fence, uint64_t t0, uint64_t t1);
+static uint64_t slow_now(void);
+static int slow_ms[VKB_MAX_TABLES];
+static VkResult cf_QueueSubmit2_(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence fence);
+
 static VKAPI_ATTR VkResult VKAPI_CALL cf_QueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence fence)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    if (!t || !slow_ms[t->id]) return cf_QueueSubmit2_(q, n, si, fence);
+    uint64_t t0 = slow_now();
+    VkResult r = cf_QueueSubmit2_(q, n, si, fence);
+    uint64_t t1 = slow_now();
+    for (uint32_t i = 0; i < n; i++) slow_record(t, q, &si[i], i + 1 == n ? fence : VK_NULL_HANDLE, t0, t1);
+    return r;
+}
+
+static VkResult cf_QueueSubmit2_(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence fence)
 {
     vkb_srv_table *t = vkb_srv_current_table();
     PFN_vkQueueSubmit2 next = t ? next_submit2[t->id] : NULL;
@@ -553,10 +649,120 @@ static VKAPI_ATTR void VKAPI_CALL cf_FreeCommandBuffers(VkDevice d, VkCommandPoo
     if (next) next(d, pool, n, cbs);
 }
 
+/* VKBRIDGE_SLOW_MS=<ms> (a diagnostic): a vkWaitSemaphores or vkWaitForFences that took longer is
+ * logged with the device's last submissions - when each reached the driver, what it waited on (and
+ * where those timeline semaphores stand now) and what it signals - to tell work that never reached
+ * the GPU from work the GPU held back. */
+#define SLOW_RING 16
+typedef struct {
+    uint64_t ns, call_ns;
+    VkQueue queue;
+    VkFence fence;
+    uint32_t cbs, nw, nsig;
+    VkSemaphore w[4], s[4];
+    uint64_t wv[4], sv[4];
+} slow_submit;
+static slow_submit slow_ring[VKB_MAX_TABLES][SLOW_RING];
+static uint32_t slow_next[VKB_MAX_TABLES];
+static pthread_mutex_t slow_lock = PTHREAD_MUTEX_INITIALIZER;
+static PFN_vkWaitSemaphores next_waitsem[VKB_MAX_TABLES];
+static PFN_vkWaitForFences next_waitfence[VKB_MAX_TABLES];
+
+static uint64_t slow_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void slow_record(vkb_srv_table *t, VkQueue q, const VkSubmitInfo2 *si, VkFence fence, uint64_t t0, uint64_t t1)
+{
+    pthread_mutex_lock(&slow_lock);
+    slow_submit *e = &slow_ring[t->id][slow_next[t->id]++ % SLOW_RING];
+    memset(e, 0, sizeof(*e));
+    e->ns = t0, e->call_ns = t1 - t0, e->queue = q, e->fence = fence, e->cbs = si->commandBufferInfoCount;
+    for (uint32_t i = 0; i < si->waitSemaphoreInfoCount && e->nw < 4; i++, e->nw++)
+        e->w[e->nw] = si->pWaitSemaphoreInfos[i].semaphore, e->wv[e->nw] = si->pWaitSemaphoreInfos[i].value;
+    for (uint32_t i = 0; i < si->signalSemaphoreInfoCount && e->nsig < 4; i++, e->nsig++)
+        e->s[e->nsig] = si->pSignalSemaphoreInfos[i].semaphore, e->sv[e->nsig] = si->pSignalSemaphoreInfos[i].value;
+    pthread_mutex_unlock(&slow_lock);
+}
+
+static void slow_dump(vkb_srv_table *t, VkDevice d, const char *what, uint64_t waited_ns, uint64_t start)
+{
+    char line[1024];
+    VKB_INFO("slow: %s %llu ms; last submissions (newest first, ms before the wait began):", what,
+             (unsigned long long)(waited_ns / 1000000));
+    slow_submit copy[SLOW_RING];
+    uint32_t n;
+    pthread_mutex_lock(&slow_lock);
+    memcpy(copy, slow_ring[t->id], sizeof(copy));
+    n = slow_next[t->id];
+    pthread_mutex_unlock(&slow_lock);
+    for (uint32_t k = 0; k < 8 && k < n; k++) {
+        slow_submit *e = &copy[(n - 1 - k) % SLOW_RING];
+        int o = snprintf(line, sizeof(line), "  %+.1f ms: queue %p, %u cb, driver call %.2f ms, fence %p; waits", ((double)start - (double)e->ns) / 1e6,
+                         (void *)e->queue, e->cbs, e->call_ns / 1e6, (void *)e->fence);
+        for (uint32_t i = 0; i < e->nw && o < (int)sizeof(line) - 80; i++) {
+            uint64_t now = 0;
+            VkResult r = t->real.vkGetSemaphoreCounterValue && e->wv[i] ? t->real.vkGetSemaphoreCounterValue(d, e->w[i], &now) : VK_ERROR_UNKNOWN;
+            o += snprintf(line + o, sizeof(line) - o, " %p>=%llu(now %lld)", (void *)e->w[i], (unsigned long long)e->wv[i],
+                          r == VK_SUCCESS ? (long long)now : -1ll);
+        }
+        o += snprintf(line + o, sizeof(line) - o, "; signals");
+        for (uint32_t i = 0; i < e->nsig && o < (int)sizeof(line) - 60; i++)
+            o += snprintf(line + o, sizeof(line) - o, " %p=%llu", (void *)e->s[i], (unsigned long long)e->sv[i]);
+        VKB_INFO("%s", line);
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL sl_WaitSemaphores(VkDevice d, const VkSemaphoreWaitInfo *wi, uint64_t timeout)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    PFN_vkWaitSemaphores next = t ? next_waitsem[t->id] : NULL;
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    uint64_t t0 = slow_now();
+    VkResult r = next(d, wi, timeout);
+    uint64_t dt = slow_now() - t0;
+    if (dt >= (uint64_t)slow_ms[t->id] * 1000000ull) {
+        char what[160];
+        snprintf(what, sizeof(what), "vkWaitSemaphores (%u: %p>=%llu, result %d)", wi->semaphoreCount,
+                 wi->semaphoreCount ? (void *)wi->pSemaphores[0] : NULL, wi->semaphoreCount ? (unsigned long long)wi->pValues[0] : 0ull, r);
+        slow_dump(t, d, what, dt, t0);
+    }
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL sl_WaitForFences(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    PFN_vkWaitForFences next = t ? next_waitfence[t->id] : NULL;
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    uint64_t t0 = slow_now();
+    VkResult r = next(d, n, f, all, timeout);
+    uint64_t dt = slow_now() - t0;
+    if (dt >= (uint64_t)slow_ms[t->id] * 1000000ull) {
+        char what[120];
+        snprintf(what, sizeof(what), "vkWaitForFences (%u: %p, result %d)", n, n ? (void *)f[0] : NULL, r);
+        slow_dump(t, d, what, dt, t0);
+    }
+    return r;
+}
+
 /* Over every layer but the report's: what reaches the layers beneath never names such a command buffer */
 void vkb_cbfail_device_init(vkb_srv_table *t)
 {
     if (!t || t->id >= VKB_MAX_TABLES) return;
+    const char *sv = vkb_srv_env("VKBRIDGE_SLOW_MS");
+    slow_ms[t->id] = sv ? atoi(sv) : 0;
+    slow_next[t->id] = 0;
+    if (slow_ms[t->id] > 0) {
+        next_waitsem[t->id] = t->dt.vkWaitSemaphores;
+        next_waitfence[t->id] = t->dt.vkWaitForFences;
+        if (t->dt.vkWaitSemaphores) t->dt.vkWaitSemaphores = sl_WaitSemaphores;
+        if (t->dt.vkWaitForFences) t->dt.vkWaitForFences = sl_WaitForFences;
+        VKB_INFO("device %u: waits over %d ms logged with the last submissions (VKBRIDGE_SLOW_MS)", t->id, slow_ms[t->id]);
+    }
     next_submit[t->id] = t->dt.vkQueueSubmit;
     next_submit2[t->id] = t->dt.vkQueueSubmit2;
     next_exec[t->id] = t->dt.vkCmdExecuteCommands;
@@ -989,7 +1195,12 @@ static void *conn_main(void *arg)
         uint64_t wait_ns = 0;
         if (conn->proc && h.cmd < VKB_CMD_COUNT && h.cmd != VKB_CMD_vkbHello) {
             uint64_t t0 = st_period ? mono_ns() : 0;
-            order_wait(conn->proc, h.barrier, h.cmd);
+            int oms = vkb_syncfd_order_ms(h.table, h.cmd); /* server_syncfd.c: a sync-fd export's deadline */
+            if (!order_wait(conn->proc, h.barrier, h.cmd, oms)) {
+                order_owed.p = conn->proc;
+                order_owed.barrier = h.barrier;
+                order_owed.cmd = h.cmd;
+            }
             if (st_period) wait_ns = mono_ns() - t0;
         }
         if (h.cmd == VKB_CMD_vkbBatch && (h.flags & VKB_F_NOREPLY) && !nfds && conn->proc) {
@@ -999,6 +1210,7 @@ static void *conn_main(void *arg)
         }
         vkb_dec_init(&c.d, payload, h.size, &conn->arena, fds, nfds);
         run_request(conn, &c, h.cmd, h.table, wait_ns);
+        vkb_srv_order_finish(); /* not taken by the handler (an error before the driver's call): owed still */
         vkb_dec_close_untaken(&c.d);
         order_done(conn->proc, h.seq);
         if (!(h.flags & VKB_F_NOREPLY)) {

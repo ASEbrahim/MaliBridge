@@ -212,9 +212,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceSurfaceCapabilities2KHR
                                                                                 VkSurfaceCapabilities2KHR *pCaps)
 {
     VkResult r = vkb_ep_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, pInfo->surface, &pCaps->surfaceCapabilities);
+    VkBool32 pw = vkb_wsi_present_wait_on(vkb_pd(physicalDevice)) ? VK_TRUE : VK_FALSE;
     for (VkBaseOutStructure *b = (VkBaseOutStructure *)pCaps->pNext; b; b = b->pNext) {
         if (b->sType == VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR)
             ((VkSurfaceProtectedCapabilitiesKHR *)b)->supportsProtected = VK_FALSE;
+        /* every surface kind: what "shown" means on each is in the present wait section below */
+        else if (b->sType == VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR)
+            ((VkSurfaceCapabilitiesPresentId2KHR *)b)->presentId2Supported = pw;
+        else if (b->sType == VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR)
+            ((VkSurfaceCapabilitiesPresentWait2KHR *)b)->presentWait2Supported = pw;
     }
     return r;
 }
@@ -631,18 +637,27 @@ static uint32_t present_timeout_s(vkb_swapchain *sc)
 }
 
 /* Waits for a frame's fence in 10 s steps, up to the limit above, and resets it. VK_SUCCESS, or
- * the wait's error (the server's VK_ERROR_DEVICE_LOST), or VK_ERROR_DEVICE_LOST past the limit. */
-VkResult vkb_wsi_wait_frame(vkb_swapchain *sc, VkFence fence)
+ * the wait's error (the server's VK_ERROR_DEVICE_LOST), or VK_ERROR_DEVICE_LOST past the limit.
+ * t0: when the wait for this frame began (a late copy present's began in vkQueuePresentKHR). */
+static VkResult wait_frame_from(vkb_swapchain *sc, VkFence fence, uint64_t t0)
 {
     VkDevice device = (VkDevice)sc->dev;
     static int slow_said, late_said;
     uint32_t limit_s = present_timeout_s(sc);
     uint64_t limit = limit_s == VKB_PRESENT_TIMEOUT_NONE ? UINT64_MAX : (uint64_t)limit_s * 1000000000ull;
-    uint64_t t0 = wsi_now_ns(), waited = 0;
+    uint64_t waited = wsi_now_ns() - t0;
     VkResult r;
     for (;;) {
+        if (waited >= limit) {
+            VKB_ERR("swapchain: a frame took more than %u s to render; the device is reported lost (VKBRIDGE_PRESENT_TIMEOUT_S, "
+                    "0: no limit)", limit_s);
+            r = VK_ERROR_DEVICE_LOST;
+            break;
+        }
         uint64_t step = limit - waited < PRESENT_WAIT_STEP_NS ? limit - waited : PRESENT_WAIT_STEP_NS;
-        r = vkb_wire_vkWaitForFences(device, 1, &fence, VK_TRUE, step);
+        vkb_hitch_in_present = 1; /* the swapchain's wait, not the app's (hitch.c) */
+        r = vkb_sm_wait_fences(sc->dev, 1, &fence, VK_TRUE, step); /* done already: no round trip (syncmirror.c) */
+        vkb_hitch_in_present = 0;
         waited = wsi_now_ns() - t0;
         if (r != VK_TIMEOUT) break;
         if (waited >= limit) {
@@ -660,16 +675,166 @@ VkResult vkb_wsi_wait_frame(vkb_swapchain *sc, VkFence fence)
                          "up to %u s (VKBRIDGE_PRESENT_TIMEOUT_S)", limit_s);
         }
     }
-    vkb_wire_vkResetFences(device, 1, &fence);
+    vkb_ep_vkResetFences(device, 1, &fence);
     if (r == VK_SUCCESS && waited >= PRESENT_WAIT_STEP_NS && !__atomic_exchange_n(&late_said, 1, __ATOMIC_RELAXED))
         VKB_WARN("swapchain: the slow frame rendered after %.1f s and was presented late", waited / 1e9);
     return r;
 }
 
-/* Waits (on the CPU) for the app's rendering into image `index`, reading it back when needed. */
-VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait)
+VkResult vkb_wsi_wait_frame(vkb_swapchain *sc, VkFence fence) { return wait_frame_from(sc, fence, wsi_now_ns()); }
+
+/*
+ * Copy presents (X11, wl_shm, headless) read the frame back, so they wait for it on the CPU. The
+ * app's thread waits only VKBRIDGE_PRESENT_HOLD_MS (default 500 ms; 0: not at all) of that: a frame
+ * not rendered by then is shown by the swapchain's own thread once it is, and vkQueuePresentKHR
+ * returns. A queue may wait for a timeline value that is signalled later, by the host or by
+ * another queue (wait-before-signal, D3D12's Wait before Signal), and the thread that will signal
+ * it may be the one presenting: waiting for the frame there waited for itself, until the present
+ * timeout called the device lost. Frames rendered within the hold go as before (the same pacing and
+ * latency); a late frame is still handed over only after its GPU work. One late frame at a time
+ * per swapchain (the read-back buffer and the fence are the swapchain's): the next present, or an
+ * acquire that finds no free image, waits for it first. The dma-buf path (Wayland, every DroidDeck
+ * game) never waited in the app's call: its presenting thread does (wsi_wayland.c).
+ */
+#define PRESENT_HOLD_DEFAULT_MS 500u
+
+static uint64_t present_hold_ns(void)
 {
-    VkDevice device = (VkDevice)sc->dev;
+    static uint64_t v = UINT64_MAX - 1;
+    uint64_t c = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (c != UINT64_MAX - 1) return c;
+    uint64_t ms = PRESENT_HOLD_DEFAULT_MS;
+    const char *e = getenv("VKBRIDGE_PRESENT_HOLD_MS");
+    if (e && *e) {
+        char *end;
+        unsigned long long n = strtoull(e, &end, 10);
+        if (!*end && *e != '-') ms = n > 3600000ull ? 3600000ull : n;
+        else VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_PRESENT_HOLD_MS=%.40s is not a number of milliseconds; %u used", e, PRESENT_HOLD_DEFAULT_MS);
+    }
+    c = ms * 1000000ull;
+    __atomic_store_n(&v, c, __ATOMIC_RELAXED);
+    return c;
+}
+
+static void dump_frame(vkb_swapchain *sc, uint32_t index);
+static int dump_on(void);
+
+/* The read-back frame is in the staging buffer: its CPU view brought up to date. */
+static VkResult staging_ready(vkb_swapchain *sc)
+{
+    if (!sc->copy_present || !sc->staging_cached) return VK_SUCCESS;
+    /* The copy is done: the CPU's stale lines of the staging buffer dropped before it is read
+     * (server_memory.c: DMA_BUF_IOCTL_SYNC). */
+    VkMappedMemoryRange whole = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, sc->staging_mem, 0, VK_WHOLE_SIZE};
+    return vkb_ep_vkInvalidateMappedMemoryRanges((VkDevice)sc->dev, 1, &whole);
+}
+
+static void *late_thread(void *arg)
+{
+    vkb_swapchain *sc = arg;
+    pthread_setname_np(pthread_self(), "vkb-present-cp");
+    pthread_mutex_lock(&sc->lock);
+    for (;;) {
+        while (!sc->late_pending && !sc->late_quit) pthread_cond_wait(&sc->late_cond, &sc->lock);
+        if (!sc->late_pending) break;
+        uint32_t index = sc->late_index, lat = sc->late_lat;
+        uint64_t pid = sc->late_pid, t0 = sc->late_t0;
+        pthread_mutex_unlock(&sc->lock);
+        VkResult r = wait_frame_from(sc, sc->fence, t0);
+        if (r >= 0) {
+            vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
+            r = staging_ready(sc);
+        }
+        if (r >= 0 && dump_on()) dump_frame(sc, index);
+        if (r >= 0 && sc->status >= 0) {
+            r = sc->backend->present(sc, index, NULL);
+            if (r >= 0) vkb_wsi_pw_committed(sc, pid, 0);
+        }
+        vkb_lat_presented(lat, r >= 0);
+        uint64_t ns = wsi_now_ns() - t0;
+        pthread_mutex_lock(&sc->lock);
+        sc->images[index].busy = 0;
+        if (r < 0 && sc->status >= 0) sc->status = r;
+        sc->late_frames++;
+        if (ns > sc->late_max_ns) sc->late_max_ns = ns;
+        sc->late_pending = 0;
+        pthread_cond_broadcast(&sc->late_cond);
+        pthread_cond_broadcast(&sc->pw_cond); /* a broken chain ends present waits */
+    }
+    pthread_mutex_unlock(&sc->lock);
+    return NULL;
+}
+
+/* Waits until no late frame is pending (the next copy present reuses the read-back buffer and the
+ * fence). deadline: CLOCK_MONOTONIC ns, UINT64_MAX: none. 1 if one was pending. */
+static int late_wait(vkb_swapchain *sc, uint64_t deadline)
+{
+    pthread_mutex_lock(&sc->lock);
+    int had = sc->late_pending;
+    while (sc->late_pending) {
+        if (deadline == UINT64_MAX) {
+            pthread_cond_wait(&sc->late_cond, &sc->lock);
+            continue;
+        }
+        if (wsi_now_ns() >= deadline) break;
+        struct timespec ts = {(time_t)(deadline / 1000000000ull), (long)(deadline % 1000000000ull)};
+        pthread_cond_timedwait(&sc->late_cond, &sc->lock, &ts);
+    }
+    pthread_mutex_unlock(&sc->lock);
+    return had;
+}
+
+/* The frame in image `index` (its fence not yet signalled) to the swapchain's thread. 0 if that
+ * thread cannot be started: the caller waits as before. */
+static int late_hand_over(vkb_swapchain *sc, uint32_t index, uint64_t pid, uint64_t t0)
+{
+    static int said;
+    pthread_mutex_lock(&sc->lock);
+    if (!sc->late_on) {
+        if (pthread_create(&sc->late_thread, NULL, late_thread, sc) != 0) {
+            pthread_mutex_unlock(&sc->lock);
+            return 0;
+        }
+        sc->late_on = 1;
+    }
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+        VKB_INFO("swapchain: a frame not rendered within %llu ms is shown by the swapchain's thread once it is; the app's present "
+                 "returns (VKBRIDGE_PRESENT_HOLD_MS)", (unsigned long long)(present_hold_ns() / 1000000ull));
+    sc->images[index].acquired = 0;
+    sc->images[index].busy = 1; /* not acquirable until shown */
+    sc->late_index = index;
+    sc->late_lat = sc->lat_n;
+    sc->late_pid = pid;
+    sc->late_t0 = t0;
+    sc->late_pending = 1;
+    pthread_cond_broadcast(&sc->late_cond);
+    pthread_mutex_unlock(&sc->lock);
+    return 1;
+}
+
+/* vkDestroySwapchainKHR: a late frame still pending is shown (or fails) first. */
+static void late_stop(vkb_swapchain *sc)
+{
+    pthread_mutex_lock(&sc->lock);
+    int on = sc->late_on;
+    sc->late_quit = 1;
+    pthread_cond_broadcast(&sc->late_cond);
+    pthread_mutex_unlock(&sc->lock);
+    if (on) pthread_join(sc->late_thread, NULL);
+    sc->late_on = 0;
+    if (sc->late_frames)
+        VKB_INFO("swapchain: %llu frames not rendered within the hold were shown by the swapchain's thread, the longest %.1f ms after "
+                 "its present", (unsigned long long)sc->late_frames, sc->late_max_ns / 1e6);
+}
+
+/* Waits (on the CPU) for the app's rendering into image `index`, reading it back when needed: up to
+ * VKBRIDGE_PRESENT_HOLD_MS, then *late = 1 and the swapchain's thread finishes it (above). */
+VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait,
+                                uint64_t pid, int *late)
+{
+    *late = 0;
+    late_wait(sc, UINT64_MAX); /* an earlier late frame: the read-back buffer and the fence are free again */
+    if (sc->status < 0) return sc->status;
     VkPipelineStageFlags *stages = alloca((nwait ? nwait : 1) * sizeof(VkPipelineStageFlags));
     for (uint32_t i = 0; i < nwait; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, nwait, wait, stages, 0, NULL, 0, NULL};
@@ -679,17 +844,20 @@ VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index
         si.commandBufferCount = 1;
         si.pCommandBuffers = &sc->copy_cbs[index];
     }
-    VkResult r = vkb_wire_vkQueueSubmit(queue, 1, &si, sc->fence);
+    VkResult r = vkb_sm_queue_submit(queue, 1, &si, sc->fence);
     if (r != VK_SUCCESS) return r;
-    r = vkb_wsi_wait_frame(sc, sc->fence);
-    if (r != VK_SUCCESS) return r;
-    if (r == VK_SUCCESS && sc->copy_present && sc->staging_cached) {
-        /* The copy is done: the CPU's stale lines of the staging buffer dropped before it is read
-         * (server_memory.c: DMA_BUF_IOCTL_SYNC). */
-        VkMappedMemoryRange whole = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, sc->staging_mem, 0, VK_WHOLE_SIZE};
-        r = vkb_ep_vkInvalidateMappedMemoryRanges(device, 1, &whole);
+    uint64_t t0 = wsi_now_ns(), hold = present_hold_ns();
+    vkb_hitch_in_present = 1; /* the swapchain's wait, not the app's (hitch.c) */
+    r = vkb_sm_wait_fences(sc->dev, 1, &sc->fence, VK_TRUE, hold);
+    vkb_hitch_in_present = 0;
+    if (r == VK_TIMEOUT && late_hand_over(sc, index, pid, t0)) {
+        *late = 1;
+        return VK_SUCCESS;
     }
-    return r;
+    if (r == VK_SUCCESS) vkb_ep_vkResetFences((VkDevice)sc->dev, 1, &sc->fence);
+    else if (r == VK_TIMEOUT) r = wait_frame_from(sc, sc->fence, t0);
+    if (r != VK_SUCCESS) return r;
+    return staging_ready(sc);
 }
 
 /* ------------------------------------------------------------------ swapchain */
@@ -700,12 +868,14 @@ static void swapchain_free(vkb_swapchain *sc)
     if (sc->backend && sc->backend->destroy) sc->backend->destroy(sc);
     for (uint32_t i = 0; i < sc->count; i++) destroy_image(sc, &sc->images[i]);
     if (sc->pool) vkb_ep_vkDestroyCommandPool(device, sc->pool, NULL);
-    if (sc->fence) vkb_wire_vkDestroyFence(device, sc->fence, NULL);
+    if (sc->fence) vkb_ep_vkDestroyFence(device, sc->fence, NULL);
     if (sc->staging) vkb_ep_vkDestroyBuffer(device, sc->staging, NULL);
     if (sc->staging_mem) vkb_ep_vkFreeMemory(device, sc->staging_mem, NULL);
     free(sc->images);
     free(sc->copy_cbs);
     free(sc->view_formats);
+    pthread_cond_destroy(&sc->pw_cond);
+    pthread_cond_destroy(&sc->late_cond);
     pthread_mutex_destroy(&sc->lock);
     free(sc);
 }
@@ -724,7 +894,7 @@ static VkResult swapchain_build(vkb_swapchain *sc, int dmabuf)
         if (r != VK_SUCCESS) return r;
     }
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkResult r = vkb_wire_vkCreateFence(device, &fci, NULL, &sc->fence);
+    VkResult r = vkb_ep_vkCreateFence(device, &fci, NULL, &sc->fence);
     if (r != VK_SUCCESS) return r;
     return sc->backend->init(sc);
 }
@@ -739,7 +909,7 @@ static void swapchain_teardown(vkb_swapchain *sc)
         memset(&sc->images[i], 0, sizeof(sc->images[i]));
         sc->images[i].dmabuf_fd = sc->images[i].ahb_sock = -1;
     }
-    if (sc->fence) vkb_wire_vkDestroyFence(device, sc->fence, NULL);
+    if (sc->fence) vkb_ep_vkDestroyFence(device, sc->fence, NULL);
     sc->fence = VK_NULL_HANDLE;
     if (sc->staging) vkb_ep_vkDestroyBuffer(device, sc->staging, NULL);
     if (sc->staging_mem) vkb_ep_vkFreeMemory(device, sc->staging_mem, NULL);
@@ -755,10 +925,22 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateSwapchainKHR(VkDevice device, cons
     vkb_frames_swapchain(); /* asked for (made or not): the process presents through the bridge (frames.c) */
     vkb_device *dev = vkb_dev(device);
     vkb_surface *s = surf(pCreateInfo->surface);
-    if (pCreateInfo->oldSwapchain) chain(pCreateInfo->oldSwapchain)->retired = 1;
+    if (pCreateInfo->oldSwapchain) {
+        vkb_swapchain *old = chain(pCreateInfo->oldSwapchain);
+        pthread_mutex_lock(&old->lock);
+        old->retired = 1;
+        pthread_cond_broadcast(&old->pw_cond); /* a wait for a present it will never make ends (out of date) */
+        pthread_mutex_unlock(&old->lock);
+    }
     vkb_swapchain *sc = calloc(1, sizeof(*sc));
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
     pthread_mutex_init(&sc->lock, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&sc->pw_cond, &ca);
+    pthread_cond_init(&sc->late_cond, &ca);
+    pthread_condattr_destroy(&ca);
     sc->dev = dev;
     sc->surface = s;
     sc->info = *pCreateInfo;
@@ -830,9 +1012,21 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroySwapchainKHR(VkDevice device, VkSwapc
     (void)pAllocator;
     if (!swapchain) return;
     vkb_swapchain *sc = chain(swapchain);
+    /* Threads still waiting for a present of it are let go first (out of date). */
+    pthread_mutex_lock(&sc->lock);
+    sc->pw_closing = 1;
+    pthread_cond_broadcast(&sc->pw_cond);
+    while (sc->pw_waiters) pthread_cond_wait(&sc->pw_cond, &sc->lock);
+    pthread_mutex_unlock(&sc->lock);
+    if (sc->pw_waits)
+        VKB_INFO("present wait: %llu waits, %llu timed out, %.1f ms on average, longest %.1f ms; %llu frames counted shown without the "
+                 "compositor's word", (unsigned long long)sc->pw_waits, (unsigned long long)sc->pw_timeouts,
+                 sc->pw_wait_ns / 1e6 / (double)sc->pw_waits, sc->pw_wait_max_ns / 1e6, (unsigned long long)sc->pw_unanswered);
+    late_stop(sc); /* a late copy present is shown first (it waits for its frame, up to the present timeout) */
     /* Images may still be in use by the GPU (present waits are CPU-side, so not by us). */
     vkb_wire_vkDeviceWaitIdle(device);
     swapchain_free(sc);
+    vkb_lat_flush(); /* the latency log's last records (latency.c) */
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain, uint32_t *pCount, VkImage *pImages)
@@ -853,6 +1047,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSwapchainImagesKHR(VkDevice device, V
 static VkResult signal_acquire(vkb_device *dev, VkSemaphore sem, VkFence fence)
 {
     VkDevice device = (VkDevice)dev;
+    if (fence) vkb_sm_fence_unknown(dev, fence); /* imported or signalled by an empty submit: asked of the server */
     if (sem) {
         VkImportSemaphoreFdInfoKHR si = {VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, NULL, sem, VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
                                          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, -1};
@@ -927,7 +1122,11 @@ static VkResult acquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t time
         uint64_t now = now_ns();
         if (timeout == 0) return VK_NOT_READY;
         if (now >= deadline) return VK_TIMEOUT;
+        /* a late copy present holds an image until shown: wait for it, not for the window system */
+        if (late_wait(sc, deadline)) continue;
+        uint64_t ht0 = vkb_hitch_active ? now_ns() : 0;
         VkResult r = sc->backend->wait_free(sc, deadline == UINT64_MAX ? UINT64_MAX : deadline - now);
+        if (ht0) vkb_hitch_waited(VKB_HITCH_W_PRESENT, VKB_CMD_COUNT, now_ns() - ht0);
         if (r < 0) {
             sc->status = r;
             return r;
@@ -996,12 +1195,63 @@ static int dump_on(void)
     return v;
 }
 
+/* VKBRIDGE_FRAME_QUEUE=N (1-8; a per-game preset, <cache dir>/env or the server's environment, or
+ * the guest's environment, which wins; 0 or unset: off). With presents that go back to the app at
+ * once (dma-buf images on Wayland: the presenting thread shows them), a game can get several
+ * frames ahead of the GPU, and each frame queued is a frame of input lag when the GPU is the limit.
+ * On, vkQueuePresentKHR returns only once at most N - 1 presented frames, its own included, are
+ * still rendering (1: once its own frame is rendered; 2: once every earlier one is). DXVK and vkd3d-proton present from a thread of
+ * their own, one frame behind the game, so for them N is D3D's maximum frame latency N
+ * (dxgi.maxFrameLatency): 1 measured the same as DXVK's own setting on the host, about 1% fps. A
+ * game that presents from its render thread (native Vulkan) loses its CPU/GPU overlap at 1; 2 is
+ * its "one frame ahead". DXVK's own setting is better for DXVK games (it also counts frames DXVK
+ * holds before presenting): with a maxFrameLatency in DXVK_CONFIG this switch stands aside (both
+ * on measured about 1% slower than DXVK's alone, for the same latency). Copy presents (X11, wl_shm)
+ * already wait for each frame: nothing changes there. The line at the swapchain's end says how often and how long presents waited. */
+static uint32_t fq_server, fq_value;
+static int fq_decided;
+
+void vkb_wsi_frame_queue_server(uint32_t n) { __atomic_store_n(&fq_server, n > 8 ? 8 : n, __ATOMIC_RELAXED); }
+
+static uint32_t frame_queue(void)
+{
+    if (__atomic_load_n(&fq_decided, __ATOMIC_ACQUIRE)) return fq_value;
+    const char *e = getenv("VKBRIDGE_FRAME_QUEUE");
+    uint32_t n = __atomic_load_n(&fq_server, __ATOMIC_RELAXED);
+    if (e && *e) {
+        char *end;
+        unsigned long v = strtoul(e, &end, 10);
+        n = *end || *e == '-' ? 0 : v > 8 ? 8 : (uint32_t)v;
+    }
+    if (n && vkb_dxvkcfg_own_latency()) {
+        VKB_INFO("frame queue: VKBRIDGE_FRAME_QUEUE=%u not used: DXVK keeps its own queue short (maxFrameLatency in DXVK_CONFIG)", n);
+        n = 0;
+    }
+    fq_value = n;
+    __atomic_store_n(&fq_decided, 1, __ATOMIC_RELEASE);
+    if (n)
+        VKB_INFO("frame queue: a present returns once at most %u frame%s (its own included) %s still rendering (VKBRIDGE_FRAME_QUEUE=%u)",
+                 n - 1, n - 1 == 1 ? "" : "s", n - 1 == 1 ? "is" : "are", n);
+    return n;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
     const VkPresentRegionsKHR *regions = NULL;
+    const uint64_t *ids = NULL; /* VkPresentIdKHR / VkPresentId2KHR: one per swapchain, 0 = none */
+    uint32_t nids = 0;
     vkb_frames_present(); /* for the server's session report (frames.c) */
+    vkb_hitch_present();  /* the per-hitch line (hitch.c) */
+    vkb_dxvkcfg_check();  /* once: what DXVK was given (dxvkcfg.c) */
+    uint32_t lat = vkb_lat_present(); /* the latency log (latency.c): before any of this present reaches the server */
     for (const VkBaseInStructure *b = pPresentInfo->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR) regions = (const void *)b;
+        else if (b->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR || b->sType == VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR) {
+            /* the two structs have the same layout */
+            const VkPresentIdKHR *pid = (const void *)b;
+            ids = pid->pPresentIds;
+            nids = ids ? pid->swapchainCount : 0;
+        }
     VkResult worst = VK_SUCCESS;
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
         vkb_swapchain *sc = chain(pPresentInfo->pSwapchains[i]);
@@ -1009,6 +1259,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
         VkResult r = sc->status;
         if (index >= sc->count) r = VK_ERROR_OUT_OF_DATE_KHR;
         uint32_t nwait = i == 0 ? pPresentInfo->waitSemaphoreCount : 0;
+        uint64_t pid = i < nids ? ids[i] : 0;
+        if (pid && r >= 0) {
+            pthread_mutex_lock(&sc->lock);
+            if (pid > sc->pw_queued) sc->pw_queued = pid;
+            pthread_mutex_unlock(&sc->lock);
+        }
         if (r >= 0 && sc->backend->present_async && sc->dmabuf && !sc->copy_present && !dump_on()) {
             /* The presenting thread goes back to the game at once: the GPU's work and the next
              * frame's overlap (Hades' Vulkan renderer presents from its render thread; waiting
@@ -1017,12 +1273,34 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
             sc->images[index].acquired = 0;
             sc->images[index].busy = 1;
             pthread_mutex_unlock(&sc->lock);
+            /* the presenting thread stamps it from here on; one swapchain's (the first) per present */
+            sc->lat_n = i == 0 ? lat : 0;
+            sc->pw_cur = pid; /* the presenting thread says when it is shown */
+            vkb_lat_flag(sc->lat_n, VKB_LAT_F_ASYNC);
             r = sc->backend->present_async(sc, queue, index, nwait, pPresentInfo->pWaitSemaphores);
+            if (r < 0) vkb_lat_presented(sc->lat_n, 0);
+            sc->lat_n = 0;
+            sc->pw_cur = 0;
             sc->presents++;
+            uint32_t fq = r >= 0 && sc->backend->wait_queue ? frame_queue() : 0;
+            if (fq) {
+                uint64_t ht0 = vkb_hitch_active ? now_ns() : 0;
+                sc->backend->wait_queue(sc, fq - 1);
+                if (ht0) vkb_hitch_waited(VKB_HITCH_W_PRESENT, VKB_CMD_COUNT, now_ns() - ht0);
+            }
             goto done;
         }
+        sc->lat_n = i == 0 ? lat : 0;
         if (r >= 0) {
-            r = vkb_wsi_wait_rendering(sc, queue, index, nwait, pPresentInfo->pWaitSemaphores);
+            int late = 0;
+            r = vkb_wsi_wait_rendering(sc, queue, index, nwait, pPresentInfo->pWaitSemaphores, pid, &late);
+            if (late) {
+                /* not rendered within the hold: the swapchain's thread shows it (and stamps it) */
+                sc->presents++;
+                sc->lat_n = 0;
+                goto done;
+            }
+            if (r >= 0) vkb_lat_stamp(sc->lat_n, VKB_LAT_DONE, 0);
         }
         pthread_mutex_lock(&sc->lock);
         if (index < sc->count) {
@@ -1034,7 +1312,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
         if (r >= 0) {
             r = sc->backend->present(sc, index, regions && i < regions->swapchainCount ? &regions->pRegions[i] : NULL);
             sc->presents++;
+            /* a copy present (X11, wl_shm), headless: shown when handed over */
+            if (r >= 0) vkb_wsi_pw_committed(sc, pid, 0);
         }
+        vkb_lat_presented(sc->lat_n, r >= 0);
+        sc->lat_n = 0;
     done:
         if (r < 0) {
             pthread_mutex_lock(&sc->lock);
@@ -1048,6 +1330,202 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
         else if (worst == VK_SUCCESS && r == VK_SUBOPTIMAL_KHR) worst = r;
     }
     return vkb_note_error("vkQueuePresentKHR", worst);
+}
+
+/* ------------------------------------------------------------------ present ids and waits */
+
+/*
+ * VK_KHR_present_id + VK_KHR_present_wait, and their successors VK_KHR_present_id2 +
+ * VK_KHR_present_wait2: the app numbers its presents (VkPresentIdKHR / VkPresentId2KHR) and waits
+ * until the frame with a number is shown (vkWaitForPresentKHR / vkWaitForPresent2KHR). vkd3d-proton
+ * limits a D3D12 game's frame latency this way and has no limit of its own without them ("supports
+ * neither present_wait1 or present_wait2. Latency will increase"); DXVK counts its frame latency to
+ * the shown frame with them, to the rendered one without.
+ *
+ * All the swapchain's own, nothing goes to the server. "Shown" on each path:
+ *  - Wayland, dma-buf images (the presenting thread; gamescope, DroidDeck's compositor): when the
+ *    compositor says the frame was presented, or that a later frame replaced it (wp_presentation
+ *    feedback). A compositor without wp_presentation: when the frame was committed to it. A frame
+ *    the compositor has not answered for 500 ms after its commit, or by the time 4 later frames
+ *    with ids were committed, counts as shown (said once, counted in the line at the end), so a
+ *    compositor that never answers costs a game at most that, not a hang.
+ *  - Wayland wl_shm, X11, headless (copy presents, the app's own call): when the frame was handed
+ *    to the window system (the end of vkQueuePresentKHR; these presents wait for the rendering).
+ * A wait returns VK_SUCCESS once the swapchain's highest shown id is at least the one asked (the
+ * spec's rule: a later frame shown completes earlier ids), VK_TIMEOUT at the app's timeout,
+ * the swapchain's error once it is broken (VK_ERROR_OUT_OF_DATE_KHR, SURFACE_LOST, DEVICE_LOST),
+ * VK_ERROR_OUT_OF_DATE_KHR when the swapchain is being destroyed, or is retired and the id was
+ * never presented on it.
+ *
+ * Offered by default to every app but DXVK (engine "DXVK" in its VkApplicationInfo: it keeps its
+ * own frame latency without them, and measured no gain with them, see FEAT-present-wait).
+ * VKBRIDGE_PRESENT_WAIT=1 (the guest's environment, or a preset / <cache dir>/env through the
+ * server): offered to DXVK too. =0: the four extensions are not offered, their features read false. =commit: offered, but
+ * a frame counts as shown once committed to the compositor (no wp_presentation asked), for a
+ * compositor whose answers come late or in bursts (the game's pacing follows them).
+ */
+#define PW_GRACE_NS (500ull * 1000 * 1000)
+#define PW_GRACE_COMMITS 4
+#define PW_SLICE_NS (50ull * 1000 * 1000)
+
+int vkb_wsi_present_wait_on(const vkb_physdev *pd)
+{
+    const char *e = getenv("VKBRIDGE_PRESENT_WAIT");
+    uint32_t srv = pd ? pd->info.present_wait : 0;
+    int on;
+    if (e && *e) on = strcmp(e, "0") != 0;
+    else if (srv) on = srv != VKB_PRESENT_WAIT_OFF;
+    else if (pd && pd->instance && pd->instance->dxvk) {
+        /* DXVK keeps its frame latency without them; with them it measured the same Present() ->
+         * shown and about 1.4% fewer frames on the host (gamescope, GPU-bound). */
+        VKB_ONCE(VKB_LOG_INFO, "present wait: not offered to DXVK (it limits its frame latency without; VKBRIDGE_PRESENT_WAIT=1 "
+                               "offers it)");
+        return 0;
+    } else on = 1;
+    if (!on)
+        VKB_ONCE(VKB_LOG_INFO, "present wait: off (VKBRIDGE_PRESENT_WAIT=0): VK_KHR_present_id, present_wait, present_id2 and "
+                               "present_wait2 not offered");
+    return on;
+}
+
+int vkb_wsi_present_wait_commit(const vkb_physdev *pd)
+{
+    const char *e = getenv("VKBRIDGE_PRESENT_WAIT");
+    int c = e && *e ? !strcmp(e, "commit") : pd && pd->info.present_wait == VKB_PRESENT_WAIT_COMMIT;
+    if (c) VKB_ONCE(VKB_LOG_INFO, "present wait: a frame counts as shown once committed to the compositor (VKBRIDGE_PRESENT_WAIT=commit)");
+    return c;
+}
+
+void vkb_wsi_patch_features(const vkb_physdev *pd, VkBaseOutStructure *b)
+{
+    VkBool32 on;
+    switch ((int)b->sType) {
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR: break;
+    default: return;
+    }
+    on = vkb_wsi_present_wait_on(pd) ? VK_TRUE : VK_FALSE;
+    /* each is { sType, pNext, VkBool32 } */
+    ((VkPhysicalDevicePresentIdFeaturesKHR *)b)->presentId = on;
+}
+
+/* lock held */
+static void pw_done_locked(vkb_swapchain *sc, uint64_t id)
+{
+    if (id <= sc->pw_done) return;
+    sc->pw_done = id;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < sc->pw_npending; i++)
+        if (sc->pw_pending[i].id > id) sc->pw_pending[k++] = sc->pw_pending[i];
+    sc->pw_npending = k;
+    pthread_cond_broadcast(&sc->pw_cond);
+}
+
+/* lock held: frames the compositor has not answered for in time count as shown */
+static void pw_unanswered_locked(vkb_swapchain *sc, uint64_t now)
+{
+    uint64_t upto = 0;
+    for (uint32_t i = 0; i < sc->pw_npending; i++)
+        if (now - sc->pw_pending[i].t >= PW_GRACE_NS || sc->pw_commits - sc->pw_pending[i].commit >= PW_GRACE_COMMITS)
+            if (sc->pw_pending[i].id > upto) upto = sc->pw_pending[i].id;
+    if (!upto || upto <= sc->pw_done) return;
+    sc->pw_unanswered++;
+    VKB_ONCE(VKB_LOG_INFO, "present wait: the compositor did not say a frame was shown (within %llu ms, or %d frames later); such "
+                           "frames count as shown", PW_GRACE_NS / 1000000, PW_GRACE_COMMITS);
+    pw_done_locked(sc, upto);
+}
+
+void vkb_wsi_pw_committed(vkb_swapchain *sc, uint64_t id, int feedback)
+{
+    if (!id) return;
+    uint64_t now = now_ns();
+    pthread_mutex_lock(&sc->lock);
+    sc->pw_commits++;
+    if (!feedback) {
+        pw_done_locked(sc, id);
+    } else if (id > sc->pw_done) {
+        if (sc->pw_npending == sizeof(sc->pw_pending) / sizeof(sc->pw_pending[0])) {
+            pw_done_locked(sc, sc->pw_pending[0].id); /* the oldest: counts as shown */
+            sc->pw_unanswered++;
+        }
+        sc->pw_pending[sc->pw_npending].id = id;
+        sc->pw_pending[sc->pw_npending].t = now;
+        sc->pw_pending[sc->pw_npending].commit = sc->pw_commits;
+        sc->pw_npending++;
+    }
+    pw_unanswered_locked(sc, now);
+    pthread_mutex_unlock(&sc->lock);
+}
+
+void vkb_wsi_pw_shown(vkb_swapchain *sc, uint64_t id)
+{
+    if (!id) return;
+    pthread_mutex_lock(&sc->lock);
+    pw_done_locked(sc, id);
+    pthread_mutex_unlock(&sc->lock);
+}
+
+static VkResult wait_for_present(VkDevice device, VkSwapchainKHR swapchain, uint64_t id, uint64_t timeout)
+{
+    (void)device;
+    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
+    vkb_swapchain *sc = chain(swapchain);
+    uint64_t t0 = now_ns();
+    uint64_t deadline = timeout >= UINT64_MAX - t0 ? UINT64_MAX : t0 + timeout;
+    VkResult r;
+    int waited = 0;
+    pthread_mutex_lock(&sc->lock);
+    sc->pw_waiters++;
+    for (;;) {
+        uint64_t now = now_ns();
+        pw_unanswered_locked(sc, now);
+        if (sc->pw_closing) {
+            r = VK_ERROR_OUT_OF_DATE_KHR;
+            break;
+        }
+        if (sc->pw_done >= id) {
+            r = sc->status == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
+            break;
+        }
+        if (sc->status < 0) {
+            r = sc->status;
+            break;
+        }
+        if (sc->retired && id > sc->pw_queued) {
+            r = VK_ERROR_OUT_OF_DATE_KHR; /* never presented, and it cannot be any more */
+            break;
+        }
+        if (now >= deadline) {
+            r = VK_TIMEOUT;
+            break;
+        }
+        /* in slices: a status set elsewhere, a compositor's silence are seen without a signal */
+        uint64_t until = deadline - now > PW_SLICE_NS ? now + PW_SLICE_NS : deadline;
+        struct timespec ts = {(time_t)(until / 1000000000ull), (long)(until % 1000000000ull)};
+        waited = 1;
+        pthread_cond_timedwait(&sc->pw_cond, &sc->lock, &ts);
+    }
+    uint64_t ns = now_ns() - t0;
+    sc->pw_waits++;
+    if (r == VK_TIMEOUT) sc->pw_timeouts++;
+    sc->pw_wait_ns += ns;
+    if (ns > sc->pw_wait_max_ns) sc->pw_wait_max_ns = ns;
+    if (--sc->pw_waiters == 0 && sc->pw_closing) pthread_cond_broadcast(&sc->pw_cond);
+    pthread_mutex_unlock(&sc->lock);
+    if (waited && vkb_hitch_active) vkb_hitch_waited(VKB_HITCH_W_PRESENT, VKB_CMD_COUNT, ns); /* the per-hitch line (hitch.c) */
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitForPresentKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t presentId, uint64_t timeout)
+{
+    return vkb_note_error("vkWaitForPresentKHR", wait_for_present(device, swapchain, presentId, timeout));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitForPresent2KHR(VkDevice device, VkSwapchainKHR swapchain, const VkPresentWait2InfoKHR *pPresentWait2Info)
+{
+    return vkb_note_error("vkWaitForPresent2KHR", wait_for_present(device, swapchain, pPresentWait2Info->presentId, pPresentWait2Info->timeout));
 }
 
 /* ------------------------------------------------------------------ headless */

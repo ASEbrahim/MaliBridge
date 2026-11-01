@@ -361,6 +361,27 @@ static const struct {
 };
 #define NIMPLICIT (sizeof(implicit13) / sizeof(implicit13[0]))
 
+/* What Vulkan 1.2 made core that gamescope never uses: on a driver whose 1.2 lacks only these (Mali
+ * r18p0/r19p0 on the Kirin 810 and Exynos 880, once timeline semaphores are the
+ * bridge's) gamescope's instance alone is offered 1.2, each of these features reported false, as
+ * the driver has them. gamescope 3.16 checks only apiVersion >= 1.2 and turns on timelineSemaphore,
+ * scalarBlockLayout, shaderFloat16 (when reported) and 1.3's dynamicRendering (emulated on 1.1
+ * drivers, server_emu_dynrend.c); its shaders are SPIR-V 1.0 (glslang -V without a target), so
+ * neither SPIR-V 1.4 nor float controls are asked of the driver; it draws with no stencil, no
+ * subpasses, no queries and no subgroup operations. Games keep the driver's version.
+ * VKBRIDGE_PROMOTE_UI_GAPS=0: gamescope only gets a complete 1.2, as before. */
+static const char *const ui_gaps_12[] = {
+    "VK_KHR_shader_float_controls", "VK_KHR_spirv_1_4", "VK_EXT_separate_stencil_usage", "uniformBufferStandardLayout",
+    "subgroupBroadcastDynamicId", "imagelessFramebuffer", "separateDepthStencilLayouts", "hostQueryReset", "shaderSubgroupExtendedTypes",
+};
+
+static int ui_gap(const char *what)
+{
+    for (size_t i = 0; i < sizeof(ui_gaps_12) / sizeof(ui_gaps_12[0]); i++)
+        if (!strcmp(what, ui_gaps_12[i])) return 1;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ switches */
 
 static uint32_t parse_version(const char *v, uint32_t dflt)
@@ -380,6 +401,11 @@ static uint32_t fake_api(void)
         __atomic_store_n(&taken, 1, __ATOMIC_RELEASE);
     }
     return v;
+}
+
+uint32_t vkb_promote_fake_api(void)
+{
+    return fake_api();
 }
 
 /* Drivers promotion was tried on and works with: by default it is on only there, the way built-in
@@ -593,13 +619,14 @@ typedef struct promo_gpu {
     char missing[512];     /* what the next version lacks (for the log and the session report) */
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     int int64;             /* shaderInt64, which no emulation adds */
+    int timeline_emu;      /* timeline semaphores kept by the bridge (server_timeline.c): the feature is there */
     uint32_t push;         /* maxPushConstantsSize, the driver's (the bridge passes it on) */
 } promo_gpu;
 
 static promo_gpu gpus[VKB_MAX_PDS];
 /* The same GPUs as gamescope sees them: promoted wherever every piece is there, tested or not. On a
  * Vulkan 1.1 driver (Mali r32p1: G77, G710, G610, G57) gamescope found no device it could use and
- * Steam mode ended at "starting display and audio" (MaliBridge#10); the games keep the driver's own
+ * Steam mode ended at "starting display and audio"; the games keep the driver's own
  * version (and DroidDeck's old DXVK for it), only the compositor is promoted. */
 static promo_gpu gpus_ui[VKB_MAX_PDS];
 static int ngpus;
@@ -659,6 +686,8 @@ static void fill_core_features(const translate *x, const promo_gpu *g, VkBaseOut
     }
     /* A shuffle where the driver has them, else a chain of constant-lane broadcasts (spirv_downgrade.h). */
     if (core[1]) ((VkPhysicalDeviceVulkan12Features *)core[1])->subgroupBroadcastDynamicId = g && (g->shuffle || g->lanes);
+    /* Mali r18/r19 have no timeline semaphores; the bridge's are complete (server_timeline.c) */
+    if (core[1] && g && g->timeline_emu) ((VkPhysicalDeviceVulkan12Features *)core[1])->timelineSemaphore = VK_TRUE;
 }
 
 static void fill_core_props(const translate *x, VkBaseOutStructure *core[3], const VkPhysicalDeviceLimits *limits)
@@ -753,6 +782,7 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     VkPhysicalDeviceFeatures2 base = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     d->vkGetPhysicalDeviceFeatures2(pd, &base);
     g.int64 = base.features.shaderInt64 != 0;
+    g.timeline_emu = vkb_timeline_missing(d, pd);
     ext_list el;
     exts_get(d, pd, &el);
     uint32_t m = VMINOR(g.drv_api);
@@ -805,11 +835,19 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     fill_core_features(x, &g, x->core);
     free(x);
     /* Each version above the driver's in turn, while every piece is there. */
+    int ui_gaps_only = 0; /* the first version short of a piece lacks only what gamescope does not use */
+    char ui_gaps[480] = "";
     for (uint32_t v = m + 1; v <= 3 && v <= VMINOR(want); v++) {
         uint32_t ver = VK_MAKE_API_VERSION(0, 1, v, 0);
         char miss[480] = "";
+        int other = 0; /* missing pieces gamescope needs */
+        *ui_gaps = 0;
         for (size_t i = 0; i < NPLAIN; i++)
-            if (plain_exts[i].version == ver && plain_exts[i].need && !exts_has(&el, plain_exts[i].ext)) append(miss, sizeof(miss), plain_exts[i].ext);
+            if (plain_exts[i].version == ver && plain_exts[i].need && !exts_has(&el, plain_exts[i].ext)) {
+                append(miss, sizeof(miss), plain_exts[i].ext);
+                if (v == 2 && ui_gap(plain_exts[i].ext)) append(ui_gaps, sizeof(ui_gaps), plain_exts[i].ext);
+                else other = 1;
+            }
         for (size_t i = 0; i < NNEEDS; i++) {
             if (needs[i].version != ver) continue;
             const void *s = needs[i].core == 12 ? (const void *)&f12 : (const void *)&f13;
@@ -822,6 +860,8 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
             if (!strcmp(needs[i].name, "subgroupBroadcastDynamicId")) ext = "subgroup shuffles";
             snprintf(what, sizeof(what), "%s (%s)", ext ? ext : "?", needs[i].name);
             append(miss, sizeof(miss), what);
+            if (v == 2 && ui_gap(needs[i].name)) append(ui_gaps, sizeof(ui_gaps), needs[i].name);
+            else other = 1;
         }
         if (v == 3) {
             /* the extended dynamic states have no core bit: their extension's own */
@@ -831,12 +871,19 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
         }
         if (*miss) {
             snprintf(g.missing, sizeof(g.missing), "Vulkan 1.%u lacks %s", v, miss);
+            ui_gaps_only = v == 2 && !other;
             break;
         }
         g.offered = VK_MAKE_API_VERSION(0, 1, v, VK_API_VERSION_PATCH(g.drv_api));
     }
     free(el.e);
     promo_gpu ui = g; /* gamescope's: promoted when complete, tested or not */
+    const char *gaps_env = vkb_srv_env("VKBRIDGE_PROMOTE_UI_GAPS");
+    if (ui_gaps_only && BELOW(ui.offered, V12) && !(gaps_env && !strcmp(gaps_env, "0"))) {
+        ui.offered = VK_MAKE_API_VERSION(0, 1, 2, VK_API_VERSION_PATCH(g.drv_api));
+        VKB_INFO("promotion: %s offered to gamescope as Vulkan 1.2 without %s (what gamescope does not use; reported false)%s", name, ui_gaps,
+                 g.timeline_emu ? "; timeline semaphores the bridge's" : "");
+    }
     if (g.offered != g.drv_api && !allowed) {
         /* not tested on this driver: said, and the app sees the driver's own version */
         VKB_INFO("promotion: %s would offer Vulkan 1.%u on its Vulkan 1.%u driver%s; off: not tested on this driver (VKBRIDGE_PROMOTE_API=1 "

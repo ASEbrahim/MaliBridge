@@ -9,9 +9,11 @@
 #      during the compile, a pipeline destroyed while compiling, one left at vkDestroyDevice; the
 #      server's summary counts the skipped draws and the synchronous reasons;
 #      =2: the pipeline without vertex input goes to the background too;
+#      =3 (deferred): every pipeline in the background, each first frame drawn (no draw skipped);
 #   4  on, a compile within the wait: the real pipeline back, drawn at once;
 #   5  on with no imitated delay and a long wait (every pipeline ready in time): smoke, cullmode,
-#      dynstate and flicker checks pass through the layer's wrappers unchanged;
+#      dynstate and flicker checks pass through the layer's wrappers unchanged; the same checks
+#      deferred (=3) with no wait, so that every graphics pipeline is a stand-in;
 #   6  the server is alive and logged no protocol errors; the protocol hash is unchanged.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
@@ -74,6 +76,14 @@ sum=$(echo "$new" | grep -o 'async compile, device [0-9]*: .*' | tail -1)
 [ $rc = 0 ] && echo "$new" | grep -q "pipelines without vertex input too" && echo "$sum" | grep -q 'no colour output 1' &&
   ! echo "$sum" | grep -q 'no vertex input'
 step $? "on (2), pipelines without vertex input in the background too: $res"
+# 3c
+run VKBRIDGE_ASYNC_COMPILE=3 VKBRIDGE_ASYNC_COMPILE_IMITATE_MS=400 -- asyncpipe_check defer
+sum=$(echo "$new" | grep -o 'async compile, device [0-9]*: .*' | tail -1)
+[ $rc = 0 ] && echo "$new" | grep -q "no draw skipped: a replay waits" && echo "$sum" | grep -q ' 0 draws skipped' &&
+  echo "$sum" | grep -qE ' [1-9][0-9]* binds waited' && ! echo "$sum" | grep -qE 'no colour output|no vertex input'
+step $? "on (3, deferred): every pipeline in the background, no draw skipped: $res"
+grep '^[PF]A[SI][SL] ' $work/run.log | sed 's/^/       /'
+echo "       server: ${sum:-no summary}" | cut -c1-300
 # 4
 run VKBRIDGE_ASYNC_COMPILE=1 VKBRIDGE_ASYNC_COMPILE_WAIT_MS=2000 -- asyncpipe_check quick
 sum=$(echo "$new" | grep -o 'async compile, device [0-9]*: .*' | tail -1)
@@ -86,12 +96,20 @@ for p in vkbridge-smoke cullmode_check dynstate_check flicker_check; do
   [ $rc = 0 ] || r5=1
   res5="$res5 $p: $(echo "$res" | cut -c1-40);"
 done
+# the same checks deferred, with no wait at all: every graphics pipeline a stand-in the replay waits for
+r5b=0 res5b=
+for p in vkbridge-smoke cullmode_check dynstate_check flicker_check; do
+  run VKBRIDGE_ASYNC_COMPILE=3 VKBRIDGE_ASYNC_COMPILE_WAIT_MS=0 -- $p
+  [ $rc = 0 ] || r5b=1
+  res5b="$res5b $p: $(echo "$res" | cut -c1-40);"
+done
 step $r5 "on, every pipeline in time:$res5"
+step $r5b "deferred (=3), no wait, every graphics pipeline a stand-in:$res5b"
 
 # 6
 kill -0 $srv 2>/dev/null && ! grep -qE "command stream:|malformed request|unknown command id|the driver has no|caught signal|contained crash" "$log"
 step $? "server alive, no protocol errors or crashes"
-grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

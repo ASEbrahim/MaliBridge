@@ -13,7 +13,7 @@
 #      emulated: the layer's own image views (the stand-ins; the app makes none) go through both.
 #
 #   4  the bridge's query and device-creation fixes in the layer: fp16_hide (MK-20) and gs_hide
-#      (issue #11) shown and enforced (fp16_check, gshide_check), the extension hiding
+# shown and enforced (fp16_check, gshide_check), the extension hiding
 #      (VKBRIDGE_SERVER_HIDE_EXTS, vulkaninfo); a driver crash inside a pipeline compile fails that
 #      call (crash_contain_check with VKBRIDGE_TEST_CRASH_PIPELINE=1), the process's own faults
 #      still reach its own handler (layer_sigchain_check), and without the layer's handler
@@ -133,7 +133,7 @@ step $? "fp16_hide (MK-20): shaderFloat16 hidden, 16-bit storage kept, taken off
 got=$(env $clean_env VKBRIDGE_ERRATA=+gs_hide VKBRIDGE_GS_HIDE_PROCS=gshide_check timeout 60 "$out/gshide_check" 2>&1)
 echo "$got" | grep -q '^features: v10.geometryShader=0 f2.geometryShader=0' && echo "$got" | grep -q '^limits: v10.maxGeometryOutputVertices=0' &&
   echo "$got" | grep -q '^device: geometryShader enabled: 0'
-step $? "gs_hide (issue #11): geometry shaders hidden from the named process and taken off its device ($(echo "$got" | grep -o '^features: [^ ]* [^ ]*'))"
+step $? "gs_hide: geometry shaders hidden from the named process and taken off its device ($(echo "$got" | grep -o '^features: [^ ]* [^ ]*'))"
 got=$(env $clean_env VKBRIDGE_ERRATA=+gs_hide VKBRIDGE_GS_HIDE_PROCS=someone_else timeout 60 "$out/gshide_check" 2>&1)
 echo "$got" | grep -q '^device: geometryShader enabled: 1' || ! echo "$got" | grep -q 'v10.geometryShader=0'
 step $? "gs_hide: another process keeps them ($(echo "$got" | grep -o '^features: [^ ]*'))"

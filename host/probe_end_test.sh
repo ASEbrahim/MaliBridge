@@ -16,7 +16,7 @@
 #   6  the process stopped (SIGSTOP, a suspended session) inside a background probe until its
 #      watchdog fires: not counted as a hang, run again at the next start;
 #   7  the server killed (SIGKILL) inside a background probe after its last client process left,
-#      as the app ends a short session (MaliBridge#10: gamescope gone after 800 ms, the server
+#      as the app ends a short session (gamescope gone after 800 ms, the server
 #      killed right after, three times in a row inside bc_transcoders, which was then recorded as
 #      died): 3 times in a row, never counted, the probe runs again and passes.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
@@ -43,6 +43,18 @@ waitfor() { # waitfor <pattern> <file> [tenths]
   for _ in $(seq ${3:-200}); do grep -q "$1" "$2" 2>/dev/null && return 0; sleep 0.1; done
   return 1
 }
+# waitdone <file> [tenths]: every GPU's background probes are done - one "background probes done" line
+# for each "probe(s) continue in the background" line (a host with two GPUs, such as a desktop with an
+# integrated one, runs two background jobs and the first line says nothing of the second)
+waitdone() {
+  local n
+  for _ in $(seq ${2:-200}); do
+    n=$(grep -c "probe(s) continue in the background" "$1" 2>/dev/null)
+    [ "${n:-0}" -ge 1 ] && [ "$(grep -c 'probe: background probes done' "$1")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
 trap 'stop; rm -f "$sock"; [ -n "$KEEP" ] && echo "kept $work" || rm -rf "$work"' EXIT
 ulimit -c 0
 unset VKBRIDGE_HIDE_EXTS VKBRIDGE_FAKE_MISSING VKBRIDGE_PROBE_BUDGET_S VKBRIDGE_PROBE_TIMEOUT_S
@@ -55,7 +67,7 @@ at() { local n; n=$(grep -n -m1 "$1" "$2" | cut -d: -f1); echo ${n:-999999}; }
 # 1  the defaults
 start $work/c1 $work/s1
 log=$work/s1/vkbridge-server.log
-waitfor "background probes done" $log
+waitdone $log
 ms=$(grep -m1 -o 'probe: [0-9]* ms at start' $log | grep -o '[0-9]*')
 [ -S "$sock" ] && grep -q "probe(s) continue in the background" $log && [ -n "$ms" ] && [ "$ms" -lt 6000 ] &&
   [ $(at "listening on" $log) -lt $(at "probe: compile_lut_standin " $log) ] && [ $(at "listening on" $log) -lt $(at "probe: compile_aces " $log) ] &&
@@ -79,7 +91,7 @@ for sig in TERM KILL; do
   mark=$(tail -c +65 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | tr -d '\0\n' | cut -c1-20)
   start $c $work/s-$sig-2 $slow
   log2=$work/s-$sig-2/vkbridge-server.log
-  waitfor "background probes done" $log2 300
+  waitdone $log2 300
   p=$(prof $c)
   if [ $sig = TERM ]; then
     want='was stopped inside the "compile_aces" probe (stopped after [0-9]* ms (Terminated)); running it again, nothing decided from it'
@@ -117,9 +129,9 @@ start $c $work/s-stop $slow
 log=$work/s-stop/vkbridge-server.log
 waitfor "compile_aces takes 3 s longer on purpose" $log 300
 kill -STOP $srv; sleep 10; kill -CONT $srv
-waitfor "background probes done" $log 200
+waitdone $log 200
 start $c $work/s-stop2 $slow
-waitfor "background probes done" $work/s-stop2/vkbridge-server.log 300
+waitdone $work/s-stop2/vkbridge-server.log 300
 p=$(prof $c)
 grep -q "probe: compile_aces reached its time limit after [0-9.]* s, [0-9.]* s of them with the process stopped; not counted" $log &&
   grep -q "background probes done (.*); some left for the next start" $log && grep -q "probe: probing .* continuing an earlier run" $work/s-stop2/vkbridge-server.log &&
@@ -141,7 +153,7 @@ done
 mark=$(tail -c +65 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | tr -d '\0\n' | cut -c1-20)
 start $c $work/s-gone4 $slow
 log=$work/s-gone4/vkbridge-server.log
-waitfor "background probes done" $log 300
+waitdone $log 300
 p=$(prof $c)
 [ $inside = 1 ] && [ "$mark" = idle ] &&
   ( for k in 2 3 4; do grep -q 'compile_aces" probe (ended after [0-9]* ms, after every client process had left (the session.s end)); running it again' $work/s-gone$k/vkbridge-server.log || exit 1; done ) &&

@@ -56,14 +56,25 @@
  * are cut), and a save that merges with what another process wrote holds about three of them in
  * the driver for a moment (ours, the file's, the merge, while vkGetPipelineCacheData copies it):
  * at 256 MB that was ~750 MB mid-game, enough for the low-memory killer on an 8 GB device. So the
- * default stays at 128 MB until a big save's memory is measured on a tablet, and a merge is skipped
+ * default stays at 128 MB on phones under 12 GB, and a merge is skipped
  * when the memory free is under three times what it would hold (the save writes ours alone, said
  * once). What this also keeps down is the server's own copies around it: files are mapped, not
  * read into the heap, saves go from vkGetPipelineCacheData straight into the (preallocated) file's
  * pages, and they come further apart as the cache grows (a save writes all of it). Past the limit
- * the file keeps what it has, and that is said once per device. */
+ * the file keeps what it has, and that is said once per device.
+ * Where ours with the file's would be over the limit but ours alone is not, ours alone is written
+ * (this run's, the newest) instead of nothing. Steam's pre-caching files get the limit less the
+ * game's own file, so that the game can take them in at its start: OPPO, Rise of the Tomb
+ * Raider, v0.5.4.2 had an 89 MB game file and a 128 MB .run file, so the .run file was left out
+ * at every start and the replays only merged into it. (A cache's data is the driver's own format:
+ * single entries cannot be picked out of it, only whole caches kept or replaced.)
+ * From 12 GB the limit follows RAM/64 up to 256 MB (about 175 MB on a 12 GB tablet, whose MemTotal reads ~11.2 GB): HL2's file reached 131 MB and was left
+ * out at 128, so its stutter came back at every launch; the merge's three copies (~600-750 MB) are what the 3x-free
+ * check above guards, and such a phone keeps several GB free in a game. Needs a save's memory measured on the S11 Ultra. */
 #define PC_MAX_MB_MIN 64u
 #define PC_MAX_MB_MAX 128u
+#define PC_MAX_MB_MAX_BIGRAM 256u /* from 12 GB of RAM (see the top) */
+#define PC_BIGRAM_MB (12000u - 1000u) /* MemTotal of a "12 GB" phone reads ~11.2-11.6 GB */
 #define PC_MAX_MB_UNKNOWN_RAM 64u
 #define PC_MAX_MB_SET_MAX (1u << 20) /* VKBRIDGE_PCACHE_MAX_MB above this is taken as this */
 /* A <file>.<pid>.<n>.tmp left by a killed save (its size reserved in full) goes at the next trim
@@ -120,6 +131,8 @@ typedef struct vkb_pcache {
     int nomerge_warned;   /* a merge skipped for want of memory, said */
     int not_loaded;       /* the file was left unloaded for want of memory: saves only merge into it */
     int keep_warned;      /* a save skipped to keep that file, said */
+    int alone_warned;     /* a save of ours alone in place of a merge over the limit, said */
+    uint64_t beside;      /* Steam's pre-caching: the size of the game's own file, which the limit leaves room for */
     uint64_t max;         /* the per-program limit in bytes (file_limit at the device's start) */
     int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
@@ -156,7 +169,7 @@ static void trim(const char *keep, int now);
 
 /* Test toggles without restarting the app (the server lives in it and reads its environment once):
  * <cache dir>/env holds KEY=VALUE lines (# comments), read again at every vkCreateDevice, and
- * vkb_srv_env() prefers them to the process environment. Only switches read per device take
+ * vkb_srv_env prefers them to the process environment. Only switches read per device take
  * effect this way (VKBRIDGE_SPIRV_FIX, VKBRIDGE_EMU_OFF, ... - see their users). A removed file
  * drops the overrides at the next device. Old tables stay allocated: a returned value is never freed. */
 typedef struct env_kv {
@@ -239,7 +252,7 @@ void vkb_srv_env_reload(void)
 
 /* Read again only when the file changed since it was last read (written, edited, replaced or
  * removed). At vkbQueryServer: a process asks for its client switches (VKBRIDGE_HEAP_MAX_MB,
- * VKBRIDGE_SPOOF_GPU, VKBRIDGE_PRESENT_TIMEOUT_S, VKBRIDGE_QUERY_MIRROR, ...) before it makes a
+ * VKBRIDGE_SPOOF_GPU, VKBRIDGE_PRESENT_TIMEOUT_S, VKBRIDGE_QUERY_MIRROR, VKBRIDGE_HITCH_MS, ...) before it makes a
  * device, so without this the first process after the file changed got the values from before
  * (only vkCreateDevice read it again). */
 void vkb_srv_env_refresh(void)
@@ -443,7 +456,8 @@ static uint64_t file_limit(void)
         bytes = set * 1048576.0 < 1024 ? 1024 : (uint64_t)(set * 1048576.0);
     } else {
         uint64_t ram = vkb_memtotal_mb(), mb = ram ? ram / 64 : PC_MAX_MB_UNKNOWN_RAM;
-        mb = mb < PC_MAX_MB_MIN ? PC_MAX_MB_MIN : mb > PC_MAX_MB_MAX ? PC_MAX_MB_MAX : mb;
+        uint64_t max = ram >= PC_BIGRAM_MB ? PC_MAX_MB_MAX_BIGRAM : PC_MAX_MB_MAX;
+        mb = mb < PC_MAX_MB_MIN ? PC_MAX_MB_MIN : mb > max ? max : mb;
         bytes = mb << 20;
     }
     uint64_t total = total_limit();
@@ -775,10 +789,11 @@ static void warn_full(vkb_pcache *p, size_t size, int merged)
 {
     if (p->full_warned) return;
     p->full_warned = 1;
-    char lim[32];
-    VKB_WARN("device %u: pipeline cache %s would be %zu KB%s, over the %s limit for one program (VKBRIDGE_PCACHE_MAX_MB): the file "
+    char lim[32], beside[64] = "";
+    if (p->warm_role) snprintf(beside, sizeof(beside), " (beside the game's own %llu KB)", (unsigned long long)(p->beside >> 10));
+    VKB_WARN("device %u: pipeline cache %s would be %zu KB%s, over the %s limit for one program%s (VKBRIDGE_PCACHE_MAX_MB): the file "
              "keeps what it has, pipelines compiled from now on are not saved (they stay in the driver's memory until the device goes)",
-             p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max));
+             p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max), beside);
 }
 
 /* A file over the limit (a lower limit than when it was saved) is not loaded, and the next save
@@ -822,8 +837,19 @@ static void consume_warm(vkb_pcache *p)
     p->nwarm = 0;
 }
 
-/* Called with save_lock held (every save in the server is, so the checks of the file hold). */
-static void save(vkb_pcache *p)
+static void save_body(vkb_pcache *p, uint64_t t0, const char *when);
+
+/* Called with save_lock held (every save in the server is, so the checks of the file hold). Timed:
+ * a save writes the whole cache while the game may be compiling (its line says how long, and the
+ * hitch line counts it, server_hitch.c). when: where it was made, for its line. */
+static void save(vkb_pcache *p, const char *when)
+{
+    uint64_t t0 = vkb_hitch_now();
+    save_body(p, t0, when);
+    vkb_hitch_note(p->t->proc, VKB_HITCH_PCACHE, t0, vkb_hitch_now(), 1, 0);
+}
+
+static void save_body(vkb_pcache *p, uint64_t t0, const char *when)
 {
     vkb_srv_table *t = p->t;
     __atomic_store_n(&p->dirty, 0, __ATOMIC_RELAXED); /* pipelines from now on make it dirty again */
@@ -887,12 +913,26 @@ static void save(vkb_pcache *p)
     int rc = save_to(&t->real, t->device, merged ? tmp : p->cache, p->path, p->max, &size);
     int e = errno;
     if (tmp) t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
+    if (rc == 1 && merged && !p->not_loaded) {
+        /* Ours with the file's is over the limit, ours alone is not (own <= max above): ours goes in its place. */
+        size_t with = size;
+        merged = 0;
+        rc = save_to(&t->real, t->device, p->cache, p->path, p->max, &size);
+        e = errno;
+        if (rc == 0 && !p->alone_warned) {
+            p->alone_warned = 1;
+            char lim[32];
+            VKB_INFO("device %u: pipeline cache %s saved without what was in the file: with it %zu KB, over the %s limit",
+                     t->id, p->path, with >> 10, limit_str(lim, p->max));
+        }
+    }
     if (rc == 1) {
         warn_full(p, size, merged);
         return;
     }
     if (rc == 0) {
-        VKB_INFO("device %u: pipeline cache saved (%zu KB%s)", t->id, size >> 10, merged ? ", with what another process saved" : "");
+        VKB_INFO("device %u: pipeline cache saved (%zu KB%s) in %.1f ms, %s", t->id, size >> 10, merged ? ", with what another process saved" : "",
+                 (vkb_hitch_now() - t0) / 1e6, when);
         ident_stat(p->path, &p->file);
         p->saved_size = own;
         p->covers = !merged;
@@ -943,7 +983,7 @@ static void *saver(void *arg)
         while (p) {
             if (__atomic_load_n(&p->dirty, __ATOMIC_RELAXED) && save_due(p, now)) {
                 merge_apps(p, 0);
-                save(p);
+                save(p, "in the background");
                 p->last_save = now;
             }
             pthread_mutex_lock(&pc_lock);
@@ -1098,6 +1138,14 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     if (t->proc && t->proc->pkey[0]) file_name(key, sizeof(key), t->proc->pkey);
     snprintf(p->path, sizeof(p->path), "%s%s.vkpc", base, key[0] ? key : prog);
     p->warm_role = strchr(key, '.') != NULL;
+    if (p->warm_role) {
+        /* Room left beside the game's own file, so that the game can take this one in. */
+        char game[512];
+        struct stat gs;
+        snprintf(game, sizeof(game), "%s%.*s.vkpc", base, (int)(strrchr(key, '.') - key), key);
+        if (stat(game, &gs) == 0 && gs.st_size > 0) p->beside = (uint64_t)gs.st_size;
+        p->max = p->beside < p->max ? p->max - p->beside : 0;
+    }
     p->last_save = mono_s();
     pthread_mutex_lock(&pc_lock);
     trim(p->path, 0);
@@ -1105,6 +1153,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     /* Used now: the last the total limit removes (before it is read, so what is read is the file as it is). */
     if (!p->warm_role) utimensat(AT_FDCWD, p->path, NULL, 0);
 
+    uint64_t load_t0 = vkb_hitch_now();
     pc_map fm = {NULL, 0, 0, 0};
     if (!p->warm_role) fm = map_file(p->path, p->max, &p->file);
     if (fm.over) warn_over(p, p->path, fm.over);
@@ -1151,10 +1200,16 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     p->mem_size = size;
     p->covers = !p->not_loaded;
     if (p->warm_role)
-        VKB_INFO("device %u: pipeline cache %s (Steam's shader pre-caching: starts empty, adds to the file)", t->id, p->path);
+        VKB_INFO("device %u: pipeline cache %s (Steam's shader pre-caching: starts empty, adds to the file), limit %s", t->id, p->path,
+                 limit_str(lim, p->max));
     else
         VKB_INFO("device %u: pipeline cache %s (%zu KB loaded%s%s), limit %s%s", t->id, p->path, size >> 10, from == p->path ? "" : " from ",
                  from == p->path ? "" : from, limit_str(lim, p->max), mapped ? ", mapped" : "");
+    if (size) {
+        uint64_t load_t1 = vkb_hitch_now();
+        VKB_INFO("device %u: pipeline cache of %zu KB read and handed to the driver in %.1f ms", t->id, size >> 10, (load_t1 - load_t0) / 1e6);
+        vkb_hitch_note(t->proc, VKB_HITCH_PCACHE, load_t0, load_t1, 1, size);
+    }
 
     /* A game takes in what Steam's shader pre-caching compiled for it. */
     size_t total = size;
@@ -1298,7 +1353,7 @@ void vkb_pcache_device_destroy(vkb_srv_table *t)
     pthread_mutex_unlock(&pc_lock);
     pthread_mutex_lock(&save_lock); /* after the saver's save of it, if it is in one */
     if (merge_apps(p, 1)) p->dirty = 1;
-    if (p->dirty) save(p);
+    if (p->dirty) save(p, "at the device's end");
     pthread_mutex_unlock(&save_lock);
     t->dt.vkCreateGraphicsPipelines = p->create_gfx;
     t->dt.vkCreateComputePipelines = p->create_compute;

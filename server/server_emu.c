@@ -65,6 +65,8 @@ static const struct {
     {"loadstorenone", {"VK_KHR_load_store_op_none", NULL}},
     {"dynrend", {"VK_KHR_dynamic_rendering", NULL}},
     {"vidyn", {"VK_EXT_vertex_input_dynamic_state", NULL}},
+    {"eds", {"VK_EXT_extended_dynamic_state", "VK_EXT_extended_dynamic_state2"}},
+    {"timeline", {"VK_KHR_timeline_semaphore", NULL}},
 };
 
 /* A driver extension the clients are not shown: named in VKBRIDGE_FAKE_MISSING (as itself or
@@ -83,8 +85,12 @@ static const char *hide_list(void)
     return snap;
 }
 
-/* On the gate (server_apicap.c) by default: VK_EXT_extended_dynamic_state not offered and dynamic rendering emulated with render passes; decided once, at the self-test. */
-static int a1_on;
+/* On the gate (server_apicap.c) by default: VK_EXT_extended_dynamic_state not offered and dynamic rendering emulated with render
+ * passes; decided once, at the self-test. VKBRIDGE_A1_ZINK=0 turns it off, =1 turns it on anywhere.
+ * Per client (vkb_emu_a1_for): Zink and Steam mode's own processes get it; any other client keeps the driver's state. */
+static int a1_on, a1_forced;
+/* the driver has dynamic rendering of its own: the render-pass emulation is there for the Steam-mode fix only */
+static int a1_dynrend_native;
 /* In-process (the Vulkan layer): the one process it serves. The gate is for Steam mode's own
  * processes there; a game's process gets the driver's dynamic rendering unless VKBRIDGE_A1_ZINK=1. */
 static int a1_layer, a1_layer_steam;
@@ -103,7 +109,7 @@ static int a1_decide(const vkb_dispatch *idt, VkPhysicalDevice pd)
     int on;
     const char *why = "VKBRIDGE_A1_ZINK=1";
     if (v && !strcmp(v, "0")) on = 0;
-    else if (v && !strcmp(v, "1")) on = 1;
+    else if (v && !strcmp(v, "1")) on = 1, __atomic_store_n(&a1_forced, 1, __ATOMIC_RELEASE);
     else if (__atomic_load_n(&a1_layer, __ATOMIC_ACQUIRE) && !a1_layer_steam) {
         on = 0;
         VKB_ONCE(VKB_LOG_INFO, "a1: off in the layer for %s, not one of Steam mode's processes (VKBRIDGE_A1_ZINK=1 turns it on)",
@@ -115,10 +121,43 @@ static int a1_decide(const vkb_dispatch *idt, VkPhysicalDevice pd)
         on = vkb_black_gate(&probe, pd, &why);
     }
     if (on)
-        VKB_ONCE(VKB_LOG_INFO, "a1: VK_EXT_extended_dynamic_state not offered and dynamic rendering made as render passes (%s; "
-                 "VKBRIDGE_A1_ZINK=0 turns it off)", why);
+        VKB_ONCE(VKB_LOG_INFO, "a1: VK_EXT_extended_dynamic_state not offered and dynamic rendering made as render passes for Zink "
+                 "and Steam mode's processes (%s; VKBRIDGE_A1_ZINK=0 turns it off, =1 gives it to every client)", why);
     __atomic_store_n(&a1_on, on, __ATOMIC_RELEASE);
     return on;
+}
+
+/* The Steam-mode fix for this client: Zink's instances and Steam mode's own processes, every client with
+ * VKBRIDGE_A1_ZINK=1; NULL (a server-wide question, as promotion's) is answered as on. */
+int vkb_emu_a1_for(const vkb_srv_table *t)
+{
+    if (!__atomic_load_n(&a1_on, __ATOMIC_ACQUIRE)) return 0;
+    /* the layer serves one process and has decided for it (vkb_emu_a1_layer) */
+    if (__atomic_load_n(&a1_forced, __ATOMIC_ACQUIRE) || __atomic_load_n(&a1_layer, __ATOMIC_ACQUIRE) || !t) return 1;
+    const vkb_srv_table *inst = t->is_device && t->parent ? t->parent : t;
+    if (inst->zink) return 1;
+    const vkb_srv_proc *pr = inst->proc ? inst->proc : t->proc;
+    return pr && vkb_steam_own_process(pr->comm);
+}
+
+/* The emulations a client outside the Steam-mode fix goes without: the render-pass one where the driver has
+ * dynamic rendering of its own. */
+uint32_t vkb_emu_a1_not_for(const vkb_srv_table *t)
+{
+    if (!__atomic_load_n(&a1_on, __ATOMIC_ACQUIRE) || !__atomic_load_n(&a1_dynrend_native, __ATOMIC_ACQUIRE) ||
+        vkb_emu_a1_for(t))
+        return 0;
+    return VKB_EMU_DYN_RENDER;
+}
+
+int vkb_emu_ext_hidden_for(const vkb_srv_table *t, const char *name)
+{
+    if (__atomic_load_n(&a1_on, __ATOMIC_ACQUIRE) && !vkb_emu_a1_for(t)) {
+        if (!strcmp(name, "VK_EXT_extended_dynamic_state")) return vkb_emu_ext_hidden_by_env(name);
+        if (!strcmp(name, "VK_KHR_dynamic_rendering") && __atomic_load_n(&a1_dynrend_native, __ATOMIC_ACQUIRE))
+            return vkb_emu_ext_hidden_by_env(name);
+    }
+    return vkb_emu_ext_hidden(name);
 }
 
 int vkb_emu_ext_hidden(const char *name)
@@ -214,16 +253,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
     const vkb_pd_knowledge *k = inst && inst->zink && !vidyn ? vkb_pd_lookup(&t->real, pd) : NULL;
     int hide_vi_dyn = k && (k->info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX));
     int have_vi_dyn = 0, xz = xclipse_zink(t, inst, pd);
+    /* ... and extended dynamic state 1 and 2 where the driver has no usable ones (vkb_eds_mode):
+     * the server's in place of the driver's, and no EDS3 (Zink uses it only with EDS2, and the
+     * server's variants make no EDS3 state static) */
+    int eds = vkb_eds_mode(inst, pd);
+    /* dma-buf memory over AHardwareBuffers: the driver's dma-buf and modifier extensions are not
+     * shown (the client offers the emulation's own three, the modifier one with LINEAR only) */
+    const vkb_pd_knowledge *dk = vkb_dab_on() ? vkb_pd_lookup(&t->real, pd) : NULL;
+    int dab = (dk && (dk->info.emu & VKB_EMU_DMABUF_AHB)) || vkb_emu_faked("dmabufext"); /* host tests: the driver imitated without them */
     for (uint32_t i = 0; i < n; i++) {
         const char *e = all[i].extensionName;
+        if (dab && vkb_dab_hides(e)) continue;
         int is_vi = !strcmp(e, "VK_EXT_vertex_input_dynamic_state");
+        if (eds && !strncmp(e, "VK_EXT_extended_dynamic_state", 29)) continue; /* the server's below */
         if (is_vi && vidyn == VKB_VIDYN_EMULATED) continue; /* the server's below */
         if (is_vi && vidyn == VKB_VIDYN_NATIVE) {
             all[kept++] = all[i], have_vi_dyn = 1;
             continue;
         }
         if (((xz & 1) && !strcmp(e, xclipse_zink_hidden[0])) || ((xz & 2) && !strcmp(e, xclipse_zink_hidden[1]))) continue;
-        if (!vkb_emu_ext_hidden(e) && !(erratum && !strcmp(e, erratum)) && !calts_hidden(e) && !(hide_vi_dyn && is_vi) &&
+        if (!vkb_emu_ext_hidden_for(inst, e) && !(erratum && !strcmp(e, erratum)) && !calts_hidden(e) && !(hide_vi_dyn && is_vi) &&
             !(no_gpl && !strcmp(e, "VK_EXT_graphics_pipeline_library")))
             all[kept++] = all[i];
     }
@@ -235,6 +284,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL hide_EnumerateDeviceExtensionProperties(Vk
             snprintf(all[kept].extensionName, sizeof(all[kept].extensionName), "VK_EXT_vertex_input_dynamic_state");
             all[kept++].specVersion = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_SPEC_VERSION;
         }
+    }
+    if (eds) {
+        VkExtensionProperties *grown = realloc(all, (kept + 2) * sizeof(*all));
+        if (grown) {
+            all = grown;
+            memset(&all[kept], 0, 2 * sizeof(all[kept]));
+            snprintf(all[kept].extensionName, sizeof(all[kept].extensionName), "VK_EXT_extended_dynamic_state");
+            all[kept++].specVersion = VK_EXT_EXTENDED_DYNAMIC_STATE_SPEC_VERSION;
+            snprintf(all[kept].extensionName, sizeof(all[kept].extensionName), "VK_EXT_extended_dynamic_state2");
+            all[kept++].specVersion = VK_EXT_EXTENDED_DYNAMIC_STATE_2_SPEC_VERSION;
+        }
+        VKB_ONCE(VKB_LOG_INFO, "emulation: VK_EXT_extended_dynamic_state and _state2 offered to Zink: the server's, their states "
+                               "made static in pipeline variants (VKBRIDGE_EMU_EDS=0 turns it off)");
     }
     if (hide_vi_dyn) VKB_ONCE(VKB_LOG_INFO, "emulation: VK_EXT_vertex_input_dynamic_state hidden from Zink (packed vertex fetch emulated)");
     if (vidyn)
@@ -292,7 +354,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL planar_GetPhysicalDeviceImageFormatPropert
 }
 
 /* VKBRIDGE_FAKE_MISSING=dmabufmod (host tests): the refusal Arm's r32p1 (Mali-G77, Retroid Pocket 4
- * Pro, MaliBridge#10) most likely gives gamescope. Its DRM-modifier image query with DMA_BUF external
+ * Pro) most likely gives gamescope. Its DRM-modifier image query with DMA_BUF external
  * memory is answered VK_ERROR_FORMAT_NOT_SUPPORTED when the image is a storage image or has a mutable
  * format (gamescope's flippable images: BGRA8, MUTABLE_FORMAT with a UNORM / SRGB list), at every
  * modifier: DroidDeck's compositor advertises LINEAR only, the desktop's many more, and gamescope
@@ -413,7 +475,7 @@ int vkb_emu_robust2_image_stand_in(vkb_srv_table *inst, VkPhysicalDevice pd, uin
  * VKBRIDGE_FAKE_MISSING=geomstreams (host tests): a driver with transform feedback but without
  * geometry streams (Mali-G720 r44p1, Galaxy Tab S10+). The query answers geometryStreams false,
  * and a device that asks for it is refused with VK_ERROR_FEATURE_NOT_PRESENT, as that driver does.
- * VKBRIDGE_FAKE_MISSING=drawparams (host tests): a driver without shaderDrawParameters (what issue #32's
+ * VKBRIDGE_FAKE_MISSING=drawparams (host tests): a driver without shaderDrawParameters (what 's
  * Mali-G78 r38p0 might be). The query answers it false in VkPhysicalDeviceShaderDrawParametersFeatures and
  * VkPhysicalDeviceVulkan11Features, and a device that asks for it in either is refused the same way.
  */
@@ -524,6 +586,30 @@ int vkb_emu_driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd)
     for (uint32_t i = 0; i < n && !found; i++) found = !strcmp(e[i].extensionName, "VK_EXT_vertex_input_dynamic_state");
     free(e);
     return found;
+}
+
+/* The driver has extended dynamic state 1 and 2 that Zink may use: both extensions (or Vulkan 1.3,
+ * where both are core), not imitated missing (VKBRIDGE_FAKE_MISSING=eds) and not taken away by the
+ * Steam-mode fix (a1_decide: on those drivers Zink's draws are lost when it uses the driver's EDS1). Where
+ * this says no, Zink gets both from the server (server_vidyn.c, vkb_eds_mode). */
+int vkb_emu_driver_eds(const vkb_dispatch *d, VkPhysicalDevice pd)
+{
+    if (vkb_emu_faked("eds") || __atomic_load_n(&a1_on, __ATOMIC_ACQUIRE)) return 0;
+    VkPhysicalDeviceProperties p;
+    d->vkGetPhysicalDeviceProperties(pd, &p);
+    if (p.apiVersion >= VK_API_VERSION_1_3) return 1;
+    uint32_t n = 0;
+    d->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
+    VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));
+    if (!e) return 1;
+    d->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
+    int one = 0, two = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        one |= !strcmp(e[i].extensionName, "VK_EXT_extended_dynamic_state");
+        two |= !strcmp(e[i].extensionName, "VK_EXT_extended_dynamic_state2");
+    }
+    free(e);
+    return one && two;
 }
 
 /* Whether this instance's clients get VKB_EMU_BGR10_VTX (the GPU needing it is the caller's check):
@@ -656,6 +742,10 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     }
     /* OPAQUE_FD external memory on dma-bufs (server_opaque.c): DXVK's D3D11 shared resources. */
     if (!env_off("VKBRIDGE_EMU_OPAQUEFD") && vkb_opaque_wanted(idt, pd, emu)) emu |= VKB_EMU_OPAQUE_FD;
+    /* dma-buf memory over AHardwareBuffers where the driver has none (Kirin, Maleoon, Venus: gamescope
+     * stops without it; server_dmabuf_ahb.c), or where VKBRIDGE_DMABUF_VIA_AHB=1 asks: the driver's
+     * dma-buf paths are then not used for clients. */
+    if (vkb_dab_wanted(idt, pd)) emu = (emu | VKB_EMU_DMABUF_AHB) & ~(VKB_EMU_DMABUF_EXPORT | VKB_EMU_OPAQUE_FD);
     /* What DXVK 3 requires and the GPU lacks (server_emu_compat.c). Vulkan 1.4 has maintenance6. */
     if (!f.dualSrcBlend && !env_off("VKBRIDGE_EMU_DUALSRC")) emu |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid && !env_off("VKBRIDGE_EMU_FILLMODE")) emu |= VKB_EMU_FILL_MODE;
@@ -670,13 +760,14 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
      * rendering; Mali's Vulkan 1.1 drivers (r32p1) lack it. Renderings become render passes
      * (server_emu_dynrend.c), made with vkCreateRenderPass2 (core in 1.2, an extension before). */
     int a1 = a1_decide(idt, pd);
+    __atomic_store_n(&a1_dynrend_native, a1 && dynrend && !env_off("VKBRIDGE_EMU_DYNREND"), __ATOMIC_RELEASE);
     if (a1) dynrend = 0;
     int dynrend_missing = !dynrend && (props.apiVersion < VK_API_VERSION_1_3 || (fake && token(fake, "dynrend")) || a1);
     if (dynrend_missing && (rp2 || props.apiVersion >= VK_API_VERSION_1_2) && !env_off("VKBRIDGE_EMU_DYNREND")) emu |= VKB_EMU_DYN_RENDER;
     /* Zink offers OpenGL 3.3 only with GL_ARB_vertex_type_2_10_10_10_rev, which wants every packed
      * 10-10-10-2 vertex format. Mali (G720 r44p1, G68, G57, G925 ...) lacks the BGRA signed one,
      * A2R10G10B10_SNORM_PACK32, and has A2B10G10R10_SNORM: Zink stopped at OpenGL 3.2, and LÖVE 12 and
-     * Godot 3 games would not start ("does not support any of the supported OpenGL versions", issue #5).
+     * Godot 3 games would not start ("does not support any of the supported OpenGL versions").
      * Fetched as the RGBA format, with red and blue swapped where the vertex shader reads it
      * (server_emu_shader.c). A format set at record time (VK_EXT_vertex_input_dynamic_state, r48 and
      * later; below r48 the errata hide it) cannot reach the shader: for Zink such a vertex input is
@@ -734,7 +825,12 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (desc_short && !env_off("VKBRIDGE_EMU_DESCLIMITS")) emu |= VKB_EMU_DESC_LIMITS;
     /* PointSize in geometry/tessellation stages: stripped when the feature is missing. */
     if (!f.shaderTessellationAndGeometryPointSize && (f.geometryShader || f.tessellationShader)) emu |= VKB_EMU_POINT_SIZE;
+    /* gamescope (Vulkan 1.2) and Zink need timeline semaphores; Mali r18/r19 (Vulkan 1.1) have none
+     * (server_timeline.c). */
+    int timeline_missing = vkb_timeline_missing(idt, pd);
+    if (timeline_missing) emu |= VKB_EMU_TIMELINE;
     uint32_t miss = 0;
+    if (timeline_missing) miss |= VKB_EMU_TIMELINE;
     if (!f.textureCompressionBC) miss |= VKB_EMU_BCN;
     if (!divisor) miss |= VKB_EMU_DIVISOR;
     if (!f.shaderClipDistance) miss |= VKB_EMU_CLIP_DISTANCE;
@@ -836,6 +932,7 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
     if (emu & VKB_EMU_MAINT5) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES);
     if (emu & VKB_EMU_MAINT6) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES);
     if (emu & VKB_EMU_DYN_RENDER) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES);
+    if (emu & VKB_EMU_TIMELINE) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
     if (emu & VKB_EMU_ROBUSTNESS2) {
         chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
         /* What robustness the GPU has stays on; robustBufferAccess2 asks for at least that. */
@@ -954,7 +1051,7 @@ static uint32_t driver_api_version(vkb_srv_table *inst, VkPhysicalDevice pd)
  * other than 0 then fails to compile; D3D11 games rarely have one, and D3D10 games none.
  * DXVK 1.10.3 also asks for shaderDrawParameters (VkPhysicalDeviceShaderDrawParametersFeatures, or
  * in VkPhysicalDeviceVulkan11Features) without checking it; a driver that reports it false would
- * refuse the device the same way (issue #32, Galaxy S21 Mali-G78 r38p0: not shown to lack it, the
+ * refuse the device the same way (, Galaxy S21 Mali-G78 r38p0: not shown to lack it, the
  * log has no 1.1 features; covered in case). Only shaderDrawParameters of the 1.1 structure is
  * taken off: its other members stay the app's business.
  * Only these structures, and only where the driver lists the extension (or has the version). What
@@ -1011,7 +1108,7 @@ void vkb_emu_device_clamp_features(vkb_srv_table *inst, VkPhysicalDevice pd, VkD
  * A refused vkCreateDevice: what the request (as it reached the driver) asks for that the driver
  * lacks, on one line: extensions it does not list, VkPhysicalDeviceFeatures members and members of
  * any feature structure it reports false, and structures it cannot be asked about (neither the
- * version nor the extension). Issue #32's -8 left the player guessing between geometryStreams and
+ * version nor the extension). Issue -8 left the player guessing between geometryStreams and
  * shaderDrawParameters; this names it. Structures that are not feature structures are not checked
  * and are listed by number.
  */

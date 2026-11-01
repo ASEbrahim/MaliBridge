@@ -2,7 +2,8 @@
 # A frame whose GPU work takes longer than 10 s is presented late, not a lost device (Watch_Dogs
 # on a Dimensity 8300 lost its device while loading, from the client's own 10 s limit;
 # client/wsi.c vkb_wsi_wait_frame), with a server of its own (socket, cache directory):
-#   1  headless surface (the synchronous present): a frame held 15 s is presented after 15 s, the
+#   1  headless surface (a copy present): a frame held 15 s is presented after 15 s (the app's call returns
+#      after VKBRIDGE_PRESENT_HOLD_MS, the swapchain's thread shows it once rendered), the
 #      next frames too; the client warns once that a frame is slow and once that it came late;
 #   2  Wayland surface, dma-buf images (the presenting thread): the same (skipped without a
 #      compositor in WAYLAND_DISPLAY);

@@ -1,11 +1,14 @@
 #!/bin/bash
 # vb_bake (MK-05, option B; server_errata_vbbake.c): strides baked into pipeline variants where
-# dynamic strides are wrong even one binding per call (the Galaxy A16's G68 r38p1, MaliBridge#3).
+# dynamic strides are wrong even one binding per call (the Galaxy A16's G68 r38p1).
 #     1  the G68's shape imitated (VKBRIDGE_ERRATA_IMITATE=vb_bake: the last stride of a call goes
 #        to every binding), fix off: vbstride_check fails
 #     2  imitated, fix forced on: vbstride_check passes and variants were made (the strides still
 #        reach the imitation; a pipeline with its strides baked in ignores them)
 #     3  no imitation, fix forced on: vbstride_check passes (exact on a right driver)
+#     3b DXVK's shape (VBSTRIDE_DXVK=1: strides of 0 in the create info), imitated, fix on: passes, the
+#        first pipeline made with its vertex sizes, the second with the strides drawn before, both
+#        drawn without a variant of their own (1 variant in all)
 #     4  fix forced on: dynstate_check and polygon_check (dynamic strides with other state) pass
 #     5  not forced and no probe result for the single-binding shape: not installed
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
@@ -50,12 +53,20 @@ run VKBRIDGE_ERRATA=-vb_bake VKBRIDGE_ERRATA_IMITATE=vb_bake -- vbstride_check
 step $? "the G68's shape imitated, fix off: vbstride_check fails ($(grep '^shape' $work/run.log | cut -c1-60))"
 
 run VKBRIDGE_ERRATA=+vb_bake VKBRIDGE_ERRATA_IMITATE=vb_bake -- vbstride_check
-[ $rc = 0 ] && echo "$new" | grep -q "vb_bake: [1-9][0-9]* pipeline(s) with their strides baked in, [1-9][0-9]* variant(s) made"
-step $? "imitated, fix on: $res; $(lg 'vb_bake: [0-9]* pipeline(s) with their strides baked in, [0-9]* variant(s) made, [0-9]* variant bind(s)')"
+[ $rc = 0 ] && echo "$new" | grep -q "vb_bake: [1-9][0-9]* pipeline(s) with their strides baked in, [1-9][0-9]* variant(s) made (" &&
+  echo "$new" | grep -q "vb_bake: 1 variant(s) made so far for [1-9][0-9]* pipeline(s), [0-9]* ms making them in the draw path"
+step $? "imitated, fix on: $res; $(lg 'vb_bake: [0-9]* pipeline(s) with their strides baked in, [0-9]* variant(s) made ([0-9]* ms'); the running tally said once at 1"
 
 run VKBRIDGE_ERRATA=+vb_bake -- vbstride_check
 [ $rc = 0 ]
 step $? "no imitation, fix on: $res"
+
+# DXVK's shape (strides of 0 in the create info): the first pipeline made with its vertex sizes and
+# drawn so, the second with the strides drawn with the first; one variant in all (three without the guess)
+VBSTRIDE_DXVK=1 run VKBRIDGE_ERRATA=+vb_bake VKBRIDGE_ERRATA_IMITATE=vb_bake -- vbstride_check
+[ $rc = 0 ] && echo "$new" | grep -q "vb_bake: 2 pipeline(s) with their strides baked in, 1 variant(s) made (" &&
+  echo "$new" | grep -q "2 made with guessed strides for strides of 0 (1 with strides drawn before, the rest vertex sizes), 2 of them drawn so"
+step $? "DXVK's shape, imitated, fix on: $res; $(lg 'vb_bake: [0-9]* pipeline(s) with their strides baked in, [0-9]* variant(s) made'); $(lg '[0-9]* made with guessed strides[^-]*')"
 
 run VKBRIDGE_ERRATA=+vb_bake -- dynstate_check
 r1=$rc d1=$res

@@ -7,7 +7,7 @@
  * OpConstantComposite of OpSpecConstantTrue/False. Mali's compiler folds that composite as if it
  * were a plain constant - taking the spec constants at their default - and every texture reads
  * black. Declaring the composite OpSpecConstantComposite (same operands, same length) keeps it
- * specializable and the fold away. Found by leegao (bionic-vulkan-wrapper issue #93,
+ * specializable and the fold away. Found by leegao (bionic-vulkan-wrapper,
  * "OpCompositeConstant" write-up, 2025-08-10); Vortek patches the same pattern.
  *
  * The code is patched in place: it lives in the server's receive buffer (vkCreateShaderModule's
@@ -17,7 +17,7 @@
  * Also here, for the same GPUs and Samsung's Xclipse: Mali (r44) fails to build a compute pipeline
  * whose layout holds immutable YCbCr samplers (VK_ERROR_INITIALIZATION_FAILED), and gamescope's
  * compositing layout has 16 of them; the Xclipse 960 fails the same pipelines with
- * VK_ERROR_UNKNOWN (135 of gamescope's 144, every game black with sound, MaliBridge#20). In compute
+ * VK_ERROR_UNKNOWN (135 of gamescope's 144, every game black with sound). In compute
  * bindings they are replaced by one plain linear sampler: RGB content composites as before; only
  * NV12 surfaces (video) lose their YCbCr conversion. VKBRIDGE_YCBCR_SWAP=1/0 forces it. On every
  * GPU the samplers that stay are counted per layout, so the first compute pipeline the driver
@@ -54,6 +54,7 @@
 #include "server_errata.h"
 #include "spirv_pervertex.h"
 #include "spirv_shlbarrier.h"
+#include "spirv_wginit.h"
 #include "spirv_lockstep.h"
 #include "spirv_shmbarrier.h"
 #include "spirv_wave32.h"
@@ -113,6 +114,8 @@ typedef struct vkb_spvfix {
     int fixes;           /* VKBRIDGE_SPIRV_FIX: the composites, per-vertex blocks, YCbCr samplers */
     int shl;             /* VKBRIDGE_SHL_BARRIER: barriers after constant left shifts */
     unsigned long shl_modules, shl_barriers, shl_seen;
+    int wginit;          /* VKBRIDGE_WG_INIT: workgroup memory zeroed by the shader, not by initializers */
+    unsigned long wginit_modules;
     int shm;             /* VKBRIDGE_SHARED_BARRIER: barriers between shared-memory writes and reads
                             (1: at the top level, 2: also inside workgroup-uniform ifs and loops) */
     int shm_dump;        /* VKBRIDGE_SHARED_BARRIER_DUMP=1: the compute modules with shared memory saved */
@@ -214,7 +217,7 @@ static int write_file(const char *path, const uint32_t *code, size_t size)
  * run-as), and a copy in the session folder's failed-spv/ (the server log's directory: Send logs
  * and Share logs zip that folder, so the shaders come with the logs). Named per process and
  * device: one counter per device used to make Xwayland's dumps overwrite the ones Steam's update
- * window had made seconds before (issue #11). 16 per device, as before; the cache directory keeps
+ * window had made seconds before. 16 per device, as before; the cache directory keeps
  * the newest DUMPS_KEPT of them over sessions. */
 #define DUMPS_KEPT 64
 static void prune_dumps(const char *dir)
@@ -349,6 +352,26 @@ static uint32_t *subst_code(vkb_spvfix *f, const uint32_t *code, size_t size, si
         out = NULL;
     }
     fclose(in);
+    return out;
+}
+
+/* The wg_init rewrite of one module's code; NULL when nothing changes. Arm's drivers make the
+ * zero initializers DXVK puts on compute shaders' shared memory very slow (spirv_wginit.c). */
+static uint32_t *wg_init(vkb_spvfix *f, const uint32_t *code, size_t size, size_t *out_size)
+{
+    if (!f->wginit) return NULL;
+    uint32_t *out = NULL;
+    vkb_wginit_stats st;
+    const char *why = NULL;
+    int r = vkb_spv_wg_init(code, size, &out, out_size, &st, &why);
+    if (r < 0) {
+        VKB_ONCE(VKB_LOG_WARN, "SPIR-V fix: wg_init: a module's workgroup initializers left as they are (%s)", why);
+        return NULL;
+    }
+    if (r == 0) return NULL;
+    if (!__atomic_fetch_add(&f->wginit_modules, 1, __ATOMIC_RELAXED))
+        VKB_INFO("SPIR-V fix: wg_init: workgroup memory zeroed by the shader instead of initializers (first module: %u variable(s), %u array(s))",
+                 st.vars, st.arrays);
     return out;
 }
 
@@ -515,6 +538,12 @@ static uint32_t *rewrite(vkb_spvfix *f, const uint32_t *code, size_t size, int p
         free(c1);
         c1 = c2, s1 = s2;
     }
+    c2 = wg_init(f, c1 ? c1 : code, c1 ? s1 : size, &s2);
+    if (c2) {
+        vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
+        free(c1);
+        c1 = c2, s1 = s2;
+    }
     c2 = shl_barrier(f, c1 ? c1 : code, c1 ? s1 : size, &s2);
     if (c2) {
         vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
@@ -629,7 +658,7 @@ static void dump_stage(vkb_spvfix *f, const VkPipelineShaderStageCreateInfo *st,
             return;
         }
     pthread_mutex_lock(&f->lock);
-    /* newest first: a destroyed module's handle comes back for the next one made (issue #11's
+    /* newest first: a destroyed module's handle comes back for the next one made ('s
      * dumps showed one handle as the VS of one pipeline and the FS of the next: the oldest entry
      * with the handle was taken) */
     for (int j = 1; j <= KEEP; j++) {
@@ -898,6 +927,9 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
      * shift and, once, the driver's pipeline cache entries of the modules it changes) */
     const char *shl_env = vkb_srv_env("VKBRIDGE_SHL_BARRIER");
     int shl = shl_env && *shl_env ? strcmp(shl_env, "0") != 0 : arm;
+    /* wg_init: Arm's driver (its zero initializers are slow; zeroing in the shader is the same result) */
+    const char *wg_env = vkb_srv_env("VKBRIDGE_WG_INIT");
+    int wginit = wg_env && *wg_env ? strcmp(wg_env, "0") != 0 : arm;
     /* shm_barrier: only when asked for (a per-game preset): it adds barriers, which cost time */
     const char *shm_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER");
     int shm = shm_env && *shm_env && strcmp(shm_env, "0") != 0 ? (strcmp(shm_env, "2") ? 1 : 2) : 0;
@@ -920,10 +952,10 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     int subst = subst_env && *subst_env && strcmp(subst_env, "0") != 0;
     /* Compute layouts with immutable YCbCr samplers (gamescope's composite shaders): Mali and
      * Samsung's Xclipse do not build such pipelines (Xclipse 960: 135 of gamescope's 144 fail with
-     * VK_ERROR_UNKNOWN, every game black, MaliBridge#20). VKBRIDGE_YCBCR_SWAP=0/1 overrides. */
+     * VK_ERROR_UNKNOWN, every game black). VKBRIDGE_YCBCR_SWAP=0/1 overrides. */
     const char *yc_env = vkb_srv_env("VKBRIDGE_YCBCR_SWAP");
     int ycs = yc_env && *yc_env ? strcmp(yc_env, "0") != 0 : on || p.vendorID == 0x144D;
-    int spv = on || shl || shm || w32 || subst;
+    int spv = on || shl || wginit || shm || w32 || subst;
     /* Installed on every GPU: the sampler and layout hooks count YCbCr samplers for the failure
      * line (they run when such objects are made, never per frame); the module and pipeline hooks
      * only where a SPIR-V change is on (they keep copies of every module). */
@@ -935,6 +967,7 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     f->fixes = on;
     f->ycbcr_swap = ycs;
     f->shl = shl;
+    f->wginit = wginit;
     f->shm = shm;
     f->shm_dump = shm_dump;
     f->dump_max = max_env && *max_env ? strtoul(max_env, NULL, 10) : 1024;

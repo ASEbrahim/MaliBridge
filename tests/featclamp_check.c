@@ -7,7 +7,7 @@
  * pEnabledFeatures (not VkPhysicalDeviceFeatures2) and VK_EXT_transform_feedback, transformFeedback
  * and geometryStreams both on whatever the query said, as DXVK 1.x does (its adapter check looks at
  * transformFeedback only). The result is printed ("device: N").
- * Argument (issue #32, DXVK 1.10.3 also asks for shaderDrawParameters without checking it):
+ * Argument (, DXVK 1.10.3 also asks for shaderDrawParameters without checking it):
  *   drawparams  VkPhysicalDeviceShaderDrawParametersFeatures queried and printed
  *               ("features: shaderDrawParameters=N") and turned on in the device, with transform
  *               feedback as above when the GPU has it

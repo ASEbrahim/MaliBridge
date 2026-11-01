@@ -10,7 +10,7 @@
  *   - a set of 1024 uniform buffers (more than the pool holds), on a fresh pool and on one grown twice;
  *   - a set of 300 (more than one pool, less than the grown books: the server's overflow pools
  *     are each the original size, so no one pool could hold it).
- * And a pool shaped like DXVK's on the XRing O3 (MaliBridge #16: maxSets 1024, 512 sampled images,
+ * And a pool shaped like DXVK's on the XRing O3 (maxSets 1024, 512 sampled images,
  * 2048 uniform buffers and others), with a set that takes 4 sampled images and 4 uniform buffers
  * and one that takes a uniform buffer only, in turns. The sampled images run out first: after
  * 8 pools' worth of them (1024 of the big sets) the pool says full while thousands of sets remain,
@@ -151,7 +151,7 @@ int main(int argc, char **argv)
     r = vkAllocateDescriptorSets(dev, &ai, &ds);
     check(r == VK_SUCCESS, "an ordinary set after those", r);
 
-    /* MaliBridge #16: one type runs out while the pool has sets left. */
+    /* one type runs out while the pool has sets left. */
     VkDescriptorSetLayoutBinding hb[2] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
                                           {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo hci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, hb};

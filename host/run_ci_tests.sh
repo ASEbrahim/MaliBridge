@@ -42,7 +42,7 @@ run_mode() {
     grep -q "imitating Mali's memory types" "$VKB_SERVER_LOG" && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG" &&
       ! grep -q "no ordinary device-local type" out/ci-smoke.log
     result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' "$VKB_SERVER_LOG"))"
-    # The XRing O3's memory table (xringmem, issue #1), as measured on r56p0: 22 types; images
+    # The XRing O3's memory table (xringmem), as measured on r56p0: 22 types; images
     # allow 0x1040, buffers 0x4100, shareable indirect buffers 0x1040 and staging buffers 0x3;
     # dma-heap pages only in type 14. v0.5 had one device-local type (type 6's) and one shared
     # type (14): texel buffers had no type at all. v0.5.1 added a device-local type for each
@@ -56,7 +56,7 @@ run_mode() {
     timeout 60 ./out/memclass_check >out/ci-memclass-xring.log 2>&1 && ! grep -q "gets no client type" out/ci-memclass-xring.log &&
       grep -q "chosen, types 0x4000 shared" "$VKB_SERVER_LOG"
     result $? "memclass_check, XRing O3's memory table: every image and buffer kind has a type ($(tail -1 out/ci-memclass-xring.log))"
-    # The XRing O1's memory table (o1mem, issues #6 and #8): a plain device-local type 0 (0x1)
+    # The XRing O1's memory table (o1mem): a plain device-local type 0 (0x1)
     # that images and buffers never allow (0x6). v0.5.2 backed the client's device-local type by
     # type 0, and every image's mask was empty (gamescope's flat texture). Without lazymem: the
     # O1's type 0 is not lazily allocated.

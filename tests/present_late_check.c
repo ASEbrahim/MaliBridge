@@ -5,16 +5,17 @@
  * into a lost device (Watch_Dogs on a Dimensity 8300 lost its device while loading, the
  * bridge client's own 10 s present-fence limit; client/wsi.c vkb_wsi_wait_frame).
  *
- *   present_late_check ok|lost [--wayland] [--delay-ms N]
+ *   present_late_check ok|lost [--wayland] [--delay-ms N] [--frames N] [--sleep-ms N]
  *
  * The first frame's rendering waits on a timeline semaphore that another thread signals N ms
  * later (default 15000): the GPU queue is held that long, as a queue busy converting textures is.
- * Then two ordinary frames. The surface is headless (the swapchain's synchronous path,
+ * Then two ordinary frames (--frames: that many, --sleep-ms apart; host/latency_test.sh uses them). The surface is headless (the swapchain's synchronous path,
  * vkb_wsi_wait_rendering) or, with --wayland, a Wayland surface of the compositor in
  * WAYLAND_DISPLAY (dma-buf images: the presenting thread, wsi_wayland.c); the Wayland surface has
  * no role, nothing is shown.
  *
- * ok:   every acquire and present succeeds; headless: the slow present returns after N ms;
+ * ok:   every acquire and present succeeds; headless: the slow present returns after N ms, or after
+ *       VKBRIDGE_PRESENT_HOLD_MS (500) when N is longer (the frame is then shown by the swapchain's thread);
  * lost: some acquire or present returns VK_ERROR_DEVICE_LOST (a limit below N ms:
  *       VKBRIDGE_PRESENT_TIMEOUT_S, in the guest or from the server).
  * One line per step, "OK: ..." / "FAILED: ..." last.
@@ -41,7 +42,7 @@ I(vkGetDeviceQueue); I(vkCreateCommandPool); I(vkAllocateCommandBuffers); I(vkBe
 I(vkCmdPipelineBarrier); I(vkQueueSubmit); I(vkCreateSemaphore); I(vkSignalSemaphore); I(vkQueueWaitIdle); I(vkDeviceWaitIdle);
 I(vkCreateHeadlessSurfaceEXT); I(vkGetPhysicalDeviceSurfaceCapabilitiesKHR); I(vkGetPhysicalDeviceSurfacePresentModesKHR);
 I(vkGetPhysicalDeviceSurfaceSupportKHR); I(vkCreateSwapchainKHR); I(vkGetSwapchainImagesKHR); I(vkAcquireNextImageKHR);
-I(vkQueuePresentKHR); I(vkCreateFence); I(vkWaitForFences); I(vkResetFences);
+I(vkQueuePresentKHR); I(vkCreateFence); I(vkWaitForFences); I(vkResetFences); I(vkDestroySwapchainKHR);
 #undef I
 
 /* VkWaylandSurfaceCreateInfoKHR without <wayland-client.h> (not installed on every host) */
@@ -131,10 +132,12 @@ int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *expect = argc > 1 ? argv[1] : "ok";
-    int use_wl = 0;
+    int use_wl = 0, extra = 2, sleep_ms = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--wayland")) use_wl = 1;
         else if (!strcmp(argv[i], "--delay-ms") && i + 1 < argc) delay_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--frames") && i + 1 < argc) extra = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sleep-ms") && i + 1 < argc) sleep_ms = atoi(argv[++i]);
     }
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
@@ -156,7 +159,7 @@ int main(int argc, char **argv)
     G(vkQueueSubmit); G(vkCreateSemaphore); G(vkSignalSemaphore); G(vkQueueWaitIdle); G(vkDeviceWaitIdle);
     G(vkCreateHeadlessSurfaceEXT); G(vkGetPhysicalDeviceSurfaceCapabilitiesKHR); G(vkGetPhysicalDeviceSurfacePresentModesKHR);
     G(vkGetPhysicalDeviceSurfaceSupportKHR); G(vkCreateSwapchainKHR); G(vkGetSwapchainImagesKHR); G(vkAcquireNextImageKHR);
-    G(vkQueuePresentKHR); G(vkCreateFence); G(vkWaitForFences); G(vkResetFences);
+    G(vkQueuePresentKHR); G(vkCreateFence); G(vkWaitForFences); G(vkResetFences); G(vkDestroySwapchainKHR);
 #undef G
     uint32_t n = 1;
     VkPhysicalDevice pd;
@@ -267,7 +270,7 @@ int main(int argc, char **argv)
     double slow_ms = 0;
     pthread_t th;
     int th_on = 0;
-    for (int frame = 0; frame < 3; frame++) {
+    for (int frame = 0; frame < 1 + extra; frame++) {
         VkSemaphore done;
         vkCreateSemaphore(dev, &bci, NULL, &done);
         uint32_t idx = 0;
@@ -319,6 +322,7 @@ int main(int argc, char **argv)
             failed = 1;
             break;
         }
+        if (frame && sleep_ms > 0) usleep((useconds_t)sleep_ms * 1000);
     }
     if (th_on) pthread_join(th, NULL);
     if (!signalled) {
@@ -327,6 +331,7 @@ int main(int argc, char **argv)
         vkSignalSemaphore(dev, &ssi);
     }
     vkDeviceWaitIdle(dev);
+    if (!lost) vkDestroySwapchainKHR(dev, sc, NULL);
 
     if (!strcmp(expect, "lost")) {
         if (lost) printf("OK: the device was reported lost (a limit below %d ms)\n", delay_ms);
@@ -337,8 +342,14 @@ int main(int argc, char **argv)
         printf("FAILED: a frame held %d ms on the GPU ended the swapchain (%s)\n", delay_ms, lost ? "device lost" : "an error");
         return 1;
     }
-    if (!use_wl && slow_ms < delay_ms - 200) {
-        printf("FAILED: the slow present returned after %.0f ms, before the GPU was done (%d ms)\n", slow_ms, delay_ms);
+    /* Headless (a copy present): the app's call waits for its frame up to VKBRIDGE_PRESENT_HOLD_MS
+     * (500 ms), then the swapchain's thread shows it once rendered (client/wsi.c). */
+    const char *he = getenv("VKBRIDGE_PRESENT_HOLD_MS");
+    int hold = he && *he ? atoi(he) : 500;
+    int expect_ms = delay_ms < hold ? delay_ms : hold;
+    if (!use_wl && (slow_ms < expect_ms - 200 || slow_ms > expect_ms + 2000)) {
+        printf("FAILED: the slow present returned after %.0f ms; expected about %d ms (the GPU held %d ms, the hold %d ms)\n", slow_ms,
+               expect_ms, delay_ms, hold);
         return 1;
     }
     printf("OK: a frame held %d ms on the GPU was presented late (%.0f ms in vkQueuePresentKHR), the next frames too\n", delay_ms, slow_ms);

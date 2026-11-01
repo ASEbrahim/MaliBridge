@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
- * gs_hide (issue #11): the Galaxy S10+'s Mali-G76 with Samsung's r38p1 beta driver
+ * gs_hide: the Galaxy S10+'s Mali-G76 with Samsung's r38p1 beta driver
  * ("v1.r38p1-01bet0") segfaults compiling the vertex + geometry + fragment pipelines Zink makes
  * for Xwayland's glamor and for Steam's update window. The bridge contains each crash, but after
  * three the device is lost; Xwayland dies of it, Steam loses its X connection, gamescope aborts.

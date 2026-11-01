@@ -9,6 +9,7 @@
 #include "wsi.h"
 
 #include <stdio.h>
+#include <strings.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -339,6 +340,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateInstance(const VkInstanceCreateInf
     ci.ppEnabledLayerNames = NULL;
     /* The app's version goes through as asked: the device's effective version is the lower of it
      * and the GPU's, which is what a driver does (and what apps compute for themselves). */
+    vkb_dxvkcfg_engine(ci.pApplicationInfo); /* DXVK or not, for the config check (dxvkcfg.c) */
+    inst->dxvk = ci.pApplicationInfo && ci.pApplicationInfo->pEngineName && !strncasecmp(ci.pApplicationInfo->pEngineName, "DXVK", 4);
     if (ci.pApplicationInfo) {
         inst->api_version = ci.pApplicationInfo->apiVersion ? ci.pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
     } else {
@@ -452,6 +455,8 @@ static const char *const client_device_exts[] = {
     "VK_KHR_swapchain", "VK_KHR_incremental_present", "VK_KHR_swapchain_mutable_format",
     /* Mapping is the client's own (memory.c); offered only with shared memory (physdev.c). */
     "VK_KHR_map_memory2", "VK_EXT_map_memory_placed",
+    /* Present ids and their waits are the swapchain's (wsi.c); offered unless VKBRIDGE_PRESENT_WAIT=0 (physdev.c). */
+    "VK_KHR_present_id", "VK_KHR_present_wait", "VK_KHR_present_id2", "VK_KHR_present_wait2",
 };
 
 int vkb_is_client_device_ext(const char *n)
@@ -490,6 +495,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateDevice(VkPhysicalDevice physicalDe
         VKB_DBG("device extension requested: %s", e);
         dev->enabled_exts[dev->enabled_ext_count++] = strdup(e);
         if (!strcmp(e, "VK_KHR_swapchain")) dev->ext_swapchain = 1;
+        if (!strcmp(e, "VK_KHR_present_id") || !strcmp(e, "VK_KHR_present_id2")) dev->present_ids = 1;
         if (vkb_is_client_device_ext(e)) continue;
         server_exts[n++] = e;
     }
@@ -533,6 +539,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateDevice(VkPhysicalDevice physicalDe
     vkb_memory_init_device(dev);
     vkb_bufview_init_device(dev);
     vkb_query_init_device(dev);
+    vkb_sm_init_device(dev);
     VKB_INFO("device created on %s", pd->props.deviceName);
     *pDevice = (VkDevice)dev;
     return VK_SUCCESS;
@@ -545,6 +552,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyDevice(VkDevice device, const VkAlloc
     vkb_device *dev = vkb_dev(device);
     vkb_bufview_destroy_device(dev);
     vkb_query_destroy_device(dev);
+    vkb_sm_destroy_device(dev);
     vkb_call c;
     vkb_call_begin(&c, VKB_CMD_vkDestroyDevice, dev->obj.table);
     vkb_enc_u64(&c.e, dev->obj.remote);
@@ -610,56 +618,130 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetDeviceQueue2(VkDevice device, const VkDev
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence)
 {
-    return vkb_note_fail("vkQueueSubmit", vkb_wire_vkQueueSubmit(queue, submitCount, pSubmits, fence));
+    vkb_dmabuf_sync_submit(); /* a sync-file export before this is not a dma-buf handover (dmabuf_sync.c) */
+    if (vkb_qvis_on())
+        for (uint32_t i = 0; i < submitCount; i++)
+            for (uint32_t k = 0; k < pSubmits[i].commandBufferCount; k++) vkb_qvis_submit(pSubmits[i].pCommandBuffers[k]);
+    return vkb_note_fail("vkQueueSubmit", vkb_sm_queue_submit(queue, submitCount, pSubmits, fence));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2 *pSubmits, VkFence fence)
 {
-    return vkb_note_fail("vkQueueSubmit2", vkb_wire_vkQueueSubmit2(queue, submitCount, pSubmits, fence));
+    vkb_dmabuf_sync_submit(); /* a sync-file export before this is not a dma-buf handover (dmabuf_sync.c) */
+    if (vkb_qvis_on())
+        for (uint32_t i = 0; i < submitCount; i++)
+            for (uint32_t k = 0; k < pSubmits[i].commandBufferInfoCount; k++) vkb_qvis_submit(pSubmits[i].pCommandBufferInfos[k].commandBuffer);
+    return vkb_note_fail("vkQueueSubmit2", vkb_sm_queue_submit2(queue, submitCount, pSubmits, fence));
 }
-
-static void quiet_over(void);
 
 /* A wait that saw GPU work done ends the poll quiet windows (below): the app may now rely on what
  * that work set. */
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueueWaitIdle(VkQueue queue)
 {
     VkResult r = vkb_wire_vkQueueWaitIdle(queue);
-    if (r == VK_SUCCESS) quiet_over();
+    if (r == VK_SUCCESS) vkb_quiet_over();
     return vkb_note_fail("vkQueueWaitIdle", r);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkDeviceWaitIdle(VkDevice device)
 {
     VkResult r = vkb_wire_vkDeviceWaitIdle(device);
-    if (r == VK_SUCCESS) quiet_over();
+    if (r == VK_SUCCESS) vkb_quiet_over();
     return vkb_note_fail("vkDeviceWaitIdle", r);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences, VkBool32 waitAll,
                                                       uint64_t timeout)
 {
-    VkResult r = vkb_wire_vkWaitForFences(device, fenceCount, pFences, waitAll, timeout);
-    if (r == VK_SUCCESS) quiet_over();
+    VkResult r = vkb_sm_wait_fences(vkb_dev(device), fenceCount, pFences, waitAll, timeout);
+    if (r == VK_SUCCESS) vkb_quiet_over();
     return vkb_note_wait("vkWaitForFences", "vkWaitForFences (no timeout)", r, timeout);
+}
+
+/* Status polls without the barrier (VKBRIDGE_POLL_NOBARRIER=0 turns it off): every synchronous call
+ * waits in the server until all the process's queued async work has run, ~1-2 ms a poll on the
+ * G720 under Dark Souls III (its render thread's vkGetEventStatus and DXVK's
+ * vkGetSemaphoreCounterValue, once a frame each). A poll needs none of it: an older answer is one
+ * a slower GPU would give. Except right after the host itself reset a fence or set or reset an
+ * event, which goes out without waiting: until that request has run, polls of that object keep the
+ * barrier. Per object the seq of the last such request; one pushed out of its slot while still
+ * pending holds back every poll until it has run (hostop_spilled). */
+#define HOSTOP_SLOTS 4096
+typedef struct hostop_slot {
+    uint64_t key, seq;
+} hostop_slot;
+static hostop_slot hostop[HOSTOP_SLOTS];
+static uint64_t hostop_spilled;
+static pthread_mutex_t hostop_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int poll_nobarrier(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_POLL_NOBARRIER");
+        v = !e || strcmp(e, "0");
+    }
+    return v;
+}
+
+static hostop_slot *hostop_find(uint64_t key)
+{
+    uint64_t k = key * 0x9e3779b97f4a7c15ull;
+    return &hostop[(k ^ (k >> 31)) & (HOSTOP_SLOTS - 1)];
+}
+
+/* After a host-side reset or set of the object (key: handle * 2 + 1 for events; syncmirror.c's
+ * vkResetFences / vkSetEvent / vkResetEvent). */
+void vkb_hostop_note(uint64_t key)
+{
+    uint64_t seq = vkb_async_seq_last();
+    if (!seq || !poll_nobarrier()) return;
+    pthread_mutex_lock(&hostop_lock);
+    hostop_slot *h = hostop_find(key);
+    if (h->key != key && h->seq > hostop_spilled && !vkb_async_ran(h->seq)) hostop_spilled = h->seq;
+    h->key = key;
+    h->seq = seq;
+    pthread_mutex_unlock(&hostop_lock);
+}
+
+/* 1: the poll may go without the barrier (marks this thread's next call). */
+static int poll_free(uint64_t key)
+{
+    if (!poll_nobarrier()) return 0;
+    pthread_mutex_lock(&hostop_lock);
+    hostop_slot *h = hostop_find(key);
+    uint64_t seq = h->key == key ? h->seq : 0;
+    if (hostop_spilled > seq) seq = hostop_spilled;
+    pthread_mutex_unlock(&hostop_lock);
+    if (seq && !vkb_async_ran(seq)) return 0;
+    vkb_call_poll_next();
+    return 1;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetFenceStatus(VkDevice device, VkFence fence)
 {
-    VkResult r = vkb_wire_vkGetFenceStatus(device, fence);
-    if (r == VK_SUCCESS) quiet_over();
+    VkResult r;
+    if (!vkb_sm_fence_status(vkb_dev(device), fence, &r)) { /* syncmirror.c */
+        poll_free((uint64_t)(uintptr_t)fence * 2);
+        r = vkb_wire_vkGetFenceStatus(device, fence);
+    }
+    if (r == VK_SUCCESS) vkb_quiet_over();
     return vkb_note_error("vkGetFenceStatus", r);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo *pWaitInfo, uint64_t timeout)
 {
-    VkResult r = vkb_wire_vkWaitSemaphores(device, pWaitInfo, timeout);
-    if (r == VK_SUCCESS) quiet_over();
+    VkResult r = vkb_sm_wait_sems(vkb_dev(device), pWaitInfo, timeout);
+    if (r == VK_SUCCESS) vkb_quiet_over();
     return vkb_note_wait("vkWaitSemaphores", "vkWaitSemaphores (no timeout)", r, timeout);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore, uint64_t *pValue)
 {
+    VkResult r;
+    if (vkb_sm_sem_value(vkb_dev(device), semaphore, pValue, &r)) return vkb_note_error("vkGetSemaphoreCounterValue", r);
+    /* vkSignalSemaphore waits for its reply: nothing of the host's can be pending */
+    if (poll_nobarrier()) vkb_call_poll_next();
     return vkb_note_error("vkGetSemaphoreCounterValue", vkb_wire_vkGetSemaphoreCounterValue(device, semaphore, pValue));
 }
 
@@ -679,9 +761,13 @@ typedef struct quiet_slot {
 } quiet_slot;
 static quiet_slot query_quiet[QUIET_SLOTS], event_quiet[QUIET_SLOTS];
 static pthread_mutex_t quiet_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t quiet_gen; /* bumped by quiet_over: windows started before it are over */
+/* Bumped by everything after which a stale "not ready" would be wrong rather than late: a host
+ * vkSetEvent or vkSignalSemaphore, and a wait that saw the GPU's work done (the app may then rely
+ * on what that work set). Windows started before it are over. A host vkResetEvent does not: a
+ * reset cannot make a "reset" answer wrong. */
+static uint64_t quiet_gen;
 
-static void quiet_over(void)
+void vkb_quiet_over(void)
 {
     __atomic_add_fetch(&quiet_gen, 1, __ATOMIC_ACQ_REL);
 }
@@ -732,39 +818,54 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetQueryPoolResults(VkDevice device, VkQ
     const VkQueryResultFlags writes = VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | VK_QUERY_RESULT_PARTIAL_BIT |
                                       VK_QUERY_RESULT_WITH_STATUS_BIT_KHR;
     VkResult mr;
-    if (vkb_query_results(vkb_dev(device), queryPool, firstQuery, queryCount, dataSize, pData, stride, flags, &mr)) return mr;
+    if (vkb_query_results(vkb_dev(device), queryPool, firstQuery, queryCount, dataSize, pData, stride, flags, &mr)) {
+        vkb_qvis_after(vkb_dev(device), queryPool, firstQuery, queryCount, dataSize, pData, stride, flags, &mr); /* qvisible.c */
+        return mr;
+    }
     static int told;
     if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 20)
         VKB_WARN("query results from the server: %s (pool %llx, %u+%u, flags 0x%x)", vkb_query_why_wire(),
                  (unsigned long long)(uintptr_t)queryPool, firstQuery, queryCount, flags);
     int poll = !(flags & writes);
     uint64_t key = (uint64_t)(uintptr_t)queryPool ^ ((uint64_t)firstQuery << 40) ^ ((uint64_t)queryCount << 20);
-    if (poll && quiet_now(query_quiet, key)) return VK_NOT_READY;
+    if (poll && quiet_now(query_quiet, key)) {
+        VkResult qr = VK_NOT_READY;
+        vkb_qvis_after(vkb_dev(device), queryPool, firstQuery, queryCount, dataSize, pData, stride, flags, &qr);
+        return qr;
+    }
     uint64_t gen = quiet_gen_now();
     VkResult r = vkb_wire_vkGetQueryPoolResults(device, queryPool, firstQuery, queryCount, dataSize, pData, stride, flags);
+    r = vkb_qvis_imitate(queryPool, firstQuery, queryCount, r); /* host tests only */
     vkb_query_wire_answer(vkb_dev(device), queryPool, firstQuery, queryCount, r); /* a query stuck in the mirror (query.c) */
     if (poll && r == VK_NOT_READY) quiet_start(query_quiet, key, gen);
+    vkb_qvis_after(vkb_dev(device), queryPool, firstQuery, queryCount, dataSize, pData, stride, flags, &r);
     return r;
 }
 
 /* The same for events: DXVK polled vkGetEventStatus ~1,200 times a second in Deep Rock Galactic. */
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetEventStatus(VkDevice device, VkEvent event)
 {
+    VkResult r;
+    if (vkb_sm_event_status(vkb_dev(device), event, &r)) return r; /* syncmirror.c */
     uint64_t key = (uint64_t)(uintptr_t)event;
     if (quiet_now(event_quiet, key)) return VK_EVENT_RESET;
     uint64_t gen = quiet_gen_now();
-    VkResult r = vkb_wire_vkGetEventStatus(device, event);
+    poll_free(key * 2 + 1);
+    r = vkb_wire_vkGetEventStatus(device, event);
     if (r == VK_EVENT_RESET) quiet_start(event_quiet, key, gen);
     return r;
 }
 
-/* Sent first, then the windows end: a poll from another thread that starts after this is ordered
- * after the set on the server, one already answered is not trusted any more. */
-VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetEvent(VkDevice device, VkEvent event)
+/* The host's own set or reset ends the event's quiet window (a set seen at once) and keeps the
+ * barrier on its polls until that request has run (syncmirror.c's vkSetEvent / vkResetEvent). */
+void vkb_event_hostop(VkEvent event)
 {
-    VkResult r = vkb_wire_vkSetEvent(device, event);
-    quiet_over();
-    return r;
+    uint64_t key = (uint64_t)(uintptr_t)event;
+    pthread_mutex_lock(&quiet_lock);
+    quiet_slot *q = quiet_find(event_quiet, key);
+    if (q->key == key) q->until = 0;
+    pthread_mutex_unlock(&quiet_lock);
+    vkb_hostop_note(key * 2 + 1);
 }
 
 /* A successful import hands the fd to the implementation, which closes it. The server holds its
@@ -773,6 +874,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkSetEvent(VkDevice device, VkEvent event)
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkImportSemaphoreFdKHR(VkDevice device, const VkImportSemaphoreFdInfoKHR *pInfo)
 {
     VkResult r = vkb_wire_vkImportSemaphoreFdKHR(device, pInfo);
+    if (r == VK_SUCCESS) vkb_sm_sem_unknown(vkb_dev(device), pInfo->semaphore);
     if (r == VK_SUCCESS && pInfo->fd >= 0) close(pInfo->fd);
     return r;
 }
@@ -780,6 +882,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkImportSemaphoreFdKHR(VkDevice device, co
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkImportFenceFdKHR(VkDevice device, const VkImportFenceFdInfoKHR *pInfo)
 {
     VkResult r = vkb_wire_vkImportFenceFdKHR(device, pInfo);
+    if (r == VK_SUCCESS) vkb_sm_fence_unknown(vkb_dev(device), pInfo->fence);
     if (r == VK_SUCCESS && pInfo->fd >= 0) close(pInfo->fd);
     return r;
 }

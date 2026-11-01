@@ -10,6 +10,10 @@
  *    AHardwareBuffers allocated by the server; each also goes to the compositor once
  *    (banner_ahb_v1.attach), which then shows the frame on its own display layer instead of
  *    copying it. The dma-buf wl_buffer stays the same, so every other path still works.
+ *    Under a nested gamescope (its Wayland display has no banner_ahb_v1) the same gralloc images are
+ *    offered to DroidDeck's compositor itself, on a connection of the process's own to the socket the
+ *    session names (VKBRIDGE_HOST_WAYLAND, banner_ahb_v1 version 3 offer/withdraw): gamescope passes a
+ *    game's frames on as the same dma-bufs, and the compositor pairs each with its offered buffer.
  *  - wl_shm: for compositors without dma-buf (KWin compositing in software on the desktop): the
  *    frame is read back and copied into a shared-memory buffer.
  *
@@ -69,6 +73,10 @@ static struct {
     int (*display_flush)(struct wl_display *);
     int (*display_get_fd)(struct wl_display *);
     int (*display_get_error)(struct wl_display *);
+    /* Optional (the nested-gamescope offers only). */
+    struct wl_display *(*display_connect)(const char *);
+    void (*display_disconnect)(struct wl_display *);
+    int (*display_roundtrip)(struct wl_display *);
     const struct wl_interface *registry_iface, *callback_iface, *buffer_iface, *shm_iface, *shm_pool_iface;
 } wl;
 
@@ -107,6 +115,9 @@ int vkb_wl_load(void)
             ok &= !!L(buffer_iface, "wl_buffer_interface");
             ok &= !!L(shm_iface, "wl_shm_interface");
             ok &= !!L(shm_pool_iface, "wl_shm_pool_interface");
+            L(display_connect, "wl_display_connect");
+            L(display_disconnect, "wl_display_disconnect");
+            L(display_roundtrip, "wl_display_roundtrip");
 #undef L
             if (ok) state = 1;
             else VKB_ERR("libwayland-client lacks functions this driver needs");
@@ -142,16 +153,38 @@ static const struct wl_message params_events[] = {
 };
 static const struct wl_interface params_iface = {"zwp_linux_buffer_params_v1", 3, 4, params_requests, 2, params_events};
 
-/* banner_ahb_v1 (DroidDeck's compositor, waylandcomp/protocols/banner-ahb-v1.xml), version 2. */
+/* banner_ahb_v1 (DroidDeck's compositor, waylandcomp/protocols/banner-ahb-v1.xml), version 3. */
 static const struct wl_interface *ahb_types[9];
 static const struct wl_message ahb_requests[] = {
     {"destroy", "", ahb_types + 0},
     {"attach", "ohuuuuuu", ahb_types + 1},
+    {"offer", "3huuuu", ahb_types + 2},
+    {"withdraw", "3u", ahb_types + 2},
 };
 static const struct wl_message ahb_events[] = {
     {"mode", "2u", ahb_types + 0},
 };
-static const struct wl_interface ahb_iface = {"banner_ahb_v1", 2, 2, ahb_requests, 1, ahb_events};
+static const struct wl_interface ahb_iface = {"banner_ahb_v1", 3, 4, ahb_requests, 1, ahb_events};
+
+/* wp_presentation / wp_presentation_feedback (presentation-time, stable), version 1: when each
+ * frame reached the screen, for the latency log (VKBRIDGE_LATLOG, latency.c). */
+static const struct wl_interface fb_iface;
+static const struct wl_interface *pres_types[2] = {NULL, &fb_iface};
+static const struct wl_message pres_requests[] = {
+    {"destroy", "", pres_types + 0},
+    {"feedback", "on", pres_types + 0},
+};
+static const struct wl_message pres_events[] = {
+    {"clock_id", "u", pres_types + 0},
+};
+static const struct wl_interface pres_iface = {"wp_presentation", 1, 2, pres_requests, 1, pres_events};
+static const struct wl_message fb_events[] = {
+    {"sync_output", "o", pres_types + 0},
+    {"presented", "uuuuuuu", pres_types + 0},
+    {"discarded", "", pres_types + 0},
+};
+static const struct wl_interface fb_iface = {"wp_presentation_feedback", 1, 0, NULL, 3, fb_events};
+#define WP_PRESENTATION_FEEDBACK 1
 
 static void init_types(void)
 {
@@ -181,6 +214,8 @@ static void init_types(void)
 #define PARAMS_CREATE_IMMED 3
 #define AHB_DESTROY 0
 #define AHB_ATTACH 1
+#define AHB_OFFER 2
+#define AHB_WITHDRAW 3
 #define WL_SHM_FORMAT_ARGB8888 0u
 #define WL_SHM_FORMAT_XRGB8888 1u
 #define FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
@@ -207,6 +242,9 @@ typedef struct wl_state {
     uint32_t dmabuf_version;
     struct wl_proxy *ahb;          /* banner_ahb_v1 */
     uint32_t ahb_version;
+    int nested;                    /* no banner_ahb_v1 here: the gralloc images are offered to the host */
+    uint32_t *offers;              /* nested: the host's names for this swapchain's offered images */
+    uint32_t noffers;
     int ahb_mode;                  /* the compositor's last mode event (-1 = none yet) */
     int connected;                 /* globals bound and their initial events in */
     int built;                     /* the swapchain is up: a mode change retires it */
@@ -233,6 +271,18 @@ typedef struct wl_state {
     pthread_cond_t changed;        /* with sc->lock: an image came back, or the chain broke */
     VkFence *fences;               /* one per image: its rendering is done */
     uint32_t ring[64], head, len;  /* frames waiting for their rendering, in present order */
+    uint32_t rendering;            /* frames given to the thread whose rendering it has not seen done yet (VKBRIDGE_FRAME_QUEUE) */
+    uint64_t fq_calls, fq_waits, fq_ns, fq_max_ns; /* the frame queue's waits, for the line at the end */
+    uint32_t ring_lat[64];         /* ... each with its latency log number (latency.c), 0 */
+    uint64_t ring_id[64];          /* ... and its present id (VK_KHR_present_id, wsi.c), 0 */
+    uint32_t lat_cur;              /* the presenting thread's frame being shown: its latency log number */
+    uint64_t id_cur;               /* ... its present id */
+    int fb_for_id;                 /* wl_present asked when that frame is shown, for its present id */
+    struct wl_proxy *presentation; /* wp_presentation, with the latency log on or present ids enabled */
+    int pres_monotonic;            /* its clock is CLOCK_MONOTONIC */
+    struct wl_proxy *lat_fb[16];   /* feedback objects not answered yet (destroyed before the queue) */
+    uint32_t lat_fb_n[16];         /* ... their frames' latency log numbers */
+    uint64_t lat_fb_id[16];        /* ... and present ids (0: none) */
 } wl_state;
 
 /* The compositor's zero-copy switch. A live swapchain built for the other mode is retired (out of
@@ -252,6 +302,55 @@ static void ahb_mode(void *data, struct wl_proxy *ahb, uint32_t enabled)
     pthread_mutex_unlock(&sc->lock);
 }
 
+static void pres_clock(void *data, struct wl_proxy *p, uint32_t clk)
+{
+    (void)p;
+    ((wl_state *)data)->pres_monotonic = clk == CLOCK_MONOTONIC;
+}
+
+/* A frame's feedback: shown at that time, or never (a later frame replaced it); then the feedback
+ * object is done. The latency log takes the time only on the client's own clock. */
+static uint32_t fb_forget(wl_state *s, struct wl_proxy *fb, uint64_t *id)
+{
+    uint32_t n = 0;
+    if (id) *id = 0;
+    for (int i = 0; i < 16; i++)
+        if (s->lat_fb[i] == fb) {
+            s->lat_fb[i] = NULL, n = s->lat_fb_n[i];
+            if (id) *id = s->lat_fb_id[i];
+        }
+    wl.proxy_destroy(fb);
+    return n;
+}
+
+static void fb_sync_output(void *data, struct wl_proxy *fb, struct wl_proxy *output)
+{
+    (void)data, (void)fb, (void)output;
+}
+
+static void fb_presented(void *data, struct wl_proxy *fb, uint32_t sec_hi, uint32_t sec_lo, uint32_t nsec, uint32_t refresh, uint32_t seq_hi,
+                         uint32_t seq_lo, uint32_t flags)
+{
+    (void)refresh, (void)seq_hi, (void)seq_lo, (void)flags;
+    wl_state *s = data;
+    uint64_t pres = (((uint64_t)sec_hi << 32) | sec_lo) * 1000000000ull + nsec, id;
+    uint32_t n = fb_forget(s, fb, &id);
+    if (s->pres_monotonic) vkb_lat_stamp(n, VKB_LAT_SHOWN, pres ? pres : 1);
+    else vkb_lat_flag(n, VKB_LAT_F_OTHER_CLOCK);
+    vkb_wsi_pw_shown(s->sc, id); /* its present wait (wsi.c) */
+}
+
+/* A later frame replaced it: for a present wait, as good as shown (the spec's "at least that id"). */
+static void fb_discarded(void *data, struct wl_proxy *fb)
+{
+    wl_state *s = data;
+    uint64_t id;
+    vkb_lat_flag(fb_forget(s, fb, &id), VKB_LAT_F_DISCARDED);
+    vkb_wsi_pw_shown(s->sc, id);
+}
+
+static const void *fb_listener[] = {(void *)fb_sync_output, (void *)fb_presented, (void *)fb_discarded};
+
 static void registry_global(void *data, struct wl_proxy *reg, uint32_t name, const char *iface, uint32_t version)
 {
     wl_state *s = data;
@@ -261,9 +360,13 @@ static void registry_global(void *data, struct wl_proxy *reg, uint32_t name, con
         uint32_t v = version < 3 ? version : 3;
         s->dmabuf = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &dmabuf_iface, v, name, dmabuf_iface.name, v, NULL);
         s->dmabuf_version = v;
+    } else if (!strcmp(iface, "wp_presentation") && !s->presentation && (vkb_lat_on() || (s->sc && s->sc->dev->present_ids && !vkb_wsi_present_wait_commit(s->sc->dev->pd)))) {
+        static const void *pres_listener[] = {(void *)pres_clock};
+        s->presentation = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &pres_iface, 1, name, pres_iface.name, 1, NULL);
+        if (s->presentation) wl.proxy_add_listener(s->presentation, (void (**)(void))pres_listener, s);
     } else if (!strcmp(iface, "banner_ahb_v1") && !s->ahb && !vkb_wsi_ahb_disabled()) {
         static const void *ahb_listener[] = {(void *)ahb_mode};
-        uint32_t v = version < 2 ? version : 2;
+        uint32_t v = version < 2 ? version : 2; /* attach and mode: version 3 adds nothing for this path */
         s->ahb = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &ahb_iface, v, name, ahb_iface.name, v, NULL);
         s->ahb_version = v;
         if (s->ahb) wl.proxy_add_listener(s->ahb, (void (**)(void))ahb_listener, s);
@@ -392,10 +495,15 @@ static void *present_thread(void *arg)
 {
     vkb_swapchain *sc = arg;
     wl_state *s = sc->bdata;
+    /* A name of its own: a new thread inherits its creator's, the app's presenting thread (vkd3d-proton's
+     * "vkd3d_queue"), and the S10+'s RE2 stall looked like vkd3d's queue thread waiting in the present. */
+    pthread_setname_np(pthread_self(), "vkb-present");
     for (;;) {
         pthread_mutex_lock(&sc->lock);
         int have = s->len > 0, quit = s->quit;
         uint32_t index = have ? s->ring[s->head] : 0;
+        uint32_t lat = have ? s->ring_lat[s->head] : 0;
+        uint64_t pid = have ? s->ring_id[s->head] : 0;
         if (have) {
             s->head = (s->head + 1) % 64;
             s->len--;
@@ -405,7 +513,24 @@ static void *present_thread(void *arg)
             /* A slow frame (a game loading) is waited for; only a real loss or a frame past the limit
              * (VKBRIDGE_PRESENT_TIMEOUT_S) ends the swapchain (wsi.c) */
             VkResult r = vkb_wsi_wait_frame(sc, s->fences[index]);
-            if (r >= 0 && !s->dead) r = wl_present(sc, index, NULL);
+            if (r >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
+            pthread_mutex_lock(&sc->lock);
+            s->rendering--; /* a present waiting for the frame queue (wl_wait_queue) may go on */
+            pthread_cond_broadcast(&s->changed);
+            pthread_mutex_unlock(&sc->lock);
+            s->lat_cur = lat;
+            s->id_cur = pid;
+            s->fb_for_id = 0;
+            int shown = 0;
+            if (r >= 0 && !s->dead) {
+                r = wl_present(sc, index, NULL);
+                shown = r >= 0;
+            }
+            vkb_lat_presented(lat, r >= 0 && !s->dead);
+            /* its present wait: shown when the compositor says so, or now without wp_presentation (wsi.c) */
+            if (shown) vkb_wsi_pw_committed(sc, pid, s->fb_for_id);
+            s->lat_cur = 0;
+            s->id_cur = 0;
             pthread_mutex_lock(&sc->lock);
             if (r < 0 || s->dead) {
                 sc->images[index].busy = 0;
@@ -447,7 +572,7 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
         if (!s->fences || s->efd < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         for (uint32_t i = 0; i < sc->count; i++)
-            if (vkb_wire_vkCreateFence(device, &fci, NULL, &s->fences[i]) != VK_SUCCESS) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            if (vkb_ep_vkCreateFence(device, &fci, NULL, &s->fences[i]) != VK_SUCCESS) return VK_ERROR_OUT_OF_HOST_MEMORY;
         pthread_cond_init(&s->changed, NULL);
         if (pthread_create(&s->thread, NULL, present_thread, sc) != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
         s->thread_on = 1;
@@ -455,7 +580,7 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
     VkPipelineStageFlags *stages = alloca((nwait ? nwait : 1) * sizeof(VkPipelineStageFlags));
     for (uint32_t i = 0; i < nwait; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, nwait, wait, stages, 0, NULL, 0, NULL};
-    VkResult r = vkb_wire_vkQueueSubmit(queue, 1, &si, s->fences[index]);
+    VkResult r = vkb_sm_queue_submit(queue, 1, &si, s->fences[index]);
     pthread_mutex_lock(&sc->lock);
     if (r != VK_SUCCESS || s->len == 64) {
         sc->images[index].busy = 0;
@@ -463,7 +588,10 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
         return r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     s->ring[(s->head + s->len) % 64] = index;
+    s->ring_lat[(s->head + s->len) % 64] = sc->lat_n;
+    s->ring_id[(s->head + s->len) % 64] = sc->pw_cur;
     s->len++;
+    s->rendering++;
     r = sc->status;
     pthread_mutex_unlock(&sc->lock);
     uint64_t one = 1;
@@ -490,6 +618,163 @@ static int dmabuf_supports(wl_state *s, uint32_t fourcc, uint64_t modifier)
         return 0;
     }
     return has_u32(s->dmabuf_formats, s->nformats, fourcc);
+}
+
+/* ------------------------------------------------------------------ the app's compositor, under gamescope */
+
+/*
+ * A program under a nested gamescope presents to gamescope, whose Wayland display has no
+ * banner_ahb_v1; gamescope then passes the program's frames on to DroidDeck's compositor as the same
+ * dma-bufs. Here the process opens one connection of its own to DroidDeck's compositor
+ * (VKBRIDGE_HOST_WAYLAND, the socket the session names) and offers it each gralloc image
+ * (banner_ahb_v1 version 3); the compositor pairs an offer with the dma-buf wl_buffer that turns out
+ * to be the same buffer, and shows that frame on its display layer without copying it. The lock
+ * covers every use: swapchains come and go from any thread. A forked child starts over.
+ */
+static struct {
+    pthread_mutex_t lock;
+    pid_t pid;
+    int tried;
+    struct wl_display *display;
+    struct wl_proxy *registry, *ahb;
+    int mode;           /* the last mode event, -1 none */
+    uint32_t next_id;
+} host = {PTHREAD_MUTEX_INITIALIZER, 0, 0, NULL, NULL, NULL, -1, 1};
+
+static void host_mode(void *data, struct wl_proxy *ahb, uint32_t enabled)
+{
+    (void)data;
+    (void)ahb;
+    host.mode = enabled ? 1 : 0;
+}
+
+static void host_global(void *data, struct wl_proxy *reg, uint32_t name, const char *iface, uint32_t version)
+{
+    (void)data;
+    static const void *listener[] = {(void *)host_mode};
+    if (strcmp(iface, "banner_ahb_v1") || host.ahb || version < 3) return;
+    host.ahb = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &ahb_iface, 3, name, ahb_iface.name, 3, NULL);
+    if (host.ahb) wl.proxy_add_listener(host.ahb, (void (**)(void))listener, NULL);
+}
+
+static void host_global_remove(void *data, struct wl_proxy *reg, uint32_t name)
+{
+    (void)data;
+    (void)reg;
+    (void)name;
+}
+
+/* Lock held. */
+static void host_close(void)
+{
+    if (host.ahb) {
+        wl.proxy_marshal(host.ahb, AHB_DESTROY);
+        wl.proxy_destroy(host.ahb);
+    }
+    if (host.registry) wl.proxy_destroy(host.registry);
+    if (host.display) wl.display_disconnect(host.display);
+    host.ahb = host.registry = NULL;
+    host.display = NULL;
+    host.mode = -1;
+}
+
+/* Lock held: the app's compositor's banner_ahb_v1 (version 3) with its mode brought up to date, NULL
+ * when there is none (no VKBRIDGE_HOST_WAYLAND, no such global, the connection lost). */
+static struct wl_proxy *host_ahb_locked(void)
+{
+    pid_t pid = getpid();
+    if (host.tried && host.pid != pid) {
+        /* A fork: the parent's connection is not this process's to use (or to close). */
+        host.display = NULL;
+        host.registry = host.ahb = NULL;
+        host.mode = -1;
+        host.tried = 0;
+    }
+    if (!host.tried) {
+        static const void *reg_listener[] = {(void *)host_global, (void *)host_global_remove};
+        host.tried = 1;
+        host.pid = pid;
+        const char *path = getenv("VKBRIDGE_HOST_WAYLAND");
+        if (!path || !*path || !wl.display_connect || !wl.display_disconnect || !wl.display_roundtrip) return NULL;
+        host.display = wl.display_connect(path);
+        if (!host.display) {
+            VKB_INFO("Wayland: no connection to the app's compositor at %s (%s); swapchains under gamescope stay ordinary dma-bufs",
+                     path, strerror(errno));
+            return NULL;
+        }
+        init_types();
+        host.registry = wl.proxy_marshal_constructor((struct wl_proxy *)host.display, WL_DISPLAY_GET_REGISTRY, wl.registry_iface, NULL);
+        if (host.registry) wl.proxy_add_listener(host.registry, (void (**)(void))reg_listener, NULL);
+        if (!host.registry || wl.display_roundtrip(host.display) < 0 || !host.ahb || wl.display_roundtrip(host.display) < 0) {
+            VKB_INFO("Wayland: the app's compositor at %s takes no offered gralloc buffers (no banner_ahb_v1 version 3); "
+                     "swapchains under gamescope stay ordinary dma-bufs", path);
+            host_close();
+            return NULL;
+        }
+        VKB_INFO("Wayland: the app's compositor at %s takes offered gralloc buffers (zero-copy %s)", path, host.mode == 1 ? "on" : "off");
+        return host.ahb;
+    }
+    if (!host.ahb) return NULL;
+    if (wl.display_get_error(host.display) || wl.display_roundtrip(host.display) < 0) {
+        VKB_WARN("Wayland: the connection to the app's compositor is gone; swapchains under gamescope stay ordinary dma-bufs");
+        host_close();
+        return NULL;
+    }
+    return host.ahb;
+}
+
+/* Under gamescope: gralloc images wanted when the app's compositor takes offers and has zero-copy on. */
+static int host_wants_ahb(void)
+{
+    pthread_mutex_lock(&host.lock);
+    int want = host_ahb_locked() != NULL && host.mode == 1;
+    pthread_mutex_unlock(&host.lock);
+    return want;
+}
+
+/* Offers the swapchain's gralloc images to the app's compositor, then waits for it to have read them
+ * (a roundtrip), so they are known there before gamescope can pass the first frame on. Images not
+ * offered are still ordinary dma-bufs: gamescope and the compositor's copy path take them as before. */
+static void host_offer(wl_state *s, vkb_swapchain *sc)
+{
+    uint32_t w = sc->info.imageExtent.width, h = sc->info.imageExtent.height;
+    pthread_mutex_lock(&host.lock);
+    struct wl_proxy *ahb = host_ahb_locked();
+    s->offers = ahb ? calloc(sc->count, sizeof(*s->offers)) : NULL;
+    if (s->offers) {
+        for (uint32_t i = 0; i < sc->count; i++) {
+            vkb_swap_image *img = &sc->images[i];
+            if (img->ahb_sock < 0) continue;
+            if (!host.next_id) host.next_id = 1;
+            uint32_t id = host.next_id++;
+            wl.proxy_marshal(ahb, AHB_OFFER, img->ahb_sock, id, w, h, img->stride / 4u);
+            close(img->ahb_sock); /* libwayland sent its own copy */
+            img->ahb_sock = -1;
+            s->offers[s->noffers++] = id;
+        }
+        if (wl.display_roundtrip(host.display) < 0 || wl.display_get_error(host.display)) {
+            VKB_WARN("Wayland: the app's compositor refused the offered gralloc buffers; it copies these frames");
+            host_close();
+            s->noffers = 0;
+        }
+    }
+    pthread_mutex_unlock(&host.lock);
+}
+
+/* The swapchain is going: its offers are withdrawn (the compositor drops its references). */
+static void host_withdraw(wl_state *s)
+{
+    if (s->noffers) {
+        pthread_mutex_lock(&host.lock);
+        if (host.ahb && host.pid == getpid()) {
+            for (uint32_t i = 0; i < s->noffers; i++) wl.proxy_marshal(host.ahb, AHB_WITHDRAW, s->offers[i]);
+            wl.display_flush(host.display);
+        }
+        pthread_mutex_unlock(&host.lock);
+    }
+    free(s->offers);
+    s->offers = NULL;
+    s->noffers = 0;
 }
 
 /* ------------------------------------------------------------------ backend */
@@ -539,7 +824,11 @@ int vkb_wl_ahb_wanted(vkb_swapchain *sc)
         return 0;
     }
     wl_state *s = sc->bdata;
-    if (!s->ahb) return 0;
+    if (!s->ahb) {
+        /* No banner_ahb_v1 here: a nested gamescope. The app's own compositor may take the images. */
+        s->nested = s->dmabuf && !vkb_wsi_ahb_disabled() && host_wants_ahb();
+        return s->nested;
+    }
     if (s->ahb_version >= 2) return s->ahb_mode == 1;
     /* A version 1 compositor has no mode: the environment decides. */
     const char *e = getenv("VKBRIDGE_WSI_AHB");
@@ -582,6 +871,7 @@ static VkResult wl_init(vkb_swapchain *sc)
                 return VK_ERROR_FORMAT_NOT_SUPPORTED;
             }
         }
+        if (sc->ahb && s->nested) host_offer(s, sc);
         s->buffers = calloc(sc->count, sizeof(*s->buffers));
         for (uint32_t i = 0; i < sc->count; i++) {
             vkb_swap_image *img = &sc->images[i];
@@ -606,7 +896,10 @@ static VkResult wl_init(vkb_swapchain *sc)
         }
         VKB_INFO("Wayland: %u dma-buf buffers %ux%u %.4s, stride %u, modifier 0x%llx%s", sc->count, w, h, (char *)&fourcc,
                  sc->images[0].stride, (unsigned long long)sc->images[0].modifier,
-                 sc->ahb ? ", gralloc AHardwareBuffers handed to the compositor (banner_ahb_v1)" : "");
+                 !sc->ahb ? ""
+                 : s->ahb ? ", gralloc AHardwareBuffers handed to the compositor (banner_ahb_v1)"
+                 : s->noffers ? ", gralloc AHardwareBuffers offered to the app's compositor, which takes them as gamescope passes them on"
+                              : ", gralloc AHardwareBuffers (the app's compositor did not take the offer)");
         s->built = 1;
         return VK_SUCCESS;
     }
@@ -702,6 +995,25 @@ static VkResult wl_present(vkb_swapchain *sc, uint32_t index, const VkPresentReg
         s->frame = wl.proxy_marshal_constructor(s->surface_wrapper, WL_SURFACE_FRAME, wl.callback_iface, NULL);
         wl.proxy_add_listener(s->frame, (void (**)(void))frame_listener, s);
     }
+    /* When the compositor shows this frame: for the latency log (the presenting thread's frame, or the
+     * app's call's) and for a present wait (the presenting thread's only: it alone takes the events
+     * as they come; a copy present counts as shown when handed over, wsi.c). */
+    int on_thread = s->thread_on && pthread_equal(pthread_self(), s->thread);
+    uint32_t lat = on_thread ? s->lat_cur : sc->lat_n;
+    uint64_t pid = on_thread && !vkb_wsi_present_wait_commit(sc->dev->pd) ? s->id_cur : 0;
+    for (int i = 0; i < 16 && (lat || pid) && s->presentation; i++)
+        if (!s->lat_fb[i]) {
+            struct wl_proxy *fb = wl.proxy_marshal_constructor(s->presentation, WP_PRESENTATION_FEEDBACK, &fb_iface, s->surface_wrapper, NULL);
+            if (fb) {
+                wl.proxy_add_listener(fb, (void (**)(void))fb_listener, s);
+                s->lat_fb[i] = fb;
+                s->lat_fb_n[i] = lat;
+                s->lat_fb_id[i] = pid;
+                s->fb_for_id = pid != 0;
+                vkb_lat_flag(lat, VKB_LAT_F_FEEDBACK);
+            }
+            break;
+        }
     wl.proxy_marshal(s->surface_wrapper, WL_SURFACE_ATTACH, buffer, 0, 0);
     int v4 = wl.proxy_get_version(s->surface_wrapper) >= 4;
     if (region && region->rectangleCount && region->pRectangles) {
@@ -717,6 +1029,31 @@ static VkResult wl_present(vkb_swapchain *sc, uint32_t index, const VkPresentReg
     wl.display_flush(s->display);
     if (wl.display_dispatch_queue_pending(s->display, s->queue) < 0) return VK_ERROR_SURFACE_LOST_KHR;
     return VK_SUCCESS;
+}
+
+/* VKBRIDGE_FRAME_QUEUE (wsi.c): until at most `max` frames are rendering. At most 2 s, so a slow
+ * frame (a game loading) holds the app no longer than that; the frame is still shown when it is done. */
+static void wl_wait_queue(vkb_swapchain *sc, uint32_t max)
+{
+    wl_state *s = sc->bdata;
+    struct timespec dl, t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 2;
+    pthread_mutex_lock(&sc->lock);
+    int waited = 0;
+    while (s->rendering > max && sc->status >= 0 && !s->dead) {
+        waited = 1;
+        if (pthread_cond_timedwait(&s->changed, &sc->lock, &dl) != 0) break;
+    }
+    pthread_mutex_unlock(&sc->lock);
+    s->fq_calls++;
+    if (!waited) return;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+    s->fq_waits++;
+    s->fq_ns += ns;
+    if (ns > s->fq_max_ns) s->fq_max_ns = ns;
 }
 
 static VkResult wl_wait_free(vkb_swapchain *sc, uint64_t timeout_ns)
@@ -761,6 +1098,12 @@ static void wl_teardown(wl_state *s)
     if (!s) return;
     vkb_swapchain *sc = s->sc;
     if (s->frame) wl.proxy_destroy(s->frame);
+    for (int i = 0; i < 16; i++)
+        if (s->lat_fb[i]) vkb_lat_flag(fb_forget(s, s->lat_fb[i], NULL), VKB_LAT_F_NO_ANSWER);
+    if (s->presentation) {
+        wl.proxy_marshal(s->presentation, 0 /* destroy */);
+        wl.proxy_destroy(s->presentation);
+    }
     if (s->buffers) {
         for (uint32_t i = 0; i < sc->count; i++)
             if (s->buffers[i]) {
@@ -790,6 +1133,7 @@ static void wl_teardown(wl_state *s)
         wl.proxy_marshal(s->ahb, AHB_DESTROY);
         wl.proxy_destroy(s->ahb);
     }
+    host_withdraw(s);
     if (s->shm) wl.proxy_destroy(s->shm);
     if (s->registry) wl.proxy_destroy(s->registry);
     if (s->surface_wrapper) wl.proxy_wrapper_destroy(s->surface_wrapper);
@@ -802,6 +1146,10 @@ static void wl_teardown(wl_state *s)
 static void wl_destroy(vkb_swapchain *sc)
 {
     wl_state *s = sc->bdata;
+    if (s && s->fq_calls)
+        VKB_INFO("frame queue: %llu of %llu presents waited for frames to render, %.1f ms on average, longest %.1f ms",
+                 (unsigned long long)s->fq_waits, (unsigned long long)s->fq_calls, s->fq_waits ? s->fq_ns / 1e6 / s->fq_waits : 0.0,
+                 s->fq_max_ns / 1e6);
     if (s && s->thread_on) {
         /* Frames already presented are shown (or dropped, on a broken chain) first. */
         pthread_mutex_lock(&sc->lock);
@@ -815,7 +1163,7 @@ static void wl_destroy(vkb_swapchain *sc)
     }
     if (s && s->fences) {
         for (uint32_t i = 0; i < sc->count; i++)
-            if (s->fences[i]) vkb_wire_vkDestroyFence((VkDevice)sc->dev, s->fences[i], NULL);
+            if (s->fences[i]) vkb_ep_vkDestroyFence((VkDevice)sc->dev, s->fences[i], NULL);
         free(s->fences);
         s->fences = NULL;
     }
@@ -824,4 +1172,4 @@ static void wl_destroy(vkb_swapchain *sc)
     sc->bdata = NULL;
 }
 
-const vkb_wsi_backend vkb_wsi_wayland_backend = {wl_init, wl_present, wl_wait_free, wl_destroy, wl_present_async};
+const vkb_wsi_backend vkb_wsi_wayland_backend = {wl_init, wl_present, wl_wait_free, wl_destroy, wl_present_async, wl_wait_queue};

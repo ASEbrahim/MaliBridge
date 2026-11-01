@@ -136,6 +136,26 @@ void *vkb_emu_chain_take(const void *head_const, VkStructureType t)
     return NULL;
 }
 
+vkb_emu_taken vkb_emu_chain_take_at(const void *head_const, VkStructureType t)
+{
+    VkBaseOutStructure *prev = (VkBaseOutStructure *)head_const;
+    for (; prev->pNext; prev = prev->pNext) {
+        if (prev->pNext->sType == t) {
+            VkBaseOutStructure *found = prev->pNext;
+            prev->pNext = found->pNext;
+            return (vkb_emu_taken){prev, found};
+        }
+    }
+    return (vkb_emu_taken){NULL, NULL};
+}
+
+void vkb_emu_chain_put_back(vkb_emu_taken k)
+{
+    if (!k.s || !k.prev) return;
+    k.s->pNext = k.prev->pNext;
+    k.prev->pNext = k.s;
+}
+
 /* Opaque-fd external memory on a driver without it (Mali r44: "opaque fd: features 0x0"). Zink
  * asks for it on GL resources it may share (tablet run 9: every such image refused with
  * VK_ERROR_INVALID_EXTERNAL_HANDLE, and Steam's browser lost its GPU process over it). The opaque
@@ -223,7 +243,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_GetDeviceImageMemoryRequirements(VkDevice 
     vkb_emu_device *e = vkb_emu_cur();
     VkImageCreateInfo ci = *pInfo->pCreateInfo;
     vkb_texcap_create_info(e, &ci);
-    vkb_emu_image_create_info(e, &ci);
+    vkb_emu_image_create_info(e, &ci, 1);
     vkb_opaque_image(e, &ci);
     VkDeviceImageMemoryRequirements info = *pInfo;
     info.pCreateInfo = &ci;
@@ -236,7 +256,7 @@ static VKAPI_ATTR void VKAPI_CALL emu_GetDeviceImageSparseMemoryRequirements(VkD
     vkb_emu_device *e = vkb_emu_cur();
     VkImageCreateInfo ci = *pInfo->pCreateInfo;
     vkb_texcap_create_info(e, &ci);
-    vkb_emu_image_create_info(e, &ci);
+    vkb_emu_image_create_info(e, &ci, 1);
     VkDeviceImageMemoryRequirements info = *pInfo;
     info.pCreateInfo = &ci;
     vkb_emu_real()->vkGetDeviceImageSparseMemoryRequirements(device, &info, pCount, pReq);
@@ -392,7 +412,7 @@ static int dmabuf_plain_retry(VkImageCreateInfo *ci)
 
 /* The export images of gamescope's nested backend (and any client exporting through a modifier list):
  * DRM-modifier tiling with VkImageDrmFormatModifierListCreateInfoEXT and DMA_BUF. Arm's r32p1
- * (Mali-G77 MC9, Retroid Pocket 4 Pro, MaliBridge#10) most likely refuses them at the LINEAR
+ * (Mali-G77 MC9, Retroid Pocket 4 Pro) most likely refuses them at the LINEAR
  * modifier: it refuses dma-buf images at LINEAR tiling outright (the dmabuf_linear_image probe), and
  * gamescope found no exportable modifier for its output images although the export emulation was on.
  * Where the emulation is on and the list holds LINEAR, such an image is made as a plain LINEAR image
@@ -528,6 +548,42 @@ static int linear_import_layout_ok(VkDevice device, VkImage image, const VkImage
     return ok;
 }
 
+/* dma-buf over AHardwareBuffers (server_dmabuf_ahb.c): the modifier extension is the server's, with
+ * the LINEAR modifier only, so a DRM-modifier image is a plain LINEAR one whatever the driver has
+ * (Kirin's have no modifier extension). An export (a modifier list holding LINEAR) and an import
+ * (the explicit LINEAR modifier, one plane) keep their dma-buf handle type for vkb_dab_image_create;
+ * an import is kept only at the layout it was given. Returns 0 (not such an image), 1 (a list),
+ * 2 (explicit, *plane its layout) or -1 (no LINEAR modifier asked: refused). */
+static int dab_linear_mod(const vkb_emu_device *e, VkImageCreateInfo *ci, VkSubresourceLayout *plane)
+{
+    if (!(e->flags & VKB_EMU_DMABUF_AHB) || ci->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) return 0;
+    int list = 0, lin = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) {
+            const VkImageDrmFormatModifierListCreateInfoEXT *l = (const void *)b;
+            list = 1;
+            for (uint32_t i = 0; i < l->drmFormatModifierCount; i++) lin |= l->pDrmFormatModifiers[i] == 0 /* DRM_FORMAT_MOD_LINEAR */;
+        }
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) {
+            const VkImageDrmFormatModifierExplicitCreateInfoEXT *x = (const void *)b;
+            lin = x->drmFormatModifier == 0 && x->drmFormatModifierPlaneCount == 1 && x->pPlaneLayouts;
+            if (lin) *plane = x->pPlaneLayouts[0];
+        }
+    }
+    if (!lin || !vkb_dab_linear_modifier() || ci->imageType != VK_IMAGE_TYPE_2D || ci->mipLevels != 1 || ci->samples != VK_SAMPLE_COUNT_1_BIT) {
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+            VKB_WARN("dma-buf over AHardwareBuffer: a DRM-modifier image without the LINEAR modifier (or not a plain 2D one: format %d "
+                     "%ux%u, %u mips, %u samples) refused; only LINEAR is offered", ci->format, ci->extent.width, ci->extent.height,
+                     ci->mipLevels, ci->samples);
+        return -1;
+    }
+    ci->tiling = VK_IMAGE_TILING_LINEAR;
+    vkb_emu_chain_take(ci, list ? VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT
+                                : VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+    return list ? 1 : 2;
+}
+
 static VkResult driver_create_image(VkDevice device, const VkImageCreateInfo *ci, const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
     static int fake = -1;
@@ -600,9 +656,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     VkFormat client_format = ci->format;
     VkImageCreateInfo app = *ci;
     uint32_t drop = vkb_texcap_create_info(e, ci);
-    vkb_emu_image_create_info(e, ci);
+    vkb_emu_image_create_info(e, ci, 0);
     int opaque = vkb_opaque_image(e, ci);
-    int linear_mod = 0;
+    VkSubresourceLayout dab_plane = {0};
+    int dab_mod = dab_linear_mod(e, ci, &dab_plane); /* dma-buf over AHardwareBuffers: the LINEAR modifier as plain LINEAR */
+    if (dab_mod < 0) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    vkb_dab_note dab;
+    vkb_dab_image_create(e, ci, &dab); /* dma-buf over AHardwareBuffers: no handle type, LINEAR where it can */
+    int linear_mod = dab_mod > 0;
     int lm_candidate = (e->flags & VKB_EMU_DMABUF_EXPORT) && has_linear_mod_list(ci);
     if (lm_candidate && linear_mod_refused(e->dev, ci)) linear_mod = linear_mod_plain(ci, VK_SUCCESS);
     VkSubresourceLayout lm_plane = {0};
@@ -613,9 +674,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
         linear_mod = lm_candidate ? linear_mod_plain(ci, r) : linear_import_plain(ci, r);
         r = driver_create_image(device, ci, pAllocator, pImage);
     }
+    if (r == VK_SUCCESS && dab_mod == 2 && !linear_import_layout_ok(device, *pImage, ci, &dab_plane)) {
+        vkb_emu_real()->vkDestroyImage(device, *pImage, pAllocator);
+        *pImage = VK_NULL_HANDLE;
+        return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+    }
     if (r == VK_SUCCESS && lm_import && linear_mod && !linear_import_layout_ok(device, *pImage, ci, &lm_plane)) {
         vkb_emu_real()->vkDestroyImage(device, *pImage, pAllocator);
         *pImage = VK_NULL_HANDLE;
+        vkb_emu_bcn_image_made(e, NULL);
         return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
     }
     if (r != VK_SUCCESS && opaque && vkb_opaque_retry(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO))
@@ -627,6 +694,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     if (r != VK_SUCCESS && dmabuf_plain_retry(ci)) r = driver_create_image(device, ci, pAllocator, pImage);
     if (r == VK_SUCCESS) {
         vkb_emu_track_image(e, *pImage, ci, client_format);
+        vkb_emu_bcn_image_made(e, vkb_is_bc(client_format) ? vkb_emu_find_image(e, *pImage) : NULL);
+        vkb_dab_image_created(e, *pImage, ci, &dab);
         if (linear_mod) {
             vkb_emu_image *ti = vkb_emu_find_image(e, *pImage);
             if (ti) ti->linear_mod = 1;
@@ -642,6 +711,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
                 break;
             }
     } else {
+        vkb_emu_bcn_image_made(e, NULL);
         /* What the driver refused, in full (tablet run 9: Zink's shareable images in Steam's
          * browser got VK_ERROR_INVALID_EXTERNAL_HANDLE). Logged for the first few. */
         static int told;
@@ -670,6 +740,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
 static VKAPI_ATTR void VKAPI_CALL emu_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *pAllocator)
 {
     if (image) untrack_image(vkb_emu_cur(), image);
+    vkb_dab_image_destroyed(vkb_emu_cur(), image);
     vkb_emu_real()->vkDestroyImage(device, image, pAllocator);
 }
 
@@ -974,7 +1045,7 @@ void vkb_emu_install(vkb_srv_table *dev)
         dt->vkGetDeviceImageSparseMemoryRequirements = emu_GetDeviceImageSparseMemoryRequirements;
     dt->vkDestroyImage = emu_DestroyImage;
     dt->vkGetImageSubresourceLayout = emu_GetImageSubresourceLayout;
-    if (e->flags & VKB_EMU_DMABUF_EXPORT) dt->vkGetImageDrmFormatModifierPropertiesEXT = emu_GetImageDrmFormatModifierPropertiesEXT;
+    if (e->flags & (VKB_EMU_DMABUF_EXPORT | VKB_EMU_DMABUF_AHB)) dt->vkGetImageDrmFormatModifierPropertiesEXT = emu_GetImageDrmFormatModifierPropertiesEXT;
     dt->vkCreateGraphicsPipelines = emu_CreateGraphicsPipelines;
     dt->vkCreateComputePipelines = emu_CreateComputePipelines;
     dt->vkCmdCopyImage = emu_CmdCopyImage;

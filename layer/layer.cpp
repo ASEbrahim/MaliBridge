@@ -48,7 +48,7 @@ LinkInfo *find_link_info(const void *chain, VkStructureType type) {
 }
 
 /* The process the layer runs in, as the bridge's server knows a client's (vkb_srv_proc): its name
- * is what the per-process fixes match (gs_hide's VKBRIDGE_GS_HIDE_PROCS, issue #11) and what the
+ * is what the per-process fixes match (gs_hide's VKBRIDGE_GS_HIDE_PROCS) and what the
  * logs say. */
 vkb_srv_proc *layer_proc() {
     static vkb_srv_proc proc;
@@ -222,7 +222,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkCreateInstance(
     vkb_emu_a1_layer(t->proc->comm); /* the a1 gate (server_apicap.c): Steam mode's own processes only */
     vkb_table_register(t);
     /* The bridge's instance fixes (server_instance.c), those that apply in-process: the extension
-     * hiding and fp16_hide (MK-20) in vkb_emu_instance_install, gs_hide (issue #11) over them */
+     * hiding and fp16_hide (MK-20) in vkb_emu_instance_install, gs_hide over them */
     vkb_emu_instance_install(t);
     vkb_errata_gs_instance_install(t);
 

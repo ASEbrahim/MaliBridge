@@ -8,7 +8,7 @@
 #   2  a build past the transcoders' limit: a hang, said as a compile; only BC7 decoded (BC2 and
 #      BC3 still go to ASTC), and the device's log says which formats are decoded; its flag is not
 #      read as MK-20's (BC7's flag shared MK-20's bit: the Retroid Pocket 4 Pro's report said
-#      "shaderFloat16 hidden" for a died bc_transcoders, MaliBridge#10);
+#      "shaderFloat16 hidden" for a died bc_transcoders);
 #   3  a hang on an earlier transcoder: those after it are not tried, and decoded too.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"

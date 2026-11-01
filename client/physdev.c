@@ -122,7 +122,7 @@ static void build_memory_model(vkb_physdev *pd)
     /* A driver whose one plain device-local type is not one images allow is taken as one without
      * such a type: the device-local type the client offers is backed by one images do allow (the
      * XRing O1's Mali-G925, r49p1: type 0 is 0x1, but images and buffers allow types 1 and 2 only,
-     * so every image's mask came out empty and gamescope could not start, issues #6 and #8). */
+     * so every image's mask came out empty and gamescope could not start). */
     int uma = pure_dl < 0 || (pd->info.image_types && !(pd->info.image_types & (1u << pure_dl)));
     if (pure_dl >= 0 && uma)
         VKB_INFO("memory: images do not allow the plain device-local type %d (they allow 0x%x): device-local types backed by those",
@@ -145,7 +145,7 @@ static void build_memory_model(vkb_physdev *pd)
         /* A device-local type with no host access, backed by the first ordinary device-local type
          * that images allow (the server's self-test tried some: image_types). Not simply the first
          * device-local type: Mali-G2-Ultra's images (XRing O3, driver 56, 22 memory types) do not
-         * list that one, and every image's mask came out empty (issue #1). A server too old to say
+         * list that one, and every image's mask came out empty. A server too old to say
          * sends 0: the first device-local type, as before. */
         for (int pass = pd->info.image_types ? 0 : 1; pass < 2 && !nc; pass++)
             for (uint32_t t = 0; t < s->memoryTypeCount; t++) {
@@ -307,7 +307,7 @@ uint32_t vkb_mem_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow
  * the driver's device-local types are host-visible too (0x7, 0xb), and the client offers them
  * without host access (dl_types: one per backing resources need). Where a buffer's mask holds
  * host-visible types but none the shared pages are made in, it got no type an app can map: the
- * XRing O3 (driver 56, issue #1) puts dma-heap pages in type 14 only, while its indirect buffers
+ * XRing O3 (driver 56) puts dma-heap pages in type 14 only, while its indirect buffers
  * allow 0x1040 and gamescope's upload buffer 0x3 ("no memory type for the buffer (types 0x1
  * allowed)", gamescope's "findMemoryType failed"). Such a buffer is offered the shared types as
  * well: memory the driver could map anyway, in another of its host-visible types, which the
@@ -410,6 +410,9 @@ int vkb_physdev_ready(vkb_physdev *pd)
     vkb_dec_raw_tail(&c.d, &pd->info, sizeof(pd->info)); /* an older server's is shorter (no dl_types) */
     vkb_call_end(&c);
     vkb_client_knobs_set(pd->info.client_knobs);
+    vkb_hitch_server_ms(pd->info.hitch_ms); /* 0 from an older server */
+    vkb_lat_server(pd->info.latlog);        /* the latency log (latency.c); 0 from an older server */
+    vkb_wsi_frame_queue_server(pd->info.frame_queue); /* the frame queue cap (wsi.c); 0 from an older server */
     vkb_wire_vkGetPhysicalDeviceProperties((VkPhysicalDevice)pd, &pd->props);
     cap_api(pd, &pd->props.apiVersion); /* the device's version (icd.c dev->api_version) follows it */
 
@@ -475,6 +478,8 @@ int vkb_physdev_ready(vkb_physdev *pd)
         /* Placed mappings move the client's own mapping of shared memory (memory.c). */
         if ((!strcmp(cl[i], "VK_EXT_map_memory_placed") || !strcmp(cl[i], "VK_KHR_map_memory2")) && pd->info.strategy == VKB_MEM_NONE)
             continue;
+        /* Present ids and waits (wsi.c): all four or none. */
+        if (!strncmp(cl[i], "VK_KHR_present_", 15) && !vkb_wsi_present_wait_on(pd)) continue;
         VkExtensionProperties *e = &pd->exts[pd->next++];
         snprintf(e->extensionName, sizeof(e->extensionName), "%s", cl[i]);
         e->specVersion = !strcmp(cl[i], "VK_KHR_swapchain") ? 70 : !strcmp(cl[i], "VK_KHR_incremental_present") ? 2 : 1;
@@ -563,8 +568,10 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice 
 {
     vkb_wire_vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
     vkb_emu_patch_features(vkb_pd(physicalDevice), &pFeatures->features);
-    for (VkBaseOutStructure *b = (VkBaseOutStructure *)pFeatures->pNext; b; b = b->pNext)
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)pFeatures->pNext; b; b = b->pNext) {
         vkb_emu_patch_features_chain(vkb_pd(physicalDevice), b);
+        vkb_wsi_patch_features(vkb_pd(physicalDevice), b); /* present ids and waits: the client's own */
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
@@ -616,13 +623,6 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceQueueFamilyProperties2(VkPh
     vkb_wire_vkGetPhysicalDeviceQueueFamilyProperties2(physicalDevice, pCount, pProps);
 }
 
-VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
-                                                                      VkFormatProperties *pFormatProperties)
-{
-    if (vkb_emu_format_properties(vkb_pd(physicalDevice), format, pFormatProperties, NULL)) return;
-    vkb_wire_vkGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
-}
-
 /* Format answers never change: DXVK asked ~900 times a second in Deep Rock Galactic, each a round
  * trip. Kept for the plain query and the one with VkFormatProperties3 (what DXVK and vkd3d send). */
 typedef struct fmt_entry {
@@ -640,6 +640,30 @@ static unsigned fmt_slot(VkPhysicalDevice pd, VkFormat format, int with3)
 {
     uint64_t k = ((uint64_t)(uintptr_t)pd >> 4) * 0x9e3779b97f4a7c15ull ^ (uint64_t)(uint32_t)format * 2654435761u ^ (uint64_t)with3;
     return (unsigned)(k ^ (k >> 29)) & (FMT_SLOTS - 1);
+}
+
+/* The v1 query too (emulated formats' answers included: the BC path asks it for each BC format
+ * it describes), under with3 = 2: the v2 query answers emulated formats before its cache. */
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
+                                                                      VkFormatProperties *pFormatProperties)
+{
+    unsigned slot = fmt_slot(physicalDevice, format, 2);
+    pthread_mutex_lock(&fmt_lock);
+    fmt_entry *e = &fmt_cache[slot];
+    if (e->pd == physicalDevice && e->format == format && e->with3 == 2) {
+        *pFormatProperties = e->props;
+        pthread_mutex_unlock(&fmt_lock);
+        return;
+    }
+    pthread_mutex_unlock(&fmt_lock);
+    if (!vkb_emu_format_properties(vkb_pd(physicalDevice), format, pFormatProperties, NULL))
+        vkb_wire_vkGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
+    pthread_mutex_lock(&fmt_lock);
+    e->pd = physicalDevice;
+    e->format = format;
+    e->with3 = 2;
+    e->props = *pFormatProperties;
+    pthread_mutex_unlock(&fmt_lock);
 }
 
 VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format,
@@ -679,19 +703,119 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties2(VkPhysica
     }
 }
 
+/* Image format answers never change either: DXVK and vkd3d ask before creating images (each
+ * texture a game streams in), a round trip each. Kept by the query as the app made it: the v1
+ * query, and v2 with no input structs but external memory and stencil usage and no output struct
+ * but the external memory properties (one of each at most); anything else goes to the server. */
+typedef struct ifmt_entry {
+    VkPhysicalDevice pd;
+    VkFormat format;
+    VkImageType type;
+    VkImageTiling tiling;
+    VkImageUsageFlags usage, stencil_usage;
+    VkImageCreateFlags flags;
+    uint32_t handle_type, shape; /* shape: 1 v1, 2 v2 (+4 stencil usage in, +8 external info in, +16 external props out) */
+    VkResult r;
+    VkImageFormatProperties props;
+    VkExternalMemoryProperties ext;
+} ifmt_entry;
+#define IFMT_SLOTS 2048
+static ifmt_entry ifmt_cache[IFMT_SLOTS];
+
+/* The key of a query (filled into k), 0 when it is not kept. */
+static int ifmt_key(ifmt_entry *k, VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *info, const VkImageFormatProperties2 *props,
+                    int v1)
+{
+    memset(k, 0, sizeof(*k));
+    k->pd = pd;
+    k->format = info->format;
+    k->type = info->type;
+    k->tiling = info->tiling;
+    k->usage = info->usage;
+    k->flags = info->flags;
+    k->shape = v1 ? 1 : 2;
+    if (v1) return 1;
+    for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO && !(k->shape & 4)) {
+            k->stencil_usage = ((const VkImageStencilUsageCreateInfo *)b)->stencilUsage;
+            k->shape |= 4;
+        } else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO && !(k->shape & 8)) {
+            k->handle_type = ((const VkPhysicalDeviceExternalImageFormatInfo *)b)->handleType;
+            k->shape |= 8;
+        } else {
+            return 0;
+        }
+    }
+    for (const VkBaseOutStructure *b = props->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES && !(k->shape & 16)) k->shape |= 16;
+        else return 0;
+    }
+    return 1;
+}
+
+static unsigned ifmt_slot(const ifmt_entry *k)
+{
+    uint64_t h = ((uint64_t)(uintptr_t)k->pd >> 4) * 0x9e3779b97f4a7c15ull ^ (uint64_t)(uint32_t)k->format * 2654435761u ^
+                 (uint64_t)k->usage << 17 ^ (uint64_t)k->flags << 37 ^ (uint64_t)k->tiling << 57 ^ (uint64_t)k->type << 60 ^
+                 (uint64_t)k->shape << 3 ^ (uint64_t)k->handle_type << 45 ^ (uint64_t)k->stencil_usage << 27;
+    h ^= h >> 31;
+    h *= 0xbf58476d1ce4e5b9ull;
+    return (unsigned)(h ^ (h >> 29)) & (IFMT_SLOTS - 1);
+}
+
+static int ifmt_same(const ifmt_entry *a, const ifmt_entry *b)
+{
+    return a->pd == b->pd && a->format == b->format && a->type == b->type && a->tiling == b->tiling && a->usage == b->usage &&
+           a->stencil_usage == b->stencil_usage && a->flags == b->flags && a->handle_type == b->handle_type && a->shape == b->shape;
+}
+
+/* 1 = answered from the cache (props, and ext where the query has it). */
+static int ifmt_get(const ifmt_entry *k, VkResult *r, VkImageFormatProperties *props, VkExternalMemoryProperties *ext)
+{
+    pthread_mutex_lock(&fmt_lock);
+    const ifmt_entry *e = &ifmt_cache[ifmt_slot(k)];
+    int hit = ifmt_same(e, k);
+    if (hit) {
+        *r = e->r;
+        *props = e->props;
+        if (ext) *ext = e->ext;
+    }
+    pthread_mutex_unlock(&fmt_lock);
+    return hit;
+}
+
+static void ifmt_put(const ifmt_entry *k, VkResult r, const VkImageFormatProperties *props, const VkExternalMemoryProperties *ext)
+{
+    if (r != VK_SUCCESS && r != VK_ERROR_FORMAT_NOT_SUPPORTED) return; /* out of memory and the like: asked again */
+    pthread_mutex_lock(&fmt_lock);
+    ifmt_entry *e = &ifmt_cache[ifmt_slot(k)];
+    *e = *k;
+    e->r = r;
+    e->props = *props;
+    if (ext) e->ext = *ext;
+    pthread_mutex_unlock(&fmt_lock);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
                                                                                VkImageType type, VkImageTiling tiling,
                                                                                VkImageUsageFlags usage, VkImageCreateFlags flags,
                                                                                VkImageFormatProperties *pProps)
 {
+    VkPhysicalDeviceImageFormatInfo2 asked = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, NULL, format, type, tiling, usage, flags};
+    ifmt_entry k;
+    VkResult r;
+    ifmt_key(&k, physicalDevice, &asked, NULL, 1);
+    if (ifmt_get(&k, &r, pProps, NULL)) return r;
     VkFormat real = vkb_emu_real_format(vkb_pd(physicalDevice), format, &usage, &flags);
     vkb_emu_planar_ext_usage(vkb_pd(physicalDevice), real, tiling, usage, &flags);
-    return vkb_wire_vkGetPhysicalDeviceImageFormatProperties(physicalDevice, real, type, tiling, usage, flags, pProps);
+    r = vkb_wire_vkGetPhysicalDeviceImageFormatProperties(physicalDevice, real, type, tiling, usage, flags, pProps);
+    ifmt_put(&k, r, pProps, NULL);
+    return r;
 }
 
 /* A DMA_BUF or DRM-modifier format query the driver refused (or answered without IMPORTABLE), logged
  * once per distinct query: what gamescope asked when it found no exportable modifier is otherwise
- * invisible (MaliBridge#10, Mali-G77 r32p1: "modifiers.size() > 0"). */
+ * invisible (, Mali-G77 r32p1: "modifiers.size > 0"). */
 static void log_refused_query(const VkPhysicalDeviceImageFormatInfo2 *info, int has_mod, uint64_t mod, VkResult r,
                               VkExternalMemoryFeatureFlags features, const char *then)
 {
@@ -716,9 +840,25 @@ static void log_refused_query(const VkPhysicalDeviceImageFormatInfo2 *info, int 
              "result %d, external features 0x%x%s", info->format, info->type, info->tiling, info->usage, info->flags, views, m, r, features, then);
 }
 
+static VkResult image_format_properties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2 *pInfo,
+                                         VkImageFormatProperties2 *pProps);
+
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
                                                                                 const VkPhysicalDeviceImageFormatInfo2 *pInfo,
                                                                                 VkImageFormatProperties2 *pProps)
+{
+    ifmt_entry k;
+    VkResult r;
+    if (!ifmt_key(&k, physicalDevice, pInfo, pProps, 0)) return image_format_properties2(physicalDevice, pInfo, pProps);
+    VkExternalImageFormatProperties *ext = k.shape & 16 ? (VkExternalImageFormatProperties *)pProps->pNext : NULL;
+    if (ifmt_get(&k, &r, &pProps->imageFormatProperties, ext ? &ext->externalMemoryProperties : NULL)) return r;
+    r = image_format_properties2(physicalDevice, pInfo, pProps);
+    ifmt_put(&k, r, &pProps->imageFormatProperties, ext ? &ext->externalMemoryProperties : NULL);
+    return r;
+}
+
+static VkResult image_format_properties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2 *pInfo,
+                                         VkImageFormatProperties2 *pProps)
 {
     VkPhysicalDeviceImageFormatInfo2 info = *pInfo;
     vkb_physdev *pd = vkb_pd(physicalDevice);

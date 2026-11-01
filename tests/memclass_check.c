@@ -3,7 +3,7 @@
  *
  * memclass_check: every kind of resource an app makes has a memory type, as an app looks for one
  * (the first type in its memoryTypeBits with the flags it wants). On the XRing O3 (Mali-G2-Ultra,
- * driver 56, issue #1) images allow one set of the driver's types and buffers others, by usage;
+ * driver 56) images allow one set of the driver's types and buffers others, by usage;
  * the v0.5 client had one device-local type, backed by a type the images allow, and one shared
  * host-visible type: buffers came out with no device-local type ("a resource allowing server types
  * 0x3 gets no client type"), indirect buffers with no host-visible one (the self-test's draws:

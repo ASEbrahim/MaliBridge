@@ -83,6 +83,7 @@ static void cmdbuf_free(vkb_cmdbuf *cb)
 {
     vkb_enc_free(&cb->stream);
     free(cb->qops);
+    free(cb->evops);
     free(cb);
 }
 
@@ -176,6 +177,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkResetCommandPool(VkDevice device, VkComm
     for (vkb_cmdbuf *cb = p ? p->head : NULL; cb; cb = cb->pool_next) {
         stream_reset(cb);
         vkb_query_cb_clear(cb);
+        vkb_sm_cb_clear(cb);
     }
     pthread_mutex_unlock(&dev->lock);
     return r;
@@ -188,6 +190,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkBeginCommandBuffer(VkCommandBuffer comma
     vkb_cmdbuf *cb = vkb_cb(commandBuffer);
     stream_reset(cb);
     vkb_query_cb_clear(cb);
+    vkb_sm_cb_clear(cb);
+    vkb_qvis_cb_begin(cb);
     cb->recording = 1;
     vkb_enc *e = vkb_cmd_record_begin(commandBuffer, VKB_CMD_vkBeginCommandBuffer);
     vkb_enc_u64(e, cb->obj.remote);
@@ -213,6 +217,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkEndCommandBuffer(VkCommandBuffer command
     vkb_cmdbuf *cb = vkb_cb(commandBuffer);
     if (!cb->recording) return VK_SUCCESS;
     vkb_query_cb_end(cb);
+    vkb_sm_cb_end(cb);
+    vkb_qvis_cb_end(cb);
     cb->recording = 0;
     if (cb->broken || cb->stream.oom) {
         VKB_ERR("command buffer could not be recorded (out of memory)");
@@ -239,6 +245,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkResetCommandBuffer(VkCommandBuffer comma
 {
     stream_reset(vkb_cb(commandBuffer));
     vkb_query_cb_clear(vkb_cb(commandBuffer));
+    vkb_sm_cb_clear(vkb_cb(commandBuffer));
     return vkb_wire_vkResetCommandBuffer(commandBuffer, flags);
 }
 
@@ -247,7 +254,11 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdExecuteCommands(VkCommandBuffer commandBu
 {
     vkb_wire_vkCmdExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
     for (uint32_t i = 0; i < commandBufferCount; i++)
-        if (pCommandBuffers[i]) vkb_query_cb_execute(vkb_cb(commandBuffer), vkb_cb(pCommandBuffers[i]));
+        if (pCommandBuffers[i]) {
+            vkb_query_cb_execute(vkb_cb(commandBuffer), vkb_cb(pCommandBuffers[i]));
+            vkb_sm_cb_execute(vkb_cb(commandBuffer), vkb_cb(pCommandBuffers[i]));
+            vkb_qvis_cb_execute(vkb_cb(commandBuffer), vkb_cb(pCommandBuffers[i]));
+        }
 }
 
 /* Debug labels never reach the driver. */

@@ -18,7 +18,7 @@
  * storageBuffer16BitAccess (dxvk_device_info.cpp) and rejects a GPU without it, so hiding it would
  * stop every D3D game. They are no way into the fp16 maths either: without the Float16 capability
  * (shaderFloat16) SPIR-V may only load, store and convert 16-bit floats (the StorageBuffer16BitAccess
- * family of capabilities); ncnn#7054's wrong results are in the arithmetic, and fp16_math checks
+ * family of capabilities); ncnnwrong results are in the arithmetic, and fp16_math checks
  * the conversions on their own (its convert sub-case). shaderInt16 and shaderInt8 stay. The
  * extensions stay offered: VK_KHR_shader_float16_int8 also carries shaderInt8, and an extension
  * whose features are all off is valid.

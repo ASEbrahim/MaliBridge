@@ -9,27 +9,31 @@
  * idle. The quiet window in icd.c only helps polls that come back not ready.
  *
  * So every occlusion/timestamp pool gets a small buffer in shared, verified-coherent memory:
- *   u64 value[count]   the query's result, written by the GPU
- *   u32 ready[count]   nonzero once value[] holds the current result
+ *   u64 value[count]   the query's result, written by the GPU; PENDING (all ones) while it has none
  * A primary command buffer that ends queries (vkCmdEndQuery[Indexed], vkCmdWriteTimestamp[2],
  * including those of the secondaries it executes) gets, appended at vkEndCommandBuffer:
- *   barrier; vkCmdCopyQueryPoolResults(64-bit, WAIT) -> value[]; barrier; vkCmdFillBuffer(1) -> ready[];
- *   barrier transfer -> host
- * The separate ready word is written only after the values are (a barrier apart), so a reader
- * that sees it set never sees a stale or torn value. vkResetQueryPool clears ready[] from the
- * host; vkCmdResetQueryPool is followed by a vkCmdFillBuffer(0) of ready[] at the same place in
- * the stream (both legal only outside render passes), which, like the reset itself, takes effect
- * when it executes.
+ *   barrier; vkCmdCopyQueryPoolResults(64-bit, WAIT) -> value[]; barrier transfer -> host
+ * vkResetQueryPool sets value[] to PENDING from the host; vkCmdResetQueryPool is followed by a
+ * vkCmdFillBuffer(PENDING) of value[] at the same place in the stream (both legal only outside
+ * render passes), which, like the reset itself, takes effect when it executes.
+ *
+ * One word per query, not a value and a separate "ready" word (v0.5.4.1 and before): Batman:
+ * Arkham Asylum (UE3 through DXVK, Galaxy Tab S12+) read walls as 0 samples, a reused
+ * slot's old value, and drew the lit rooms behind them. Nothing orders the host's view of two GPU
+ * writes to different places before a fence wait: a GPU cache can write the ready word's line back
+ * before the value's, however the commands are ordered on the GPU. Writes to one place are seen in
+ * order, so a reader now sees PENDING or this use's value, never the last use's. No real result is
+ * all ones: occlusion counts are far below it, and a timestamp would have to run for centuries.
  *
  * A query is answered from the mirror only while it is "mirrored": set when a command buffer
- * appended its copy and by a host reset (ready cleared), cleared by a command buffer that ended it
+ * appended its copy and by a host reset (value PENDING), cleared by a command buffer that ended it
  * but could not copy it (a queue family without graphics/compute). Anything else (unmirrored queries, other
  * query types, VK_QUERY_RESULT_WITH_STATUS_BIT_KHR, WAIT on a query not ready yet) goes to the
  * server as before. Limit: a multiview render pass ends N consecutive queries per vkCmdEndQuery;
  * only the first is copied; the others (mirrored by a host reset) are found by the stuck-query
  * check below, which asks the server about a query the mirror has said "not ready" for too long.
  *
- * VKBRIDGE_QUERY_MIRROR=0 turns this off.
+ * VKBRIDGE_QUERY_MIRROR=0 turns this off, VKBRIDGE_QUERY_MIRROR_OCCLUSION=0 for occlusion pools only.
  */
 #define _GNU_SOURCE
 #include "vkb_client.h"
@@ -39,14 +43,15 @@
 #include <string.h>
 #include <time.h>
 
+#define PENDING (~(uint64_t)0)
+
 typedef struct vkb_qmirror {
     VkQueryPool pool;
+    VkQueryType type;
     uint32_t count;
     VkBuffer buf;
     VkDeviceMemory mem;
-    uint64_t *value;
-    uint32_t *ready;
-    VkDeviceSize ready_off;
+    uint64_t *value;         /* per query, atomic; PENDING = no result yet */
     uint8_t *mirrored;       /* per query, atomic */
     uint32_t *nr_polls;      /* per query: not-ready answers from the mirror in a row (stuck_ask) */
     uint32_t *nr_since;      /* per query: ms clock of the first of them */
@@ -66,6 +71,20 @@ typedef struct vkb_qm_dev {
     uint32_t fam_count;
     VkQueueFlags *fam_flags;
 } vkb_qm_dev;
+
+/* VKBRIDGE_QUERY_MIRROR_OCCLUSION=0 (guest env): occlusion results from the server, timestamps
+ * still from the mirror. For a game whose occlusion results would still come wrong from the mirror
+ * on some driver (a per-game preset), at the cost of its round trips. */
+static int occlusion_mirrored(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_QUERY_MIRROR_OCCLUSION");
+        v = !(e && !strcmp(e, "0"));
+        if (!v) VKB_INFO("query mirror: occlusion results from the server (VKBRIDGE_QUERY_MIRROR_OCCLUSION=0), timestamps mirrored");
+    }
+    return v;
+}
 
 static int mirror_enabled(void)
 {
@@ -160,8 +179,7 @@ static vkb_qmirror *mirror_create(vkb_device *d, VkQueryPool pool, uint32_t coun
     }
     m->pool = pool;
     m->count = count;
-    m->ready_off = (VkDeviceSize)count * 8;
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, m->ready_off + (VkDeviceSize)count * 4,
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)count * 8,
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (vkb_ep_vkCreateBuffer(device, &bci, NULL, &m->buf) != VK_SUCCESS) goto fail;
     VkMemoryRequirements req;
@@ -170,7 +188,7 @@ static vkb_qmirror *mirror_create(vkb_device *d, VkQueryPool pool, uint32_t coun
     for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount && type == UINT32_MAX; i++) {
         if (!(req.memoryTypeBits & (1u << i)) || !pd->type_map[i].shared) continue;
         if (!(pd->info.coherent_types & (1u << pd->type_map[i].server_type))) continue;
-        if (pd->type_map[i].cached) continue; /* CPU-cached pages need invalidates: the ready words would go stale */
+        if (pd->type_map[i].cached) continue; /* CPU-cached pages need invalidates: the values would go stale */
         if (pd->client_mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) type = i;
     }
     if (type == UINT32_MAX) {
@@ -185,9 +203,8 @@ static vkb_qmirror *mirror_create(vkb_device *d, VkQueryPool pool, uint32_t coun
     if (vkb_wire_vkBindBufferMemory(device, m->buf, m->mem, 0) != VK_SUCCESS) goto fail;
     vkb_memory *vm = vkb_map_get(&d->memories, (uint64_t)m->mem);
     if (!vm || !vm->ptr) goto fail;
-    memset(vm->ptr, 0, (size_t)bci.size);
+    memset(vm->ptr, 0xff, (size_t)bci.size); /* PENDING */
     m->value = (uint64_t *)vm->ptr;
-    m->ready = (uint32_t *)((uint8_t *)vm->ptr + m->ready_off);
     return m;
 fail:
     VKB_ONCE(VKB_LOG_WARN, "query mirror: a pool could not get its mirror; its results stay on the wire (logged once)");
@@ -199,10 +216,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateQueryPool(VkDevice device, const V
                                                         const VkAllocationCallbacks *pAllocator, VkQueryPool *pQueryPool)
 {
     VkResult r = vkb_wire_vkCreateQueryPool(device, pCreateInfo, pAllocator, pQueryPool);
+    if (r == VK_SUCCESS) vkb_qvis_pool_create(*pQueryPool, pCreateInfo);
     vkb_device *d = vkb_dev(device);
     if (r != VK_SUCCESS || !d->qm || d->qm->disabled || !pCreateInfo->queryCount) return r;
     if (pCreateInfo->queryType != VK_QUERY_TYPE_OCCLUSION && pCreateInfo->queryType != VK_QUERY_TYPE_TIMESTAMP) return r;
+    if (pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION && !occlusion_mirrored()) return r;
     vkb_qmirror *m = mirror_create(d, *pQueryPool, pCreateInfo->queryCount);
+    if (m) m->type = pCreateInfo->queryType;
     if (m) vkb_map_put(&d->qm->pools, (uint64_t)*pQueryPool, m);
     return r;
 }
@@ -214,6 +234,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyQueryPool(VkDevice device, VkQueryPoo
     if (!queryPool) return;
     vkb_device *d = vkb_dev(device);
     vkb_wire_vkDestroyQueryPool(device, queryPool, pAllocator);
+    vkb_qvis_pool_destroy(queryPool);
     vkb_qmirror *m = d->qm ? vkb_map_remove(&d->qm->pools, (uint64_t)queryPool) : NULL;
     if (m) mirror_free(d, m);
 }
@@ -224,16 +245,17 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkResetQueryPool(VkDevice device, VkQueryPool 
     vkb_qmirror *m = mirror_of(vkb_dev(device), queryPool);
     if (m && firstQuery < m->count) {
         uint32_t end = queryCount > m->count - firstQuery ? m->count : firstQuery + queryCount;
-        /* A reset query is unavailable until it is ended and that work runs, which is what the
-         * cleared ready word says: it stays mirrored. DXVK polls queries whose command buffer is
+        /* A reset query is unavailable until it is ended and that work runs, which is what
+         * PENDING says: it stays mirrored. DXVK polls queries whose command buffer is
          * still recording; sent to the server, those were ~5,400 round trips a second in DRG. A
          * command buffer that ends one without being able to copy it unmirrors it (below). */
         for (uint32_t q = firstQuery; q < end; q++) {
-            __atomic_store_n(&m->ready[q], 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&m->value[q], PENDING, __ATOMIC_RELEASE);
             __atomic_store_n(&m->mirrored[q], 1, __ATOMIC_RELEASE);
             __atomic_store_n(&m->nr_polls[q], 0, __ATOMIC_RELAXED);
         }
     }
+    vkb_qvis_reset(queryPool, firstQuery, queryCount);
     vkb_wire_vkResetQueryPool(device, queryPool, firstQuery, queryCount);
 }
 
@@ -271,6 +293,7 @@ void vkb_query_cb_clear(vkb_cmdbuf *cb)
 static void ended(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query)
 {
     vkb_cmdbuf *cb = vkb_cb(commandBuffer);
+    if (cb->recording) vkb_qvis_end(cb, queryPool, query);
     vkb_qmirror *m = mirror_of(cb->device, queryPool);
     if (m && cb->recording && query < m->count) qop_add(cb, m, query, 1, 0);
 }
@@ -283,13 +306,14 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdResetQueryPool(VkCommandBuffer commandBuf
 {
     vkb_wire_vkCmdResetQueryPool(commandBuffer, queryPool, firstQuery, queryCount);
     vkb_cmdbuf *cb = vkb_cb(commandBuffer);
+    if (cb->recording) vkb_qvis_reset(queryPool, firstQuery, queryCount);
     vkb_qmirror *m = mirror_of(cb->device, queryPool);
     if (!m || !cb->recording || firstQuery >= m->count) return;
     uint32_t n = queryCount > m->count - firstQuery ? m->count - firstQuery : queryCount;
-    /* After earlier writes of the mirror (earlier command buffers' copies and fills). */
+    /* After earlier writes of the mirror (earlier copies and fills of the same values). */
     vkb_wire_vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &xfer_xfer, 0, NULL,
                                   0, NULL);
-    vkb_wire_vkCmdFillBuffer(commandBuffer, m->buf, m->ready_off + (VkDeviceSize)firstQuery * 4, (VkDeviceSize)n * 4, 0);
+    vkb_wire_vkCmdFillBuffer(commandBuffer, m->buf, (VkDeviceSize)firstQuery * 8, (VkDeviceSize)n * 8, 0xffffffffu); /* PENDING */
     qop_add(cb, m, firstQuery, n, 1);
 }
 
@@ -337,11 +361,11 @@ static int item_cmp(const void *a, const void *b)
     return x->first < y->first ? -1 : x->first > y->first;
 }
 
-/* Called by vkEndCommandBuffer while the command buffer still records. */
-void vkb_query_cb_end(vkb_cmdbuf *cb)
+/* Appends the copies of the queries ended so far (and not reset again after) to a primary command
+ * buffer that still records, outside any render pass, and forgets them: at vkEndCommandBuffer, and
+ * with VKBRIDGE_QUERY_EARLY=1 also after each render pass that ended occlusion queries. */
+static void flush_qops(vkb_cmdbuf *cb)
 {
-    if (!cb->nqops) return;
-    if (cb->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) return; /* kept for vkCmdExecuteCommands */
     VkCommandBuffer commandBuffer = (VkCommandBuffer)cb;
     /* Queries ended and not reset again later in the command buffer: those are available at its
      * end (a WAIT copy of any other one could wait forever). Walk backwards collecting resets. */
@@ -384,27 +408,33 @@ void vkb_query_cb_end(vkb_cmdbuf *cb)
         items[nrun].count = 1;
         nrun++;
     }
-    /* Everything recorded before: the copy must not start before the queries' commands are done.
+    /* Everything recorded before: the copy must not start before the queries' commands are done
+     * (nor before a vkCmdResetQueryPool's fill of the same values).
      * A transfer-only barrier let Mali run it early: a compute pass timed 0.15 ms instead of 20 ms
      * (gpubench, tablet), the end timestamp read before it was written. */
     VkMemoryBarrier all = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     vkb_wire_vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &all, 0, NULL,
                                   0, NULL);
-    for (uint32_t i = 0; i < nrun; i++)
+    /* Test hooks (host tests only), each leaving out a flush's copies, so its values stay PENDING:
+     * VKBRIDGE_TEST_QUERY_LOSE_READY=1, the first flush (a command buffer's end, or with
+     * VKBRIDGE_QUERY_EARLY=1 a render pass's end): an update lost on the way, as in Deep Rock
+     * Galactic's stall on the S11 Ultra (the GPU done, the server idle, the mirror never ready);
+     * stuck_ask must end it. VKBRIDGE_TEST_QUERY_LOSE_VALUE=N, the Nth flush: its values reaching
+     * the host late. With a separate ready word that was a stale answer; now it can only
+     * be a late one. */
+    static int lose = -1, lose_value = -1;
+    static uint32_t flushes;
+    if (lose < 0) lose = getenv("VKBRIDGE_TEST_QUERY_LOSE_READY") && atoi(getenv("VKBRIDGE_TEST_QUERY_LOSE_READY")) == 1;
+    if (lose_value < 0) lose_value = getenv("VKBRIDGE_TEST_QUERY_LOSE_VALUE") ? atoi(getenv("VKBRIDGE_TEST_QUERY_LOSE_VALUE")) : 0;
+    int skip = lose && __atomic_exchange_n(&lose, 0, __ATOMIC_ACQ_REL);
+    if (skip) VKB_WARN("query mirror: test: this command buffer's ready words are left out (VKBRIDGE_TEST_QUERY_LOSE_READY=1)");
+    if (lose_value > 0 && __atomic_add_fetch(&flushes, 1, __ATOMIC_RELAXED) == (uint32_t)lose_value) {
+        skip = 1;
+        VKB_WARN("query mirror: test: this command buffer's values are left out (VKBRIDGE_TEST_QUERY_LOSE_VALUE)");
+    }
+    for (uint32_t i = 0; i < nrun && !skip; i++)
         vkb_wire_vkCmdCopyQueryPoolResults(commandBuffer, items[i].m->pool, items[i].first, items[i].count, items[i].m->buf,
                                            (VkDeviceSize)items[i].first * 8, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-    vkb_wire_vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &xfer_xfer, 0, NULL,
-                                  0, NULL);
-    /* VKBRIDGE_TEST_QUERY_LOSE_READY=1 (host tests only): the first command buffer's ready words are
-     * not written, as if the update were lost on the way (Deep Rock Galactic's stall on the S11 Ultra:
-     * the GPU done, the server idle, the mirror's ready word never set). stuck_ask must end it. */
-    static int lose = -1;
-    if (lose < 0) lose = getenv("VKBRIDGE_TEST_QUERY_LOSE_READY") && atoi(getenv("VKBRIDGE_TEST_QUERY_LOSE_READY")) == 1;
-    int skip_ready = lose && __atomic_exchange_n(&lose, 0, __ATOMIC_ACQ_REL);
-    if (skip_ready) VKB_WARN("query mirror: test: this command buffer's ready words are left out (VKBRIDGE_TEST_QUERY_LOSE_READY=1)");
-    for (uint32_t i = 0; i < nrun && !skip_ready; i++)
-        vkb_wire_vkCmdFillBuffer(commandBuffer, items[i].m->buf, items[i].m->ready_off + (VkDeviceSize)items[i].first * 4,
-                                 (VkDeviceSize)items[i].count * 4, 1);
     VkMemoryBarrier host = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
     vkb_wire_vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, NULL, 0, NULL);
     for (uint32_t i = 0; i < nrun; i++)
@@ -416,11 +446,99 @@ out:
     vkb_query_cb_clear(cb);
 }
 
+/* Called by vkEndCommandBuffer while the command buffer still records. */
+void vkb_query_cb_end(vkb_cmdbuf *cb)
+{
+    if (!cb->nqops) return;
+    if (cb->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) return; /* kept for vkCmdExecuteCommands */
+    flush_qops(cb);
+}
+
+/* ------------------------------------------------------------------ early copies (lite mode)
+ *
+ * Stray (UE4, D3D11 through DXVK, S11 Ultra 2026-10-26): the render thread waits for last frame's
+ * occlusion results (UE4's GetQueryData spins on GetData with a timeout read from
+ * QueryPerformanceCounter, the clock_gettime in its profile). From the mirror a result is ready
+ * only when the whole command buffer that ended it is done, since the copy sits at its end, and
+ * DXVK records about a frame per command buffer: the thread waited for the GPU's whole frame
+ * (14.0 fps, GPU 47% busy, the thread 98% of a core). With the mirror off the server answers from
+ * the driver, which has a query once its render pass is done: 15.2 fps, the thread 43% of a core.
+ *
+ * VKBRIDGE_QUERY_EARLY=1 (guest env, off by default) copies a primary's ended queries right after
+ * each render pass that ended an occlusion query (vkCmdEndRenderPass[2], vkCmdEndRendering[2]),
+ * with the same barriers as at the end: results are ready when that pass is done. Not after a
+ * dynamic rendering that suspends (nothing may come between it and its resume). Timestamps alone
+ * still wait for the end. Costs per such pass one barrier from all earlier work and the copies:
+ * on a tiler that keeps the next pass's vertex work from overlapping this pass's fragment work if
+ * the driver serializes on it (to be measured on the device). */
+static int early_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_QUERY_EARLY");
+        v = e && *e && strcmp(e, "0") != 0;
+        if (v) VKB_INFO("query mirror: occlusion results copied after each render pass that ended one (VKBRIDGE_QUERY_EARLY=1)");
+    }
+    return v;
+}
+
+static void pass_ended(VkCommandBuffer commandBuffer)
+{
+    vkb_cmdbuf *cb = vkb_cb(commandBuffer);
+    if (!cb->nqops || !cb->recording || cb->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY || !early_mode()) return;
+    int occ = 0;
+    for (uint32_t i = 0; i < cb->nqops && !occ; i++) occ = !cb->qops[i].reset && cb->qops[i].m->type == VK_QUERY_TYPE_OCCLUSION;
+    if (occ) flush_qops(cb);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRenderPass(VkCommandBuffer commandBuffer)
+{
+    vkb_wire_vkCmdEndRenderPass(commandBuffer);
+    pass_ended(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo *pSubpassEndInfo)
+{
+    vkb_wire_vkCmdEndRenderPass2(commandBuffer, pSubpassEndInfo);
+    pass_ended(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRenderingInfo)
+{
+    vkb_wire_vkCmdBeginRendering(commandBuffer, pRenderingInfo);
+    vkb_cb(commandBuffer)->rendering_suspends = pRenderingInfo && (pRenderingInfo->flags & VK_RENDERING_SUSPENDING_BIT);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRendering(VkCommandBuffer commandBuffer)
+{
+    vkb_wire_vkCmdEndRendering(commandBuffer);
+    if (!vkb_cb(commandBuffer)->rendering_suspends) pass_ended(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdEndRendering2KHR(VkCommandBuffer commandBuffer, const VkRenderingEndInfoKHR *pRenderingEndInfo)
+{
+    vkb_wire_vkCmdEndRendering2KHR(commandBuffer, pRenderingEndInfo);
+    if (!vkb_cb(commandBuffer)->rendering_suspends) pass_ended(commandBuffer);
+}
+
 /* ------------------------------------------------------------------ results */
 
 /* Why the last vkb_query_results call said "ask the server" (the first few are logged by the
  * caller: on the tablet DRG still made ~5,400 query round trips a second with the mirror on). */
 static __thread const char *why_wire;
+
+/* VKBRIDGE_QUERY_NOTREADY_WIRE=1 (guest env, off by default; an A/B arm for the early copies):
+ * a query the mirror has not got yet is asked of the server, whose driver has it once its render
+ * pass is done; icd.c's 1 ms quiet window then answers repeated polls of it. */
+static int notready_wire(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_QUERY_NOTREADY_WIRE");
+        v = e && *e && strcmp(e, "0") != 0;
+    }
+    return v;
+}
 const char *vkb_query_why_wire(void) { return why_wire ? why_wire : "?"; }
 
 /* ------------------------------------------------------------------ stuck queries
@@ -429,10 +547,10 @@ const char *vkb_query_why_wire(void) { return why_wire ? why_wire : "?"; }
  * render thread spun at 100% of a core for minutes in this file's not-ready answer (61% of its
  * samples), with no syscalls, every DXVK thread idle, the server idle and no bridge call pending,
  * until UE4 gave up ("GameThread timed out waiting for RenderThread after 120.00 secs"). The GPU
- * had the query; the mirror's ready word was never set. With the mirror off every load passed.
- * Whatever leaves a ready word unset (an update lost on the way, a query ended where no
- * copy follows it - a multiview pass ends N queries per vkCmdEndQuery and only the first is
- * copied), the mirror must not say "not ready" forever: no call of the app's ever reaches the
+ * had the query; the mirror's ready word was never set. With the mirror off every load
+ * passed. Whatever leaves a value PENDING (an update lost on the way, a query ended where no copy
+ * follows it - a multiview pass ends N queries per vkCmdEndQuery and only the first is copied),
+ * the mirror must not say "not ready" forever: no call of the app's ever reaches the
  * server again to notice.
  *
  * So a query the mirror has answered "not ready" for 200 ms in a row is asked of the server once.
@@ -526,12 +644,16 @@ int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t 
     why_wire = "query not mirrored (reset, or not ended in a finished primary)";
     for (uint32_t q = first; q < first + count; q++) {
         if (!__atomic_load_n(&m->mirrored[q], __ATOMIC_ACQUIRE)) return 0;
-        int rq = __atomic_load_n(&m->ready[q], __ATOMIC_ACQUIRE) != 0;
+        int rq = __atomic_load_n(&m->value[q], __ATOMIC_ACQUIRE) != PENDING;
         all &= rq;
         if (!rq && first_nr == UINT32_MAX) first_nr = q;
     }
     why_wire = "WAIT on a query not ready";
     if (!all && (flags & VK_QUERY_RESULT_WAIT_BIT)) return 0; /* the server waits */
+    /* VKBRIDGE_QUERY_NOTREADY_WIRE=1 asks the server on every not-ready answer, so a query stuck in the
+     * mirror is never answered "not ready" from it alone; the stuck check below is for the default. */
+    why_wire = "not ready in the mirror (VKBRIDGE_QUERY_NOTREADY_WIRE=1)";
+    if (!all && notready_wire()) return 0; /* the driver may have it before the mirror's copy ran */
     uint32_t held = 0;
     if (!all && stuck_ask(m, first_nr, &held)) {
         why_wire = "not ready in the mirror for VKBRIDGE_QUERY_STUCK_MS (asked once)";
@@ -546,9 +668,10 @@ int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t q = first + i;
         uint8_t *out = (uint8_t *)data + (size_t)i * stride;
-        int ready = __atomic_load_n(&m->ready[q], __ATOMIC_ACQUIRE) != 0;
-        uint64_t v = 0;
-        if (ready) v = __atomic_load_n(&m->value[q], __ATOMIC_RELAXED);
+        /* One load: the answer and its value come from the same word. */
+        uint64_t v = __atomic_load_n(&m->value[q], __ATOMIC_ACQUIRE);
+        int ready = v != PENDING;
+        if (!ready) v = 0;
         ready_all &= ready;
         /* A run of not-ready answers ends when the query is seen ready. */
         if (ready && __atomic_load_n(&m->nr_polls[q], __ATOMIC_RELAXED)) __atomic_store_n(&m->nr_polls[q], 0, __ATOMIC_RELAXED);

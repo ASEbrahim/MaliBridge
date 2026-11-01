@@ -11,7 +11,10 @@
 #   4  a client switch (VKBRIDGE_QUERY_MIRROR=0) added: the first process after it says so;
 #   5  removed (after a process that made a device): the first process after it gets the real GPU
 #      and heaps again;
-#   6  the file is not read again (nor its lines logged) while it stays the same.
+#   6  the file is not read again (nor its lines logged) while it stays the same;
+#   7  VKBRIDGE_HITCH_MS added: the per-hitch line is on for the first process after it (the
+#      server's "hitch attribution on for process <pid>"), and off again for the first one after
+#      it is removed.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -92,6 +95,18 @@ n2=$(grep -c 'override from .*VKBRIDGE_HEAP_MAX_MB=1024' "$log")
 # gpuview_check makes no device: only vkbQueryServer could read it, and only when it changed
 [ $rc = 0 ] && heaps_are "$v" 1024 && [ "$n1" -ge 1 ] && [ $((n2 - n1)) = 0 ]
 step $? "6: unchanged: not read again by 2 more processes ($((n2 - n1)) reads; $n1 when it changed)"
+
+# 7
+echo 'VKBRIDGE_HITCH_MS=50' >> "$cache/env"
+view
+p1=$(grep -c 'hitch attribution on for process .*(gpuview_check): frames over 50 ms' "$log")
+[ $rc = 0 ] && [ "$p1" = 1 ]
+step $? "7a: VKBRIDGE_HITCH_MS=50 added, first process after it: $(grep -m1 -o 'hitch attribution on for process [0-9]* ([a-z_]*): frames over [0-9]* ms' "$log" || echo 'not on')"
+printf 'VKBRIDGE_HEAP_MAX_MB=1024\n' > "$cache/env"
+view
+p2=$(grep -c 'hitch attribution on for process .*(gpuview_check)' "$log")
+[ $rc = 0 ] && [ "$p2" = 1 ]
+step $? "7b: removed again, first process after it: off ($p2 process with it on in all, want 1: 7a's)"
 
 stop
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; fi

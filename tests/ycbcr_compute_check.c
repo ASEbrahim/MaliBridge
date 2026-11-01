@@ -4,7 +4,7 @@
  * ycbcr_compute_check: compute pipelines whose layout holds an immutable YCbCr-conversion sampler,
  * as gamescope's composite shaders have (16 of them in its compositing layout). Mali and Samsung's
  * Xclipse 960 do not build such pipelines (Xclipse: VK_ERROR_UNKNOWN for 135 of gamescope's 144,
- * every game black with sound, MaliBridge#20); the server puts a plain sampler in their place in
+ * every game black with sound); the server puts a plain sampler in their place in
  * compute bindings (server_spvfix.c, VKBRIDGE_YCBCR_SWAP). VKBRIDGE_FAKE_MISSING=ycbcrcompute
  * imitates the refusal on the host.
  *

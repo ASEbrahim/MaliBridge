@@ -168,7 +168,7 @@ uint32_t filter_device_create_info(VkPhysicalDevice physicalDevice,
     /* In the bridge's order (server_instance.c vkb_sv_vkCreateDevice) */
     vkb_emu_device_create_info(inst, physicalDevice, p.caps.emu, pCreateInfo, arena);
     vkb_errata_fp16_device_create_info(inst, physicalDevice, pCreateInfo); /* MK-20: what an app enables anyway */
-    vkb_errata_gs_device_create_info(inst, physicalDevice, pCreateInfo);   /* issue #11: likewise */
+    vkb_errata_gs_device_create_info(inst, physicalDevice, pCreateInfo);   /* likewise */
     vkb_emu_device_clamp_features(inst, physicalDevice, pCreateInfo, p.exts.data(),
                                   static_cast<uint32_t>(p.exts.size())); /* last: what the driver lacks never reaches it */
     return p.caps.emu;

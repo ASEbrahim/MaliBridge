@@ -83,6 +83,7 @@ typedef struct vkb_instance {
     vkb_physdev *pds;
     pthread_mutex_t lock;
     uint8_t ext_surface, ext_wayland, ext_xcb, ext_xlib, ext_headless, ext_surface_caps2, ext_debug_utils;
+    uint8_t dxvk;            /* the app's engine is DXVK (its VkApplicationInfo): no present waits by default (wsi.c) */
 } vkb_instance;
 
 struct vkb_queue;
@@ -101,9 +102,11 @@ typedef struct vkb_device {
     struct vkb_bv_cache *bufviews; /* bufview.c */
     struct vkb_rq_cache *buf_reqs; /* memory.c: buffer requirements by create info */
     struct vkb_qm_dev *qm;         /* query.c: query result mirrors */
+    struct vkb_sm_dev *sm;         /* syncmirror.c: fence and event status mirrors */
     const char **enabled_exts;
     uint32_t enabled_ext_count;
     uint8_t ext_swapchain;
+    uint8_t present_ids;     /* VK_KHR_present_id or present_id2 enabled: the swapchain asks the compositor when frames are shown (wsi.c) */
     uint32_t api_version;
 } vkb_device;
 
@@ -126,7 +129,11 @@ typedef struct vkb_cmdbuf {
     uint32_t family;         /* the pool's queue family (UINT32_MAX: unknown) */
     struct vkb_qop *qops;    /* query.c: queries ended / reset by the recorded commands */
     uint32_t nqops, qops_cap;
+    int rendering_suspends;  /* query.c: the open vkCmdBeginRendering said VK_RENDERING_SUSPENDING_BIT */
+    struct vkb_evop *evops;  /* syncmirror.c: events set / reset by the recorded commands */
+    uint32_t nevops, evops_cap;
     struct vkb_cmdbuf *pool_next, *pool_prev;
+    uint64_t qv_rec;         /* qvisible.c: this recording's number */
 } vkb_cmdbuf;
 
 typedef struct vkb_cmdpool {
@@ -163,10 +170,17 @@ int vkb_call_exec(vkb_call *c);
 void vkb_call_end(vkb_call *c);
 /* Sends without waiting for a reply (void commands without outputs); ordered by vkb_msg_hdr.seq. */
 int vkb_call_exec_async(vkb_call *c);
+/* Client-only call flag: a status poll, sent with no barrier (vkb_call_poll_next marks this
+ * thread's next call so). vkb_async_seq_last: the seq of this thread's last async request;
+ * vkb_async_ran: 1 once a synchronous call has seen every async request up to seq run. */
+#define VKB_CALL_POLL 0x40000000u
+void vkb_call_poll_next(void);
+uint64_t vkb_async_seq_last(void);
+int vkb_async_ran(uint64_t seq);
 int vkb_async_results(void);
-/* Asynchronous requests framed as one vkbBatch message, vkUpdateDescriptorSets packed: off unless
- * VKBRIDGE_DESC_BATCH=1 (in both modes for now); vkb_async_framed and vkb_desc_packed are its two halves (each can be
- * turned off alone, conn.c). */
+/* Descriptor batching: asynchronous requests framed as one vkbBatch message (on by default, VKBRIDGE_DESC_BATCH=0 or
+ * VKBRIDGE_NO_DESC_BATCH=1 off) and vkUpdateDescriptorSets packed (off unless VKBRIDGE_DESC_PACK=1); vkb_async_framed
+ * and vkb_desc_packed are its two halves (conn.c). */
 int vkb_desc_batch(void);
 /* VKBRIDGE_MODE in the guest: safe (the default) or performance (the client's defaults by mode) */
 enum { VKB_CLIENT_MODE_SAFE, VKB_CLIENT_MODE_PERFORMANCE };
@@ -176,6 +190,11 @@ int vkb_desc_packed(void);
 /* vkb_server_pd_info.client_knobs from the first vkbQueryServer (conn.c): the server's switches */
 void vkb_client_knobs_set(uint32_t w);
 int vkb_query_mirror_wanted(void);
+int vkb_sync_mirror_wanted(void);
+/* The server's switch at shift (VKB_KNOB_*): 1 on, 0 off, -1 nothing said (*known 0: not in yet) */
+int vkb_client_knob(int shift, int *known);
+/* Implicit sync for dma-bufs on kernels without dma-buf sync files (dmabuf_sync.c) */
+void vkb_dmabuf_sync_submit(void);
 void vkb_stats_count(uint32_t cmd, int async, size_t bytes);
 extern uint32_t vkb_stat_refused; /* refused vkAllocateDescriptorSets, for VKBRIDGE_STATS */
 extern uint32_t vkb_stat_pool_full; /* pools handed back full after their growth (descriptor.c) */
@@ -208,6 +227,36 @@ void vkb_bufview_init_device(vkb_device *d);
 void vkb_bufview_destroy_device(vkb_device *d);
 void vkb_bufview_buffer_destroyed(vkb_device *d, VkBuffer buffer);
 
+/* syncmirror.c */
+void vkb_quiet_over(void); /* icd.c: the poll quiet windows end */
+void vkb_hostop_note(uint64_t key); /* icd.c: a host reset/set of a fence (handle*2) or event (handle*2+1) */
+void vkb_event_hostop(VkEvent event); /* icd.c */
+void vkb_sm_init_device(vkb_device *d);
+void vkb_sm_destroy_device(vkb_device *d);
+void vkb_sm_fence_created(vkb_device *d, const VkFenceCreateInfo *ci, VkFence fence);
+void vkb_sm_fence_destroyed(vkb_device *d, VkFence fence);
+void vkb_sm_fence_unknown(vkb_device *d, VkFence fence);
+void vkb_sm_fences_reset(vkb_device *d, uint32_t n, const VkFence *fences);
+VkResult vkb_sm_queue_submit(VkQueue queue, uint32_t n, const VkSubmitInfo *si, VkFence fence);
+VkResult vkb_sm_queue_submit2(VkQueue queue, uint32_t n, const VkSubmitInfo2 *si, VkFence fence);
+int vkb_sm_fence_status(vkb_device *d, VkFence fence, VkResult *out);
+VkResult vkb_sm_wait_fences(vkb_device *d, uint32_t n, const VkFence *fences, VkBool32 all, uint64_t timeout);
+void vkb_sm_event_created(vkb_device *d, const VkEventCreateInfo *ci, VkEvent ev);
+void vkb_sm_event_destroyed(vkb_device *d, VkEvent ev);
+void vkb_sm_event_host(vkb_device *d, VkEvent ev, uint32_t set);
+int vkb_sm_event_status(vkb_device *d, VkEvent ev, VkResult *out);
+void vkb_sm_cb_event(vkb_cmdbuf *cb, VkEvent ev, uint32_t set);
+void vkb_sm_cb_clear(vkb_cmdbuf *cb);
+void vkb_sm_cb_execute(vkb_cmdbuf *primary, const vkb_cmdbuf *secondary);
+void vkb_sm_cb_end(vkb_cmdbuf *cb);
+void vkb_sm_sem_created(vkb_device *d, const VkSemaphoreCreateInfo *ci, VkSemaphore s);
+void vkb_sm_sem_destroyed(vkb_device *d, VkSemaphore s);
+void vkb_sm_sem_settle(vkb_device *d, VkSemaphore s);
+void vkb_sm_sem_unknown(vkb_device *d, VkSemaphore s);
+void vkb_sm_sem_host_signal(vkb_device *d, VkSemaphore s, uint64_t v);
+int vkb_sm_sem_value(vkb_device *d, VkSemaphore s, uint64_t *out, VkResult *r);
+VkResult vkb_sm_wait_sems(vkb_device *d, const VkSemaphoreWaitInfo *wi, uint64_t timeout);
+
 /* query.c */
 void vkb_query_init_device(vkb_device *d);
 void vkb_query_destroy_device(vkb_device *d);
@@ -215,6 +264,19 @@ void vkb_query_cb_clear(vkb_cmdbuf *cb);
 void vkb_query_cb_end(vkb_cmdbuf *cb);
 void vkb_query_cb_execute(vkb_cmdbuf *primary, const vkb_cmdbuf *secondary);
 const char *vkb_query_why_wire(void);
+/* qvisible.c: VKBRIDGE_QUERY_VISIBLE_MS, the answer for an occlusion query its done work left "not ready" */
+int vkb_qvis_on(void);
+void vkb_qvis_pool_create(VkQueryPool pool, const VkQueryPoolCreateInfo *ci);
+void vkb_qvis_pool_destroy(VkQueryPool pool);
+void vkb_qvis_reset(VkQueryPool pool, uint32_t first, uint32_t count);
+void vkb_qvis_end(vkb_cmdbuf *cb, VkQueryPool pool, uint32_t query);
+void vkb_qvis_cb_begin(vkb_cmdbuf *cb);
+void vkb_qvis_cb_end(vkb_cmdbuf *cb);
+void vkb_qvis_cb_execute(vkb_cmdbuf *primary, vkb_cmdbuf *secondary);
+void vkb_qvis_submit(VkCommandBuffer cb);
+void vkb_qvis_after(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t count, size_t size, void *data, VkDeviceSize stride,
+                    VkQueryResultFlags flags, VkResult *r);
+VkResult vkb_qvis_imitate(VkQueryPool pool, uint32_t first, uint32_t count, VkResult r);
 void vkb_query_wire_answer(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t count, VkResult r);
 int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t count, size_t size, void *data,
                       VkDeviceSize stride, VkQueryResultFlags flags, VkResult *result);
@@ -233,6 +295,39 @@ void vkb_frames_present(void); /* frames.c: frame statistics for the server's se
 void vkb_frames_swapchain(void); /* frames.c: a swapchain made */
 void vkb_frames_external(void);  /* frames.c: memory the app exported or imported as an fd */
 uint64_t vkb_frames_presented(void); /* frames.c: presents so far in this process */
+/* hitch.c: the per-hitch line's client half (VKBRIDGE_HITCH_MS). vkb_hitch_active: 0 while off. */
+extern int vkb_hitch_active;
+extern __thread int vkb_hitch_in_present;   /* inside the swapchain's own wait (wsi.c) */
+uint64_t vkb_hitch_now(void);
+void vkb_hitch_server_ms(uint32_t ms);      /* vkbQueryServer's hitch_ms (physdev.c) */
+void vkb_hitch_rt(uint32_t cmd, uint64_t ns); /* a round trip (conn.c) */
+void vkb_hitch_waited(int kind, uint32_t cmd, uint64_t ns); /* VKB_HITCH_W_*; cmd VKB_CMD_COUNT: an acquire */
+void vkb_hitch_present(void);              /* at each vkQueuePresentKHR (wsi.c) */
+/* latency.c: the latency log's client half (VKBRIDGE_LATLOG). vkb_lat_active: 0 while off. A frame
+ * number 0 is no frame: every call below takes it and does nothing. */
+extern int vkb_lat_active;
+enum { VKB_LAT_DONE, VKB_LAT_SHOWN };
+int vkb_lat_on(void);                       /* decides from the guest's environment the first time */
+uint64_t vkb_lat_now(void);
+void vkb_lat_server(uint32_t on);
+/* VK_KHR_present_id/present_wait (and id2/wait2) offered: unless VKBRIDGE_PRESENT_WAIT=0 in the guest, or the
+ * server's vkbQueryServer present_wait says off (wsi.c) */
+int vkb_wsi_present_wait_on(const vkb_physdev *pd);
+/* VKBRIDGE_PRESENT_WAIT=commit: a frame counts as shown once committed, no compositor feedback asked (wsi.c) */
+int vkb_wsi_present_wait_commit(const vkb_physdev *pd);
+/* their features (VkPhysicalDevicePresent{Id,Wait,Id2,Wait2}FeaturesKHR) in a vkGetPhysicalDeviceFeatures2 chain */
+void vkb_wsi_patch_features(const vkb_physdev *pd, VkBaseOutStructure *b);
+void vkb_wsi_frame_queue_server(uint32_t n); /* vkbQueryServer's frame_queue (physdev.c); the guest's VKBRIDGE_FRAME_QUEUE beats it */           /* vkbQueryServer's latlog (physdev.c) */
+uint32_t vkb_lat_present(void);             /* at each vkQueuePresentKHR, first: the frame's number, 0 off */
+void vkb_lat_stamp(uint32_t n, int what, uint64_t t); /* VKB_LAT_DONE / VKB_LAT_SHOWN at t (0: now) */
+void vkb_lat_flag(uint32_t n, uint32_t flags);        /* VKB_LAT_F_* (vkb_proto.h) */
+void vkb_lat_presented(uint32_t n, int ok);           /* the present call is over: committed now, or failed */
+void vkb_lat_flush(void);                             /* a swapchain destroyed: the completed records sent */
+/* dxvkcfg.c: what DXVK was given (DXVK_CONFIG, DXVK_CONFIG_FILE, dxvk.conf) and whether its own log
+ * shows it applied, logged once per process at the first present */
+void vkb_dxvkcfg_engine(const VkApplicationInfo *app);
+void vkb_dxvkcfg_check(void);
+int vkb_dxvkcfg_own_latency(void); /* DXVK with a maxFrameLatency in its DXVK_CONFIG (the frame queue stands aside, wsi.c) */
 
 /* conn.c: logs the first time each call returns each error. The test stays at the call site, so a
  * call that succeeds costs one compare. */

@@ -34,6 +34,7 @@ People whose reports, logs and testing directly led to fixes or shaped MaliBridg
 | [AmmarFQ](https://github.com/AmmarFQ) | Galaxy Tab S9 FE+ | Reports and logs on the Samsung black screen |
 | [scyboy](https://github.com/scyboy) | Galaxy A54 | Logs on the Samsung black screen |
 | [timothyjustiniano](https://github.com/timothyjustiniano) | Galaxy S10+ phone | Logs that led to two crash fixes |
+| [maxjivi05](https://github.com/maxjivi05) | | Brought MaliBridge v0.5.4 into DroidDeck's CI builds ([DroidDeck #1587](https://github.com/Droid-Deck/DroidDeck/pull/1587)) |
 | [zachlagan](https://github.com/zachlagan), [FireAngelx](https://github.com/FireAngelx) | Retroid Pocket 4 Pro, Huawei Nova 7 | Steam start-up reports with logs |
 | [fd0712](https://github.com/fd0712), [fsminecrafter](https://github.com/fsminecrafter) | Galaxy A55, Galaxy A56 | Detailed reports and logs on Samsung Xclipse GPUs |
 | [djbravo06](https://github.com/djbravo06) | Galaxy F15 | Logs, and the report that the logs code got lost |
@@ -59,7 +60,8 @@ Thank you for backing the work on [Ko-fi](https://ko-fi.com/asebrahim) and
 MaliBridge's own code is written from scratch. These projects' ideas and findings helped shape it
 (no code copied unless listed under third-party code in the [README](README.md#credits-and-licence)):
 [DroidDeck](https://github.com/Droid-Deck/DroidDeck), Lee Gao ([compat_layer](https://github.com/leegao/compat_layer),
-bionic-vulkan-wrapper, winlator-internals), Julius Pinsker (bionic-vulkan-wrapper), David Cimo
+bionic-vulkan-wrapper, winlator-internals, and the Vulkan layer in v0.5.5,
+[pull request #13](https://github.com/ASEbrahim/MaliBridge/pull/13)), Julius Pinsker (bionic-vulkan-wrapper), David Cimo
 ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali)), The412Banner (DroidDeck non-Adreno work and
 early device testing), taowen ([libhybris](https://github.com/taowen/libhybris/tree/arlinux)), GameNative,
 wallentx, Mesa's panvk, Winlator and ANGLE.

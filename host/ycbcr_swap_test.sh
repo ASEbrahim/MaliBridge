@@ -3,7 +3,7 @@
 # driver, with the refusal of Mali and Samsung's Xclipse 960 imitated beneath it
 # (VKBRIDGE_FAKE_MISSING=ycbcrcompute: compute pipelines whose layout reaches the driver with
 # immutable YCbCr samplers fail with VK_ERROR_UNKNOWN, as gamescope's 135 composite pipelines did
-# on the Xclipse, MaliBridge#20). A server of its own per step (the imitation is read once per server):
+# on the Xclipse). A server of its own per step (the imitation is read once per server):
 #   1  as it is (the desktop GPU): no swap, ycbcr_compute_check builds everything, nothing logged;
 #   2  imitated, VKBRIDGE_YCBCR_SWAP=0: the YCbCr pipeline refused, the plain ones built; the first
 #      failure logged with its layout's one YCbCr sampler;

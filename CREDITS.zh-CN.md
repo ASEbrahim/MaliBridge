@@ -32,6 +32,7 @@ MaliBridge 由 [ASEbrahim](https://github.com/ASEbrahim) 一个人开发，但�
 | [AmmarFQ](https://github.com/AmmarFQ) | Galaxy Tab S9 FE+ | 三星黑屏问题的报告和日志 |
 | [scyboy](https://github.com/scyboy) | Galaxy A54 | 三星黑屏问题的日志 |
 | [timothyjustiniano](https://github.com/timothyjustiniano) | Galaxy S10+ 手机 | 带来两个闪退修复的日志 |
+| [maxjivi05](https://github.com/maxjivi05) | | 让 MaliBridge v0.5.4 进入 DroidDeck 的 CI 构建（[DroidDeck #1587](https://github.com/Droid-Deck/DroidDeck/pull/1587)） |
 | [zachlagan](https://github.com/zachlagan), [FireAngelx](https://github.com/FireAngelx) | Retroid Pocket 4 Pro, Huawei Nova 7 | Steam 启动问题的报告和日志 |
 | [fd0712](https://github.com/fd0712), [fsminecrafter](https://github.com/fsminecrafter) | Galaxy A55, Galaxy A56 | 三星 Xclipse GPU 的详细报告和日志 |
 | [djbravo06](https://github.com/djbravo06) | Galaxy F15 | 日志，以及日志代码丢失问题的报告 |
@@ -54,6 +55,6 @@ MaliBridge 由 [ASEbrahim](https://github.com/ASEbrahim) 一个人开发，但�
 ## 项目
 
 MaliBridge 的代码都是从零写的。下面这些项目的思路和发现帮助塑造了它（除了 [README](README.md#credits-and-licence) 第三方代码部分列出的以外，没有复制任何代码）：
-[DroidDeck](https://github.com/Droid-Deck/DroidDeck)、Lee Gao（[compat_layer](https://github.com/leegao/compat_layer)、bionic-vulkan-wrapper、winlator-internals）、Julius Pinsker（bionic-vulkan-wrapper）、David Cimo（[droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali)）、The412Banner（DroidDeck 非 Adreno 适配和早期设备测试）、taowen（[libhybris](https://github.com/taowen/libhybris/tree/arlinux)）、GameNative、wallentx、Mesa 的 panvk、Winlator 和 ANGLE。
+[DroidDeck](https://github.com/Droid-Deck/DroidDeck)、Lee Gao（[compat_layer](https://github.com/leegao/compat_layer)、bionic-vulkan-wrapper、winlator-internals，以及 v0.5.5 里的 Vulkan 层，[pull request #13](https://github.com/ASEbrahim/MaliBridge/pull/13)）、Julius Pinsker（bionic-vulkan-wrapper）、David Cimo（[droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali)）、The412Banner（DroidDeck 非 Adreno 适配和早期设备测试）、taowen（[libhybris](https://github.com/taowen/libhybris/tree/arlinux)）、GameNative、wallentx、Mesa 的 panvk、Winlator 和 ANGLE。
 
 名单里漏了你，或者想改名、删除？开一个 [issue](https://github.com/ASEbrahim/MaliBridge/issues) 或在 [Discord](https://discord.gg/9xC67qTjDq) 告诉我。

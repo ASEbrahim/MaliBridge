@@ -300,4 +300,6 @@ void vkb_sv_vkbAllocDescSets(vkb_srv_call *c);
 void vkb_sv_vkbAllocScanout(vkb_srv_call *c);
 void vkb_sv_vkbUpdateDescSets(vkb_srv_call *c);
 void vkb_sv_vkbBatch(vkb_srv_call *c);
+void vkb_sv_vkbHitch(vkb_srv_call *c);
+void vkb_sv_vkbLatency(vkb_srv_call *c);
 #endif

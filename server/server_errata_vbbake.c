@@ -3,17 +3,25 @@
  *
  * vb_bake (MK-05, option B): dynamic vertex strides wrong even one binding per call.
  *
- * The startup probe vb_strides found a driver (Mali-G68 r38p1, Galaxy A16: MaliBridge#3) whose
+ * The startup probe vb_strides found a driver (Mali-G68 r38p1, Galaxy A16:) whose
  * vkCmdBindVertexBuffers2 pStrides come out wrong in every shape it tries, single-binding calls
  * included: every attribute read with one and the same stride. The split into single calls
  * (vb_split, option A) cannot help there, and Zink binds its vertex buffers with dynamic strides,
  * so Steam's interface drew nothing but black. The fix keeps the driver from drawing with dynamic
  * strides: they are baked into pipeline variants.
  *   - vkCreateGraphicsPipelines: a complete pipeline with VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_
- *     STRIDE is made without it, with the strides its create info names (usually the ones it is
- *     drawn with); its create info is kept, encoded, with its shaders' SPIR-V (server_pipekeep.c:
- *     modules can be gone by the time a variant is made, DXVK destroys them right after the
- *     pipeline).
+ *     STRIDE is made without it, with the strides its create info names; its create info is kept,
+ *     encoded, with its shaders' SPIR-V (server_pipekeep.c: modules can be gone by the time a
+ *     variant is made, DXVK destroys them right after the pipeline). A stride of 0 there is taken
+ *     as "drawn with dynamic strides": DXVK writes 0 into every binding it draws with dynamic
+ *     strides (so that one pipeline serves them all), and only binds a stride at least the
+ *     binding's vertex size there. A pipeline made with 0 was never drawn: every one was made
+ *     twice, the second time in the draw path (the A26's Left 4 Dead 2: a compile hitch at each
+ *     new pipeline). Such a binding is made with the stride last drawn with a binding of the same
+ *     shape (its number, input rate and attributes' offsets and formats: a game's vertex formats
+ *     repeat across its pipelines), or, for a shape not drawn yet, its vertex size (the end of its
+ *     last attribute, the stride a tightly packed vertex has). A stride the guess misses gets its
+ *     variant as before; the guess only decides which variant is made first.
  *   - vkCmdBindVertexBuffers2: the strides are noted per command buffer and passed on as they are:
  *     a pipeline with its strides baked in ignores them, and every other one (a library, one linked
  *     from libraries, one that could not be kept) takes them as before.
@@ -39,9 +47,11 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define NB 32      /* vertex bindings tracked */
 #define HB 256     /* hash buckets */
+#define LH 1024    /* binding shapes whose drawn stride is remembered */
 
 static unsigned hk(uint64_t k)
 {
@@ -62,6 +72,9 @@ typedef struct prec {
     vkb_pk_ci *kept;
     uint32_t nbind, bind_no[NB];
     uint32_t base_key[NB];
+    int guessed, guess_hit; /* base_key has guessed strides for the create info's strides of 0; drawn with them */
+    uint32_t zero;          /* bindings (index) whose create info stride was 0 */
+    uint64_t shape[NB];     /* their shapes (shape_of), for learning the strides drawn */
     variant *vars;
     pthread_mutex_t lock;
     struct prec *next;
@@ -85,6 +98,14 @@ typedef struct vkb_errata_vbbake {
     prec *pipes[HB];
     cbstate *cbs[HB];
     uint64_t made, variants, swaps, unkept;
+    uint64_t guessed, guess_hits; /* pipelines made with guessed strides for strides of 0; of those, drawn so */
+    uint64_t guess_seen;          /* of the guessed, ones with a stride drawn before (the rest: vertex sizes) */
+    pthread_mutex_t learn_lock;   /* learn[]: the stride last drawn per binding shape, open addressing */
+    struct {
+        uint64_t shape;
+        uint32_t stride;
+    } learn[LH];
+    uint64_t make_ns, make_max_ns; /* time spent making variants, in the draw path */
 } vkb_errata_vbbake;
 
 typedef struct vkb_vbbake_imi {
@@ -197,6 +218,110 @@ static int wants_bake(const VkGraphicsPipelineCreateInfo *ci)
     return 1;
 }
 
+/* Bytes a vertex attribute of this format takes, 0: not a vertex format known here */
+static uint32_t vtx_fmt_bytes(VkFormat f)
+{
+    if (f == VK_FORMAT_R4G4_UNORM_PACK8) return 1;
+    if (f >= VK_FORMAT_R4G4B4A4_UNORM_PACK16 && f <= VK_FORMAT_A1R5G5B5_UNORM_PACK16) return 2;
+    if (f >= VK_FORMAT_R8_UNORM && f <= VK_FORMAT_R8_SRGB) return 1;
+    if (f >= VK_FORMAT_R8G8_UNORM && f <= VK_FORMAT_R8G8_SRGB) return 2;
+    if (f >= VK_FORMAT_R8G8B8_UNORM && f <= VK_FORMAT_B8G8R8_SRGB) return 3;
+    if (f >= VK_FORMAT_R8G8B8A8_UNORM && f <= VK_FORMAT_A2B10G10R10_SINT_PACK32) return 4;
+    if (f >= VK_FORMAT_R16_UNORM && f <= VK_FORMAT_R16_SFLOAT) return 2;
+    if (f >= VK_FORMAT_R16G16_UNORM && f <= VK_FORMAT_R16G16_SFLOAT) return 4;
+    if (f >= VK_FORMAT_R16G16B16_UNORM && f <= VK_FORMAT_R16G16B16_SFLOAT) return 6;
+    if (f >= VK_FORMAT_R16G16B16A16_UNORM && f <= VK_FORMAT_R16G16B16A16_SFLOAT) return 8;
+    if (f >= VK_FORMAT_R32_UINT && f <= VK_FORMAT_R32_SFLOAT) return 4;
+    if (f >= VK_FORMAT_R32G32_UINT && f <= VK_FORMAT_R32G32_SFLOAT) return 8;
+    if (f >= VK_FORMAT_R32G32B32_UINT && f <= VK_FORMAT_R32G32B32_SFLOAT) return 12;
+    if (f >= VK_FORMAT_R32G32B32A32_UINT && f <= VK_FORMAT_R32G32B32A32_SFLOAT) return 16;
+    if (f >= VK_FORMAT_R64_UINT && f <= VK_FORMAT_R64_SFLOAT) return 8;
+    if (f >= VK_FORMAT_R64G64_UINT && f <= VK_FORMAT_R64G64_SFLOAT) return 16;
+    if (f >= VK_FORMAT_R64G64B64_UINT && f <= VK_FORMAT_R64G64B64_SFLOAT) return 24;
+    if (f >= VK_FORMAT_R64G64B64A64_UINT && f <= VK_FORMAT_R64G64B64A64_SFLOAT) return 32;
+    if (f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) return 4;
+    return 0;
+}
+
+/* A binding's shape: its number, input rate and attributes (offset, format; in any order) */
+static uint64_t shape_of(const VkPipelineVertexInputStateCreateInfo *vi, const VkVertexInputBindingDescription *bd)
+{
+    uint64_t h = 0x9e3779b97f4a7c15ull ^ ((uint64_t)bd->binding << 32 | bd->inputRate);
+    uint64_t sum = 0;
+    for (uint32_t j = 0; j < vi->vertexAttributeDescriptionCount; j++) {
+        const VkVertexInputAttributeDescription *a = &vi->pVertexAttributeDescriptions[j];
+        if (a->binding != bd->binding) continue;
+        uint64_t k = ((uint64_t)a->offset << 32 | (uint32_t)a->format) * 0xff51afd7ed558ccdull;
+        sum += k ^ k >> 29;
+    }
+    h ^= sum * 0xc4ceb9fe1a85ec53ull;
+    return (h ^ h >> 31) | 1; /* never 0: 0 is a free slot */
+}
+
+static unsigned learn_slot(vkb_errata_vbbake *b, uint64_t shape) /* learn_lock held; the slot of shape, or a free one */
+{
+    unsigned i = (unsigned)(shape >> 40) & (LH - 1);
+    for (unsigned n = 0; n < LH; n++, i = (i + 1) & (LH - 1))
+        if (b->learn[i].shape == shape || !b->learn[i].shape) return i;
+    return LH;
+}
+
+static uint32_t learned(vkb_errata_vbbake *b, uint64_t shape)
+{
+    pthread_mutex_lock(&b->learn_lock);
+    unsigned i = learn_slot(b, shape);
+    uint32_t st = i < LH && b->learn[i].shape == shape ? b->learn[i].stride : 0;
+    pthread_mutex_unlock(&b->learn_lock);
+    return st;
+}
+
+/* The strides of a variant just made for r: remembered for its bindings that had 0 (a full table
+ * keeps what it has) */
+static void learn(vkb_errata_vbbake *b, const prec *r, const uint32_t *key)
+{
+    if (!r->zero) return;
+    pthread_mutex_lock(&b->learn_lock);
+    for (uint32_t i = 0; i < r->nbind; i++) {
+        if (!(r->zero >> i & 1) || !key[i] || key[i] > 2048) continue;
+        unsigned j = learn_slot(b, r->shape[i]);
+        if (j < LH) b->learn[j].shape = r->shape[i], b->learn[j].stride = key[i];
+    }
+    pthread_mutex_unlock(&b->learn_lock);
+}
+
+/* The strides a pipeline is made with (see the top): out[i] for vi's binding i, the create info's
+ * own, or for a 0 there the stride last drawn with that shape, else the binding's vertex size.
+ * *zero, shape[]: the bindings that had 0 and their shapes. 1: one or more guessed; *seen: one or
+ * more of them drawn before. */
+static int guess_strides(vkb_errata_vbbake *b, const VkPipelineVertexInputStateCreateInfo *vi, VkVertexInputBindingDescription *out,
+                         uint32_t *zero, uint64_t *shape, int *seen)
+{
+    int any = 0;
+    *zero = 0, *seen = 0;
+    for (uint32_t i = 0; i < vi->vertexBindingDescriptionCount; i++) {
+        out[i] = vi->pVertexBindingDescriptions[i];
+        if (out[i].stride) continue;
+        *zero |= 1u << i;
+        shape[i] = shape_of(vi, &out[i]);
+        uint32_t st = learned(b, shape[i]);
+        if (st) {
+            out[i].stride = st, any = 1, *seen = 1;
+            continue;
+        }
+        uint32_t end = 0, known = 1;
+        for (uint32_t j = 0; j < vi->vertexAttributeDescriptionCount; j++) {
+            const VkVertexInputAttributeDescription *a = &vi->pVertexAttributeDescriptions[j];
+            if (a->binding != out[i].binding) continue;
+            uint32_t sz = vtx_fmt_bytes(a->format);
+            if (!sz) known = 0;
+            if (a->offset + sz > end) end = a->offset + sz;
+        }
+        /* 2048: the least maxVertexInputBindingStride Vulkan allows */
+        if (known && end && end <= 2048) out[i].stride = end, any = 1;
+    }
+    return any;
+}
+
 /* The record of ci, with its create info and shader code kept, or NULL when it cannot be kept.
  * ci is the one the driver gets: the stride taken out of its dynamic list. */
 static prec *keep(vkb_errata_vbbake *b, VkDevice dev, const VkGraphicsPipelineCreateInfo *ci)
@@ -230,8 +355,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL bk_CreateGraphicsPipelines(VkDevice dev, V
     VkPipelineDynamicStateCreateInfo *ds = malloc(n * sizeof(*ds));
     VkDynamicState **lists = calloc(n, sizeof(*lists));
     prec **recs = calloc(n, sizeof(*recs));
-    if (!c || !ds || !lists || !recs) {
-        free(c), free(ds), free(lists), free(recs);
+    VkPipelineVertexInputStateCreateInfo *vis = malloc(n * sizeof(*vis));
+    VkVertexInputBindingDescription(*bds)[NB] = malloc(n * sizeof(*bds));
+    uint64_t(*shapes)[NB] = malloc(n * sizeof(*shapes));
+    if (!c || !ds || !lists || !recs || !vis || !bds || !shapes) {
+        free(c), free(ds), free(lists), free(recs), free(vis), free(bds), free(shapes);
         return b->next.vkCreateGraphicsPipelines(dev, cache, n, ci, a, out);
     }
     /* the stride taken out of the dynamic list of each one that is kept; the others as asked */
@@ -247,7 +375,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL bk_CreateGraphicsPipelines(VkDevice dev, V
         ds[i].dynamicStateCount = k;
         ds[i].pDynamicStates = lists[i];
         c[i].pDynamicState = &ds[i];
-        if (!(recs[i] = keep(b, dev, &c[i]))) {
+        uint32_t zero;
+        int seen;
+        int guessed = guess_strides(b, ci[i].pVertexInputState, bds[i], &zero, shapes[i], &seen);
+        if (guessed) {
+            vis[i] = *ci[i].pVertexInputState;
+            vis[i].pVertexBindingDescriptions = bds[i];
+            c[i].pVertexInputState = &vis[i];
+        }
+        if ((recs[i] = keep(b, dev, &c[i]))) {
+            recs[i]->guessed = guessed ? 1 + seen : 0;
+            recs[i]->zero = zero;
+            memcpy(recs[i]->shape, shapes[i], sizeof(shapes[i]));
+        } else {
             c[i] = ci[i];
             __atomic_add_fetch(&b->unkept, 1, __ATOMIC_RELAXED);
             VKB_ONCE(VKB_LOG_WARN, "errata: vb_bake: a pipeline with dynamic strides could not be kept for variants (a module "
@@ -268,10 +408,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL bk_CreateGraphicsPipelines(VkDevice dev, V
         p->next = b->pipes[h];
         b->pipes[h] = p;
         b->made++;
+        b->guessed += p->guessed != 0;
+        b->guess_seen += p->guessed == 2;
     }
     pthread_mutex_unlock(&b->lock);
     for (uint32_t i = 0; i < n; i++) free(lists[i]);
-    free(lists), free(ds), free(c), free(recs);
+    free(lists), free(ds), free(c), free(recs), free(vis), free(bds), free(shapes);
     return r;
 }
 
@@ -345,7 +487,13 @@ static VkPipeline variant_for(vkb_errata_vbbake *b, prec *r, const uint32_t *key
 {
     pthread_mutex_lock(&r->lock);
     VkPipeline found = VK_NULL_HANDLE;
-    if (!memcmp(key, r->base_key, r->nbind * sizeof(*key))) found = r->p;
+    if (!memcmp(key, r->base_key, r->nbind * sizeof(*key))) {
+        found = r->p;
+        if (r->guessed && !r->guess_hit) {
+            r->guess_hit = 1;
+            __atomic_add_fetch(&b->guess_hits, 1, __ATOMIC_RELAXED);
+        }
+    }
     for (variant *v = r->vars; v && !found; v = v->next)
         if (!memcmp(key, v->key, r->nbind * sizeof(*key))) found = v->p;
     if (found) {
@@ -354,15 +502,36 @@ static VkPipeline variant_for(vkb_errata_vbbake *b, prec *r, const uint32_t *key
     }
     VkPipeline p = VK_NULL_HANDLE;
     stride_edit x = {r, key};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     VkResult res = vkb_pk_make(b->pk, r->kept, set_strides, &x, &p);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t took = (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+    __atomic_add_fetch(&b->make_ns, took, __ATOMIC_RELAXED);
+    for (uint64_t m = __atomic_load_n(&b->make_max_ns, __ATOMIC_RELAXED); took > m &&
+         !__atomic_compare_exchange_n(&b->make_max_ns, &m, took, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {
+    }
     variant *v = res == VK_SUCCESS && p ? calloc(1, sizeof(*v)) : NULL;
     if (v) {
         memcpy(v->key, key, r->nbind * sizeof(*key));
         v->p = p;
         v->next = r->vars;
         r->vars = v;
-        __atomic_add_fetch(&b->variants, 1, __ATOMIC_RELAXED);
+        learn(b, r, key);
+        uint64_t n = __atomic_add_fetch(&b->variants, 1, __ATOMIC_RELAXED);
         VKB_ONCE(VKB_LOG_INFO, "errata: vb_bake: first pipeline variant with the bound strides baked in - MK-05");
+        /* Made while the app records its draws: a tally at 1, 10, 100, ... says what it costs a game
+         * (a session usually ends without the device's own summary at vkDestroyDevice) */
+        uint64_t t = 1;
+        while (t < n) t *= 10;
+        if (t == n)
+            VKB_INFO("errata: vb_bake: %llu variant(s) made so far for %llu pipeline(s), %.0f ms making them in the draw path "
+                     "(longest %.0f ms), %llu variant bind(s); %llu of %llu made with guessed strides drawn so - MK-05",
+                     (unsigned long long)n, (unsigned long long)__atomic_load_n(&b->made, __ATOMIC_RELAXED),
+                     __atomic_load_n(&b->make_ns, __ATOMIC_RELAXED) / 1e6, __atomic_load_n(&b->make_max_ns, __ATOMIC_RELAXED) / 1e6,
+                     (unsigned long long)__atomic_load_n(&b->swaps, __ATOMIC_RELAXED),
+                     (unsigned long long)__atomic_load_n(&b->guess_hits, __ATOMIC_RELAXED),
+                     (unsigned long long)__atomic_load_n(&b->guessed, __ATOMIC_RELAXED));
     } else {
         if (p) b->next.vkDestroyPipeline(r->dev, p, NULL);
         p = r->p; /* drawn with the create info's own strides */
@@ -490,8 +659,10 @@ void vkb_errata_vbbake_install(vkb_srv_table *t, vkb_errata_dev *e)
     vkb_errata_vbbake *b = calloc(1, sizeof(*b));
     if (!b) return;
     pthread_mutex_init(&b->lock, NULL);
+    pthread_mutex_init(&b->learn_lock, NULL);
     b->next = t->real;
     if (!(b->pk = vkb_pk_create(&b->next))) {
+        pthread_mutex_destroy(&b->learn_lock);
         pthread_mutex_destroy(&b->lock);
         free(b);
         return;
@@ -527,10 +698,12 @@ void vkb_errata_vbbake_destroy(vkb_errata_dev *e)
     vkb_errata_vbbake *b = e->vbbake;
     vkb_vbbake_imi *m = e->vbbake_imi;
     if (b && (b->made || b->unkept))
-        VKB_INFO("errata: vb_bake: %llu pipeline(s) with their strides baked in, %llu variant(s) made, %llu variant bind(s); "
-                 "%llu with dynamic strides made as asked (not kept) - MK-05",
-                 (unsigned long long)b->made, (unsigned long long)b->variants, (unsigned long long)b->swaps,
-                 (unsigned long long)b->unkept);
+        VKB_INFO("errata: vb_bake: %llu pipeline(s) with their strides baked in, %llu variant(s) made (%.0f ms, longest %.0f ms), "
+                 "%llu variant bind(s); %llu with dynamic strides made as asked (not kept); %llu made with guessed strides "
+                 "for strides of 0 (%llu with strides drawn before, the rest vertex sizes), %llu of them drawn so - MK-05",
+                 (unsigned long long)b->made, (unsigned long long)b->variants, b->make_ns / 1e6, b->make_max_ns / 1e6,
+                 (unsigned long long)b->swaps, (unsigned long long)b->unkept, (unsigned long long)b->guessed,
+                 (unsigned long long)b->guess_seen, (unsigned long long)b->guess_hits);
     if (m && m->wrong) VKB_INFO("errata: vb_bake: imitated: %llu call(s) whose last stride went to every binding", (unsigned long long)m->wrong);
     if (b) {
         vkb_errata_vbbake *exp = b;
@@ -540,6 +713,7 @@ void vkb_errata_vbbake_destroy(vkb_errata_dev *e)
             for (cbstate *s = b->cbs[h], *nx; s; s = nx) nx = s->next, free(s);
         }
         vkb_pk_destroy(b->pk);
+        pthread_mutex_destroy(&b->learn_lock);
         pthread_mutex_destroy(&b->lock);
         free(b);
     }

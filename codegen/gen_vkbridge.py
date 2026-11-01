@@ -63,7 +63,12 @@ EXT_BLOCK_SUBSTR = [
 STRUCT_BLOCK = {'VkAllocationCallbacks', 'VkDebugUtilsMessengerCreateInfoEXT',
                 'VkDebugReportCallbackCreateInfoEXT', 'VkValidationFeaturesEXT',
                 'VkValidationFlagsEXT', 'VkLayerSettingsCreateInfoEXT',
-                'VkDirectDriverLoadingListLUNARG', 'VkExportMetalObjectCreateInfoEXT'}
+                'VkDirectDriverLoadingListLUNARG', 'VkExportMetalObjectCreateInfoEXT',
+                # present ids and waits are the client's own (client/wsi.c): never sent, and the
+                # server's driver is not asked for them
+                'VkPresentIdKHR', 'VkPhysicalDevicePresentIdFeaturesKHR', 'VkPhysicalDevicePresentWaitFeaturesKHR',
+                'VkPresentId2KHR', 'VkPhysicalDevicePresentId2FeaturesKHR', 'VkSurfaceCapabilitiesPresentId2KHR',
+                'VkPhysicalDevicePresentWait2FeaturesKHR', 'VkSurfaceCapabilitiesPresentWait2KHR', 'VkPresentWait2InfoKHR'}
 EXT_AUTHORS = ('KHR', 'EXT', 'ARM', 'VALVE', 'GOOGLE', 'MESA', 'IMG')
 # Implemented by the client itself (no server round trip, or not on the wire at all).
 CLIENT_EXTENSIONS = {
@@ -71,6 +76,7 @@ CLIENT_EXTENSIONS = {
     'VK_KHR_xlib_surface', 'VK_EXT_headless_surface', 'VK_KHR_get_surface_capabilities2',
     'VK_EXT_swapchain_colorspace', 'VK_KHR_incremental_present', 'VK_EXT_debug_utils',
     'VK_KHR_swapchain_mutable_format',
+    'VK_KHR_present_id', 'VK_KHR_present_wait', 'VK_KHR_present_id2', 'VK_KHR_present_wait2',
 }
 # Extension commands handled entirely client-side (no wire code generated).
 LOCAL_COMMANDS_PREFIX = ('vkCreateDebugUtilsMessengerEXT', 'vkDestroyDebugUtilsMessengerEXT',
@@ -93,6 +99,9 @@ CLIENT_CUSTOM = {
     'vkGetPhysicalDeviceSparseImageFormatProperties', 'vkGetPhysicalDeviceSparseImageFormatProperties2',
     'vkGetPhysicalDeviceToolProperties',
     'vkCreateDevice', 'vkDestroyDevice', 'vkGetDeviceQueue', 'vkGetDeviceQueue2',
+    'vkCreateFence', 'vkDestroyFence', 'vkResetFences', 'vkQueueBindSparse', 'vkCreateEvent', 'vkDestroyEvent',
+    'vkSetEvent', 'vkResetEvent', 'vkCmdSetEvent', 'vkCmdResetEvent', 'vkCmdSetEvent2', 'vkCmdResetEvent2',
+    'vkCreateSemaphore', 'vkDestroySemaphore', 'vkSignalSemaphore',
     'vkAllocateCommandBuffers', 'vkFreeCommandBuffers', 'vkDestroyCommandPool', 'vkResetCommandPool',
     'vkBeginCommandBuffer', 'vkEndCommandBuffer', 'vkResetCommandBuffer',
     'vkAllocateMemory', 'vkFreeMemory', 'vkMapMemory', 'vkUnmapMemory', 'vkMapMemory2KHR',
@@ -105,7 +114,7 @@ CLIENT_CUSTOM = {
     'vkUpdateDescriptorSetWithTemplate', 'vkCmdPushDescriptorSetWithTemplateKHR',
     'vkCreatePrivateDataSlot', 'vkDestroyPrivateDataSlot', 'vkSetPrivateData', 'vkGetPrivateData',
     'vkQueueSubmit', 'vkQueueSubmit2', 'vkQueueWaitIdle', 'vkDeviceWaitIdle', 'vkWaitForFences',
-    'vkGetFenceStatus', 'vkWaitSemaphores', 'vkGetSemaphoreCounterValue',
+    'vkGetFenceStatus', 'vkResetFences', 'vkSetEvent', 'vkResetEvent', 'vkWaitSemaphores', 'vkGetSemaphoreCounterValue',
     'vkGetPhysicalDeviceExternalBufferProperties', 'vkGetPhysicalDeviceQueueFamilyProperties',
     'vkGetPhysicalDeviceQueueFamilyProperties2', 'vkSetDebugUtilsObjectNameEXT',
     'vkSetDebugUtilsObjectTagEXT', 'vkQueueBeginDebugUtilsLabelEXT', 'vkQueueEndDebugUtilsLabelEXT',
@@ -119,6 +128,8 @@ CLIENT_CUSTOM = {
     'vkGetQueryPoolResults', 'vkGetEventStatus', 'vkSetEvent', 'vkCreateBufferView', 'vkDestroyBufferView',
     'vkCreateQueryPool', 'vkDestroyQueryPool', 'vkResetQueryPool', 'vkCmdResetQueryPool', 'vkCmdEndQuery',
     'vkCmdEndQueryIndexedEXT', 'vkCmdWriteTimestamp', 'vkCmdWriteTimestamp2', 'vkCreateCommandPool',
+    'vkCmdEndRenderPass', 'vkCmdEndRenderPass2', 'vkCmdBeginRendering', 'vkCmdEndRendering', 'vkCmdEndRendering2KHR',
+    'vkGetSemaphoreFdKHR', 'vkGetMemoryFdKHR',
     }
 # Commands whose server handler is hand-written (server/*.c defines vkb_sv_<name>).
 SERVER_CUSTOM = {
@@ -418,9 +429,11 @@ SERVER_DISPATCH_EXTRA = ['vkMapMemory', 'vkUnmapMemory', 'vkGetMemoryHostPointer
 dispatch_cmds = sorted(set(wire_cmds) | {reg.canon_cmd(c) for c in SERVER_DISPATCH_EXTRA})
 # Wire-only helpers that are not Vulkan commands (handled by hand on both sides).
 # vkbUpdateDescSets: vkUpdateDescriptorSets packed (client/descriptor.c); vkbBatch: queued
-# asynchronous requests as one message (client/conn.c, server_conn.c run_batch).
+# asynchronous requests as one message (client/conn.c, server_conn.c run_batch); vkbHitch: a frame
+# over VKBRIDGE_HITCH_MS, for the server's per-hitch line (client/hitch.c, server_hitch.c);
+# vkbLatency: each present's stage times, VKBRIDGE_LATLOG (client/latency.c, server_latency.c).
 EXTRA_WIRE = ['vkbHello', 'vkbQueryServer', 'vkbDescUpdateRaw', 'vkbPushDescRaw', 'vkbAllocDescSets', 'vkbAllocScanout',
-              'vkbUpdateDescSets', 'vkbBatch']
+              'vkbUpdateDescSets', 'vkbBatch', 'vkbHitch', 'vkbLatency']
 
 # --------------------------------------------------------------------------------------------
 # Struct closure: every struct reachable from wire commands (params, members, pNext extenders).

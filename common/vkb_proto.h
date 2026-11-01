@@ -66,6 +66,10 @@ static inline VkFormat vkb_bgr10_rgba(VkFormat f)
 }
 #define VKB_EMU_UF11_VTX       (1u << 22)  /* B10G11R11_UFLOAT vertex fetch as R32_UINT, unpacked in the vertex shader
                                             * (Zink's GL_ARB_vertex_type_10f_11f_11f_rev: OpenGL 4.4 and up) */
+#define VKB_EMU_TIMELINE       (1u << 23)  /* VK_KHR_timeline_semaphore on fences and binary semaphores (Mali r18/r19, Vulkan 1.1:
+                                            * gamescope and Zink; server_timeline.c) */
+#define VKB_EMU_DMABUF_AHB     (1u << 24)  /* VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf over AHardwareBuffers where the
+                                            * driver has no dma-buf memory (Kirin, Maleoon, Venus: gamescope; server_dmabuf_ahb.c) */
 #define VKB_EMU_ROBUST2_ACCESS (1u << 19)  /* robustBufferAccess2/robustImageAccess2 reported where the driver's robustness2
                                             * has nullDescriptor only (Mali-G715 r54p3); core robustness on instead (DXVK 3) */
 
@@ -97,8 +101,69 @@ typedef struct vkb_server_pd_info {
     uint32_t present_timeout_s;    /* VKBRIDGE_PRESENT_TIMEOUT_S from the server (a preset, <cache dir>/env): how long a frame
                                     * may take before the client calls the device lost (client/wsi.c); VKB_PRESENT_TIMEOUT_NONE:
                                     * never; 0: nothing said (an older server too), the client's default */
-    uint32_t api_cap;              /* the highest Vulkan version this process is shown (VK_MAKE_API_VERSION(0, 1, minor, 0)); 0: no cap */
+    uint32_t hitch_ms;             /* VKBRIDGE_HITCH_MS from the server (a preset, <cache dir>/env): a frame that takes longer is
+                                    * reported to the server (vkbHitch), which logs what it spent its time on; 0: off */
+    uint32_t latlog;               /* VKBRIDGE_LATLOG from the server (a preset, <cache dir>/env): 1, the client times each frame's
+                                    * stages and sends them (vkbLatency); 0: off, or an older server */
+    uint32_t frame_queue;          /* VKBRIDGE_FRAME_QUEUE from the server (a preset, <cache dir>/env): 1-8, vkQueuePresentKHR
+                                    * returns once at most this many minus one frames (its own included) are still rendering
+                                    * (client/wsi.c); 0: off, or an older server */
+    uint32_t present_wait;         /* VKBRIDGE_PRESENT_WAIT from the server (a preset, <cache dir>/env): VKB_PRESENT_WAIT_OFF, the
+                                    * client offers no VK_KHR_present_id/present_wait (client/wsi.c); VKB_PRESENT_WAIT_ON; _COMMIT; 0:
+                                    * nothing said (an older server too), on */
+    uint32_t api_cap;              /* the highest Vulkan version this process is shown (VK_MAKE_API_VERSION(0, 1, minor, 0)); 0: no cap (an older server too) */
 } vkb_server_pd_info;
+
+#define VKB_PRESENT_WAIT_ON 1u
+#define VKB_PRESENT_WAIT_OFF 2u
+#define VKB_PRESENT_WAIT_COMMIT 3u  /* VKBRIDGE_PRESENT_WAIT=commit: a frame counts as shown once committed to the compositor */
+
+/* vkbLatency (client/latency.c -> server_latency.c), no reply, VKBRIDGE_LATLOG. Sent at each
+ * vkQueuePresentKHR of the process, before that present's own work goes to the server, so the
+ * server's time of it is when the ordered stream reached the present. It numbers the present (n,
+ * from 1 in the process) and carries the frames that are done since the last one: when each was
+ * presented by the app, when its rendering was seen done, committed to the compositor, and shown
+ * (wp_presentation), all CLOCK_MONOTONIC ns (one kernel: the server's and DroidDeck's clock too),
+ * 0 when not seen. The server joins them with its own time of each and writes one line a frame. */
+typedef struct vkb_lat_frame {
+    uint64_t queued, gpu_done, committed, shown;
+    uint32_t n, flags;             /* VKB_LAT_F_* */
+} vkb_lat_frame;
+
+#define VKB_LAT_F_ASYNC 1u         /* shown by the presenting thread (dma-buf images), else in the app's present call */
+#define VKB_LAT_F_FEEDBACK 2u      /* the compositor was asked when it is shown (wp_presentation) */
+#define VKB_LAT_F_DISCARDED 4u     /* ... and said it never was (a later frame replaced it) */
+#define VKB_LAT_F_NO_ANSWER 8u     /* ... and had not answered when the record was sent */
+#define VKB_LAT_F_FAILED 16u       /* the present failed (out of date, lost) */
+#define VKB_LAT_F_OTHER_CLOCK 32u  /* the compositor said it was shown, on a clock other than CLOCK_MONOTONIC (no time) */
+#define VKB_LAT_MAX_FRAMES 8
+
+typedef struct vkb_lat_msg {
+    uint32_t n;                    /* this present's number; 0: none (records only) */
+    uint32_t count;                /* frames below (only these are sent) */
+    uint64_t queued;               /* this present, as the app called it */
+    vkb_lat_frame f[VKB_LAT_MAX_FRAMES];
+} vkb_lat_msg;
+
+/* vkbHitch (client/hitch.c -> server_hitch.c), no reply. A frame over the threshold: its window in
+ * CLOCK_MONOTONIC ns (one kernel: the server's clock too) and what the client saw the process wait
+ * for in it. Sent once with frame 0 when the client turns it on (the server then keeps its events).
+ * Each vkb_hitch_wait: the time in it summed over threads, how many, the longest and where. */
+typedef struct vkb_hitch_wait {
+    uint64_t ns, n, max_ns;
+    uint32_t max_cmd;              /* VKB_CMD_* of the longest (VKB_CMD_COUNT: the swapchain's acquire) */
+    char max_thread[16];           /* the thread that waited longest (its name) */
+    uint32_t pad;
+} vkb_hitch_wait;
+
+enum { VKB_HITCH_W_APP, VKB_HITCH_W_PRESENT, VKB_HITCH_W_RT, VKB_HITCH_W_COUNT };
+
+typedef struct vkb_hitch_msg {
+    uint64_t frame;                /* presents so far in the process (0: turned on) */
+    uint64_t t_prev, t_start, t_end; /* the frame before's start, this frame's start and end (its present) */
+    uint32_t threshold_ms, pad;
+    vkb_hitch_wait w[VKB_HITCH_W_COUNT]; /* the app's fence/semaphore/idle waits, the swapchain's own, other round trips */
+} vkb_hitch_msg;
 
 #define VKB_PRESENT_TIMEOUT_NONE 0xffffffffu
 
@@ -114,6 +179,11 @@ typedef struct vkb_server_pd_info {
 #define VKB_KNOB_ON 2u
 #define VKB_KNOB_DESC_BATCH_SHIFT 0   /* VKBRIDGE_DESC_BATCH / VKBRIDGE_NO_DESC_BATCH */
 #define VKB_KNOB_QUERY_MIRROR_SHIFT 2 /* VKBRIDGE_QUERY_MIRROR */
+#define VKB_KNOB_SYNCFD_SIDE_SHIFT 4   /* VKBRIDGE_SYNCFD_ORDER_MS on: queued requests ahead of a sync-fd export go on the
+                                        * flusher's connection (client/conn.c, server_syncfd.c) */
+#define VKB_KNOB_SYNC_MIRROR_SHIFT 6  /* VKBRIDGE_SYNC_MIRROR */
+#define VKB_KNOB_DMABUF_SYNC_SHIFT 8   /* VKBRIDGE_DMABUF_SYNC_MS: 0 off (client/dmabuf_sync.c, implicit sync on kernels without it) */
+#define VKB_KNOB_DMABUF_SYNC_FAKE_SHIFT 10 /* VKBRIDGE_DMABUF_SYNC_FAKE_OLD: the kernel taken as one without dma-buf sync files */
 #define VKB_KNOB_GET(word, shift) (((word) >> (shift)) & 3u)
 
 /* vkb_server_pd_info.spoof_gpu (once reserved: an older server sends 0, an older client ignores

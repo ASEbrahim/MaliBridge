@@ -392,6 +392,22 @@ static int slow_mode(void)
     return 0;
 }
 
+/* --again: the marked vertex pipeline asked for twice, each outcome on a "RESULT" line; with the
+ * server's VKBRIDGE_TEST_CRASH_PIPELINE=spin it hangs (and goes in stuck-pipelines), without it
+ * the driver builds it (compile_watchdog_test.sh: a later run asks the driver again, once) */
+static int again_mode(void)
+{
+    for (int i = 0; i < 2; i++) {
+        VkPipeline pipe = VK_NULL_HANDLE;
+        double t0 = secs();
+        VkResult r = graphics_pipeline(1, &pipe);
+        printf("RESULT %d %s %.1f s\n", i, r == VK_SUCCESS && pipe && draw_ok(pipe) ? "built" : "failed", secs() - t0);
+    }
+    vkDestroyDevice(dev, NULL);
+    vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int spin = argc > 1 && !strcmp(argv[1], "--spin"), spinfc2 = argc > 1 && !strcmp(argv[1], "--spinfc2");
@@ -437,6 +453,7 @@ int main(int argc, char **argv)
     }
     if (spin || spinfc2) return spin_mode(spinfc2);
     if (argc > 1 && !strcmp(argv[1], "--slow")) return slow_mode();
+    if (argc > 1 && !strcmp(argv[1], "--again")) return again_mode();
     VkPipeline pipe;
     VkResult r = graphics_pipeline(1, &pipe);
     expect_contained(r, pipe, "A: faulting graphics pipeline fails, not the connection");

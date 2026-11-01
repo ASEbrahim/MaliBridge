@@ -17,6 +17,8 @@
 #   7  vkbridge-smoke on the "1.1 driver": 13 of 13, its timeline semaphore check run (it asks for 1.2);
 #   8  the "1.1 driver" with Mali-G720's gaps imitated as well (mali_env.sh's list): promote_check 1.3
 #      and vkbridge-smoke;
+#  10  Mali r18/r19 imitated (no timeline semaphores, nine 1.2 pieces gamescope does not use): gamescope
+#      alone offered 1.2 with the bridge's timelines, another app 1.1; VKBRIDGE_PROMOTE_UI_GAPS=0 off;
 #   9  the lowering over tests/downgrade (SPIR-V 1.5 / 1.6 from glslc, one by hand): each module's
 #      expected rewrite, every output spirv-val clean for Vulkan 1.1 + SPIR-V 1.4 (1.6 ones also to 1.5
 #      for Vulkan 1.2), a second pass changing nothing.
@@ -73,8 +75,8 @@ step $? "a 1.1 driver with the extensions: $(offered); $res"
 # 1b
 start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_PROMOTE_API=1 VKBRIDGE_FAKE_MISSING=shuffle
 run "$out/promote_check" 1.3
-[ $rc = 0 ] && grep -q "RADV NAVI31) offered as Vulkan 1.3 on its Vulkan 1.1 driver" "$log" &&
-  grep -q "RADV NAVI31) has no subgroup shuffles: a dynamic-id broadcast (Vulkan 1.2) becomes [0-9]* constant-lane broadcasts" "$log" &&
+[ $rc = 0 ] && grep -q ") offered as Vulkan 1.3 on its Vulkan 1.1 driver" "$log" &&
+  grep -q ") has no subgroup shuffles: a dynamic-id broadcast (Vulkan 1.2) becomes [0-9]* constant-lane broadcasts" "$log" &&
   grep -q "promotion: SPIR-V 1.6 lowered to 1.4 (.* 0 dynamic broadcast(s) made shuffles, 1 made chains over [0-9]* lanes)" "$log"
 step $? "... without subgroup shuffles (Mali r18-r26): $(offered), the dynamic broadcast a chain over $(grep -m1 -o 'becomes [0-9]* constant-lane' "$log" | grep -o '[0-9]*') lanes; $res"
 # 2
@@ -131,6 +133,38 @@ run "$out/vkbridge-smoke"
 [ $r8 = 0 ] && [ $rc = 0 ] && grep -q "PASS timeline semaphore" $work/run.log
 step $? "the 1.1 driver with Mali's gaps: $res8; vkbridge-smoke $res"
 unset VKBRIDGE_HIDE_EXTS
+# 10 Mali r18p0 / r19p0 (a player log Mali-G52 Mali-G76: Vulkan 1.1, gpuinfo 52871's extensions):
+#    no timeline semaphores (the bridge's), and 1.2 short of pieces gamescope does not use: gamescope
+#    alone gets 1.2 (timeline_check gamescope: its device and every timeline step through the core
+#    names); another app keeps 1.1; VKBRIDGE_PROMOTE_UI_GAPS=0: gamescope keeps 1.1 too
+r18="timeline,shuffle,dynrend,VK_KHR_shader_float_controls,VK_KHR_spirv_1_4,VK_EXT_separate_stencil_usage,VK_KHR_uniform_buffer_standard_layout"
+r18="$r18,VK_KHR_imageless_framebuffer,VK_KHR_separate_depth_stencil_layouts,VK_EXT_host_query_reset,VK_KHR_shader_subgroup_extended_types"
+r18="$r18,VK_EXT_scalar_block_layout,VK_EXT_descriptor_indexing,VK_KHR_draw_indirect_count"
+start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_FAKE_MISSING=$r18
+run "$out/timeline_check" gamescope
+r10=$rc res10=$res dev10=$(grep -m1 -o 'device: .*' $work/run.log)
+run "$out/timeline_check" core
+[ $r10 = 0 ] && [ $rc = 77 ] && grep -q "offered to gamescope as Vulkan 1.2 without .*timeline semaphores the bridge's" "$log" &&
+  grep -q "Vulkan 1.2 lacks .*VK_KHR_spirv_1_4" "$log" && ! grep -q "Vulkan 1.2 lacks .*timelineSemaphore" "$log" &&
+  grep -q "sync mirror off: the timeline semaphores are the bridge's" "$log"
+step $? "Mali r18/r19 imitated: gamescope $dev10, $res10; another app: $res; $(grep -m1 -o 'offered to gamescope as Vulkan 1.2 without [^(]*' "$log")"
+start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_FAKE_MISSING=$r18 VKBRIDGE_PROMOTE_UI_GAPS=0
+run "$out/timeline_check" gamescope
+[ $rc = 77 ] && ! grep -q "offered to gamescope" "$log"
+step $? "the same, VKBRIDGE_PROMOTE_UI_GAPS=0: gamescope keeps 1.1 ($res)"
+# 11 Mali r23p0 (a player log Huawei WGR-W09, Kirin 9000E Mali-G78, Vulkan 1.1.131, Android 10): a newer
+#    1.1 driver than r18/r19: shuffles, float controls, host query reset, scalar layout, descriptor
+#    indexing are there; 1.2 lacks only timeline semaphores and five of the pieces gamescope does not
+#    use. Same rule, no driver-version gate: gamescope alone offered 1.2, games keep 1.1.
+r23="timeline,dynrend,VK_KHR_spirv_1_4,VK_KHR_uniform_buffer_standard_layout,VK_KHR_imageless_framebuffer"
+r23="$r23,VK_KHR_separate_depth_stencil_layouts,VK_KHR_shader_subgroup_extended_types"
+start VKBRIDGE_FAKE_API=1.1 VKBRIDGE_FAKE_MISSING=$r23
+run "$out/timeline_check" gamescope
+r11=$rc res11=$res dev11=$(grep -m1 -o 'device: .*' $work/run.log)
+run "$out/timeline_check" core
+[ $r11 = 0 ] && [ $rc = 77 ] && grep -q "offered to gamescope as Vulkan 1.2 without .*timeline semaphores the bridge's" "$log" &&
+  grep -q "Vulkan 1.2 lacks .*VK_KHR_spirv_1_4" "$log" && ! grep -q "Vulkan 1.2 lacks .*\(float_controls\|host_query\|timelineSemaphore\|shuffles\)" "$log"
+step $? "Mali r23p0 imitated (a player log's six gaps): gamescope $dev11, $res11; another app: $res"
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; srv=
 
 # 9 the corpus

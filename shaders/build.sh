@@ -34,6 +34,7 @@ done
 variant spv_bc1_16 -DFMT_BC1 -DPACK16
 # transcoders: decode, then encode to a format the GPU samples compressed
 variant spv_bc1_etc2 -DFMT_BC1 -DENC_ETC2
+variant spv_bc1_astc -DFMT_BC1 -DENC_ASTC
 variant spv_bc2_astc -DFMT_BC2 -DENC_ASTC
 variant spv_bc3_astc -DFMT_BC3 -DENC_ASTC
 variant spv_bc4_eac -DFMT_BC4 -DENC_EAC
@@ -45,6 +46,15 @@ for n in 6 8; do
   for f in BC2 BC3 BC7; do
     variant spv_$(echo $f | tr A-Z a-z)_astc$n -DFMT_$f -DENC_ASTCN -DASTC_N=$n
   done
+done
+# re-encoders: a decoded BC image's texels into its transcoded format (copies between the two)
+variant spv_raw_etc2 -DFMT_BC1 -DENC_ETC2 -DSRC_RAW
+variant spv_raw_astc -DFMT_BC3 -DENC_ASTC -DSRC_RAW
+variant spv_raw_eac_r -DFMT_BC4 -DENC_EAC -DSRC_RAW
+variant spv_raw_eac_rg -DFMT_BC5 -DENC_EAC -DSRC_RAW
+variant spv_raw_astc_hdr -DFMT_BC6H -DENC_ASTC_HDR -DSRC_RAW
+for n in 6 8; do
+  variant spv_raw_astc$n -DFMT_BC3 -DENC_ASTCN -DASTC_N=$n -DSRC_RAW
 done
 rm -rf "$tmp"
 echo "wrote $out"

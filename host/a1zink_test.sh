@@ -1,5 +1,5 @@
 #!/bin/bash
-# server_emu.c's extended dynamic state hiding and render-pass emulation per driver version, a server per step.
+# server_emu.c's extended dynamic state hiding and render-pass emulation per driver version and client, a server per step.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
 work=$(mktemp -d)
@@ -33,7 +33,10 @@ run() {
 }
 counts() { grep -o 'dynamic rendering emulation, device [0-9]*: .*' "$log" | tail -1 | sed 's/.*: //'; }
 
-exts() { VK_DRIVER_FILES=$out/vkbridge_icd.json timeout 60 vulkaninfo 2>/dev/null | grep -o 'VK_[A-Za-z0-9_]*' > $work/exts.txt; }
+mkdir -p $work/bin
+ln -s "$(command -v vulkaninfo)" $work/bin/steam
+ln -s "$out/dynrend_check" $work/bin/Xwayland
+exts() { VK_DRIVER_FILES=$out/vkbridge_icd.json timeout 60 "${1:-$work/bin/steam}" 2>/dev/null | grep -o 'VK_[A-Za-z0-9_]*' > $work/exts.txt; }
 has() { grep -qx "$1" $work/exts.txt; }
 once() { [ "$(grep -cx "$1" $work/exts.txt)" -ge 1 ] && [ "$(sort $work/exts.txt | uniq -c | awk -v e="$1" '$2==e{print $1}')" = "$(sort $work/exts.txt | uniq -c | awk '$2=="VK_KHR_swapchain"{print $1}')" ]; }
 line() { grep -c "a1: VK_EXT_extended_dynamic_state not offered and dynamic rendering made as render passes" "$log"; }
@@ -41,7 +44,7 @@ line() { grep -c "a1: VK_EXT_extended_dynamic_state not offered and dynamic rend
 # 1
 start VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:jm
 exts
-run env VKBRIDGE_MAX_API=1.2 "$out/dynrend_check"
+run env VKBRIDGE_MAX_API=1.2 "$work/bin/Xwayland"
 stop
 [ "$(line)" = 1 ] && ! has VK_EXT_extended_dynamic_state && has VK_EXT_extended_dynamic_state2 && once VK_KHR_dynamic_rendering &&
   [ $rc = 0 ] && echo "$res" | grep -q "^OK: 12 of 12" && grep -q "dynamic rendering emulated on device" "$log"
@@ -69,9 +72,8 @@ step $? "r44p1 (CSF): off"
 start VKBRIDGE_FAKE_DRIVER_VERSION=r38p1-01bet0:jm VKBRIDGE_FAKE_API=1.1
 exts
 stop
-[ "$(line)" = 1 ] && ! has VK_EXT_extended_dynamic_state && grep -q "Vulkan 1.1 to apps, VK_EXT_extended_dynamic_state offered" "$log" &&
-  ! grep -q "api cap:" "$log"
-step $? "r38p1 beta job manager at Vulkan 1.1 (#11's S10 / Note10+): on, nothing capped"
+[ "$(line)" = 1 ] && ! has VK_EXT_extended_dynamic_state && grep -q "Vulkan 1.1 to apps, VK_EXT_extended_dynamic_state offered" "$log"
+step $? "r38p1 beta job manager at Vulkan 1.1 (S10 / Note10+): on (its cap: apicap_test step 5b)"
 # 6
 start VKBRIDGE_FAKE_DRIVER_VERSION=r54p1:jm
 exts
@@ -90,5 +92,40 @@ exts
 stop
 [ "$(line)" = 1 ] && ! has VK_EXT_extended_dynamic_state
 step $? "unknown release on a job manager GPU: on"
+
+# 9
+start VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:csf
+exts
+run env VKBRIDGE_MAX_API=1.2 "$work/bin/Xwayland"
+stop
+[ "$(line)" = 1 ] && ! has VK_EXT_extended_dynamic_state && has VK_EXT_extended_dynamic_state2 && once VK_KHR_dynamic_rendering &&
+  grep -q "a1: .*(Arm driver r38, CSF, " "$log" &&
+  [ $rc = 0 ] && echo "$res" | grep -q "^OK: 12 of 12" && grep -q "dynamic rendering emulated on device" "$log"
+step $? "r38p1 CSF (G715): on ($(grep -o 'a1: .*(Arm[^;]*' "$log" | head -1)); $res"
+# 10
+start VKBRIDGE_FAKE_DRIVER_VERSION=r43p0:csf
+exts
+stop
+[ "$(line)" = 1 ] && ! has VK_EXT_extended_dynamic_state
+step $? "r43p0 CSF: on"
+start VKBRIDGE_FAKE_DRIVER_VERSION=unknown:csf
+exts
+stop
+[ "$(line)" = 0 ] && has VK_EXT_extended_dynamic_state
+step $? "unknown release on a CSF GPU: off"
+
+# 11
+start VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:jm
+exts vulkaninfo
+run env VKBRIDGE_MAX_API=1.2 "$out/dynrend_check"
+stop
+[ "$(line)" = 1 ] && has VK_EXT_extended_dynamic_state && once VK_KHR_dynamic_rendering &&
+  [ $rc = 0 ] && echo "$res" | grep -q "^OK: " && ! grep -q "dynamic rendering emulated on device" "$log"
+step $? "r38p1 job manager, a game's process: the driver's extended dynamic state and dynamic rendering; $res"
+start VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:jm VKBRIDGE_A1_ZINK=1
+exts vulkaninfo
+stop
+[ "$(line)" = 1 ] && ! has VK_EXT_extended_dynamic_state && once VK_KHR_dynamic_rendering
+step $? "r38p1 job manager, a game's process with VKBRIDGE_A1_ZINK=1: on"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

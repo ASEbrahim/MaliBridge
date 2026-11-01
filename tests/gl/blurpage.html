@@ -1,0 +1,15 @@
+<!-- eds_test.sh: Steam-UI-like layers (rotated translucent cards, small text, a backdrop-filter blur bar, a 2D canvas) for a headless Chromium through Zink -->
+<!doctype html><html><head><style>
+body{margin:0;width:800px;height:600px;background:linear-gradient(45deg,#203040,#a04060);font:16px sans-serif;color:#fff;overflow:hidden}
+.card{position:absolute;width:150px;height:90px;border-radius:12px;background:rgba(255,255,255,.25);box-shadow:0 4px 20px rgba(0,0,0,.5)}
+.blur{position:absolute;left:0;top:500px;width:800px;height:100px;backdrop-filter:blur(8px);background:rgba(0,0,0,.4)}
+.txt{position:absolute;opacity:.8}
+img{position:absolute}
+</style></head><body>
+<script>
+for(let i=0;i<24;i++){const d=document.createElement('div');d.className='card';d.style.left=(i%6)*130+10+'px';d.style.top=Math.floor(i/6)*110+20+'px';d.style.transform='rotate('+(i*7%30-15)+'deg)';d.textContent='Card '+i;document.body.appendChild(d);}
+for(let i=0;i<10;i++){const t=document.createElement('div');t.className='txt';t.style.left='20px';t.style.top=(460+i*14)+'px';t.style.fontSize=(10+i)+'px';t.textContent='The quick brown fox jumps over the lazy dog '+i;document.body.appendChild(t);}
+const b=document.createElement('div');b.className='blur';b.textContent='OPTIONS   SELECT   BACK';document.body.appendChild(b);
+const c=document.createElement('canvas');c.width=200;c.height=150;c.style.position='absolute';c.style.left='580px';c.style.top='440px';document.body.appendChild(c);
+const g=c.getContext('2d');for(let i=0;i<40;i++){g.strokeStyle='hsl('+i*9+',80%,60%)';g.beginPath();g.arc(100,75,i*2,0,6);g.stroke();}
+</script></body></html>

@@ -43,6 +43,23 @@
  * A stand-in that is ready is bound as its real pipeline. A compile that fails leaves its draws
  * skipped for good (DXVK skips a failed pipeline's draws too).
  *
+ * VKBRIDGE_ASYNC_COMPILE=3 (or "defer"): no draw is ever skipped. A pipeline not compiled within
+ * the wait still comes back as a stand-in and compiles on a worker, but the replay of a command
+ * buffer that binds it (its vkEndCommandBuffer, which the client sends without waiting for the
+ * reply) waits there until it is ready; a compile still in the queue then runs on the replay thread
+ * itself instead of waiting for a free worker. The frame still waits for its new pipelines, but
+ * at its submit instead of at each draw: the app records the rest of the frame meanwhile, and a
+ * burst of new pipelines compiles on the workers side by side instead of one after another at
+ * each draw. Since nothing is skipped, the colour/effects rules above do not apply: every pipeline
+ * whose create info this layer can hold goes to the background (depth-only, storage writes,
+ * full-screen passes, any graphics stages). A create goes to the background only while a worker is
+ * idle: with every worker busy the creating thread compiles it itself, as before (it is one more
+ * compiler working in parallel, and an app that compiles on several threads of its own - vkd3d-proton,
+ * a loading screen - keeps them all). Only a compile that fails in the background leaves its
+ * draws skipped (the create already returned VK_SUCCESS). A create with
+ * VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT stays synchronous in every mode: the
+ * driver answers it from its cache at once (it is counted on its own in the summary).
+ *
  * VKBRIDGE_ASYNC_COMPILE_IMITATE_MS=<ms> (tests, measurements): every graphics compile through
  * this layer waits that long first, synchronous ones included, with the layer off too - a slow
  * compiler for the host suite (host/asyncpipe_test.sh) and an A/B on a fast one.
@@ -71,17 +88,18 @@ enum { ST_PENDING, ST_READY, ST_FAILED };
 enum { OBJ_MODULE, OBJ_LAYOUT, OBJ_RENDER_PASS };
 enum {
     WHY_BATCH, WHY_FLAGS, WHY_CHAIN, WHY_STAGES, WHY_NO_COLOR, WHY_DISCARD, WHY_NO_VERTEX_INPUT, WHY_EFFECTS,
-    WHY_MODULE, WHY_QUEUE, WHY_COUNT
+    WHY_MODULE, WHY_QUEUE, WHY_FAIL_REQUIRED, WHY_BUSY, WHY_COUNT
 };
 static const char *const why_names[WHY_COUNT] = {
     "batch", "flags", "structures", "stages", "no colour output", "rasterizer discard", "no vertex input", "stores or xfb",
-    "unknown module", "queue full",
+    "unknown module", "queue full", "fail-on-compile-required", "every worker busy",
 };
 
 typedef struct vkb_async {
     vkb_srv_table *t;
     int on;            /* background compiles; 0: the imitation's delay alone */
     int fullscreen;    /* VKBRIDGE_ASYNC_COMPILE=2: pipelines without vertex input too */
+    int defer;         /* VKBRIDGE_ASYNC_COMPILE=3: no draw skipped, the replay waits for the compile */
     double imitate_ms; /* VKBRIDGE_ASYNC_COMPILE_IMITATE_MS */
     double wait_ms;    /* VKBRIDGE_ASYNC_COMPILE_WAIT_MS */
     /* what this layer calls: the next one down */
@@ -108,6 +126,7 @@ typedef struct vkb_async {
     /* statistics (atomic) */
     uint64_t n_background, n_quick, n_failed, n_sync[WHY_COUNT], draws_skipped, binds_skipped, compile_us_total;
     uint64_t compile_us_max, create_us_max, queue_max;
+    uint64_t binds_waited, bind_wait_us_total, bind_wait_us_max, n_stolen; /* defer: replays that waited */
     uint64_t logged_background, logged_skipped;
     uint32_t chain_stype; /* the first structure that kept a pipeline synchronous (the summary names it) */
     double last_log;
@@ -120,6 +139,8 @@ typedef struct apipe {
     int state;     /* ST_* (lk) */
     int exposed;   /* the client has the stand-in (lk); 0: the creating thread takes the result */
     int destroyed; /* the client destroyed the stand-in while it compiled (lk) */
+    int started;   /* taken from the queue, by a worker or a waiting replay (lk) */
+    int waiters;   /* replays waiting for it (defer, lk): the last one frees it if destroyed meanwhile */
     VkPipeline real;
     uint8_t *blob; /* the encoded create info */
     size_t blob_len;
@@ -152,6 +173,7 @@ static int nproxies; /* atomic reads: binds look nothing up while it is 0 */
 static objref *objs[OBJ_BUCKETS];
 static vkb_async *devs;
 static int nworkers, want_workers;
+static int g_busy; /* compiles queued or running, every device (lk) */
 
 /* The command buffer whose draws this thread drops (its bound pipeline is a stand-in not ready). */
 static __thread VkCommandBuffer tls_skip;
@@ -190,7 +212,11 @@ static vkb_async *cur(void)
 
 static void imitate(const vkb_async *a)
 {
-    if (a->imitate_ms > 0) usleep((useconds_t)(a->imitate_ms * 1000));
+    if (a->imitate_ms <= 0) return;
+    uint64_t t0 = vkb_hitch_now();
+    usleep((useconds_t)(a->imitate_ms * 1000));
+    /* the hitch line counts it as compile time, as it would the slow compiler it stands for */
+    if (vkb_hitch_on(a->t->proc)) vkb_hitch_note(a->t->proc, VKB_HITCH_COMPILE, t0, vkb_hitch_now(), 0, 0);
 }
 
 /* ------------------------------------------------------------------ handle maps (lk held) */
@@ -326,10 +352,12 @@ static void scan_inline(const VkGraphicsPipelineCreateInfo *ci, uint32_t fx[6])
  * held. */
 static int classify(vkb_async *a, const VkGraphicsPipelineCreateInfo *ci, const uint32_t inline_fx[6], objref **refs, uint32_t *nrefs)
 {
+    if (ci->flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) return WHY_FAIL_REQUIRED;
     if (ci->flags & ~(VkPipelineCreateFlags)FLAGS_OK) return WHY_FLAGS;
     for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext) {
         if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO) {
             const VkPipelineCreateFlags2CreateInfo *f = (const void *)s;
+            if (f->flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) return WHY_FAIL_REQUIRED;
             if (f->flags & ~(VkPipelineCreateFlags2)(VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT | VK_PIPELINE_CREATE_2_ALLOW_DERIVATIVES_BIT))
                 return WHY_FLAGS;
         } else if (s->sType != VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO && s->sType != VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO) {
@@ -337,28 +365,30 @@ static int classify(vkb_async *a, const VkGraphicsPipelineCreateInfo *ci, const 
             return WHY_CHAIN;
         }
     }
-    /* colour output */
-    const VkPipelineRasterizationStateCreateInfo *rs = ci->pRasterizationState;
-    if (!rs || rs->rasterizerDiscardEnable || dynamic(ci, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) return WHY_DISCARD;
-    for (const VkBaseInStructure *s = rs->pNext; s; s = s->pNext)
-        if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT) return WHY_EFFECTS;
-    const VkPipelineColorBlendStateCreateInfo *cb = ci->pColorBlendState;
-    int color = 0;
-    for (uint32_t i = 0; cb && cb->pAttachments && i < cb->attachmentCount; i++) color |= cb->pAttachments[i].colorWriteMask != 0;
-    if (cb && cb->attachmentCount && dynamic(ci, VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT)) color = 1;
-    for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext)
-        if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
-            const VkPipelineRenderingCreateInfo *r = (const void *)s;
-            int any = 0;
-            for (uint32_t i = 0; r->pColorAttachmentFormats && i < r->colorAttachmentCount; i++)
-                any |= r->pColorAttachmentFormats[i] != VK_FORMAT_UNDEFINED;
-            if (!any) color = 0;
-        }
-    if (!color) return WHY_NO_COLOR;
-    /* vertex input */
-    const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
-    if (!a->fullscreen && !dynamic(ci, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT) && (!vi || !vi->vertexBindingDescriptionCount))
-        return WHY_NO_VERTEX_INPUT;
+    /* colour output (the defer mode skips nothing: any output will do) */
+    if (!a->defer) {
+        const VkPipelineRasterizationStateCreateInfo *rs = ci->pRasterizationState;
+        if (!rs || rs->rasterizerDiscardEnable || dynamic(ci, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) return WHY_DISCARD;
+        for (const VkBaseInStructure *s = rs->pNext; s; s = s->pNext)
+            if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT) return WHY_EFFECTS;
+        const VkPipelineColorBlendStateCreateInfo *cb = ci->pColorBlendState;
+        int color = 0;
+        for (uint32_t i = 0; cb && cb->pAttachments && i < cb->attachmentCount; i++) color |= cb->pAttachments[i].colorWriteMask != 0;
+        if (cb && cb->attachmentCount && dynamic(ci, VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT)) color = 1;
+        for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext)
+            if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+                const VkPipelineRenderingCreateInfo *r = (const void *)s;
+                int any = 0;
+                for (uint32_t i = 0; r->pColorAttachmentFormats && i < r->colorAttachmentCount; i++)
+                    any |= r->pColorAttachmentFormats[i] != VK_FORMAT_UNDEFINED;
+                if (!any) color = 0;
+            }
+        if (!color) return WHY_NO_COLOR;
+        /* vertex input */
+        const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
+        if (!a->fullscreen && !dynamic(ci, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT) && (!vi || !vi->vertexBindingDescriptionCount))
+            return WHY_NO_VERTEX_INPUT;
+    }
     /* stages: a vertex and a fragment stage, each without side effects */
     uint32_t seen = 0, fx = 0, n = 0;
     objref *r[REFS_MAX];
@@ -386,10 +416,9 @@ static int classify(vkb_async *a, const VkGraphicsPipelineCreateInfo *ci, const 
             return WHY_MODULE;
         }
     }
-    if (!(seen & VK_SHADER_STAGE_VERTEX_BIT) || !(seen & VK_SHADER_STAGE_FRAGMENT_BIT) ||
-        (seen & ~(VkShaderStageFlags)VK_SHADER_STAGE_ALL_GRAPHICS))
-        return WHY_STAGES;
-    if (fx) return WHY_EFFECTS;
+    if (seen & ~(VkShaderStageFlags)VK_SHADER_STAGE_ALL_GRAPHICS) return WHY_STAGES;
+    if (!a->defer && (!(seen & VK_SHADER_STAGE_VERTEX_BIT) || !(seen & VK_SHADER_STAGE_FRAGMENT_BIT))) return WHY_STAGES;
+    if (fx && !a->defer) return WHY_EFFECTS;
     if (ci->layout) {
         objref *o = obj_get(a, OBJ_LAYOUT, (uint64_t)(uintptr_t)ci->layout);
         if (!o) return WHY_QUEUE;
@@ -424,19 +453,28 @@ static void log_summary(vkb_async *a, const char *when)
             o += snprintf(sync + o, sizeof(sync) - o, " (first: structure type %u)", a->chain_stype);
     }
     uint64_t bg = __atomic_load_n(&a->n_background, __ATOMIC_RELAXED);
+    char waits[160] = "";
+    if (a->defer)
+        snprintf(waits, sizeof(waits), ", %llu binds waited for their compile (longest %.0f ms, total %.0f ms; %llu compiled on the replay thread)",
+                 (unsigned long long)__atomic_load_n(&a->binds_waited, __ATOMIC_RELAXED), a->bind_wait_us_max / 1000.0,
+                 __atomic_load_n(&a->bind_wait_us_total, __ATOMIC_RELAXED) / 1000.0,
+                 (unsigned long long)__atomic_load_n(&a->n_stolen, __ATOMIC_RELAXED));
     VKB_INFO("async compile, device %u%s: %llu pipelines in the background (%llu failed, longest %.0f ms, mean %.0f ms, queue up to %llu), "
-             "%llu ready within the %.0f ms wait, %llu draws skipped (%llu binds); %llu synchronous%s%s%s (longest call %.0f ms)",
+             "%llu ready within the %.0f ms wait, %llu draws skipped (%llu binds)%s; %llu synchronous%s%s%s (longest call %.0f ms)",
              a->t->id, when, (unsigned long long)bg, (unsigned long long)a->n_failed, a->compile_us_max / 1000.0,
              bg ? a->compile_us_total / 1000.0 / bg : 0.0, (unsigned long long)a->queue_max, (unsigned long long)a->n_quick, a->wait_ms,
-             (unsigned long long)a->draws_skipped, (unsigned long long)a->binds_skipped, (unsigned long long)nsync, *sync ? " (" : "", sync,
+             (unsigned long long)a->draws_skipped, (unsigned long long)a->binds_skipped, waits, (unsigned long long)nsync, *sync ? " (" : "", sync,
              *sync ? ")" : "", a->create_us_max / 1000.0);
 }
 
 static void compile_job(apipe *x, vkb_arena *arena)
 {
     vkb_async *a = x->a;
+    /* a replay thread compiling its own wait (defer) goes back to its command buffer after */
+    vkb_srv_table *saved_table = vkb_srv_current_table();
+    const char *saved_cmd = vkb_srv_current_cmd;
     vkb_srv_set_current_table(a->t); /* the layers beneath find their device by it */
-    vkb_srv_current_cmd = "vkCreateGraphicsPipelines (in the background)";
+    vkb_srv_current_cmd = saved_table ? "vkCreateGraphicsPipelines (for the replay waiting on it)" : "vkCreateGraphicsPipelines (in the background)";
     double t0 = now_s();
     vkb_dec d;
     vkb_dec_init(&d, x->blob, x->blob_len, arena, NULL, 0);
@@ -452,7 +490,7 @@ static void compile_job(apipe *x, vkb_arena *arena)
         VKB_ERR("async compile: the queued create info did not decode");
     }
     vkb_arena_reset(arena);
-    vkb_srv_current_cmd = NULL;
+    vkb_srv_current_cmd = saved_cmd;
     uint64_t us = (uint64_t)((now_s() - t0) * 1e6);
     __atomic_add_fetch(&a->compile_us_total, us, __ATOMIC_RELAXED);
     stat_max(&a->compile_us_max, us);
@@ -467,7 +505,8 @@ static void compile_job(apipe *x, vkb_arena *arena)
     pthread_mutex_lock(&lk);
     x->real = p;
     x->state = p ? ST_READY : ST_FAILED;
-    int drop = x->exposed && x->destroyed; /* the client let go of it meanwhile */
+    int drop = x->exposed && x->destroyed && !x->waiters; /* the client let go of it meanwhile (a waiting replay frees it then) */
+    if (x->waiters) pthread_cond_broadcast(&done_cv);
     pthread_mutex_unlock(&lk);
     if (drop) {
         if (p) a->destroy_pipe(a->t->device, p, NULL);
@@ -484,7 +523,7 @@ static void compile_job(apipe *x, vkb_arena *arena)
     }
     pthread_mutex_unlock(&lk);
     if (say) log_summary(a, " so far");
-    vkb_srv_set_current_table(NULL);
+    vkb_srv_set_current_table(saved_table);
 }
 
 static void *worker(void *arg)
@@ -498,12 +537,14 @@ static void *worker(void *arg)
         q_head = x->qnext;
         if (!q_head) q_tail = NULL;
         vkb_async *a = x->a;
+        x->started = 1;
         a->queued--;
         a->running++;
         pthread_mutex_unlock(&lk);
         compile_job(x, &arena); /* x may be gone after it */
         pthread_mutex_lock(&lk);
         a->running--;
+        g_busy--;
         pthread_cond_broadcast(&done_cv);
     }
     return NULL;
@@ -573,7 +614,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL as_CreateGraphicsPipelines(VkDevice device
     uint32_t inline_fx[6];
     if (ci->stageCount <= 6) scan_inline(ci, inline_fx);
     pthread_mutex_lock(&lk);
-    int why = a->queued >= ASYNC_QUEUE_MAX ? WHY_QUEUE : classify(a, ci, inline_fx, x->refs, &x->nrefs);
+    /* defer: only to an idle worker - with every one busy this thread compiles it itself as before, so
+     * an app compiling on several threads (vkd3d-proton's, a loading screen) keeps that parallelism */
+    int why = a->queued >= ASYNC_QUEUE_MAX           ? WHY_QUEUE
+              : a->defer && g_busy >= want_workers ? WHY_BUSY
+                                                     : classify(a, ci, inline_fx, x->refs, &x->nrefs);
     pthread_mutex_unlock(&lk);
     if (why < 0) {
         /* the copy the worker decodes: no base pipeline (a hint; the base may be a stand-in) */
@@ -606,6 +651,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL as_CreateGraphicsPipelines(VkDevice device
     else q_head = x;
     q_tail = x;
     a->queued++;
+    g_busy++;
     stat_max(&a->queue_max, (uint64_t)a->queued);
     pthread_cond_signal(&work_cv);
     /* a pipeline the cache has is done within the wait: its real handle goes back as before */
@@ -647,9 +693,9 @@ static VKAPI_ATTR void VKAPI_CALL as_DestroyPipeline(VkDevice device, VkPipeline
         VkPipeline real = VK_NULL_HANDLE;
         if (x) {
             proxy_remove(x);
-            pending = x->state == ST_PENDING;
+            pending = x->state == ST_PENDING || x->waiters; /* a replay still waking from its wait has it too */
             real = x->real;
-            if (pending) x->destroyed = 1; /* the worker destroys it when done */
+            if (pending) x->destroyed = 1; /* the worker (or the last waiting replay) destroys it when done */
         }
         pthread_mutex_unlock(&lk);
         if (x) {
@@ -707,6 +753,54 @@ static VKAPI_ATTR VkResult VKAPI_CALL as_BeginCommandBuffer(VkCommandBuffer cb, 
     return cur()->begin(cb, bi);
 }
 
+/* defer: the replay binding x (its waiters already counted) waits until it is compiled; one still in the queue is compiled here
+ * (this thread would only wait for a worker). Its real pipeline, or VK_NULL_HANDLE when the compile
+ * failed (or the client destroyed the stand-in meanwhile: its draws are skipped then). */
+static VkPipeline wait_ready(vkb_async *a, apipe *x)
+{
+    double t0 = now_s();
+    int stole = 0;
+    pthread_mutex_lock(&lk);
+    if (x->state == ST_PENDING && !x->started) {
+        for (apipe **pp = &q_head, *prev = NULL; *pp; prev = *pp, pp = &(*pp)->qnext)
+            if (*pp == x) {
+                *pp = x->qnext;
+                if (q_tail == x) q_tail = prev;
+                x->qnext = NULL;
+                x->started = 1;
+                a->queued--;
+                a->running++;
+                stole = 1;
+                break;
+            }
+    }
+    if (stole) {
+        pthread_mutex_unlock(&lk);
+        vkb_arena arena = {0};
+        compile_job(x, &arena); /* x stays: waiters > 0 */
+        vkb_arena_free(&arena);
+        pthread_mutex_lock(&lk);
+        a->running--;
+        g_busy--;
+        pthread_cond_broadcast(&done_cv);
+    }
+    while (x->state == ST_PENDING) pthread_cond_wait(&done_cv, &lk);
+    VkPipeline real = x->state == ST_READY && !x->destroyed ? x->real : VK_NULL_HANDLE;
+    int free_it = --x->waiters == 0 && x->destroyed;
+    VkPipeline gone = free_it ? x->real : VK_NULL_HANDLE;
+    pthread_mutex_unlock(&lk);
+    if (free_it) {
+        if (gone) a->destroy_pipe(a->t->device, gone, NULL);
+        free(x);
+    }
+    uint64_t us = (uint64_t)((now_s() - t0) * 1e6);
+    __atomic_add_fetch(&a->binds_waited, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&a->bind_wait_us_total, us, __ATOMIC_RELAXED);
+    stat_max(&a->bind_wait_us_max, us);
+    if (stole) __atomic_add_fetch(&a->n_stolen, 1, __ATOMIC_RELAXED);
+    return real;
+}
+
 static VKAPI_ATTR void VKAPI_CALL as_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p)
 {
     vkb_async *a = cur();
@@ -715,7 +809,10 @@ static VKAPI_ATTR void VKAPI_CALL as_CmdBindPipeline(VkCommandBuffer cb, VkPipel
             pthread_mutex_lock(&lk);
             apipe *x = proxy_find(p);
             VkPipeline real = x && x->state == ST_READY ? x->real : VK_NULL_HANDLE;
+            int wait = x && x->state == ST_PENDING && a->defer;
+            if (wait) x->waiters++; /* under the same lock as the find: a destroy cannot free it meanwhile */
             pthread_mutex_unlock(&lk);
+            if (wait) real = wait_ready(a, x); /* x is not touched after: it may be gone */
             if (x && !real) { /* still compiling (or failed): its draws are dropped */
                 tls_skip = cb;
                 __atomic_add_fetch(&a->binds_skipped, 1, __ATOMIC_RELAXED);
@@ -825,6 +922,7 @@ void vkb_async_device_init(vkb_srv_table *t)
     const char *w_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_WAIT_MS");
     const char *n_s = vkb_srv_env("VKBRIDGE_ASYNC_COMPILE_THREADS");
     int on = on_s && *on_s && *on_s != '0';
+    int mode = !on ? 0 : !strcmp(on_s, "defer") ? 3 : atoi(on_s) > 0 ? atoi(on_s) : 1;
     double im = im_s ? atof(im_s) : 0;
     vkb_dispatch *dt = &t->dt;
     if ((!on && im <= 0) || !dt->vkCreateGraphicsPipelines || !dt->vkDestroyPipeline || !dt->vkCmdBindPipeline) return;
@@ -833,7 +931,8 @@ void vkb_async_device_init(vkb_srv_table *t)
     if (!a) return;
     a->t = t;
     a->on = on;
-    a->fullscreen = on && atoi(on_s) >= 2;
+    a->defer = mode == 3;
+    a->fullscreen = mode == 2 || mode == 3;
     a->imitate_ms = im > 0 ? im : 0;
     a->wait_ms = w_s && *w_s ? atof(w_s) : ASYNC_WAIT_MS_DEFAULT;
     if (a->wait_ms < 0) a->wait_ms = 0;
@@ -872,7 +971,8 @@ void vkb_async_device_init(vkb_srv_table *t)
     t->async = a;
     if (a->on)
         VKB_INFO("device %u: asynchronous pipeline compile on (VKBRIDGE_ASYNC_COMPILE=%d): %d worker thread(s), %.1f ms wait%s%s", t->id,
-                 a->fullscreen ? 2 : 1, want_workers, a->wait_ms, a->fullscreen ? "; pipelines without vertex input too" : "",
+                 a->defer ? 3 : a->fullscreen ? 2 : 1, want_workers, a->wait_ms,
+                 a->defer ? "; no draw skipped: a replay waits for the compiles it binds" : a->fullscreen ? "; pipelines without vertex input too" : "",
                  a->imitate_ms > 0 ? "; compiles slowed down (VKBRIDGE_ASYNC_COMPILE_IMITATE_MS)" : "");
     else
         VKB_INFO("device %u: graphics pipeline compiles slowed down by %.0f ms (VKBRIDGE_ASYNC_COMPILE_IMITATE_MS)%s", t->id, a->imitate_ms,
@@ -894,6 +994,7 @@ void vkb_async_device_destroy(vkb_srv_table *t)
         }
         *pp = x->qnext;
         a->queued--;
+        g_busy--;
         x->qnext = dropped;
         dropped = x;
     }
@@ -913,7 +1014,7 @@ void vkb_async_device_destroy(vkb_srv_table *t)
         if (mine && !x->destroyed) proxy_remove(x);
         pthread_cond_broadcast(&done_cv);
         pthread_mutex_unlock(&lk);
-        if (mine) free(x);
+        if (mine && !x->waiters) free(x);
     }
     /* stand-ins the app did not destroy (the driver frees their pipelines with the device), and the
      * device's object records */

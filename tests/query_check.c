@@ -523,6 +523,9 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--gpu") && i + 1 < argc) gpu = atoi(argv[++i]);
     const char *mv = getenv("VKBRIDGE_QUERY_MIRROR");
     mirror = !(mv && !strcmp(mv, "0"));
+    /* occlusion from the server: its round trips are expected (timestamps' are not counted then) */
+    const char *mo = getenv("VKBRIDGE_QUERY_MIRROR_OCCLUSION");
+    if (mo && !strcmp(mo, "0")) mirror = 0;
     /* The client's trace of round trips, into a file this test reads back. */
     int saved_err = dup(2);
     trace = tmpfile();
