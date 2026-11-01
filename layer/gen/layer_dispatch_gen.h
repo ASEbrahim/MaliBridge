@@ -1347,6 +1347,7 @@ VKAPI_ATTR void VKAPI_CALL Layer_vkGetImageSubresourceLayout2(VkDevice device, V
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR* pGetFdInfo, int* pFd)
 {
+    // server_dmabuf_ahb.c (dab_GetMemoryFdKHR)
     // server_memory.c (exp_GetMemoryFdKHR)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkGetMemoryFdKHR(device, pGetFdInfo, pFd);
@@ -1354,6 +1355,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetMemoryFdKHR(VkDevice device, const VkM
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetMemoryFdPropertiesKHR(VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType, int fd, VkMemoryFdPropertiesKHR* pMemoryFdProperties)
 {
+    // server_dmabuf_ahb.c (dab_GetMemoryFdPropertiesKHR)
     // server_memory.c (fdt_GetMemoryFdPropertiesKHR)
     auto ctx = get_scoped_ctx(device);
     return ctx->t->dt.vkGetMemoryFdPropertiesKHR(device, handleType, fd, pMemoryFdProperties);
@@ -1361,6 +1363,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetMemoryFdPropertiesKHR(VkDevice device,
 
 VKAPI_ATTR void VKAPI_CALL Layer_vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalBufferInfo* pExternalBufferInfo, VkExternalBufferProperties* pExternalBufferProperties)
 {
+    // server_dmabuf_ahb.c (dab_GetPhysicalDeviceExternalBufferProperties)
     // server_opaque.c (op_GetPhysicalDeviceExternalBufferProperties)
     auto ctx = get_scoped_ctx(physicalDevice);
     ctx->t->dt.vkGetPhysicalDeviceExternalBufferProperties(physicalDevice, pExternalBufferInfo, pExternalBufferProperties);
@@ -1375,6 +1378,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetPhysicalDeviceImageFormatProperties(Vk
 
 VKAPI_ATTR VkResult VKAPI_CALL Layer_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo, VkImageFormatProperties2* pImageFormatProperties)
 {
+    // server_dmabuf_ahb.c (dab_GetPhysicalDeviceImageFormatProperties2)
     // server_emu.c (dmabufmod_GetPhysicalDeviceImageFormatProperties2)
     // server_emu.c (planar_GetPhysicalDeviceImageFormatProperties2)
     // server_opaque.c (op_GetPhysicalDeviceImageFormatProperties2)
