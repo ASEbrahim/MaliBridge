@@ -126,9 +126,47 @@ int vkb_emu_dumping(void)
     return dumping;
 }
 
+/* VKBRIDGE_SPIRV_SUBST=1 at this end too: the driver's module (after every rewrite above) is replaced by
+ * <pipeline cache dir>/spv-subst/<16 hex digits>.spv named by the FNV-1a hash of the code as the profiler's
+ * dump-spirv/g-<hash>.spv names it, so a dumped module can be edited and put back without a rebuild. */
+static uint32_t *subst_driver_code(const uint32_t *code, size_t size, size_t *out_size)
+{
+    const char *on = vkb_srv_env("VKBRIDGE_SPIRV_SUBST"), *dir = vkb_pcache_dir();
+    if (!on || strcmp(on, "1") != 0 || !dir || !code || size < 20) return NULL;
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *b = (const uint8_t *)code;
+    for (size_t i = 0; i < size; i++) h = (h ^ b[i]) * 1099511628211ull;
+    char path[700];
+    snprintf(path, sizeof(path), "%s/spv-subst/%016llx.spv", dir, (unsigned long long)h);
+    FILE *in = fopen(path, "rb");
+    if (!in) return NULL;
+    uint32_t *out = NULL;
+    long n = fseek(in, 0, SEEK_END) == 0 ? ftell(in) : -1;
+    if (n >= 20 && n < (64l << 20) && !(n & 3) && fseek(in, 0, SEEK_SET) == 0 && (out = malloc((size_t)n)) &&
+        fread(out, 1, (size_t)n, in) == (size_t)n && out[0] == 0x07230203u) {
+        *out_size = (size_t)n;
+        VKB_INFO("SPIR-V subst (driver module): %016llx (%zu bytes) replaced by spv-subst/%016llx.spv (%ld bytes)",
+                 (unsigned long long)h, size, (unsigned long long)h, n);
+    } else {
+        free(out);
+        out = NULL;
+    }
+    fclose(in);
+    return out;
+}
+
 VkResult vkb_emu_driver_module(VkDevice device, const VkShaderModuleCreateInfo *ci, VkShaderModule *out)
 {
+    VkShaderModuleCreateInfo sci = *ci;
+    size_t subsz = 0;
+    uint32_t *sub = subst_driver_code(ci->pCode, ci->codeSize, &subsz);
+    if (sub) {
+        sci.pCode = sub;
+        sci.codeSize = subsz;
+        ci = &sci;
+    }
     VkResult r = vkb_emu_real()->vkCreateShaderModule(device, ci, NULL, out);
+    free(sub);
     if (r == VK_SUCCESS && vkb_emu_dumping()) {
         static int seq;
         char path[600];

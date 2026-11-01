@@ -134,13 +134,82 @@ static void answer(VkExternalMemoryProperties *p, VkExternalMemoryFeatureFlags d
     p->compatibleHandleTypes = OPAQUE;
 }
 
+/*
+ * Mali r32p1 (Mali-G77 MC9, Retroid Pocket 4 Pro, Android 13) answers VK_ERROR_FORMAT_NOT_SUPPORTED
+ * to vkGetPhysicalDeviceImageFormatProperties2 for an external (dma-buf) image at DRM-modifier
+ * tiling as soon as VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT is set - with or without the
+ * VkImageFormatListCreateInfo - while the same image without the flag is supported (importable),
+ * and vkCreateImage itself takes the flag, the format list, the modifier list and the external
+ * handle type, exports the memory and makes the sRGB view (tools/vkcreate.py, 2026-10-26).
+ * gamescope sets the flag on every flippable image whose sRGB twin differs (XR24/AR24:
+ * CVulkanTexture::BInit), found no modifier it could use and ended the session at its
+ * "modifiers.size() > 0" assertion: Steam mode stopped at "Starting display and audio"
+ * (MaliBridge#10). The refused question is asked again without the flag and the list; a
+ * supported answer is the answer.
+ */
+static VkResult mutable_query_retry(const vkb_dispatch *real, VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *info,
+                                    VkImageFormatProperties2 *props)
+{
+    VkPhysicalDeviceImageFormatInfo2 *ii = (VkPhysicalDeviceImageFormatInfo2 *)info;
+    VkImageCreateFlags flags = ii->flags;
+    ii->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    VkImageFormatListCreateInfo *list = vkb_emu_chain_take(ii, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+    VkResult r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, ii, props);
+    if (list) {
+        list->pNext = ii->pNext;
+        ii->pNext = list;
+    }
+    ii->flags = flags;
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4) {
+        const VkExternalImageFormatProperties *ep = props ? chain_find(props, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) : NULL;
+        VKB_INFO("image format query: the driver refuses MUTABLE_FORMAT on an external image (format %u tiling %d usage 0x%x, %s); "
+                 "asked without it -> %d (external features 0x%x) - the image itself is made with the flag (Mali r32p1)",
+                 info->format, (int)info->tiling, info->usage, list ? "with a format list" : "no format list", r,
+                 ep ? ep->externalMemoryProperties.externalMemoryFeatures : 0);
+    }
+    return r;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL op_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd,
                                                                                 const VkPhysicalDeviceImageFormatInfo2 *info,
                                                                                 VkImageFormatProperties2 *props)
 {
     const vkb_dispatch *real = &vkb_srv_current_table()->real;
     VkPhysicalDeviceExternalImageFormatInfo *ei = chain_find(info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
-    if (!ei || ei->handleType != OPAQUE || !pd_on(real, pd)) return real->vkGetPhysicalDeviceImageFormatProperties2(pd, info, props);
+    if (!ei || ei->handleType != OPAQUE || !pd_on(real, pd)) {
+        VkResult r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, info, props);
+        if (r == VK_ERROR_FORMAT_NOT_SUPPORTED && ei && (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
+            r = mutable_query_retry(real, pd, info, props);
+        if (vkb_verbose && ei) {
+            /* RP4 Pro investigation: what the driver was asked and what it said (vkb_verbose only) */
+            char chain[200] = "";
+            int n = 0;
+            const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mi = NULL;
+            for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext) {
+                n += snprintf(chain + n, n < (int)sizeof(chain) ? sizeof(chain) - (size_t)n : 0, " %d", (int)b->sType);
+                if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT) mi = (const void *)b;
+            }
+            VkExternalImageFormatProperties *ep = props ? chain_find(props, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) : NULL;
+            VKB_INFO("image format query: format %u type %u tiling %u usage 0x%x flags 0x%x handle 0x%x chain [%s]%s mod 0x%llx sharing %u qfc %u -> %d, ext features 0x%x",
+                     info->format, info->type, info->tiling, info->usage, info->flags, ei->handleType, chain, mi ? "" : " (no modifier info)",
+                     mi ? (unsigned long long)mi->drmFormatModifier : 0ull, mi ? mi->sharingMode : 0, mi ? mi->queueFamilyIndexCount : 0, r,
+                     ep ? ep->externalMemoryProperties.externalMemoryFeatures : 0);
+            if (mi && r != VK_SUCCESS) {
+                /* the same question built here, to tell a wire problem from a driver answer */
+                VkPhysicalDeviceImageDrmFormatModifierInfoEXT m2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, NULL,
+                                                                    mi->drmFormatModifier, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+                VkPhysicalDeviceExternalImageFormatInfo e2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &m2, ei->handleType};
+                VkPhysicalDeviceImageFormatInfo2 i2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &e2, info->format, info->type,
+                                                       info->tiling, info->usage, info->flags};
+                VkExternalImageFormatProperties p2e = {VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+                VkImageFormatProperties2 p2 = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &p2e};
+                VkResult r2 = real->vkGetPhysicalDeviceImageFormatProperties2(pd, &i2, &p2);
+                VKB_INFO("image format query: rebuilt on the server -> %d, ext features 0x%x", r2, p2e.externalMemoryProperties.externalMemoryFeatures);
+            }
+        }
+        return r;
+    }
     /* The rest of the request's chain (format lists, usage) still applies; the external struct
      * and the external answer are ours. */
     VkPhysicalDeviceImageFormatInfo2 *ii = (VkPhysicalDeviceImageFormatInfo2 *)info;

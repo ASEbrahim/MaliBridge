@@ -83,7 +83,10 @@ static const vkb_native_handle *(*p_AHardwareBuffer_getNativeHandle)(const struc
 static int ahb_rarely = -1;
 static int ahb_uncached(void)
 {
-    if (ahb_rarely < 0) ahb_rarely = vkb_srv_env_global("VKBRIDGE_AHB_RARELY") != NULL;
+    if (ahb_rarely < 0) {
+        const char *v = vkb_srv_env_global("VKBRIDGE_AHB_RARELY"); /* "0" means off, like the other switches */
+        ahb_rarely = v ? strcmp(v, "0") != 0 : 0;
+    }
     return ahb_rarely;
 }
 #ifdef __ANDROID__
@@ -481,6 +484,7 @@ vkb_srv_mem *vkb_mem_find(vkb_srv_table *dev, VkDeviceMemory mem, int remove)
 /* Frees the server-side resources of an allocation (the VkDeviceMemory must already be freed). */
 static void mem_release_backing(vkb_srv_mem *m)
 {
+    if (m->cu_map) vkb_cu_remove(m);
     if (m->host_ptr) munmap(m->host_ptr, m->host_len);
 #ifdef __ANDROID__
     if (m->ahb) p_AHardwareBuffer_release(m->ahb);
@@ -767,7 +771,7 @@ static VkResult alloc_shared(const vkb_dispatch *dt, VkDevice dev, uint32_t s, c
         }
         /* CPU usage decides how gralloc caches the pages: uncached where the self-test needed it
          * (ahb_rarely) or VKBRIDGE_AHB_RARELY=1 asks. */
-        uint64_t cpu = ahb_uncached() ? (2ull | (2ull << 4)) : (AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN);
+        uint64_t cpu = ahb_uncached() && cached != 2 ? (2ull | (2ull << 4)) : (AHB_USAGE_CPU_READ_OFTEN | AHB_USAGE_CPU_WRITE_OFTEN);
         vkb_ahb_desc d = {(uint32_t)sz, 1, 1, AHB_FORMAT_BLOB, cpu | AHB_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
         struct AHardwareBuffer *ahb = NULL;
         int ar = p_AHardwareBuffer_allocate(&d, &ahb);
@@ -1199,8 +1203,63 @@ static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties2(VkPhys
     fake_lazy_props(&mp->memoryProperties);
 }
 
+/* ------------------------------------------------------------------ linear images under the AHB strategy */
+
+/*
+ * Under the AHardwareBuffer memory strategy (no dma-heap: Retroid Pocket 4 Pro, kernel 4.19) the
+ * client makes its linear images with the AHB handle type so the app can map them, and the server
+ * binds them to BLOB AHardwareBuffers. Mali r32p1 cannot address such an image: it reports a
+ * rowPitch of 0 for it and reads every row as row 0 (tools/vklinear.py: a 320x240 image written
+ * through its mapping copied out as 240 copies of its first row), so a Zink staging texture mapped
+ * this way - wined3d's system-memory surfaces, Ys Origin's 320x240 DirectDraw scratch - came out
+ * as one repeated row, white on screen. Zink takes linear tiling only where the format's
+ * linearTilingFeatures allow it; with none reported it stages through buffers, whose uploads and
+ * read-backs are right here. So under this strategy no format offers linear tiling.
+ * VKBRIDGE_AHB_LINEAR=1 keeps the driver's answer (to see what a newer driver does).
+ */
+static int ahb_linear_hidden(VkPhysicalDevice pd)
+{
+    static int keep = -1;
+    if (keep < 0) {
+        const char *v = vkb_srv_env("VKBRIDGE_AHB_LINEAR");
+        keep = v && !strcmp(v, "1");
+    }
+    if (keep) return 0;
+    vkb_srv_table *t = vkb_srv_current_table();
+    const vkb_pd_knowledge *k = t ? vkb_pd_lookup(&t->real, pd) : NULL;
+    return k && k->info.strategy == VKB_MEM_AHB;
+}
+
+static void hide_linear(VkPhysicalDevice pd, VkFormatProperties *p, VkFormatProperties3 *p3)
+{
+    if (!ahb_linear_hidden(pd)) return;
+    static int told;
+    if (p->linearTilingFeatures && !__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED))
+        VKB_INFO("linear tiling hidden from clients under the AHardwareBuffer memory strategy: an image bound to a BLOB AHardwareBuffer "
+                 "reads every row as its first (Mali r32p1); Zink stages its mapped textures through buffers instead (VKBRIDGE_AHB_LINEAR=1 keeps it)");
+    p->linearTilingFeatures = 0;
+    if (p3) p3->linearTilingFeatures = 0;
+}
+
+static VKAPI_ATTR void VKAPI_CALL nolinear_GetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat format, VkFormatProperties *p)
+{
+    vkb_srv_current_table()->real.vkGetPhysicalDeviceFormatProperties(pd, format, p);
+    hide_linear(pd, p, NULL);
+}
+
+static VKAPI_ATTR void VKAPI_CALL nolinear_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat format, VkFormatProperties2 *p)
+{
+    vkb_srv_current_table()->real.vkGetPhysicalDeviceFormatProperties2(pd, format, p);
+    VkFormatProperties3 *p3 = NULL;
+    for (VkBaseOutStructure *b = p->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) p3 = (VkFormatProperties3 *)b;
+    hide_linear(pd, &p->formatProperties, p3);
+}
+
 void vkb_mem_instance_install(vkb_srv_table *t)
 {
+    if (t->real.vkGetPhysicalDeviceFormatProperties) t->dt.vkGetPhysicalDeviceFormatProperties = nolinear_GetPhysicalDeviceFormatProperties;
+    if (t->real.vkGetPhysicalDeviceFormatProperties2) t->dt.vkGetPhysicalDeviceFormatProperties2 = nolinear_GetPhysicalDeviceFormatProperties2;
     if (!fake_lazy()) return;
     if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
     if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;
@@ -2014,10 +2073,19 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             VKB_ONCE(VKB_LOG_WARN, "cached readback asked for in memory type %u, which the self-test did not pass; uncached pages instead",
                      ai.memoryTypeIndex);
         int opaque = vkb_opaque_shared_info(t, &ai); /* server_opaque.c */
-        r = alloc_shared(c->dt, dev, s, &ai, client_fd, cached, &m, &out_fd);
+        /* Cached upload (server_cached_upload.c): cached AHB pages the server cleans before each
+         * submit and cleans+invalidates after each wait; the client still sees a coherent type. */
+        uint64_t want = ai.allocationSize;
+        int upload = !cached && !opaque && s == VKB_MEM_AHB && vkb_cu_reserve(want);
+        r = alloc_shared(c->dt, dev, s, &ai, client_fd, upload ? 2 : cached, &m, &out_fd);
+        if (upload) {
+            if (r == VK_SUCCESS && m->sync_fd1) vkb_cu_add(m);
+            else vkb_cu_unreserve(want);
+        }
         if (r == VK_SUCCESS && opaque) vkb_opaque_shared_done(m, out_fd);
         char path[48];
-        snprintf(path, sizeof(path), "shared (%s%s)", vkb_mem_strategy_name(s), cached ? ", cached" : "");
+        snprintf(path, sizeof(path), "shared (%s%s)", vkb_mem_strategy_name(s),
+                 upload && m && m->cu_map ? ", cached upload" : cached ? ", cached" : "");
         log_alloc(t, &ai, ai.memoryTypeIndex, ded, path, r);
     } else {
         if (client_fd >= 0) close(client_fd);
