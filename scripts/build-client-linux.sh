@@ -16,7 +16,7 @@ mkdir -p "$d/usr/local/lib/vkbridge" "$d/usr/local/share/vkbridge" "$d/usr/local
     $inc -I"$root/client" -I"$root/client/compat" -pthread \
     -Wl,--no-undefined -Wl,-z,nodelete -Wl,-soname,libvulkan_droidbridge.so \
     -o "$d/usr/local/lib/vkbridge/libvulkan_droidbridge.so" \
-    "$root"/client/*.c "$root/common/vkb_wire.c" "$root/common/gen/vkb_gen_structs.c" "$root/common/gen/vkb_gen_client.c" -ldl
+    "$root"/client/*.c "$root/common/vkb_wire.c" "$root/common/vkb_caps.c" "$root/common/gen/vkb_gen_structs.c" "$root/common/gen/vkb_gen_client.c" -ldl
 "$strip" --strip-unneeded "$d/usr/local/lib/vkbridge/libvulkan_droidbridge.so"
 "$cc" -O2 -Wall $inc -I"$root/tests" -o "$d/usr/local/bin/droiddeck-vkbridge-smoke" "$root/tests/smoke.c" -ldl
 "$strip" --strip-unneeded "$d/usr/local/bin/droiddeck-vkbridge-smoke"

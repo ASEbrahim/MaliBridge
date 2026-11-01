@@ -159,6 +159,8 @@ void vkb_emu_vb_sizes_resolve(vkb_emu_device *e, uint32_t n, const VkBuffer *buf
                               const VkDeviceSize *sizes);
 int vkb_emu_ext_hidden(const char *name); /* VKBRIDGE_FAKE_MISSING / VKBRIDGE_SERVER_HIDE_EXTS */
 int vkb_emu_ext_hidden_by_env(const char *name); /* the same, without server_emu.c's own hiding */
+void vkb_emu_a1_layer(const char *comm); /* the layer: the a1 gate only for Steam mode's own processes */
+int vkb_steam_own_process(const char *comm); /* server_apicap.c: gamescope, Xwayland, steamwebhelper, steam */
 int vkb_emu_hiding_exts(void);
 void vkb_emu_instance_install(vkb_srv_table *t); /* clients see the device extensions without the hidden ones */
 void vkb_emu_compat_uninstall(vkb_srv_table *dev);

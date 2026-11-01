@@ -3,257 +3,72 @@
  *
  * Client side of feature emulation: the app sees a feature when the GPU has it or the server
  * emulates it (vkb_server_pd_info.emu), and does not see one the GPU lacks (.missing).
+ *
+ * Note: see common/vk_caps.c for actual implementation
  */
 #define _GNU_SOURCE
 #include "emu.h"
 #include "gen/vkb_client_gen.h"
+#include "vkb_caps.h"
 #include "vkb_emu_formats.h"
-#include "vkb_ext_alias.h"
 
-#include <string.h>
 #include <unistd.h>
-
-#define EMU(pd, f) (((pd)->info.emu & (f)) != 0)
-#define MISSING(pd, f) (((pd)->info.missing & (f)) != 0 && !EMU(pd, f))
 
 const VkExtensionProperties *vkb_emu_extensions(vkb_physdev *pd, uint32_t *n)
 {
-    static __thread VkExtensionProperties list[16];
-    uint32_t c = 0;
-    if (EMU(pd, VKB_EMU_MAINT5)) list[c++] = (VkExtensionProperties){"VK_KHR_maintenance5", 1};
-    if (EMU(pd, VKB_EMU_DIVISOR)) {
-        list[c++] = (VkExtensionProperties){"VK_EXT_vertex_attribute_divisor", 3};
-        list[c++] = (VkExtensionProperties){"VK_KHR_vertex_attribute_divisor", 1};
-    }
-    if (EMU(pd, VKB_EMU_DEPTH_CLIP)) list[c++] = (VkExtensionProperties){"VK_EXT_depth_clip_enable", 1};
-    if (EMU(pd, VKB_EMU_ROBUSTNESS2)) list[c++] = (VkExtensionProperties){"VK_EXT_robustness2", 1};
-    if (EMU(pd, VKB_EMU_MAINT6)) list[c++] = (VkExtensionProperties){"VK_KHR_maintenance6", 1};
-    if (EMU(pd, VKB_EMU_LOADSTORE_NONE)) list[c++] = (VkExtensionProperties){"VK_KHR_load_store_op_none", 1};
-    if (EMU(pd, VKB_EMU_PUSH_DESC)) list[c++] = (VkExtensionProperties){"VK_KHR_push_descriptor", 2};
-    if (EMU(pd, VKB_EMU_DYN_RENDER)) list[c++] = (VkExtensionProperties){"VK_KHR_dynamic_rendering", 1};
-    *n = c;
-    return list;
+    return vkb_caps_emu_extensions(&pd->caps, n);
 }
-
-/* vkd3d-proton's minimum is 1,000,000 (D3D12 resource binding tier 2); the server cuts layouts
- * past the GPU's own limits (server_emu_desc.c). */
-#define DESC_LIMIT (1u << 20)
-#define RAISE(x, v) do { if ((x) < (v)) (x) = (v); } while (0)
 
 void vkb_emu_patch_limits(vkb_physdev *pd, VkPhysicalDeviceProperties *p)
 {
-    if (EMU(pd, VKB_EMU_DESC_LIMITS)) {
-        VkPhysicalDeviceLimits *l = &p->limits;
-        RAISE(l->maxPerStageDescriptorSampledImages, DESC_LIMIT);
-        RAISE(l->maxPerStageDescriptorStorageImages, DESC_LIMIT);
-        RAISE(l->maxPerStageDescriptorStorageBuffers, DESC_LIMIT);
-        RAISE(l->maxDescriptorSetSampledImages, DESC_LIMIT);
-        RAISE(l->maxDescriptorSetStorageImages, DESC_LIMIT);
-        RAISE(l->maxDescriptorSetStorageBuffers, DESC_LIMIT);
-        RAISE(l->maxPerStageResources, 4 * DESC_LIMIT);
-    }
-    /* D3D11 has 16 viewports; with multiViewport emulated, all but the first are dropped. */
-    if (EMU(pd, VKB_EMU_MULTI_VIEWPORT) && p->limits.maxViewports < 16) p->limits.maxViewports = 16;
-    if (EMU(pd, VKB_EMU_DUAL_SRC) && p->limits.maxFragmentDualSrcAttachments < 1) p->limits.maxFragmentDualSrcAttachments = 1;
-    /* Without multiDrawIndirect the limit is 1; the server splits any count into single draws. */
-    if (EMU(pd, VKB_EMU_MULTI_DRAW)) p->limits.maxDrawIndirectCount = UINT32_MAX;
+    vkb_caps_patch_properties(&pd->caps, p, 0);
 }
 
-/* The update-after-bind limits: same member names in VkPhysicalDeviceVulkan12Properties and
- * VkPhysicalDeviceDescriptorIndexingProperties. */
-#define raise_uab(d)                                                             \
-    do {                                                                         \
-        RAISE((d)->maxPerStageDescriptorUpdateAfterBindSampledImages, DESC_LIMIT); \
-        RAISE((d)->maxPerStageDescriptorUpdateAfterBindStorageImages, DESC_LIMIT); \
-        RAISE((d)->maxPerStageDescriptorUpdateAfterBindStorageBuffers, DESC_LIMIT); \
-        RAISE((d)->maxDescriptorSetUpdateAfterBindSampledImages, DESC_LIMIT);    \
-        RAISE((d)->maxDescriptorSetUpdateAfterBindStorageImages, DESC_LIMIT);    \
-        RAISE((d)->maxDescriptorSetUpdateAfterBindStorageBuffers, DESC_LIMIT);   \
-        RAISE((d)->maxPerStageUpdateAfterBindResources, 4 * DESC_LIMIT);         \
-    } while (0)
-
-/* The app name of an extension the driver has under its KHR name only (vkb_ext_alias.h). */
-static int aliased(vkb_physdev *pd, const char *app)
+static void client_get_props2_cb(VkPhysicalDevice p, VkPhysicalDeviceProperties2 *out, void *user)
 {
-    for (uint32_t i = 0; i < VKB_EXT_ALIAS_COUNT; i++)
-        if ((pd->aliased & (1u << i)) && !strcmp(vkb_ext_aliases[i].app, app)) return 1;
-    return 0;
+    vkb_wire_vkGetPhysicalDeviceProperties2(p, out);
 }
 
 void vkb_emu_patch_properties_chain(vkb_physdev *pd, VkBaseOutStructure *b)
 {
-    if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT)
-        ((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT *)b)->minPlacedMemoryMapAlignment = (VkDeviceSize)sysconf(_SC_PAGESIZE);
-    if (EMU(pd, VKB_EMU_DESC_LIMITS)) {
-        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES) raise_uab((VkPhysicalDeviceVulkan12Properties *)b);
-        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES)
-            raise_uab((VkPhysicalDeviceDescriptorIndexingProperties *)b);
-    }
-    if (EMU(pd, VKB_EMU_PUSH_DESC) && b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES)
-        ((VkPhysicalDevicePushDescriptorProperties *)b)->maxPushDescriptors = 32;
-    if (EMU(pd, VKB_EMU_TEXEL_ALIGN)) {
-        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES)
-            ((VkPhysicalDeviceVulkan13Properties *)b)->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
-        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES)
-            ((VkPhysicalDeviceTexelBufferAlignmentProperties *)b)->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
-    }
-    if (EMU(pd, VKB_EMU_MAINT6) && b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES) {
-        VkPhysicalDeviceMaintenance6Properties *m = (void *)b;
-        m->blockTexelViewCompatibleMultipleLayers = VK_FALSE;
-        m->maxCombinedImageSamplerDescriptorCount = 3;
-        m->fragmentShadingRateClampCombinerInputs = VK_FALSE;
-    }
-    if (EMU(pd, VKB_EMU_ROBUSTNESS2) && b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT) {
-        VkPhysicalDeviceRobustness2PropertiesEXT *r = (void *)b;
-        r->robustStorageBufferAccessSizeAlignment = 4;
-        r->robustUniformBufferAccessSizeAlignment = 256;
-    }
-    if (EMU(pd, VKB_EMU_DIVISOR)) {
-        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT)
-            ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *)b)->maxVertexAttribDivisor = UINT32_MAX;
-        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES) {
-            VkPhysicalDeviceVertexAttributeDivisorProperties *p = (void *)b;
-            p->maxVertexAttribDivisor = UINT32_MAX;
-            p->supportsNonZeroFirstInstance = VK_TRUE;
-        }
-    } else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT &&
-               aliased(pd, "VK_EXT_vertex_attribute_divisor")) {
-        /* The EXT structure is not an alias of the KHR one: a KHR-only driver leaves it alone. */
-        VkPhysicalDeviceVertexAttributeDivisorProperties k = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES};
-        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &k};
-        vkb_wire_vkGetPhysicalDeviceProperties2((VkPhysicalDevice)pd, &p2);
-        ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *)b)->maxVertexAttribDivisor = k.maxVertexAttribDivisor;
-    }
-}
-
-static void set_feature(vkb_physdev *pd, uint32_t flag, VkBool32 *f)
-{
-    if (EMU(pd, flag)) *f = VK_TRUE;
-    else if (MISSING(pd, flag)) *f = VK_FALSE;
+    vkb_caps_patch_properties_chain(&pd->caps, (VkPhysicalDevice)pd, b, client_get_props2_cb, NULL);
 }
 
 void vkb_emu_patch_features(vkb_physdev *pd, VkPhysicalDeviceFeatures *f)
 {
-    set_feature(pd, VKB_EMU_BCN, &f->textureCompressionBC);
-    set_feature(pd, VKB_EMU_CLIP_DISTANCE, &f->shaderClipDistance);
-    set_feature(pd, VKB_EMU_CULL_DISTANCE, &f->shaderCullDistance);
-    set_feature(pd, VKB_EMU_DUAL_SRC, &f->dualSrcBlend);
-    set_feature(pd, VKB_EMU_FILL_MODE, &f->fillModeNonSolid);
-    set_feature(pd, VKB_EMU_MULTI_VIEWPORT, &f->multiViewport);
-    set_feature(pd, VKB_EMU_MULTI_DRAW, &f->multiDrawIndirect);
+    vkb_caps_patch_features(&pd->caps, f);
 }
 
 void vkb_emu_patch_features_chain(vkb_physdev *pd, VkBaseOutStructure *b)
 {
-    switch ((int)b->sType) {
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES:
-        if (EMU(pd, VKB_EMU_MAINT5)) ((VkPhysicalDeviceMaintenance5Features *)b)->maintenance5 = VK_TRUE;
-        break;
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES:
-        if (EMU(pd, VKB_EMU_MAINT6)) ((VkPhysicalDeviceMaintenance6Features *)b)->maintenance6 = VK_TRUE;
-        break;
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES: {
-        VkPhysicalDeviceVertexAttributeDivisorFeatures *d = (void *)b;
-        set_feature(pd, VKB_EMU_DIVISOR, &d->vertexAttributeInstanceRateDivisor);
-        set_feature(pd, VKB_EMU_DIVISOR, &d->vertexAttributeInstanceRateZeroDivisor);
-        break;
-    }
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT:
-        /* Emulated depth clip is pipeline state (clamp = not clip): neither may be dynamic. */
-        if (MISSING(pd, VKB_EMU_DEPTH_CLIP) || EMU(pd, VKB_EMU_DEPTH_CLIP)) {
-            VkPhysicalDeviceExtendedDynamicState3FeaturesEXT *d3 = (void *)b;
-            d3->extendedDynamicState3DepthClipEnable = VK_FALSE;
-            if (EMU(pd, VKB_EMU_DEPTH_CLIP)) d3->extendedDynamicState3DepthClampEnable = VK_FALSE;
-        }
-        break;
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
-        if (EMU(pd, VKB_EMU_ROBUSTNESS2)) {
-            VkPhysicalDeviceRobustness2FeaturesEXT *r = (void *)b;
-            r->robustBufferAccess2 = r->robustImageAccess2 = r->nullDescriptor = VK_TRUE;
-        } else if (EMU(pd, VKB_EMU_ROBUST2_ACCESS)) {
-            /* the driver's null descriptors, its core robustness for the rest (server_emu.c) */
-            VkPhysicalDeviceRobustness2FeaturesEXT *r = (void *)b;
-            r->robustBufferAccess2 = r->robustImageAccess2 = VK_TRUE;
-        }
-        break;
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
-        set_feature(pd, VKB_EMU_DYN_RENDER, &((VkPhysicalDeviceDynamicRenderingFeatures *)b)->dynamicRendering);
-        break;
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
-        set_feature(pd, VKB_EMU_DYN_RENDER, &((VkPhysicalDeviceVulkan13Features *)b)->dynamicRendering);
-        break;
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
-        set_feature(pd, VKB_EMU_DEPTH_CLIP, &((VkPhysicalDeviceDepthClipEnableFeaturesEXT *)b)->depthClipEnable);
-        break;
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES: {
-        VkPhysicalDeviceVulkan14Features *v = (void *)b;
-        v->hostImageCopy = VK_FALSE;
-        if (EMU(pd, VKB_EMU_MAINT6)) v->maintenance6 = VK_TRUE;
-        set_feature(pd, VKB_EMU_DIVISOR, &v->vertexAttributeInstanceRateDivisor);
-        set_feature(pd, VKB_EMU_DIVISOR, &v->vertexAttributeInstanceRateZeroDivisor);
-        break;
-    }
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT: {
-        /* Whole allocations only: memory.c moves the client's mapping to the address. */
-        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *m = (void *)b;
-        m->memoryMapPlaced = m->memoryUnmapReserve = pd->info.strategy != VKB_MEM_NONE;
-        m->memoryMapRangePlaced = VK_FALSE;
-        break;
-    }
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES:
+    if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES) {
         /* Host image copy hands the driver host pointers: never offered across the bridge. */
         ((VkPhysicalDeviceHostImageCopyFeatures *)b)->hostImageCopy = VK_FALSE;
-        break;
-    default:
-        break;
+        return;
     }
+
+    vkb_caps_patch_features_chain(&pd->caps, b, /*is_remote_bridge=*/ 1, pd->info.strategy != VKB_MEM_NONE);
 }
 
-int vkb_emu_is_emulated_format(vkb_physdev *pd, VkFormat format)
+static void get_pd_format_properties(VkPhysicalDevice p, VkFormat format, VkFormatProperties *out, void *user)
 {
-    return vkb_is_bc(format) && EMU(pd, VKB_EMU_BCN);
+    vkb_wire_vkGetPhysicalDeviceFormatProperties(p, format, out);
+}
+
+static void get_pd_format_properties2(VkPhysicalDevice p, VkFormat format, VkFormatProperties2 *out, void *user)
+{
+    vkb_wire_vkGetPhysicalDeviceFormatProperties2(p, format, out);
 }
 
 int vkb_emu_format_properties(vkb_physdev *pd, VkFormat format, VkFormatProperties *fp, VkFormatProperties2 *fp2)
 {
-    if ((vkb_bgr10_rgba(format) != VK_FORMAT_UNDEFINED && EMU(pd, VKB_EMU_BGR10_VTX)) ||
-        (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && EMU(pd, VKB_EMU_UF11_VTX))) {
-        /* Vertex fetch: done as the A2B10G10R10 format with red and blue swapped, or as R32_UINT
-         * unpacked, in the vertex shader (server_emu_shader.c), exact also where the driver has it;
-         * everything else as the driver says. */
-        if (fp2) vkb_wire_vkGetPhysicalDeviceFormatProperties2((VkPhysicalDevice)pd, format, fp2);
-        else vkb_wire_vkGetPhysicalDeviceFormatProperties((VkPhysicalDevice)pd, format, fp);
-        fp->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
-        for (VkBaseOutStructure *b = fp2 ? (VkBaseOutStructure *)fp2->pNext : NULL; b; b = b->pNext)
-            if (b->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) ((VkFormatProperties3 *)b)->bufferFeatures |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-        return 1;
-    }
-    if (!vkb_is_bc(format) || !(pd->info.missing & VKB_EMU_BCN)) return 0;
-    memset(fp, 0, sizeof(*fp));
-    if (EMU(pd, VKB_EMU_BCN)) {
-        /* What the decoded image can do, limited to what a compressed texture is used for. */
-        VkFormatProperties real;
-        vkb_wire_vkGetPhysicalDeviceFormatProperties((VkPhysicalDevice)pd, vkb_bc_view_format(format), &real);
-        fp->optimalTilingFeatures = real.optimalTilingFeatures &
-                                    (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-                                     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                                     VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT);
-    }
-    if (fp2) {
-        for (VkBaseOutStructure *b = (VkBaseOutStructure *)fp2->pNext; b; b = b->pNext) {
-            if (b->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
-                VkFormatProperties3 *p3 = (void *)b;
-                p3->linearTilingFeatures = 0;
-                p3->optimalTilingFeatures = fp->optimalTilingFeatures;
-                p3->bufferFeatures = 0;
-            } else if (b->sType == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT) {
-                ((VkDrmFormatModifierPropertiesListEXT *)b)->drmFormatModifierCount = 0;
-            } else if (b->sType == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT) {
-                ((VkDrmFormatModifierPropertiesList2EXT *)b)->drmFormatModifierCount = 0;
-            }
-        }
-    }
-    return 1;
+    return vkb_caps_format_properties2(&pd->caps, (VkPhysicalDevice)pd, format, fp, fp2,
+                                        get_pd_format_properties, get_pd_format_properties2, NULL);
+}
+
+int vkb_emu_is_emulated_format(vkb_physdev *pd, VkFormat format)
+{
+    return vkb_is_bc(format) && (pd->caps.emu & VKB_EMU_BCN);
 }
 
 VkFormat vkb_emu_real_format(vkb_physdev *pd, VkFormat format, VkImageUsageFlags *usage, VkImageCreateFlags *flags)
@@ -266,78 +81,14 @@ VkFormat vkb_emu_real_format(vkb_physdev *pd, VkFormat format, VkImageUsageFlags
     return vkb_bc_view_format(format);
 }
 
+int vkb_emu_planar_ext_usage(vkb_physdev *pd, VkFormat format, VkImageTiling tiling,
+                             VkImageUsageFlags usage, VkImageCreateFlags *flags)
+{
+    return vkb_caps_planar_ext_usage(&pd->caps, (VkPhysicalDevice)pd, format, tiling, usage,
+                                     flags, get_pd_format_properties, NULL);
+}
+
 /* Image creation is rewritten on the server (it knows the decode); nothing to do here. */
 void vkb_emu_image_create_info(vkb_device *dev, VkImageCreateInfo *ci) { (void)dev; (void)ci; }
 void vkb_emu_image_created(vkb_device *dev, const VkImageCreateInfo *ci, VkImage image) { (void)dev; (void)ci; (void)image; }
 void vkb_emu_image_destroyed(vkb_device *dev, VkImage image) { (void)dev; (void)image; }
-
-/* ------------------------------------------------------------------ multi-planar extended usage */
-
-/*
- * The Mali-G925 driver refuses VK_IMAGE_CREATE_EXTENDED_USAGE_BIT on multi-planar (YCbCr) formats:
- * vkGetPhysicalDeviceImageFormatProperties(2) answers VK_ERROR_FORMAT_NOT_SUPPORTED for an NV12
- * (G8_B8R8_2PLANE_420) image that is MUTABLE_FORMAT | EXTENDED_USAGE, even when every usage bit
- * asked for is one the format itself supports, and gives the same image without EXTENDED_USAGE.
- * The flag only relaxes the rules (usage may include bits only a view format supports), so with
- * usage the format covers it changes nothing. DXVK sets both flags on every multi-planar D3D11
- * texture (its plane views are R8 / R8G8), so each NV12 texture failed: "D3D11: Cannot create
- * texture: Format 103", Media Foundation's H.264 decoder could not allocate its output samples
- * ("Failed to initialize allocator, hr 0x80070057"), and Risk of Rain Returns waited for its intro
- * video's first frame for ever (2026-10-19).
- *
- * Such a query or image goes to the driver without EXTENDED_USAGE when the usage is all supported
- * by the format at that tiling (an image whose usage needs a view format's features keeps the flag,
- * and the driver's answer). VKBRIDGE_PLANAR_EXT_FIX=0 turns it off.
- */
-static int is_multiplanar(VkFormat f)
-{
-    switch (f) {
-    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
-    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM: case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
-    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
-    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16: case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
-    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16: case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
-    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
-    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16: case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
-    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16: case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
-    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
-    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM: case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
-    case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM: case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
-    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
-    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM: case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
-    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16: case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-int vkb_emu_planar_ext_usage(vkb_physdev *pd, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags *flags)
-{
-    static int off = -1;
-    if (off < 0) {
-        const char *v = getenv("VKBRIDGE_PLANAR_EXT_FIX");
-        off = v && !strcmp(v, "0");
-    }
-    if (off || !(*flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) || !is_multiplanar(format)) return 0;
-    if (tiling != VK_IMAGE_TILING_OPTIMAL && tiling != VK_IMAGE_TILING_LINEAR) return 0;
-    VkFormatProperties fp;
-    vkb_ep_vkGetPhysicalDeviceFormatProperties((VkPhysicalDevice)pd, format, &fp);
-    VkFormatFeatureFlags have = tiling == VK_IMAGE_TILING_OPTIMAL ? fp.optimalTilingFeatures : fp.linearTilingFeatures;
-    static const struct { VkImageUsageFlags u; VkFormatFeatureFlags f; } need[] = {
-        {VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_FEATURE_TRANSFER_SRC_BIT},
-        {VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_FORMAT_FEATURE_TRANSFER_DST_BIT},
-        {VK_IMAGE_USAGE_SAMPLED_BIT, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT},
-        {VK_IMAGE_USAGE_STORAGE_BIT, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT},
-        {VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT},
-    };
-    VkImageUsageFlags left = usage;
-    for (unsigned i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
-        if (!(usage & need[i].u)) continue;
-        if (!(have & need[i].f)) return 0; /* a view format's feature: the flag is needed */
-        left &= ~need[i].u;
-    }
-    if (left) return 0; /* a usage this check does not know */
-    *flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-    return 1;
-}
