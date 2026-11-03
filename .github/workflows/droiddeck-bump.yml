@@ -1,0 +1,67 @@
+name: DroidDeck bump
+run-name: DroidDeck pin branch for ${{ inputs.tag }}
+
+# After a release's asset is attached, prepare a branch on the owner's DroidDeck fork that moves the pin to it.
+# It stops there: it never opens a pull request, and it skips cleanly while the DD_BUMP_TOKEN secret (a
+# fine-grained token with Contents and Workflows write on ASEbrahim/DroidDeck) does not exist.
+
+on:
+    workflow_call:
+        inputs:
+            tag:
+                required: true
+                type: string
+        secrets:
+            DD_BUMP_TOKEN:
+                required: false
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: Release tag whose asset is already attached
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    bump:
+        name: Prepare the branch
+        runs-on: ubuntu-24.04
+        env:
+            TAG: ${{ inputs.tag }}
+            PUSH_TOKEN: ${{ secrets.DD_BUMP_TOKEN }}
+        steps:
+            - name: Check the token
+              id: token
+              run: |
+                  if [ -z "$PUSH_TOKEN" ]; then
+                      echo "::notice::DD_BUMP_TOKEN is not set, so no DroidDeck branch was prepared."
+                      {
+                          echo "### DroidDeck bump skipped"
+                          echo "The repository secret \`DD_BUMP_TOKEN\` does not exist. Create a fine-grained token with Contents and Workflows: read and write on ASEbrahim/DroidDeck (Workflows because the branch carries official main's workflow files) and add it under Settings, Secrets and variables, Actions. Nothing else is needed."
+                      } >> "$GITHUB_STEP_SUMMARY"
+                      echo "have=false" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "have=true" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Checkout the scripts
+              if: steps.token.outputs.have == 'true'
+              uses: actions/checkout@v4
+
+            - name: Download the release files
+              if: steps.token.outputs.have == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D assets \
+                      -p malibridge-droiddeck.tar.zst -p malibridge-droiddeck.tar.zst.sha256 \
+                      -p malibridge-source.tar.zst -p malibridge-source.tar.zst.sha256
+
+            - name: Prepare the branch on the fork
+              if: steps.token.outputs.have == 'true'
+              env:
+                  SYNC_FORK: "1"
+              run: scripts/droiddeck-bump.sh "$TAG" assets

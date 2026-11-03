@@ -1,0 +1,127 @@
+name: DroidDeck asset
+run-name: DroidDeck asset for ${{ github.event.release.tag_name || inputs.tag }}
+
+# Builds the one file DroidDeck pins (malibridge-droiddeck.tar.zst) and the matching source archive for a
+# release tag, and attaches them to the existing GitHub release. The release is published first and the APK
+# is uploaded by hand afterwards, so this runs on its own and only adds files.
+
+on:
+    release:
+        types: [published]
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: Release tag to build and attach to (the release must exist)
+                required: true
+            bump:
+                description: Also prepare the DroidDeck pin branch afterwards
+                type: boolean
+                default: false
+
+permissions:
+    contents: read
+
+env:
+    NDK_VERSION: 27.3.13750724
+    TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+    build:
+        name: Build the asset
+        runs-on: ubuntu-24.04
+        steps:
+            # The scripts come from the commit this workflow runs from, the source from the tag, so a tag made
+            # before the scripts existed can still be packaged.
+            - name: Checkout the packaging scripts
+              uses: actions/checkout@v4
+              with:
+                  path: tools
+
+            - name: Checkout the release tag
+              uses: actions/checkout@v4
+              with:
+                  ref: refs/tags/${{ env.TAG }}
+                  fetch-depth: 0
+                  fetch-tags: true
+                  path: src
+
+            - name: Install the toolchain
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu zstd
+                  if [ ! -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
+                      yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null || true
+                  fi
+                  test -x "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+
+            - name: Build twice, from two directories
+              run: |
+                  set -euo pipefail
+                  ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
+                  git -C src describe --tags --exact-match
+                  cp -a src src2
+                  tools/scripts/package-droiddeck-asset.sh "$ndk" out1 src
+                  tools/scripts/package-droiddeck-asset.sh "$ndk" out2 src2
+                  cmp out1/malibridge-droiddeck.tar.zst out2/malibridge-droiddeck.tar.zst
+                  cmp out1/malibridge-droiddeck.tar.zst.sha256 out2/malibridge-droiddeck.tar.zst.sha256
+                  mkdir dist
+                  cp out1/malibridge-droiddeck.tar.zst out1/malibridge-droiddeck.tar.zst.sha256 dist/
+
+            - name: Check the asset
+              run: tools/scripts/check-droiddeck-asset.sh dist/malibridge-droiddeck.tar.zst "$TAG"
+
+            - name: Source archive
+              run: |
+                  set -euo pipefail
+                  git -C src archive --format=tar --prefix="MaliBridge-$TAG/" "refs/tags/$TAG" | zstd -19 --no-check -q -o dist/malibridge-source.tar.zst
+                  (cd dist && sha256sum malibridge-source.tar.zst > malibridge-source.tar.zst.sha256)
+                  ls -l dist
+                  cat dist/*.sha256
+
+            - name: Summary
+              run: |
+                  {
+                      echo "### DroidDeck asset for $TAG"
+                      echo '```'
+                      cat dist/*.sha256
+                      echo '```'
+                      tar --zstd -xOf dist/malibridge-droiddeck.tar.zst ./MALIBRIDGE.json | head -12
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: droiddeck-asset
+                  path: dist/
+                  if-no-files-found: error
+
+    upload:
+        name: Attach to the release
+        needs: build
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  name: droiddeck-asset
+                  path: dist
+
+            - name: Upload
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  (cd dist && sha256sum -c malibridge-droiddeck.tar.zst.sha256 malibridge-source.tar.zst.sha256)
+                  gh release upload "$TAG" dist/malibridge-droiddeck.tar.zst dist/malibridge-droiddeck.tar.zst.sha256 \
+                      dist/malibridge-source.tar.zst dist/malibridge-source.tar.zst.sha256 --clobber -R "$GITHUB_REPOSITORY"
+                  gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | "\(.name) \(.size)"'
+
+    bump:
+        name: Prepare the DroidDeck pin branch
+        needs: upload
+        # Never for pre-releases or drafts; for a manual run only when asked.
+        if: ${{ (github.event_name == 'release' && !github.event.release.prerelease && !github.event.release.draft) || (github.event_name == 'workflow_dispatch' && inputs.bump) }}
+        uses: ./.github/workflows/droiddeck-bump.yml
+        with:
+            tag: ${{ github.event.release.tag_name || inputs.tag }}
+        secrets: inherit
