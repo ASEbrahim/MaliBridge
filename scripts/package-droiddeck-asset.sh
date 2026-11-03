@@ -13,6 +13,12 @@ set -euo pipefail
 # (BRIDGE_PAGES_ABI) or the banner_ahb_v1 version. The app refuses an asset with another number.
 INTERFACE=${MALIBRIDGE_INTERFACE:-1}
 
+# The build scripts compile "server/*.c" and "client/*.c" in the order the shell sorts them, and that order
+# changes the bytes of the libraries. The releases are built and tested with en_US.UTF-8, so the asset is
+# built with it too: the libraries are then the same bytes as the ones in the APK that was tested.
+locale -a | grep -qix 'en_US\.utf-\?8' || { echo "the locale en_US.UTF-8 is needed (the file order of the build, see the comment above)" >&2; exit 1; }
+export LC_ALL=en_US.UTF-8
+
 ndk=$(cd "$1" && pwd)
 mkdir -p "$2"
 out=$(cd "$2" && pwd)
@@ -78,7 +84,7 @@ JSON
 find "$r" -type d -exec chmod 755 {} +
 find "$r" -type f -exec chmod 644 {} +
 chmod 755 "$r/usr/local/bin/droiddeck-vkbridge-smoke"
-tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
+LC_ALL=C tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
     -C "$r" -cf "$stage/asset.tar" .
 zstd -19 --no-check -q -f -o "$out/malibridge-droiddeck.tar.zst" "$stage/asset.tar"
 (cd "$out" && sha256sum malibridge-droiddeck.tar.zst > malibridge-droiddeck.tar.zst.sha256)

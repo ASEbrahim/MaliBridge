@@ -48,7 +48,8 @@ jobs:
             - name: Install the toolchain
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross zstd
+                  sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross zstd locales
+                  sudo locale-gen en_US.UTF-8
                   if [ ! -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
                       yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null || true
                   fi
