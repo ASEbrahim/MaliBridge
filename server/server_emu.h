@@ -28,6 +28,8 @@ typedef struct vkb_emu_image {
     uint32_t drop;            /* VKBRIDGE_TEX_MAXDIM: the app's top levels not created (app level m is level m - drop here) */
     int linear_mod;           /* a modifier-list dma-buf image made plain LINEAR (reports the LINEAR modifier) */
     int64_t bc_fallback;      /* BC decoded over VKBRIDGE_BC_TX_BUDGET: the bytes that costs over transcoding it */
+    VkImageUsageFlags client_usage; /* BC: the usage the app asked for (the transcoded image has no COLOR_ATTACHMENT) */
+    struct bc_sink *sinks;    /* BC transcoded: stand-ins for uncompressed views the app may render to (server_emu_bcn.c) */
     struct vkb_emu_image *next;
 } vkb_emu_image;
 

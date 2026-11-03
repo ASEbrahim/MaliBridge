@@ -55,6 +55,7 @@ typedef struct vkb_qmirror {
     uint8_t *mirrored;       /* per query, atomic */
     uint32_t *nr_polls;      /* per query: not-ready answers from the mirror in a row (stuck_ask) */
     uint32_t *nr_since;      /* per query: ms clock of the first of them */
+    uint32_t late;           /* atomic: a query of this pool was found done on the GPU while the mirror said not ready (stuck_ask) */
 } vkb_qmirror;
 
 typedef struct vkb_qop {
@@ -553,13 +554,17 @@ const char *vkb_query_why_wire(void) { return why_wire ? why_wire : "?"; }
  * the mirror must not say "not ready" forever: no call of the app's ever reaches the
  * server again to notice.
  *
- * So a query the mirror has answered "not ready" for 200 ms in a row is asked of the server once.
- * If the driver has it, the query leaves the mirror (answered by the server, the authority, until
- * its next reset or copy mirrors it again) and the
+ * So a query the mirror has answered "not ready" for VKBRIDGE_QUERY_STUCK_MS (default 200; 0 =
+ * never) in a row is asked of the server once. A pool in which that found a result (a "late" pool: the
+ * mirror's copy sits at the end of the command buffer, the driver has the result when the render pass
+ * is done, so on a slow frame the mirror is late by the rest of it) asks after LATE_MS for its other
+ * queries too: Sifu (UE4) stalled 0.2-1.7 s once per query, 128 times in one pool. If the driver has it, the query leaves the mirror
+ * (answered by the server, the authority, until its next reset or copy mirrors it again) and the
  * case is logged; if not, the count starts over. The normal case is untouched: a result reaches
  * the mirror at most a GPU frame after its submit (Stray at 14 fps: ~70 ms),
  * and a poll that sees it ready costs no round trip, as before. The clock is read on the first 64
  * not-ready answers of a run and then every 64th, so a tight spin pays almost nothing for it. */
+#define LATE_MS 2
 static uint32_t stuck_ms(void)
 {
     static int v = -2;
@@ -590,12 +595,16 @@ static int stuck_ask(vkb_qmirror *m, uint32_t q, uint32_t *held)
 {
     uint32_t limit = stuck_ms();
     if (!limit) return 0;
+    /* A pool already found late: its other queries are late the same way (the copy waits for the end of the command buffer,
+     * the driver has the result when the render pass is done), so ask after LATE_MS, not 200 (Sifu, 128 stalls of 0.2-1.7 s). */
+    int late = __atomic_load_n(&m->late, __ATOMIC_RELAXED);
+    if (late && limit > LATE_MS) limit = LATE_MS;
     uint32_t n = __atomic_add_fetch(&m->nr_polls[q], 1, __ATOMIC_RELAXED);
     if (n == 1) {
         __atomic_store_n(&m->nr_since[q], now_ms(), __ATOMIC_RELAXED);
         return 0;
     }
-    if (n > 64 && (n & 63)) return 0;
+    if (!late && n > 64 && (n & 63)) return 0;
     uint32_t t = now_ms() - __atomic_load_n(&m->nr_since[q], __ATOMIC_RELAXED);
     if (t < limit) return 0;
     /* Start over: if the server says not ready either, the next question comes a period later. */
@@ -618,6 +627,9 @@ void vkb_query_wire_answer(vkb_device *d, VkQueryPool pool, uint32_t first, uint
         return;
     }
     for (uint32_t q = first; q < first + count && q < m->count; q++) __atomic_store_n(&m->mirrored[q], 0, __ATOMIC_RELEASE);
+    if (!__atomic_exchange_n(&m->late, 1, __ATOMIC_RELAXED))
+        VKB_INFO("query mirror: pool %llx is late (the GPU had a result %u ms before the mirror): its not-ready queries are asked of the "
+                 "server after %d ms from now on", (unsigned long long)(uintptr_t)pool, stuck_probe.ms, LATE_MS);
     uint32_t n = __atomic_add_fetch(&stuck_found, 1, __ATOMIC_RELAXED);
     if (n <= 5 || (n & (n - 1)) == 0)
         VKB_WARN("query mirror: query %u+%u of pool %llx was not ready in the mirror for %u ms but done on the GPU; answered by the "

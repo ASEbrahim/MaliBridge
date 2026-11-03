@@ -16,6 +16,11 @@
  * the marker: the server's compile watchdog must replace it with its neutral LUT stand-in, and
  * the drawn texel must be that stand-in's value (no grading) - not this shader's red tint.
  *
+ * --lutslow: the LUT-shaped fragment stage with the marker, the pipeline made and nothing drawn; one "RESULT built|failed"
+ * line (the server runs with VKBRIDGE_TEST_CRASH_PIPELINE=slow: host/gsfold_test.sh step 5, three runs on one cache
+ * directory: the compile that takes longer than the limit gets the stand-in, is compiled again with twice the limit
+ * in the next run, and built with that limit in the one after).
+ *
  * Shaders: tests/shaders/gsfold/ (glslc -O --target-env=vulkan1.2 -mfmt=num -> gsfold_*.inc).
  */
 #define VK_NO_PROTOTYPES
@@ -67,7 +72,8 @@ static const VkSpecializationInfo marker = {1, &marker_entry, 4, &marker_value};
 
 int main(int argc, char **argv)
 {
-    int mark = argc > 1 && !strcmp(argv[1], "--mark"), lut = argc > 1 && !strcmp(argv[1], "--lut");
+    int mark = argc > 1 && !strcmp(argv[1], "--mark"), lutslow = argc > 1 && !strcmp(argv[1], "--lutslow"),
+        lut = lutslow || (argc > 1 && !strcmp(argv[1], "--lut"));
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) return printf("FAIL loader\n"), 2;
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
@@ -178,6 +184,10 @@ int main(int argc, char **argv)
                                         pl, rp, 0, VK_NULL_HANDLE, -1};
     VkPipeline pipe;
     VkResult pr = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gci, NULL, &pipe);
+    if (lutslow) {
+        printf("RESULT %s\n", pr ? "failed" : "built");
+        return 0;
+    }
     if (pr) return printf("FAIL pipeline: %d\n", pr), 1;
 
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, W * H * 4 * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};

@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
@@ -134,6 +135,16 @@ static rp_class classes[RP_CLASSES];
 static int nclasses, dropped_classes;
 static rp_proc procs[RP_PROCS];
 static int nprocs;
+
+/* Another process presented frames after [since] (session seconds): the one that is asked about is
+ * not the picture in front (the Steam UI or the Wine desktop behind a game), so its quiet is not a
+ * fault. */
+static int other_presented_after(const rp_proc *p, double since)
+{
+    for (int i = 0; i < nprocs; i++)
+        if (&procs[i] != p && procs[i].last_frame_s > since) return 1;
+    return 0;
+}
 static int dirty, started_thread;
 static long avail_min_kb = -1, mem_total_kb;
 static int64_t rss_peak_kb;
@@ -867,16 +878,14 @@ typedef struct issues {
     FILE *f;
     int n;
     int json;
+    int notes; /* 0: list the problems, 1: list the informational notes (not counted as problems) */
 } issues;
 
-static void issue(issues *is, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-static void issue(issues *is, const char *fmt, ...)
+static void emit_line(issues *is, const char *fmt, va_list ap) __attribute__((format(printf, 2, 0)));
+static void emit_line(issues *is, const char *fmt, va_list ap)
 {
     char line[900];
-    va_list ap;
-    va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
     is->n++;
     if (!is->f) return;
     if (is->json) {
@@ -887,6 +896,27 @@ static void issue(issues *is, const char *fmt, ...)
         md_text(is->f, line);
         fputc('\n', is->f);
     }
+}
+
+static void issue(issues *is, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void issue(issues *is, const char *fmt, ...)
+{
+    if (is->notes) return;
+    va_list ap;
+    va_start(ap, fmt);
+    emit_line(is, fmt, ap);
+    va_end(ap);
+}
+
+/* A line that is not a problem (shown under Notes, not counted in the summary). */
+static void note(issues *is, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void note(issues *is, const char *fmt, ...)
+{
+    if (!is->notes) return;
+    va_list ap;
+    va_start(ap, fmt);
+    emit_line(is, fmt, ap);
+    va_end(ap);
 }
 
 static void probe_issue(void *arg, const char *line) { issue(arg, "%s", line); }
@@ -951,6 +981,32 @@ static double stall_s(void)
     return v && *v ? atof(v) : 30.0;
 }
 
+/* VKBRIDGE_REPORT_QUICK_EXIT_S: a game that exits within this long of creating its device is named (60 s; 0: never) */
+static double quick_exit_s(void)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_REPORT_QUICK_EXIT_S");
+    return v && *v ? atof(v) : 60.0;
+}
+
+/* A program of Steam's or the Wine / Proton session around a game, not the game: its exit says nothing
+ * (prefix of the process name, any case). */
+static int helper_process(const char *comm)
+{
+    static const char *const names[] = {"steam", "explorer", "gamescope", "xwayland", "wineserver", "wineboot", "services", "svchost",
+                                        "winedevice", "plugplay", "rpcss", "conhost", "mangoapp", "vulkaninfo", "vulkandriver", "gldriverquery",
+                                        "fossilize", "pressure-vessel", "srt-", "reaper", "droiddeck", "vkcube", "crashhandler", "start.exe"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strncasecmp(comm, names[i], strlen(names[i]))) return 1;
+    return 0;
+}
+
+/* The presents the client's frames line counts (0: no line). */
+static unsigned long long frames_counted(const rp_proc *p)
+{
+    const char *s = strstr(p->frames, "presents=");
+    return s ? strtoull(s + 9, NULL, 10) : 0;
+}
+
 /* VKBRIDGE_REPORT_STUCK_S: how long a request may run before the report names it (10 s; 0: never). */
 static double stuck_s(void)
 {
@@ -977,9 +1033,9 @@ static double running_stuck(const rp_proc *p, const char **call)
 }
 
 /* Everything that should be looked at, one line each (the report's head). */
-static int list_issues(FILE *f, int json)
+static int list_issues(FILE *f, int json, int notes)
 {
-    issues is = {f, 0, json};
+    issues is = {f, 0, json, notes};
     test_switches(probe_issue, &is);
     vkb_probe_issues(probe_issue, &is);
     char nm[120];
@@ -1005,15 +1061,38 @@ static int list_issues(FILE *f, int json)
                   nm, call, stuck);
         if (p->compile_fail) issue(&is, "%s: %llu pipeline(s) failed to build", nm, (unsigned long long)p->compile_fail);
         if (p->fps_p50 > 0 && p->fps_p50 < 20) issue(&is, "%s: low frame rate, median %.1f fps", nm, p->fps_p50);
+        /* No frame while another process presented after it: the Steam UI or the Wine desktop behind
+         * a game (normal), or a game that hung while Steam keeps presenting behind it. Kept as a
+         * note, not dropped, so the second case can still be read from the report. */
+        const char *front = "; another program was in front (normal)";
         if (p->devices && p->first_frame_s < 0 && p->t_device > 0 && !presents_elsewhere(p) &&
-            (p->alive ? now_s() : p->t_gone) - p->t_device > 60)
-            issue(&is, "%s: a device for %.0f s and no frame presented", nm, (p->alive ? now_s() : p->t_gone) - p->t_device);
+            (p->alive ? now_s() : p->t_gone) - p->t_device > 60) {
+            double d = (p->alive ? now_s() : p->t_gone) - p->t_device;
+            if (other_presented_after(p, p->t_device)) note(&is, "%s: a device for %.0f s and no frame presented%s", nm, d, front);
+            else issue(&is, "%s: a device for %.0f s and no frame presented", nm, d);
+        }
         /* Frames that stopped while the game ran on (a hang the player sees as a frozen picture),
          * or a while before it exited (a game quits within seconds of its last frame). */
         double end = p->alive ? now_s() : p->t_gone, stall = stall_s();
-        if (p->last_frame_s > 0 && stall > 0 && end - p->last_frame_s > stall && !presents_elsewhere(p))
-            issue(&is, p->alive ? "%s: no frame for the last %.0f s while it runs (presents stopped)"
-                                : "%s: presents stopped %.0f s before it exited", nm, end - p->last_frame_s);
+        if (p->last_frame_s > 0 && stall > 0 && end - p->last_frame_s > stall && !presents_elsewhere(p)) {
+            int behind = other_presented_after(p, p->last_frame_s + stall);
+            const char *tail = behind ? front : "";
+            const char *fmt = p->alive ? "%s: no frame for the last %.0f s while it runs%s%s"
+                                       : "%s: presents stopped %.0f s before it exited%s%s";
+            const char *mid = p->alive && !behind ? " (presents stopped)" : "";
+            if (behind) note(&is, fmt, nm, end - p->last_frame_s, mid, tail);
+            else issue(&is, fmt, nm, end - p->last_frame_s, mid, tail);
+        }
+        /* A game process that exited soon after creating its device, or with hardly a frame: nothing in the
+         * bridge's log says why (LEGO Indiana Jones exited 104 ms after vkCreateDevice), so the player's
+         * Proton log is what shows it. */
+        if (!p->alive && p->t_gone > 0 && p->devices && p->t_device > 0 && p->comm[0] && !helper_process(p->comm) && !presents_elsewhere(p)) {
+            double life = p->t_gone - p->t_device, quick = quick_exit_s();
+            unsigned long long fr = frames_counted(p);
+            if ((quick > 0 && life < quick) || (p->frames[0] && fr < 30))
+                issue(&is, "%s: exited %.0f s after its device was created (%llu frames); a Proton log helps: launch options PROTON_LOG=1 %%command%%",
+                      nm, life < 0 ? 0 : life, fr);
+        }
         if (p->samples && p->cpu_cap_min && p->cpu_cap_min < 70)
             issue(&is, "%s: CPU clocks capped to %u%% of their maximum while it ran (thermal)", nm, p->cpu_cap_min);
         char held[200];
@@ -1138,10 +1217,14 @@ static void write_md(FILE *f, int final)
     fprintf(f, "Session started %s, report written %s (%.0f s in)%s. Machine-readable: `malibridge-report.json`.\n\n", ts0, ts, now_s(),
             final ? ", final" : "; rewritten every 5 s");
     test_switches(md_switch, f);
-    int n = list_issues(NULL, 0);
+    int n = list_issues(NULL, 0, 0);
     fprintf(f, "## Summary: %d issue%s\n\n", n, n == 1 ? "" : "s");
-    if (n) list_issues(f, 0);
+    if (n) list_issues(f, 0, 0);
     else fprintf(f, "Nothing to report: every probe passed and nothing was logged as an error or warning.\n");
+    if (list_issues(NULL, 0, 1)) {
+        fprintf(f, "\n## Notes (not problems)\n\n");
+        list_issues(f, 0, 1);
+    }
     fprintf(f, "\n## Device\n\n| | |\n|---|---|\n");
     struct utsname u;
     uname(&u);
@@ -1305,8 +1388,10 @@ static void write_json(FILE *f, int final)
     fprintf(f, "  \"mode\": {\"value\": \"%s\", \"source\": ", vkb_mode_name(mode));
     js(f, vkb_mode_source_name());
     fprintf(f, ", \"compile_timeout_s\": %.1f},\n", vkb_guard_timeout_s(mode, NULL));
-    fprintf(f, "  \"issue_count\": %d,\n  \"issues\": [", list_issues(NULL, 1));
-    list_issues(f, 1);
+    fprintf(f, "  \"issue_count\": %d,\n  \"issues\": [", list_issues(NULL, 1, 0));
+    list_issues(f, 1, 0);
+    fprintf(f, "\n  ],\n  \"notes\": [");
+    list_issues(f, 1, 1);
     struct utsname u;
     uname(&u);
     fprintf(f, "\n  ],\n  \"device\": {\"model\": ");

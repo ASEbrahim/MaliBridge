@@ -1195,17 +1195,96 @@ static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties(VkPhysi
     fake_lazy_props(mp);
 }
 
+/*
+ * VK_EXT_memory_budget that follows the memory really free (player logs: phones of 11 GB
+ * with 2.5-3 GB free at the Steam menu, games closed by the system at 1.2-1.4 GB free). The driver's budget
+ * and the client's heap cap say how much the GPU could have; DXVK and vkd3d-proton re-read the budget while
+ * they run and stay under it, so it is lowered to what the GPU's memory plus the memory available now can
+ * reach, less a reserve for the system and the game's own heap:
+ *   budget = min(the driver's, max(live GPU memory + MemAvailable - reserve, floor)), and while it is lowered
+ *   heapUsage is at least the live GPU memory (the server's own count, `mem:` lines).
+ * It is only ever lowered, never raised: with enough memory free the answer is the driver's, exactly as
+ * before (the client then clamps it to the heap it shows). The floor (1 GB) keeps a game from being starved at
+ * its start. VKBRIDGE_BUDGET_RESERVE_MB=<MB>: the reserve (default 1536); 0: off, the old behaviour.
+ * MemAvailable is read at most every 250 ms (VKBRIDGE_FAKE_MEMAVAIL_MB for tests: read at each call).
+ */
+#define BUDGET_RESERVE_DEFAULT_MB 1536
+#define BUDGET_FLOOR_BYTES ((uint64_t)1 << 30)
+#define BUDGET_AVAIL_CACHE_NS 250000000ull
+
+static uint64_t budget_avail_kb(void)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t kb, at;
+    if (getenv("VKBRIDGE_FAKE_MEMAVAIL_MB")) return vkb_memavail_kb();
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    pthread_mutex_lock(&lock);
+    if (!at || now - at >= BUDGET_AVAIL_CACHE_NS) {
+        kb = vkb_memavail_kb();
+        at = now;
+    }
+    uint64_t r = kb;
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+/* The lowered budget for `drv`, or `drv` itself; *lowered says which. Pure arithmetic (host tests call it
+ * through the wire; see heapcap_test.sh step 9). */
+static uint64_t budget_follow(uint64_t drv, uint64_t live, uint64_t avail, uint64_t reserve, int *lowered)
+{
+    *lowered = 0;
+    if (!reserve || !avail) return drv;
+    uint64_t reach = live + avail;
+    uint64_t want = reach > reserve ? reach - reserve : 0;
+    if (want < BUDGET_FLOOR_BYTES) want = BUDGET_FLOOR_BYTES;
+    if (want >= drv) return drv;
+    *lowered = 1;
+    return want;
+}
+
+static void budget_follow_props2(VkPhysicalDeviceMemoryProperties2 *mp)
+{
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT *bp = NULL;
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)mp->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) bp = (VkPhysicalDeviceMemoryBudgetPropertiesEXT *)b;
+    if (!bp) return;
+    const char *rv = vkb_srv_env("VKBRIDGE_BUDGET_RESERVE_MB");
+    uint64_t reserve = ((rv && *rv) ? (uint64_t)strtoull(rv, NULL, 10) : (uint64_t)BUDGET_RESERVE_DEFAULT_MB) << 20;
+    if (!reserve) return;
+    uint64_t avail = budget_avail_kb() << 10;
+    if (!avail) return;
+    int64_t pid_b, total, images, bc_images, bc_src;
+    vkb_memstat_query(0, &pid_b, &total, &images, &bc_images, &bc_src);
+    uint64_t live = total > 0 ? (uint64_t)total : 0;
+    for (uint32_t h = 0; h < mp->memoryProperties.memoryHeapCount; h++) {
+        if (!(mp->memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        int lowered;
+        uint64_t drv = bp->heapBudget[h], b = budget_follow(drv, live, avail, reserve, &lowered);
+        if (!lowered) continue;
+        bp->heapBudget[h] = b;
+        if (bp->heapUsage[h] < live) bp->heapUsage[h] = live;
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 6)
+            VKB_INFO("memory budget: heap %u told %llu MB, not the driver's %llu MB (%llu MB free, GPU memory %llu MB, reserve %llu MB; "
+                     "VKBRIDGE_BUDGET_RESERVE_MB=0 turns this off)", h, (unsigned long long)(b >> 20), (unsigned long long)(drv >> 20),
+                     (unsigned long long)(avail >> 20), (unsigned long long)(live >> 20), (unsigned long long)(reserve >> 20));
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2 *mp)
 {
     vkb_srv_current_table()->real.vkGetPhysicalDeviceMemoryProperties2(pd, mp);
-    fake_lazy_props(&mp->memoryProperties);
+    if (fake_lazy()) fake_lazy_props(&mp->memoryProperties);
+    budget_follow_props2(mp);
 }
 
 void vkb_mem_instance_install(vkb_srv_table *t)
 {
+    if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;
     if (!fake_lazy()) return;
     if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
-    if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;
     VKB_INFO("imitating Mali's memory types: device-local types without host access are lazily allocated");
 }
 

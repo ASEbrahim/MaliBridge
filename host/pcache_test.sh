@@ -31,7 +31,12 @@
 #  15  Steam's pre-caching beside a game's file under the limit (an 89 MB game file and a 128 MB
 #      .run file, the .run file left out at every start): the replay's limit is what the game's file
 #      leaves; its save replaces a .run file over that, and writes its own alone where the two
-#      together would be over; the game then takes it in.
+#      together would be over; the game then takes it in (VKBRIDGE_PCACHE_OVER_X=1: the limit is hard);
+#  16  the same two files over the plain limit but within twice it, with the memory free over four times the
+#      limit (Steam's pre-caching left out at a 242 MB limit on a 15 GB phone): taken in, the limit
+#      raised for that device and said, the file saved over the plain limit; the next start loads it; a start
+#      that adds nothing leaves the file untouched (no rewrite); a start with the memory not there keeps the
+#      file as it is (not loaded, not replaced); a cache over twice the limit is still left out.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}  # VKB_OUT=out-tsan for the ThreadSanitizer build
@@ -42,7 +47,7 @@ log=$work/server.log
 VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
     "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$cache" >/dev/null 2>&1 &
 srv=$!
-trap 'kill $srv 2>/dev/null; rm -f "$sock"; rm -rf "$work"' EXIT
+trap 'kill $srv 2>/dev/null; rm -f "$sock"; if [ -n "$KEEP" ]; then echo "kept $work"; else rm -rf "$work"; fi' EXIT
 for _ in $(seq 50); do [ -S "$sock" ] && break; sleep 0.1; done
 export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILENAMES=
 unset SteamAppId SteamGameId VKBRIDGE_PCACHE_KEY
@@ -272,7 +277,7 @@ rm -rf "$work"/c10
 fz15=$work/s15/steamapps/shadercache
 mkdir -p "$fz15/4280/fozpipelinesv6/steamapprun_pipeline_cache.0123456789abcdef" "$fz15/4281/fozpipelinesv6"
 ln -sf "$out/pcache_check" "$work/s15/fossilize_replay"
-srv10 $l15-a.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PROBE=0
+srv10 $l15-a.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PCACHE_OVER_X=1 VKBRIDGE_PROBE=0
 VKBRIDGE_SOCKET=$sock.10 SteamAppId=4280 "$out/pcache_check" --first 7000 --count 20 >$work/15a.log 2>&1
 VKBRIDGE_SOCKET=$sock.10 "$work/s15/fossilize_replay" "$fz15/4281/fozpipelinesv6/steam_pipeline_cache.foz" --first 7100 --count 30 >$work/15b.log 2>&1
 end10
@@ -280,7 +285,7 @@ g15=$(size10 steam4280)
 for f in "$work"/c10/*-steam4281.dl.vkpc; do mv "$f" "${f%4281.dl.vkpc}4280.run.vkpc"; done
 w15=$(size10 steam4280.run)
 #    the game starts: the .run file left out
-srv10 $l15-b.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PROBE=0
+srv10 $l15-b.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PCACHE_OVER_X=1 VKBRIDGE_PROBE=0
 VKBRIDGE_SOCKET=$sock.10 SteamAppId=4280 "$out/pcache_check" --first 7000 --count 1 >$work/15c.log 2>&1
 #    a replay of 5 others: its limit is 4194 - 2704 = 1490 bytes; the 3584-byte file is over it and replaced
 VKBRIDGE_SOCKET=$sock.10 "$work/s15/fossilize_replay" "$fz15/4280/fozpipelinesv6/steamapprun_pipeline_cache.0123456789abcdef/x.foz" --first 7200 --count 5 >$work/15d.log 2>&1
@@ -298,6 +303,59 @@ grep -q "steam4280.run.vkpc ([0-9]* KB) left out: over the 4 KB limit with the r
   [ "$g15" -gt 2000 ] && [ "$w15" -gt 3000 ] && [ "$r15a" -gt 0 ] && [ "$r15a" -le 1490 ] && [ "$r15b" -gt 0 ] && [ "$r15b" -le 1490 ] &&
   grep -q "taken in from .*steam4280.run.vkpc" $l15-b.log && ! ls "$work"/c10/*-steam4280.run.vkpc >/dev/null 2>&1 && [ "$g15b" -gt "$g15" ] && [ "$g15b" -le 4194 ]
 step $? "pre-caching beside the game's file: game $g15 + .run $w15 bytes left out; replays saved $r15a then $r15b bytes (its limit 1490); taken in, game file $g15b bytes"
+
+# 16 as 15 (a game file of 20 pipelines, a .run file of 30 from another game, 2704 + 3584 bytes over the 4 KB limit)
+#    but with the memory free (the PC's own: far over 4 x 4 KB) and the default factor of 2
+l16=$work/server16
+rm -rf "$work"/c10
+fz16=$work/s16/steamapps/shadercache
+mkdir -p "$fz16/4291/fozpipelinesv6"
+ln -sf "$out/pcache_check" "$work/s16/fossilize_replay"
+srv10 $l16-a.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PCACHE_OVER_X=1 VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4290 "$out/pcache_check" --first 8000 --count 20 >$work/16a.log 2>&1
+VKBRIDGE_SOCKET=$sock.10 "$work/s16/fossilize_replay" "$fz16/4291/fozpipelinesv6/steam_pipeline_cache.foz" --first 8100 --count 30 >$work/16b.log 2>&1
+end10
+g16=$(size10 steam4290)
+for f in "$work"/c10/*-steam4291.dl.vkpc; do mv "$f" "${f%4291.dl.vkpc}4290.run.vkpc"; done
+w16=$(size10 steam4290.run)
+srv10 $l16-b.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4290 "$out/pcache_check" --first 8000 --count 1 >$work/16c.log 2>&1
+end10
+g16b=$(size10 steam4290)
+f16=$(ls "$work"/c10/*-steam4290.vkpc)
+i16=$(stat -c '%i' "$f16") # the inode and the content: loading a file touches its time (the total limit's use order)
+i16=$i16$(cksum < "$f16")
+#    the next start loads it (over the plain limit, within the raised one) and adds nothing: the file is not rewritten
+srv10 $l16-c.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4290 "$out/pcache_check" --first 8000 --count 20 >$work/16d.log 2>&1
+end10
+i16b=$(stat -c '%i' "$f16")$(cksum < "$f16")
+#    the memory not there for it (16 KB free: not over four times 4 KB): kept as it is, not replaced
+srv10 $l16-d.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_FAKE_MEMAVAIL_MB=0.016 VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4290 "$out/pcache_check" --first 8500 --count 3 >$work/16e.log 2>&1
+end10
+g16d=$(size10 steam4290)
+#    over twice the limit: a .run file of 100 pipelines (made under a 20 KB limit) beside the game's 2704 bytes
+#    is more than the 8388 bytes the raised limit allows: left out as before
+rm -rf "$work"/c10
+srv10 $l16-e.log VKBRIDGE_PCACHE_MAX_MB=0.02 VKBRIDGE_PCACHE_OVER_X=1 VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4290 "$out/pcache_check" --first 8000 --count 20 >$work/16f.log 2>&1
+VKBRIDGE_SOCKET=$sock.10 "$work/s16/fossilize_replay" "$fz16/4291/fozpipelinesv6/steam_pipeline_cache.foz" --first 8700 --count 100 >$work/16g.log 2>&1
+end10
+for f in "$work"/c10/*-steam4291.dl.vkpc; do mv "$f" "${f%4291.dl.vkpc}4290.run.vkpc"; done
+w16e=$(size10 steam4290.run)
+srv10 $l16-f.log VKBRIDGE_PCACHE_MAX_MB=0.004 VKBRIDGE_PROBE=0
+VKBRIDGE_SOCKET=$sock.10 SteamAppId=4290 "$out/pcache_check" --first 8000 --count 1 >$work/16h.log 2>&1
+end10
+[ "$g16" -gt 2000 ] && [ "$w16" -gt 3000 ] && [ "$g16b" -gt 4194 ] && [ "$g16b" -le 8388 ] && [ "$g16b" -gt "$g16" ] &&
+  grep -q "the cache's limit is 8 KB here: [0-9]* KB with Steam's shader pre-caching is over the plain limit" $l16-b.log &&
+  grep -q "taken in from .*steam4290.run.vkpc" $l16-b.log && ! grep -q "steam4290.run.vkpc ([0-9]* KB) left out" $l16-b.log &&
+  grep -q "steam4290.vkpc ([0-9]* KB loaded), limit 8 KB" $l16-c.log && ! grep -q "over the 4 KB limit for one program" $l16-c.log &&
+  ! grep -q "pipeline cache saved" $l16-c.log && [ "$i16" = "$i16b" ] &&
+  grep -q "steam4290.vkpc ([0-9]* KB) is over the plain limit and [0-9]* KB of memory are free: not loaded this time; the file is kept" $l16-d.log &&
+  [ "$g16d" -ge "$g16b" ] &&
+  [ "$w16e" -gt 6000 ] && grep -q "steam4290.run.vkpc ([0-9]* KB) left out: over the 4 KB limit with the rest" $l16-f.log
+step $? "pre-caching over the plain limit with memory to spare: game $g16 + .run $w16 bytes taken in, file $g16b bytes (plain limit 4194); next start loads it and leaves it untouched ($([ "$i16" = "$i16b" ] && echo same || echo rewritten)); short of memory kept ($g16d bytes); over twice the limit still left out (.run $w16e bytes)"
 
 grep -E "process [0-9]+ is|pipeline cache|taken in|removed|several|cache directory" "$log" > "$out/t-pcache-server.log"
 if [ $fails = 0 ]; then echo "OK: persistent pipeline cache"; else echo "FAILED: $fails step(s) (server log in $out/t-pcache-server.log)"; exit 1; fi

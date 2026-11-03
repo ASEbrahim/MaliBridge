@@ -37,6 +37,11 @@
  *                                300 ms, its siblings at once); a query reset and never ended, and one
  *                                ended in a primary never submitted, stay not ready
  *
+ *   querystuck_check late        Sifu (UE4 through DXVK): two pools whose mirror copies are lost
+ *                                (imitated: the 1st and the 2nd flush); the first query found stuck marks
+ *                                its pool late, and that pool's other queries then come ready at once
+ *                                instead of 200 ms each; the other pool is still on the 200 ms rule
+ *
  *   querystuck_check stale       Batman: Arkham Asylum on the Galaxy Tab S12+ (, UE3 through
  *                                DXVK): a query slot whose last use counted 0 samples is reset and
  *                                reused for a draw that counts many, and the second command buffer's
@@ -359,6 +364,45 @@ static void case_lost(void)
                  told ? "yes" : "NO (this client has no VKBRIDGE_TEST_QUERY_LOSE_READY)");
     check(bad < 0 && told > 0, "lost ready-word update: the query still comes ready", d);
     vkDestroyQueryPool(dev, pool, NULL);
+}
+
+/* Sifu's pattern: a pool whose queries the mirror is late with, one after the other. */
+static void case_late(void)
+{
+    char d[320];
+    VkFence f;
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(dev, &fci, NULL, &f);
+    VkQueryPool pool[2] = {make_pool(8), make_pool(8)};
+    double took[2][3] = {{0}};
+    int ok = 1;
+    for (int p = 0; p < 2; p++) {
+        vkResetQueryPool(dev, pool[p], 0, 8);
+        VkCommandBuffer cb = alloc_cb(cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+        begin_primary(cb);
+        begin_pass(cb, &plain, VK_SUBPASS_CONTENTS_INLINE);
+        for (uint32_t q = 0; q < 3; q++) counted_draw(cb, &plain, pool[p], q, 4 + q * 3, 5 + q);
+        vkCmdEndRenderPass(cb);
+        ok &= submit_wait(cb, f);
+    }
+    for (int p = 0; p < 2; p++)
+        for (uint32_t q = 0; q < 3; q++) {
+            uint64_t v = 0;
+            VkResult r = spin(pool[p], q, &v, 3.0, &took[p][q], NULL);
+            uint64_t want = (uint64_t)(4 + q * 3) * (5 + q);
+            if (r != VK_SUCCESS || (precise ? v != want : v == 0)) ok = 0;
+        }
+    long told = trace_count("left out (VKBRIDGE_TEST_QUERY_LOSE");
+    snprintf(d, sizeof(d), "pool A %.0f/%.0f/%.0f ms, pool B %.0f/%.0f/%.0f ms, lost copies imitated: %ld", took[0][0] * 1e3, took[0][1] * 1e3,
+             took[0][2] * 1e3, took[1][0] * 1e3, took[1][1] * 1e3, took[1][2] * 1e3, told);
+    check(ok, "late pool: every result exact", d);
+    if (mirror && told == 2) {
+        /* The first query of a pool waits the 200 ms rule; once the pool is known late its others come at once. */
+        check(took[0][0] > 0.15 && took[0][1] < 0.08 && took[0][2] < 0.08, "late pool: the first query waits 200 ms, the pool's others come ready at once", d);
+        check(took[1][0] > 0.15, "a pool never found late stays on the 200 ms rule", d);
+    }
+    vkDestroyQueryPool(dev, pool[0], NULL);
+    vkDestroyQueryPool(dev, pool[1], NULL);
 }
 
 /* ------------------------------------------------------------------ a stale value */
@@ -686,6 +730,10 @@ int main(int argc, char **argv)
     if (mo && !strcmp(mo, "0")) mirror = 0;
     if (!strcmp(what, "lost")) setenv("VKBRIDGE_TEST_QUERY_LOSE_READY", "1", 1);
     if (!strcmp(what, "stale")) setenv("VKBRIDGE_TEST_QUERY_LOSE_VALUE", "2", 1);
+    if (!strcmp(what, "late")) {
+        setenv("VKBRIDGE_TEST_QUERY_LOSE_READY", "1", 1);
+        setenv("VKBRIDGE_TEST_QUERY_LOSE_VALUE", "2", 1);
+    }
     drg_batman = !strcmp(what, "batman");
     int burst = !strcmp(what, "burst") ? 0 : !strcmp(what, "burst-never") ? 1 : !strcmp(what, "burst-visible") ? 2 : -1;
     uint32_t burst_n = argc > 2 ? (uint32_t)atol(argv[2]) : 640;
@@ -779,6 +827,7 @@ int main(int argc, char **argv)
     if (all || !strcmp(what, "multiview")) case_multiview();
     if (all || !strcmp(what, "drg") || drg_batman) case_drg(frames);
     if (!strcmp(what, "stale")) case_stale();
+    if (!strcmp(what, "late")) case_late();
     if (burst >= 0) case_burst(burst, burst_n);
 
     vkDeviceWaitIdle(dev);

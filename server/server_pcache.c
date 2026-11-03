@@ -76,6 +76,14 @@
 #define PC_MAX_MB_MAX_BIGRAM 256u /* from 12 GB of RAM (see the top) */
 #define PC_BIGRAM_MB (12000u - 1000u) /* MemTotal of a "12 GB" phone reads ~11.2-11.6 GB */
 #define PC_MAX_MB_UNKNOWN_RAM 64u
+/* While the memory free is over PC_OVER_FREE_X times the limit, a program's cache may reach PC_OVER_X times it:
+ * Steam's pre-caching with the game's own file was left out for being over the limit together (a player log, a
+ * 15 GB phone with 7.5 GB free: 122 MB + 130 MB over 242 MB), and the game's shaders compiled again at
+ * every start. VKBRIDGE_PCACHE_OVER_X=<n>: the factor (1: off, the limit is hard). A merge still needs three
+ * times its size free and a file is loaded only with twice its size free (both below), and a file over the
+ * plain limit is kept as it is when the memory is not there at a start. */
+#define PC_OVER_X_DEFAULT 2u
+#define PC_OVER_FREE_X 4u
 #define PC_MAX_MB_SET_MAX (1u << 20) /* VKBRIDGE_PCACHE_MAX_MB above this is taken as this */
 /* A <file>.<pid>.<n>.tmp left by a killed save (its size reserved in full) goes at the next trim
  * once its process is gone, or after this long whatever its pid (pids are reused). */
@@ -133,7 +141,8 @@ typedef struct vkb_pcache {
     int keep_warned;      /* a save skipped to keep that file, said */
     int alone_warned;     /* a save of ours alone in place of a merge over the limit, said */
     uint64_t beside;      /* Steam's pre-caching: the size of the game's own file, which the limit leaves room for */
-    uint64_t max;         /* the per-program limit in bytes (file_limit at the device's start) */
+    uint64_t max;         /* the per-program limit in bytes (file_limit at the device's start; raised to max_ext when the cache was over it with plenty of memory free) */
+    uint64_t max_ext;     /* the most it may be raised to (PC_OVER_X times file_limit, within the total limit) */
     int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
     time_t last_save;     /* CLOCK_MONOTONIC seconds */
@@ -470,6 +479,25 @@ static const char *limit_str(char out[32], uint64_t bytes)
     if (bytes >= (1u << 20)) snprintf(out, 32, "%llu MB", (unsigned long long)(bytes >> 20));
     else snprintf(out, 32, "%llu KB", (unsigned long long)(bytes >> 10));
     return out;
+}
+
+/* The most a program's file may reach when memory is plentiful: PC_OVER_X times its limit, within the total limit. */
+static uint64_t over_limit(uint64_t max)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PCACHE_OVER_X");
+    uint64_t x = v && *v ? strtoull(v, NULL, 10) : PC_OVER_X_DEFAULT;
+    if (x < 1) x = 1;
+    if (x > 16) x = 16;
+    uint64_t total = total_limit(), ext = max * x;
+    if (total && ext > total) ext = total;
+    return ext < max ? max : ext;
+}
+
+/* Is there room to go over the limit: the memory free is over PC_OVER_FREE_X times it (unknown: no). */
+static int over_ok(const vkb_pcache *p)
+{
+    uint64_t avail_kb = vkb_memavail_kb();
+    return p->max_ext > p->max && avail_kb && avail_kb > (p->max >> 10) * PC_OVER_FREE_X;
 }
 
 static time_t mono_s(void);
@@ -1127,6 +1155,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     if (!p) return;
     p->t = t;
     p->max = file_limit();
+    p->max_ext = over_limit(p->max);
     char lim[32];
     VkPhysicalDeviceProperties props;
     t->real.vkGetPhysicalDeviceProperties(t->physical, &props);
@@ -1145,6 +1174,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         snprintf(game, sizeof(game), "%s%.*s.vkpc", base, (int)(strrchr(key, '.') - key), key);
         if (stat(game, &gs) == 0 && gs.st_size > 0) p->beside = (uint64_t)gs.st_size;
         p->max = p->beside < p->max ? p->max - p->beside : 0;
+        p->max_ext = p->max; /* a replay's file is what is left beside the game's */
     }
     p->last_save = mono_s();
     pthread_mutex_lock(&pc_lock);
@@ -1155,8 +1185,24 @@ void vkb_pcache_device_init(vkb_srv_table *t)
 
     uint64_t load_t0 = vkb_hitch_now();
     pc_map fm = {NULL, 0, 0, 0};
+    int over_load = 0; /* the file is over the plain limit (a cache that went over it with memory to spare) */
     if (!p->warm_role) fm = map_file(p->path, p->max, &p->file);
-    if (fm.over) warn_over(p, p->path, fm.over);
+    if (fm.over && !p->warm_role && p->max_ext > p->max && (uint64_t)fm.over <= p->max_ext) {
+        over_load = 1;
+        if (over_ok(p)) {
+            p->max = p->max_ext;
+            fm = map_file(p->path, p->max, &p->file);
+        }
+    }
+    if (fm.over && over_load) {
+        /* Not the memory for it now: kept as it is (a save only merges into it), not replaced. */
+        p->max = p->max_ext;
+        p->not_loaded = 1;
+        VKB_WARN("device %u: pipeline cache %s (%lld KB) is over the plain limit and %llu KB of memory are free: not loaded this time; the file is kept",
+                 t->id, p->path, (long long)(fm.over >> 10), (unsigned long long)vkb_memavail_kb());
+    } else if (fm.over) {
+        warn_over(p, p->path, fm.over);
+    }
     const char *from = p->path;
     char legacy[512];
     if (!fm.data && !p->file.valid && key[0] && !p->warm_role) {
@@ -1221,6 +1267,14 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         size_t wsize = wm.data ? wm.size : (size_t)wm.over;
         if (!wsize) continue;
         VkPipelineCache tmp = VK_NULL_HANDLE;
+        if (total + wsize > p->max && total + wsize <= p->max_ext && over_ok(p)) {
+            /* over the plain limit with the rest, with the memory to spare: the limit goes up for this device
+             * (its saves keep all of it) */
+            char l2[32];
+            p->max = p->max_ext;
+            VKB_INFO("device %u: the cache's limit is %s here: %zu KB with Steam's shader pre-caching is over the plain limit, %llu KB of memory are free",
+                     t->id, limit_str(l2, p->max), (total + wsize) >> 10, (unsigned long long)vkb_memavail_kb());
+        }
         if (total + wsize > p->max)
             VKB_WARN("device %u: %s (%zu KB) left out: over the %s limit with the rest (VKBRIDGE_PCACHE_MAX_MB)", t->id, wpath,
                      wsize >> 10, limit_str(lim, p->max));

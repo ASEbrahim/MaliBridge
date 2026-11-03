@@ -717,7 +717,12 @@ static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const 
     if (!s) return VK_FORMAT_UNDEFINED;
     VkFormat t = s->tx[BC_INDEX(ci->format)];
     const VkImageUsageFlags texture = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (!t || (ci->usage & ~texture)) return VK_FORMAT_UNDEFINED;
+    /* COLOR_ATTACHMENT is left out of the test: no BC image can be rendered to in Vulkan, and Zink (every
+     * OpenGL game) puts it on every texture with the EXTENDED_USAGE / MUTABLE flags (all 16 logged
+     * BC images decoded, 620 MB of BC held as 3.1 GB). STORAGE still decodes. The transcoded image
+     * is made without it (vkb_emu_image_create_info). */
+    const VkImageUsageFlags ignored = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (!t || (ci->usage & ~(texture | ignored))) return VK_FORMAT_UNDEFINED;
     /* VKBRIDGE_BC_TRANSCODE_MAX=<texels>: images wider or taller than that are decoded. A large
      * texture streamed in mid-game is one transcode of hundreds of ms in the frame's command
      * stream (Dark Souls III froze 300-700 ms while walking on the G925); decoding it is cheap,
@@ -741,8 +746,8 @@ static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const 
     VkImageFormatProperties ip;
     VkImageCreateFlags flags = ci->flags & ~(VkImageCreateFlags)(VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
     if (!r->vkGetPhysicalDeviceImageFormatProperties ||
-        r->vkGetPhysicalDeviceImageFormatProperties(e->dev->physical, t, ci->imageType, ci->tiling, ci->usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                                    flags, &ip) != VK_SUCCESS ||
+        r->vkGetPhysicalDeviceImageFormatProperties(e->dev->physical, t, ci->imageType, ci->tiling,
+                                                    (ci->usage & ~ignored) | VK_IMAGE_USAGE_TRANSFER_DST_BIT, flags, &ip) != VK_SUCCESS ||
         ci->extent.width > ip.maxExtent.width || ci->extent.height > ip.maxExtent.height || ci->extent.depth > ip.maxExtent.depth ||
         ci->mipLevels > ip.maxMipLevels || ci->arrayLayers > ip.maxArrayLayers) {
         VKB_ONCE(VKB_LOG_INFO, "BC emulation: the GPU takes no %ux%ux%u image of type %d in format %d; BC images like it are decoded "
@@ -791,6 +796,10 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci, int que
     }
     ci->format = view;
     ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+    if (tx) { /* ETC2 / EAC / ASTC are not colour attachments; the extended usage was for that and uncompressed views */
+        ci->usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
     if (n == 1) ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ci->usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (fl) {
@@ -807,9 +816,104 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci, int que
                  (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) ? " (STORAGE, the app's)" : "", ci->flags, n, n == 1 ? "" : "s");
 }
 
+/* A transcoded BC image has no COLOR_ATTACHMENT (ETC2 / EAC / ASTC cannot be rendered to) and no uncompressed
+ * view of it can be given to the driver as a render target. Zink makes such views (R32G32B32A32_UINT of a BC2 /
+ * BC3 / BC7 image: the one-time "uncompressed view ... shows decoded texels" warning in a player log, Soma) and
+ * renders block data into them. A decoded image gave such a view a format it could render to; the transcoded
+ * one gets this instead: an image of the blocks (one texel a block, the requested format, about the bytes of
+ * the compressed image), made when the first such view is, that the view is made of. What is rendered there
+ * is not seen through the BC views, as it was not meaningful through them when decoded (the texels were
+ * the blocks' bits in a colour format), and nothing invalid reaches the driver. */
+typedef struct bc_sink {
+    VkFormat format;
+    VkImage image;
+    VkDeviceMemory mem;
+    uint32_t mips;
+    struct bc_sink *next;
+} bc_sink;
+
+#define SINK_USAGE (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+
+static void sink_free(vkb_emu_device *e, bc_sink *k)
+{
+    e->dev->real.vkDestroyImage(e->dev->device, k->image, NULL);
+    e->dev->real.vkFreeMemory(e->dev->device, k->mem, NULL);
+    free(k);
+}
+
+static bc_sink *sink_make(vkb_emu_device *e, const vkb_emu_image *r, VkFormat format)
+{
+    bcn_state *s = e->bcn;
+    const vkb_dispatch *d = &e->dev->real;
+    uint32_t w = (r->extent.width + 3) / 4, h = (r->extent.height + 3) / 4, mips = 1;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    for (uint32_t m = w > h ? w : h; m > 1 && mips < r->mips; m >>= 1) mips++;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, format, {w, h, 1}, mips, r->layers,
+                            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, SINK_USAGE, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                            VK_IMAGE_LAYOUT_UNDEFINED};
+    bc_sink *k = calloc(1, sizeof(*k));
+    if (!k) return NULL;
+    k->format = format;
+    k->mips = mips;
+    if (d->vkCreateImage(e->dev->device, &ci, NULL, &k->image) != VK_SUCCESS) {
+        free(k);
+        return NULL;
+    }
+    VkMemoryRequirements req;
+    d->vkGetImageMemoryRequirements(e->dev->device, k->image, &req);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < s->mp.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((req.memoryTypeBits & (1u << i)) && (s->mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    for (uint32_t i = 0; i < s->mp.memoryTypeCount && type == UINT32_MAX; i++)
+        if (req.memoryTypeBits & (1u << i)) type = i;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, type};
+    if (type == UINT32_MAX || d->vkAllocateMemory(e->dev->device, &ai, NULL, &k->mem) != VK_SUCCESS) {
+        d->vkDestroyImage(e->dev->device, k->image, NULL);
+        free(k);
+        return NULL;
+    }
+    if (d->vkBindImageMemory(e->dev->device, k->image, k->mem, 0) != VK_SUCCESS) {
+        sink_free(e, k);
+        return NULL;
+    }
+    return k;
+}
+
+/* The sink for `format` of image r (made now if there is none), NULL: none can be made. */
+static bc_sink *sink_get(vkb_emu_device *e, vkb_emu_image *r, VkFormat format)
+{
+    pthread_mutex_lock(&e->lock);
+    bc_sink *k = r->sinks;
+    while (k && k->format != format) k = k->next;
+    pthread_mutex_unlock(&e->lock);
+    if (k) return k;
+    bc_sink *n = sink_make(e, r, format);
+    if (!n) return NULL;
+    pthread_mutex_lock(&e->lock);
+    for (k = r->sinks; k && k->format != format; k = k->next) {}
+    if (!k) {
+        n->next = r->sinks;
+        r->sinks = k = n;
+        n = NULL;
+    }
+    pthread_mutex_unlock(&e->lock);
+    if (n) sink_free(e, n);
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+        VKB_INFO("BC emulation: an uncompressed view (format %d) of a transcoded BC image the app may render to: it gets an image of the "
+                 "blocks of its own (%ux%u, %u mips), not the texture (logged for the first few)", format, (r->extent.width + 3) / 4,
+                 (r->extent.height + 3) / 4, k->mips);
+    return k;
+}
+
 void vkb_emu_image_release(vkb_emu_device *e, vkb_emu_image *img)
 {
-    (void)e;
+    while (img->sinks) {
+        bc_sink *k = img->sinks;
+        img->sinks = k->next;
+        sink_free(e, k);
+    }
     if (img->bc_fallback) __atomic_sub_fetch(&g_fb_live, img->bc_fallback, __ATOMIC_RELAXED);
 }
 
@@ -837,7 +941,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImageView(VkDevice device, const
                                                          const VkAllocationCallbacks *pAllocator, VkImageView *pView)
 {
     VkImageViewCreateInfo *v = (VkImageViewCreateInfo *)ci;
-    v->format = vkb_emu_bcn_view_format(vkb_emu_cur(), ci->image, ci->format);
+    vkb_emu_device *e = vkb_emu_cur();
+    vkb_emu_image *r = (e->flags & VKB_EMU_BCN) && !vkb_is_bc(ci->format) ? vkb_emu_find_image(e, ci->image) : NULL;
+    if (r && vkb_is_bc(r->client_format) && vkb_tx_block_bytes(r->format)) {
+        /* An uncompressed view of a transcoded image: what the view may be used as is the app's image usage, or
+         * its VkImageViewUsageCreateInfo's; the image the driver holds has no COLOR_ATTACHMENT and is no
+         * render target (see bc_sink). A view that is only sampled stays a view of the image. */
+        VkImageViewUsageCreateInfo *vu = NULL;
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO) vu = (VkImageViewUsageCreateInfo *)b;
+        VkImageUsageFlags want = vu ? vu->usage : r->client_usage;
+        if (r->type == VK_IMAGE_TYPE_2D && (want & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT))) {
+            bc_sink *k = sink_get(e, r, ci->format);
+            if (k) {
+                VkImageViewUsageCreateInfo use = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL,
+                                                  (want & SINK_USAGE) ? (want & SINK_USAGE) : VK_IMAGE_USAGE_SAMPLED_BIT};
+                VkImageViewCreateInfo sv = *ci;
+                sv.pNext = &use;
+                sv.image = k->image;
+                if (sv.subresourceRange.baseMipLevel >= k->mips) sv.subresourceRange.baseMipLevel = k->mips - 1;
+                if (sv.subresourceRange.levelCount != VK_REMAINING_MIP_LEVELS &&
+                    sv.subresourceRange.baseMipLevel + sv.subresourceRange.levelCount > k->mips)
+                    sv.subresourceRange.levelCount = k->mips - sv.subresourceRange.baseMipLevel;
+                return vkb_emu_real()->vkCreateImageView(device, &sv, pAllocator, pView);
+            }
+        }
+        /* a view only sampled (or no stand-in could be made): the usage the image has */
+        if (vu) vu->usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (vu && !vu->usage) vu->usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    v->format = vkb_emu_bcn_view_format(e, ci->image, ci->format);
     return vkb_emu_real()->vkCreateImageView(device, v, pAllocator, pView);
 }
 

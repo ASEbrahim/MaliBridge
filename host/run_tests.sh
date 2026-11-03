@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 # With no names the whole suite runs. `--list` prints the names.
 # The Makefile/CMake `test` targets pass the output directory as the first argument; ignore it.
 VKB_TEST_NAMES="smoke smoke_memtypes smoke_xring memclass_xring fdprops_xring smoke_o1 memclass_o1
-bgr10 uf11 memclass_g720 smoke_push bcn_transcode bcn_decode bcn_astc texcap bcn nulldesc opaque
+bgr10 uf11 memclass_g720 smoke_push bcn_transcode bcn_zink bcn_decode bcn_astc texcap bcn nulldesc opaque
 planar dmabuf_image fdprops memclass procaddr exitclean recycle desc_traffic flicker d3d11
 d3d11_flicker pcache wait_imitate compile_watchdog gsfold probe_report probe_end probe_tx errata
 bitwise shlbarrier promote shmbarrier wave32 clampzero views cmdstate vbbake cullmode_test dedimport
@@ -243,6 +243,18 @@ run_mode() {
     if want bcn_transcode; then
       VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
       timeout 180 ./out/bcn_check transcode >out/t-bcn.log 2>&1; result $? "bcn_check, BC transcoded ($(tail -1 out/t-bcn.log))"
+    fi
+    # Zink's BC images (usage 0x17 with COLOR_ATTACHMENT, flags 0x108) are transcoded too, within the same floors
+    # (they were all decoded, 620 MB of BC held as 3.1 GB); none is logged as decoded; Zink's uncompressed views
+    # of them (rendered to) get an image of the blocks of their own, and the texture is unchanged
+    if want bcn_zink; then
+      VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
+      from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+      timeout 180 ./out/bcn_check transcode zink >out/t-bcn-zink.log 2>&1 &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: image .* transcoded as format [0-9]*, usage 0x7," &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: an uncompressed view (format [0-9]*) of a transcoded BC image the app may render to" &&
+        ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: image .* decoded as format"
+      result $? "bcn_check transcode zink, BC images made as Zink makes them are transcoded ($(tail -1 out/t-bcn-zink.log); $(tail -n +$from "$VKB_SERVER_LOG" | grep -c 'BC emulation: image .* transcoded as') logged transcoded)"
     fi
     if want bcn_budget; then
       VKB_BC_TX_BUDGET=32:4 . ./mali_env.sh >/dev/null
@@ -967,9 +979,9 @@ run_mode() {
   fi
   if want querystuck; then
     # stale, batman: a reused slot's new value reaching the host late must be answered late, never as the slot's old value
-    for c in multiview lost drg stale batman; do
+    for c in multiview lost drg stale batman late; do
       timeout 60 ./out/querystuck_check $c >out/t-qstuck-$c.log 2>&1
-      result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (multiview|lost|Deep|a reused|UE3)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
+      result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (multiview|lost|Deep|a reused|UE3|late)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
     done
   fi
   if want querystuck_burst; then

@@ -20,7 +20,12 @@
 #      7680 MB -> 3584, 8704 -> 4096, 5000 -> 2048 (the floor), 11377 (the XRing O3, #18) and
 #      12800 -> 4096, logged once; 12801 MB, performance mode, <cache dir>/env's
 #      VKBRIDGE_HEAP_MAX_MB=0 and the guest's =0 leave the heaps alone, and an explicit 1024 wins;
-#   8  the protocol hash is unchanged.
+#   8  the protocol hash is unchanged;
+#   9  the budget follows the memory really free (server_memory.c, VKBRIDGE_FAKE_MEMAVAIL_MB stands in for
+#      MemAvailable): plenty free (1 TB) or VKBRIDGE_BUDGET_RESERVE_MB=0: every device-local budget as the
+#      driver's (reserve 0, the old behaviour); 6000 MB free: 6000 - 1536 reserve; 3000 MB free with a
+#      512 MB reserve: 2488; 2000 MB free: the 1024 MB floor, never below; usage never under the budget's
+#      reading and the budget never above the driver's.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -174,5 +179,45 @@ step $? "safe-mode default for 8 and 12 GB devices:$d7 MB, logged once; 12801 MB
 stop
 grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
+
+# 9
+# budgets_of <output>: the device-local heaps' budgets in MB, space separated
+budgets_of() { echo "$1" | grep 'local=1' | sed 's/.*budget_mb=\([0-9]*\).*/\1/' | paste -sd' ' -; }
+# near <value> <want> <slack>: value in [want - 4, want + slack]
+near() { [ "$1" -ge $(($2 - 4)) ] && [ "$1" -le $(($2 + $3)) ]; }
+r9=
+start mem0 VKBRIDGE_FAKE_MEMAVAIL_MB=1000000; view; v_plenty=$v; rc_plenty=$rc
+grep -q 'memory budget: heap' "$log" && r9="$r9 plenty-logged"
+start mem1 VKBRIDGE_FAKE_MEMAVAIL_MB=2000 VKBRIDGE_BUDGET_RESERVE_MB=0; view; v_off=$v; rc_off=$rc
+grep -q 'memory budget: heap' "$log" && r9="$r9 off-logged"
+start mem2 VKBRIDGE_FAKE_MEMAVAIL_MB=6000; view; v_6g=$v; rc_6g=$rc
+start mem3 VKBRIDGE_FAKE_MEMAVAIL_MB=3000 VKBRIDGE_BUDGET_RESERVE_MB=512; view; v_3g=$v; rc_3g=$rc
+start mem4 VKBRIDGE_FAKE_MEMAVAIL_MB=2000; view; v_2g=$v; rc_2g=$rc
+grep -q 'memory budget: heap [0-9]* told 1024 MB, not the driver' "$log" || r9="$r9 floor-not-logged"
+[ $rc_plenty$rc_off$rc_6g$rc_3g$rc_2g = 00000 ] || r9="$r9 rc"
+nb=$(budgets_of "$v_plenty")
+[ -n "$nb" ] || r9="$r9 nobudget"
+nsz=$(echo "$v_plenty" | grep 'local=1' | grep -o 'size_mb=[0-9]*' | sed 's/size_mb=//' | paste -sd' ' -)
+i=0
+for b in $nb; do
+  i=$((i+1))
+  sz=$(echo $nsz | cut -d' ' -f$i)
+  off=$(echo "$(budgets_of "$v_off")" | cut -d' ' -f$i)
+  b6=$(echo "$(budgets_of "$v_6g")" | cut -d' ' -f$i)
+  b3=$(echo "$(budgets_of "$v_3g")" | cut -d' ' -f$i)
+  b2=$(echo "$(budgets_of "$v_2g")" | cut -d' ' -f$i)
+  # the driver's budget moves a little between runs (RADV: the VRAM in use); never more than 256 MB apart
+  [ $((b - off)) -le 256 ] && [ $((off - b)) -le 256 ] || r9="$r9 plenty!=off($b,$off)"
+  w6=$((6000 - 1536)); [ $off -lt $w6 ] && w6=$off; [ $sz -lt $w6 ] && w6=$sz
+  near $b6 $w6 160 || r9="$r9 6g($b6,want $w6)"
+  w3=$((3000 - 512)); [ $off -lt $w3 ] && w3=$off; [ $sz -lt $w3 ] && w3=$sz
+  near $b3 $w3 160 || r9="$r9 3g($b3,want $w3)"
+  w2=1024; [ $off -lt $w2 ] && w2=$off
+  near $b2 $w2 0 || r9="$r9 2g($b2,want $w2)"
+  [ $b6 -le $((off + 256)) ] && [ $b3 -le $((off + 256)) ] && [ $b2 -le $((off + 256)) ] || r9="$r9 raised"
+done
+[ $i -gt 0 ] && [ "${big:-0}" -gt 6000 ] || r9="$r9 heap-too-small($big)"
+step $([ -z "$r9" ] && echo 0 || echo 1) "memory budget follows free memory: 1 TB free or reserve 0 = the driver's ($nb), 6000 free -> $(budgets_of "$v_6g"), 3000 free with reserve 512 -> $(budgets_of "$v_3g"), 2000 free -> $(budgets_of "$v_2g") (the 1 GB floor)${r9:+ (failed:$r9)}"
+stop
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

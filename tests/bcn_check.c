@@ -26,6 +26,9 @@
  * `bcn_check transcode astc6` / `astc8` (the server started with VKBRIDGE_BC_ASTC_BLOCK=6x6 / 8x8): the
  * same with BC2 / BC3 / BC7 in ASTC 6x6 / 8x8 blocks, whose PSNR floors are lower; sub-region uploads
  * and copies are placed on that block's edges.
+ * `bcn_check transcode zink`: the same quality check (every BC format, PSNR floors, "exact" fails) with the BC
+ * images made as Zink makes them: usage SAMPLED|TRANSFER_SRC|TRANSFER_DST|COLOR_ATTACHMENT (0x17), flags
+ * MUTABLE_FORMAT|EXTENDED_USAGE (0x108). The bridge must transcode them (they were all decoded).
  * `bcn_check pcache [file]`: what the driver's pipeline cache spares on two of the transcoders
  * (compute pipelines), in this process and from the data an earlier run left in file.
  */
@@ -51,6 +54,7 @@ static int astc_n = 4; /* ... BC2 / BC3 / BC7 into ASTC 6x6 or 8x8 (argument "as
                         * VKBRIDGE_BC_ASTC_BLOCK=6x6 / 8x8) */
 static int tx_hdr; /* ... BC6H too (to ASTC 4x4 HDR, where the GPU samples it) */
 static double min_psnr;
+static int zink_style; /* BC images made as Zink makes them (argument "zink"): see the header */
 
 static int is_bc1_unorm(VkFormat f) { return f == VK_FORMAT_BC1_RGB_UNORM_BLOCK || f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK; }
 
@@ -83,6 +87,8 @@ F(vkFreeMemory); F(vkGetPhysicalDeviceProperties); F(vkCreateImageView); F(vkDes
 F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCmdCopyImage2); F(vkCreateShaderModule); F(vkDestroyShaderModule);
 F(vkCreateDescriptorSetLayout); F(vkCreatePipelineLayout); F(vkCreateComputePipelines); F(vkCreateDescriptorPool);
 F(vkAllocateDescriptorSets); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
+F(vkCreateRenderPass); F(vkDestroyRenderPass); F(vkCreateFramebuffer); F(vkDestroyFramebuffer); F(vkCmdBeginRenderPass);
+F(vkCmdEndRenderPass);
 F(vkCmdDispatch); F(vkCreatePipelineCache); F(vkGetPipelineCacheData); F(vkDestroyPipelineCache); F(vkDestroyPipeline);
 #undef F
 
@@ -1463,9 +1469,12 @@ static VkImage make_image(VkFormat f, uint32_t w, uint32_t h, uint32_t mips, uin
                           const VkFormat *list, uint32_t nlist, VkDeviceMemory *mem)
 {
     VkImageFormatListCreateInfo fl = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, nlist, list};
+    int zink = zink_style && f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK;
+    if (zink) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nlist ? &fl : NULL, flags, VK_IMAGE_TYPE_2D, f, {w, h, 1}, mips, layers,
                              VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                 (zink ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     VkImage img;
     if (vkCreateImage(dev, &ici, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -1779,6 +1788,106 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
         vkFreeMemory(dev, um, NULL);
         vkFreeMemory(dev, im, NULL);
     }
+}
+
+/* Zink renders into uncompressed views of its BC images (R32G32B32A32_UINT of a 128-bit-block image, the
+ * "uncompressed view shows decoded texels" warning of a player log): image flags BLOCK_TEXEL_VIEW_COMPATIBLE |
+ * MUTABLE_FORMAT | EXTENDED_USAGE, usage 0x17 with COLOR_ATTACHMENT. The bridge transcodes such images, which
+ * cannot be rendered to, so the view must not reach the driver as a view of the transcoded image: a render pass
+ * clearing it must run (the device stays alive, a view of the transcoded ASTC image as an attachment would not
+ * be valid), the same for a view whose VkImageViewUsageCreateInfo asks COLOR_ATTACHMENT, a sampled-only view
+ * is made too, and the BC texture is unchanged by all of it (its levels compared again by PSNR). */
+static void test_zink_views(VkFormat f, VkFormat view_fmt, const char *name)
+{
+    enum { S = 256 };
+    const int kinds[1] = {IMG_PHOTO};
+    level lv = {S, S, S / 4, S / 4, image_blocks(f, kinds[0], S, S, 0, 0)};
+    size_t n = (size_t)lv.bw * lv.bh * block_bytes(f);
+    VkDeviceMemory um, im;
+    void *upp;
+    VkBuffer up = host_buffer(n, &um, &upp);
+    memcpy(upp, lv.blocks, n);
+    VkImage img = make_image(f, S, S, 1, 1, VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT, NULL, 0, &im);
+    if (!img) {
+        printf("FAIL %s: cannot create the image\n", name);
+        failures++;
+        return;
+    }
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {S, S, 1}};
+    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    VkImageViewUsageCreateInfo uc = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    VkImageViewUsageCreateInfo us = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT};
+    const VkImageViewUsageCreateInfo *usage[3] = {NULL, &uc, &us};
+    const char *what[3] = {"the image's usage", "COLOR_ATTACHMENT view usage", "sampled-only view usage"};
+    int bad = 0;
+    VkAttachmentDescription ad = {0, view_fmt, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                  VK_IMAGE_LAYOUT_GENERAL};
+    VkAttachmentReference ar = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ar, NULL, NULL, 0, NULL};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &ad, 1, &sp, 0, NULL};
+    VkRenderPass rp;
+    if (vkCreateRenderPass(dev, &rpi, NULL, &rp) != VK_SUCCESS) {
+        printf("FAIL %s: no render pass\n", name);
+        failures++;
+        return;
+    }
+    for (int k = 0; k < 3; k++) {
+        VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, usage[k], 0, img, VK_IMAGE_VIEW_TYPE_2D, view_fmt,
+                                     {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkImageView v;
+        if (vkCreateImageView(dev, &vci, NULL, &v) != VK_SUCCESS) {
+            printf("FAIL %s: no view (%s)\n", name, what[k]);
+            bad++;
+            continue;
+        }
+        if (k == 2) { /* sampled only: made, nothing more to do with it here */
+            vkDestroyImageView(dev, v, NULL);
+            continue;
+        }
+        VkFramebufferCreateInfo fi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &v, S / 4, S / 4, 1};
+        VkFramebuffer fb;
+        if (vkCreateFramebuffer(dev, &fi, NULL, &fb) != VK_SUCCESS) {
+            printf("FAIL %s: no framebuffer (%s)\n", name, what[k]);
+            bad++;
+            vkDestroyImageView(dev, v, NULL);
+            continue;
+        }
+        VkClearValue cv;
+        memset(&cv, 0, sizeof(cv));
+        cv.color.uint32[0] = 0x11223344u + (uint32_t)k;
+        VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {S / 4, S / 4}}, 1, &cv};
+        VkCommandBuffer c2 = begin();
+        vkCmdBeginRenderPass(c2, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdEndRenderPass(c2);
+        vkEndCommandBuffer(c2);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &c2, 0, NULL};
+        VkResult q = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        VkResult w = q == VK_SUCCESS ? vkQueueWaitIdle(queue) : q;
+        vkFreeCommandBuffers(dev, pool, 1, &c2);
+        if (w != VK_SUCCESS) {
+            printf("FAIL %s: rendering into the view (%s) failed (%d)\n", name, what[k], w);
+            bad++;
+        }
+        vkDestroyFramebuffer(dev, fb, NULL);
+        vkDestroyImageView(dev, v, NULL);
+    }
+    vkDestroyRenderPass(dev, rp, NULL);
+    /* the BC texture itself, after the renders: unchanged */
+    int cmp = compare_level(img, f, 0, 0, &lv, 0, name);
+    if (last_psnr >= 99) cmp = 1; /* decoded: the bridge did not transcode it */
+    printf("%s %s: uncompressed %d views of the image (usage, COLOR_ATTACHMENT, sampled) made and rendered to; texture PSNR %.1f dB\n",
+           bad || cmp ? "FAIL" : "PASS", name, (int)view_fmt, last_psnr);
+    failures += bad || cmp;
+    free(lv.blocks);
+    vkDestroyImage(dev, img, NULL);
+    vkDestroyBuffer(dev, up, NULL);
+    vkFreeMemory(dev, um, NULL);
+    vkFreeMemory(dev, im, NULL);
 }
 
 /* BC7 fields per mode: subsets, partition / rotation / index-selection bits, colour and alpha
@@ -2757,7 +2866,7 @@ static void test_many_cbs(void)
 
 int main(int argc, char **argv)
 {
-    int gpu = 0, hdr_only = 0, bc7_only = 0, mix_only = 0;
+    int gpu = 0, hdr_only = 0, bc7_only = 0, mix_only = 0, zink_only = 0;
     const char *pcache_file = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "transcode")) tx = 1;
@@ -2766,6 +2875,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "hdr")) hdr_only = 1;
         else if (!strcmp(argv[i], "bc7")) bc7_only = 1;
         else if (!strcmp(argv[i], "mixcopy")) mix_only = 1;
+        else if (!strcmp(argv[i], "zink")) zink_only = zink_style = 1;
         else if (!strcmp(argv[i], "pcache")) pcache_file = i + 1 < argc ? argv[++i] : "bcn_check-pcache.bin";
         else gpu = atoi(argv[i]);
     }
@@ -2802,6 +2912,7 @@ int main(int argc, char **argv)
     G(vkBindBufferMemory); G(vkMapMemory); G(vkCreateImage); G(vkGetImageMemoryRequirements); G(vkBindImageMemory);
     G(vkCmdPipelineBarrier); G(vkCmdCopyBufferToImage); G(vkCmdBlitImage); G(vkCmdCopyImageToBuffer); G(vkDestroyImage);
     G(vkDestroyBuffer); G(vkFreeMemory); G(vkCreateImageView); G(vkDestroyImageView); G(vkCmdCopyImage); G(vkFreeCommandBuffers);
+    G(vkCreateRenderPass); G(vkDestroyRenderPass); G(vkCreateFramebuffer); G(vkDestroyFramebuffer); G(vkCmdBeginRenderPass); G(vkCmdEndRenderPass);
     if (props.apiVersion >= VK_API_VERSION_1_3) {
         G(vkCmdCopyBufferToImage2);
         G(vkCmdCopyImage2);
@@ -2859,6 +2970,26 @@ int main(int argc, char **argv)
         test_mixed_copy(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 mixed copies", 0, NULL, 0, 0);
         test_mixed_copy(VK_FORMAT_BC5_SNORM_BLOCK, "BC5 snorm mixed copies", 0, NULL, 0, 0);
         test_mixed_copy(VK_FORMAT_BC6H_UFLOAT_BLOCK, tx_hdr ? "BC6H -> ASTC 4x4 HDR mixed copies" : "BC6H (decoded both sides) copies", 0, NULL, 0, 0);
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
+    if (zink_only) { /* `bcn_check transcode zink`: Zink's image usage and flags, transcoded all the same */
+        if (!tx) {
+            printf("FAIL zink needs the bridge's transcoding (bcn_check transcode zink)\n");
+            return 1;
+        }
+        static const int photo[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT}, cut[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_CUT};
+        static const int soft[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_SOFT}, normal[] = {IMG_NORMAL};
+        test_quality(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB, Zink usage 0x17 flags 0x108", photo, 3);
+        test_quality(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 RGBA, Zink usage", cut, 4);
+        test_quality(VK_FORMAT_BC3_UNORM_BLOCK, "BC3, Zink usage", soft, 4);
+        test_quality(VK_FORMAT_BC3_SRGB_BLOCK, "BC3 sRGB, Zink usage", soft, 4);
+        test_quality(VK_FORMAT_BC7_UNORM_BLOCK, "BC7, Zink usage", soft, 4);
+        test_quality(VK_FORMAT_BC4_UNORM_BLOCK, "BC4, Zink usage", photo, 3);
+        test_quality(VK_FORMAT_BC5_UNORM_BLOCK, "BC5, Zink usage", normal, 1);
+        test_zink_views(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC3, Zink uncompressed views");
+        test_zink_views(VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC7, Zink uncompressed views");
+        test_zink_views(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R32G32_UINT, "BC1, Zink uncompressed views");
         printf("%s\n", failures ? "FAILED" : "OK");
         return failures ? 1 : 0;
     }

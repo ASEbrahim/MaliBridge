@@ -695,6 +695,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     if (r == VK_SUCCESS) {
         vkb_emu_track_image(e, *pImage, ci, client_format);
         vkb_emu_bcn_image_made(e, vkb_is_bc(client_format) ? vkb_emu_find_image(e, *pImage) : NULL);
+        if (vkb_is_bc(client_format)) {
+            vkb_emu_image *bi = vkb_emu_find_image(e, *pImage);
+            if (bi) bi->client_usage = app.usage;
+        }
         vkb_dab_image_created(e, *pImage, ci, &dab);
         if (linear_mod) {
             vkb_emu_image *ti = vkb_emu_find_image(e, *pImage);

@@ -478,6 +478,8 @@ static int stuck_tries_take(const uint64_t *key, uint32_t n, int mode)
         for (uint32_t i = 0; i < n; i++) same += stuck[k][i] == key[i];
         if (same != n || !n) continue;
         if (mode == FB_FAIL && (stuck_retried[k] || stuck_tries[k] >= RETRY_MAX)) break;
+        /* a graphics pipeline that got the LUT stand-in (UE4 CombineLUTs): one try in a later run, with twice the limit */
+        if (mode == FB_LUT && (stuck_retried[k] || stuck_tries[k] >= 2)) break;
         stuck_retried[k] = 1;
         tries = stuck_tries[k] > 0 ? stuck_tries[k] : 1;
     }
@@ -1005,7 +1007,7 @@ __attribute__((noinline)) static VkResult armed_gfx(vkb_guard *g, VkDevice devic
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, "vkCreateGraphicsPipelines", g->t->id, g->limit, h, stg, nh, n ? infos[0].pStages : NULL, n ? infos[0].stageCount : 0);
+    w = watch_begin(&arm, "vkCreateGraphicsPipelines", g->t->id, tls_limit > 0 ? tls_limit : g->limit, h, stg, nh, n ? infos[0].pStages : NULL, n ? infos[0].stageCount : 0);
     for (uint32_t i = 0; i < n; i++) test_fault(infos[i].pStages, infos[i].stageCount, sizeof(*infos[i].pStages));
     VkResult r = g->gfx(device, cache, n, infos, a, out);
     tls_arm = arm.prev;
@@ -1082,6 +1084,44 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
     int known = tls_retrying || is_healed(key, nh) ? 0 : is_stuck(key, nh);
     if (known) {
         int mode = known - 1;
+        /* UE4's CombineLUTs (a colour-grading LUT) that timed out in an earlier run got its neutral stand-in, and
+         * the stand-in stayed for ever (a player log, Sifu: two 10 s timeouts, no colour grading in any game after
+         * that). As a compute pipeline that did not finish is (above), it is compiled again once in a later run
+         * with twice the limit, written down before it starts (a compile that hangs is not repeated): built, it
+         * is kept as "built with a longer limit" (m=5) and built with that limit from then on; not built, the
+         * stand-in as before (m=4, t=2: no third try). */
+        double base = g->limit > 0 ? g->limit : g->limit < 0 ? 0 : timeout_s;
+        int slow = mode == FB_SLOW;
+        int tries = (mode == FB_LUT || slow) && n == 1 && base > 0 && !tls_retrying ? stuck_tries_take(key, nh, mode) : 0;
+        if (tries) {
+            int step = slow ? tries : tries + 1;
+            double lim = base * (double)(1 << (step - 1)), t0 = mono_s();
+            char stx[400], note[480];
+            stages_text(h, stg, nh, stx, sizeof(stx));
+            if (!slow) {
+                VKB_WARN("UE4 colour-grading LUT pipeline (stages %s) got its neutral stand-in in an earlier run: compiled again with %.0f s",
+                         stx, lim);
+                snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, try %d with %.0f s", stx, step, lim);
+                add_stuck(key, nh, FB_LUT, step, note); /* first: a try that hangs is not repeated */
+            }
+            tls_limit = lim;
+            r = armed_gfx(g, device, cache, 1, infos, a, out, h, stg, nh, &timed);
+            tls_limit = 0;
+            if (r == VK_SUCCESS) {
+                if (!slow) {
+                    VKB_WARN("  built this time, in %.1f s: built with %.0f s from now on, with its colour grading", mono_s() - t0, lim);
+                    snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, %.1f s of %.0f s", stx, mono_s() - t0, lim);
+                    add_stuck(key, nh, FB_SLOW, step, note);
+                }
+                return r;
+            }
+            VKB_ERR("  %s with %.0f s: the stand-in again", timed ? "timed out" : "failed", lim);
+            if (slow) {
+                snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, timed out with %.0f s", stx, lim);
+                add_stuck(key, nh, FB_LUT, 2, note);
+            }
+            mode = FB_LUT;
+        }
         VKB_ONCE(VKB_LOG_WARN, "a pipeline the driver never finished compiling was asked for again: its fallback at once (logged once)");
         r = VK_ERROR_INITIALIZATION_FAILED;
         if (mode != FB_FAIL && n == 1) r = try_fallback(g, device, cache, infos, a, out, h, stg, nh, mode, &timed);
