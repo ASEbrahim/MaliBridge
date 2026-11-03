@@ -101,7 +101,7 @@
 #endif
 
 /* Bump when a probe is added, removed or its pass criterion changes: cached profiles are re-run. */
-#define PROBE_VERSION 3
+#define PROBE_VERSION 4
 #define MAX_RESULTS 48
 #define DETAIL 480
 
@@ -865,6 +865,9 @@ static void p_dma_heaps(pctx *c)
 /* A real export of an image's memory as a dma-buf, where the driver says it can (gamescope's need). */
 static void p_dmabuf_export(pctx *c)
 {
+    uint64_t linear = 0; /* DRM_FORMAT_MOD_LINEAR */
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, NULL,
+                                                        linear, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     VkPhysicalDeviceExternalImageFormatInfo ei = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, NULL,
                                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
     VkPhysicalDeviceImageFormatInfo2 ii = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &ei, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
@@ -874,6 +877,23 @@ static void p_dmabuf_export(pctx *c)
     VkResult r = c->idt->vkGetPhysicalDeviceImageFormatProperties2(c->pd, &ii, &ip);
     VkExternalMemoryFeatureFlags ef = r == VK_SUCCESS ? ep.externalMemoryProperties.externalMemoryFeatures : 0;
     say(c, "query (optimal RGBA8): %d, features 0x%x", r, ef);
+    int use_modifier = 0;
+    /* Some drivers advertise export only for modifier images. Test that claim too: PanVK on
+     * Android reports a LINEAR dma-buf export but vkGetMemoryFdKHR fails. A skipped OPTIMAL
+     * query otherwise leaves the export emulation off even when its AHB backing is available.
+     * Only take the fallback if the same format is also importable, as the emulation requires. */
+    if (!(ef & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) && c->api >= VK_API_VERSION_1_1 &&
+        has_ext(c, "VK_EXT_image_drm_format_modifier")) {
+        ei.pNext = &mi;
+        ii.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        memset(&ep.externalMemoryProperties, 0, sizeof(ep.externalMemoryProperties));
+        r = c->idt->vkGetPhysicalDeviceImageFormatProperties2(c->pd, &ii, &ip);
+        ef = r == VK_SUCCESS ? ep.externalMemoryProperties.externalMemoryFeatures : 0;
+        say(c, "; query (LINEAR modifier RGBA8): %d, features 0x%x", r, ef);
+        use_modifier = (ef & (VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)) ==
+                       (VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+        if (!use_modifier) ef = 0;
+    }
     if (!(ef & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
         say(c, "; not claimed exportable%s%s", (c->emu & VKB_EMU_DMABUF_EXPORT) ? " (emulated, pages from the " : "",
             (c->emu & VKB_EMU_DMABUF_EXPORT) ? vkb_mem_export_backing() == 2 ? "AHardwareBuffer)" : "dma-heap)" : "");
@@ -881,9 +901,11 @@ static void p_dmabuf_export(pctx *c)
         return;
     }
     VkExternalMemoryImageCreateInfo emi = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkImageDrmFormatModifierListCreateInfoEXT ml = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT, NULL, 1, &linear};
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &emi, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {64, 64, 1}, 1, 1,
                             VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (use_modifier) emi.pNext = &ml, ci.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
     VkImage i = VK_NULL_HANDLE;
     r = c->d.vkCreateImage(c->dev, &ci, NULL, &i);
     if (r != VK_SUCCESS) {
@@ -891,18 +913,24 @@ static void p_dmabuf_export(pctx *c)
         outcome(c, PS_FAIL);
         return;
     }
-    track(c, O_IMG, H(i));
     VkMemoryRequirements mr;
     c->d.vkGetImageMemoryRequirements(c->dev, i, &mr);
     VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, i, VK_NULL_HANDLE};
     VkExportMemoryAllocateInfo ex = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &ded, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
     VkDeviceMemory m = alloc(c, &mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ex);
+    /* release() destroys objects in reverse order, so the image must precede its memory. */
+    track(c, O_IMG, H(i));
     if (!m) {
         say(c, "; exportable allocation refused");
         outcome(c, PS_FAIL);
         return;
     }
-    c->d.vkBindImageMemory(c->dev, i, m, 0);
+    r = c->d.vkBindImageMemory(c->dev, i, m, 0);
+    if (r != VK_SUCCESS) {
+        say(c, "; image bind refused: %d", r);
+        outcome(c, PS_FAIL);
+        return;
+    }
     VkMemoryGetFdInfoKHR gi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, NULL, m, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
     int fd = -1;
     r = c->d.vkGetMemoryFdKHR(c->dev, &gi, &fd);

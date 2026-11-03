@@ -233,6 +233,12 @@ static int server_init(const char *vk_lib, const char *cache_dir)
     }
     vkb_gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
     if (!vkb_gipa) {
+        /* An ICD loaded directly (--vulkan: PanVK and other Android ICDs) exports the ICD entry
+         * point instead of the loader's; the signatures match. */
+        vkb_gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vk_icdGetInstanceProcAddr");
+        if (vkb_gipa) VKB_INFO("Vulkan ICD: vk_icdGetInstanceProcAddr (loaded directly)");
+    }
+    if (!vkb_gipa) {
         VKB_ERR("the Vulkan loader exports no vkGetInstanceProcAddr");
         return 0;
     }
