@@ -12,6 +12,7 @@
   <a href="https://github.com/ASEbrahim/MaliBridge/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/ASEbrahim/MaliBridge/total?style=for-the-badge&label=downloads&color=blue"></a>
   <a href="https://discord.gg/9xC67qTjDq"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
   <a href="https://ko-fi.com/asebrahim"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white"></a>
+  <a href="https://www.patreon.com/c/ASEbrahim"><img alt="Patreon" src="https://img.shields.io/badge/Patreon-support-F96854?style=for-the-badge&logo=patreon&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -142,7 +143,7 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 
 [安装指南（英文）](INSTALL.md)里有每一步的详细说明。
 
-**在 [Ko-fi](https://ko-fi.com/asebrahim) 上支持我。**欢迎来 [Discord](https://discord.gg/9xC67qTjDq) 打个招呼，也可以在 [YouTube](https://www.youtube.com/@malibridge) 和 [哔哩哔哩](https://space.bilibili.com/3747573858831484) 上看它的运行效果。
+**在 [Ko-fi](https://ko-fi.com/asebrahim) 或 [Patreon](https://www.patreon.com/c/ASEbrahim) 上支持我。**欢迎来 [Discord](https://discord.gg/9xC67qTjDq) 打个招呼，也可以在 [YouTube](https://www.youtube.com/@malibridge) 和 [哔哩哔哩](https://space.bilibili.com/3747573858831484) 上看它的运行效果。
 
 ## 能运行的游戏
 
@@ -524,6 +525,7 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 
 - Discord：[加入服务器](https://discord.gg/9xC67qTjDq)，获取帮助和新消息（中国大陆可能无法直接访问）
 - 在 [Ko-fi](https://ko-fi.com/asebrahim) 上支持我
+- 在 [Patreon](https://www.patreon.com/c/ASEbrahim) 上支持我
 - 视频：[哔哩哔哩](https://space.bilibili.com/3747573858831484) · [YouTube](https://www.youtube.com/@malibridge)
 - 反馈问题和设备报告：[GitHub Issues](https://github.com/ASEbrahim/MaliBridge/issues)
 

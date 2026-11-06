@@ -10,6 +10,7 @@ It runs on the device's own driver, with no custom GPU driver to install.</p>
   <a href="https://github.com/ASEbrahim/MaliBridge/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/ASEbrahim/MaliBridge/total?style=for-the-badge&label=downloads&color=blue"></a>
   <a href="https://discord.gg/9xC67qTjDq"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
   <a href="https://ko-fi.com/asebrahim"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white"></a>
+  <a href="https://www.patreon.com/c/ASEbrahim"><img alt="Patreon" src="https://img.shields.io/badge/Patreon-support-F96854?style=for-the-badge&logo=patreon&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -153,7 +154,7 @@ Logs from your device help a lot (see [Getting help](#getting-help)).
 The [install guide](INSTALL.md) has every step, what you need (Android version, RAM, storage), the
 settings to check, and which games to try first.
 
-**Support me on [Ko-fi](https://ko-fi.com/asebrahim).** Come say hi on [Discord](https://discord.gg/9xC67qTjDq), and see it running on [YouTube](https://www.youtube.com/@malibridge) and [Bilibili](https://space.bilibili.com/3747573858831484).
+**Support me on [Ko-fi](https://ko-fi.com/asebrahim) or [Patreon](https://www.patreon.com/c/ASEbrahim).** Come say hi on [Discord](https://discord.gg/9xC67qTjDq), and see it running on [YouTube](https://www.youtube.com/@malibridge) and [Bilibili](https://space.bilibili.com/3747573858831484).
 
 <a id="status"></a>
 ## Games that run
@@ -594,6 +595,7 @@ The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 
 - **Discord:** [join the server](https://discord.gg/9xC67qTjDq) for help and news.
 - **Ko-fi:** [support me on Ko-fi](https://ko-fi.com/asebrahim).
+- **Patreon:** [support me on Patreon](https://www.patreon.com/c/ASEbrahim).
 - **Videos:** [YouTube](https://www.youtube.com/@malibridge) · [Bilibili](https://space.bilibili.com/3747573858831484)
 - **Problems and device reports:** [GitHub Issues](https://github.com/ASEbrahim/MaliBridge/issues)
 
