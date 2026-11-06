@@ -135,6 +135,8 @@ typedef struct vkb_pcache {
     pc_ident file;        /* the file as this cache last read or wrote it */
     int covers;           /* the file holds nothing `cache` lacks (it was written from it alone) */
     int full_warned;
+    int full;             /* ours alone was over the limit at a save: never written again, so app caches are no longer merged into it (atomic) */
+    unsigned reloads;     /* times it went back to the file past the limit (reload) */
     int over_warned;      /* warn_over said for this device */
     int nomerge_warned;   /* a merge skipped for want of memory, said */
     int not_loaded;       /* the file was left unloaded for want of memory: saves only merge into it */
@@ -820,8 +822,9 @@ static void warn_full(vkb_pcache *p, size_t size, int merged)
     char lim[32], beside[64] = "";
     if (p->warm_role) snprintf(beside, sizeof(beside), " (beside the game's own %llu KB)", (unsigned long long)(p->beside >> 10));
     VKB_WARN("device %u: pipeline cache %s would be %zu KB%s, over the %s limit for one program%s (VKBRIDGE_PCACHE_MAX_MB): the file "
-             "keeps what it has, pipelines compiled from now on are not saved (they stay in the driver's memory until the device goes)",
-             p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max), beside);
+             "keeps what it has, pipelines compiled from now on are not saved (they stay in the driver's memory until the device goes%s)",
+             p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max), beside,
+             merged ? "" : "; the app's own caches are no longer copied into this one, and once it is half the limit over it, it goes back to what the file holds");
 }
 
 /* A file over the limit (a lower limit than when it was saved) is not loaded, and the next save
@@ -841,6 +844,11 @@ static int merge_apps(vkb_pcache *p, int all)
 {
     vkb_srv_table *t = p->t;
     int n = 0;
+    /* Past the limit nothing of ours is saved again, and a merge only grows ours by a copy of what
+     * the app's cache already holds in the driver: Detroit: Become Human (a player log, G925) compiled
+     * into its own caches for 17 minutes and ours grew to 598 MB beside a 179 MB limit, part of the
+     * server heap growing by ~110 MB a minute until it aborted. */
+    if (__atomic_load_n(&p->full, __ATOMIC_RELAXED)) return 0;
     pthread_mutex_lock(&p->alock);
     for (pc_app *a = p->apps; a; a = a->next) {
         if (a->extsync || (!all && !a->used)) continue;
@@ -890,6 +898,7 @@ static void save_body(vkb_pcache *p, uint64_t t0, const char *when)
         return;
     }
     if (own > p->max) {
+        __atomic_store_n(&p->full, 1, __ATOMIC_RELAXED); /* caches only grow, and the limit stays: for good */
         warn_full(p, own, 0);
         return;
     }
@@ -994,6 +1003,91 @@ static time_t mono_s(void)
     return ts.tv_sec;
 }
 
+/* Past the limit (p->full) nothing of the cache is saved again, yet every pipeline made without a
+ * cache of the app's own (DXVK and vkd3d-proton pass none) still goes into it: it grew with each new
+ * pipeline for the rest of the session, in the driver's heap of the server (a4e691e stopped the
+ * copies of the app's caches; this is the other way in). Once it is PC_FULL_SLACK_DIV-th of the
+ * limit over it, it goes back to what the file holds: the pipelines of earlier sessions keep being
+ * found, only the ones of this session past the limit (never saved anyway) are compiled again if the
+ * game makes them again. VKBRIDGE_PCACHE_FULL_RELOAD=0: not (the cache grows as before). */
+#define PC_FULL_SLACK_DIV 2
+/* How long the saver tries for the write lock at a swap (compiles hold the read lock while the
+ * driver works; they are never made to wait for it): tried again at the next save otherwise. */
+#define PC_SWAP_TRY_MS 500
+
+static int full_reload_on(void)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_PCACHE_FULL_RELOAD");
+    return !(v && !strcmp(v, "0"));
+}
+
+static uint64_t full_ceiling(const vkb_pcache *p) { return p->max + p->max / PC_FULL_SLACK_DIV; }
+
+/* Called by the saver (save_lock held, so the cache stays). The new cache is made beside the old
+ * one, from the file and the pre-caching files not yet in it, the way the device's start loads them;
+ * with less than twice the file's size free (where a start would not load it) it starts empty and
+ * the file is kept as it is (not_loaded: saves only merge into it). */
+static void reload(vkb_pcache *p)
+{
+    vkb_srv_table *t = p->t;
+    uint64_t t0 = vkb_hitch_now();
+    size_t was = __atomic_load_n(&p->mem_size, __ATOMIC_RELAXED), size = 0;
+    pc_ident id = {0};
+    pc_map fm = {NULL, 0, 0, 0};
+    int load = !p->warm_role && !p->not_loaded;
+    if (load) fm = map_file(p->path, p->max, &id);
+    uint64_t avail = vkb_memavail_kb();
+    int short_mem = fm.data && avail && avail < ((uint64_t)fm.size * 2 >> 10);
+    VkPipelineCache nc = short_mem ? VK_NULL_HANDLE : cache_from(t, fm.data, fm.size);
+    if (nc) size = fm.size;
+    unmap_file(&fm);
+    if (!nc) {
+        VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL};
+        if (t->real.vkCreatePipelineCache(t->device, &ci, NULL, &nc) != VK_SUCCESS) return; /* the next save tries again */
+    }
+    for (int i = 0; nc && load && !short_mem && i < p->nwarm; i++) {
+        pc_map wm = map_file(p->warm[i], p->max, NULL);
+        VkPipelineCache tmp = wm.data && size + wm.size <= p->max ? cache_from(t, wm.data, wm.size) : VK_NULL_HANDLE;
+        if (tmp && t->real.vkMergePipelineCaches(t->device, nc, 1, &tmp) == VK_SUCCESS) size += wm.size;
+        if (tmp) t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
+        unmap_file(&wm);
+    }
+    int locked = 0;
+    for (int i = 0; i < PC_SWAP_TRY_MS && !(locked = pthread_rwlock_trywrlock(&p->use) == 0); i++) {
+        struct timespec ms = {0, 1000000};
+        nanosleep(&ms, NULL);
+    }
+    if (!locked) {
+        t->real.vkDestroyPipelineCache(t->device, nc, NULL);
+        return;
+    }
+    VkPipelineCache old = p->cache;
+    p->cache = nc;
+    pthread_rwlock_unlock(&p->use);
+    t->real.vkDestroyPipelineCache(t->device, old, NULL);
+    size_t now = 0;
+    t->real.vkGetPipelineCacheData(t->device, nc, &now, NULL);
+    __atomic_store_n(&p->mem_size, now, __ATOMIC_RELAXED);
+    p->saved_size = now;
+    if (short_mem) {
+        p->not_loaded = 1;
+        p->covers = 0;
+    } else if (size) {
+        p->file = id;
+        p->covers = 1; /* as at the start: made from the file (and pre-caching files it lacks) */
+    } else {
+        p->covers = 0; /* empty: the file (if any) holds what this one lacks */
+    }
+    p->reloads++;
+    /* said the first 3 times, then every 10th (a replay's cache with no room beside the game's file goes back at every save) */
+    if (p->reloads > 3 && p->reloads % 10) return;
+    char lim[32];
+    VKB_INFO("device %u: pipeline cache past its limit (%s) grew to %zu KB in memory, not saved: back to %s (%zu KB) in %.1f ms (%u time%s)", t->id,
+             limit_str(lim, p->max), was >> 10,
+             short_mem ? "empty, the memory free is under twice the file's size (the file is kept)" : size ? "what the file holds" : "empty", now >> 10,
+             (vkb_hitch_now() - t0) / 1e6, p->reloads, p->reloads == 1 ? "" : "s");
+}
+
 static void *saver(void *arg)
 {
     (void)arg;
@@ -1013,6 +1107,9 @@ static void *saver(void *arg)
                 merge_apps(p, 0);
                 save(p, "in the background");
                 p->last_save = now;
+                if (__atomic_load_n(&p->full, __ATOMIC_RELAXED) && full_reload_on() &&
+                    __atomic_load_n(&p->mem_size, __ATOMIC_RELAXED) > full_ceiling(p))
+                    reload(p);
             }
             pthread_mutex_lock(&pc_lock);
             p = p->next;
@@ -1088,9 +1185,11 @@ static VkResult VKAPI_CALL pc_CreatePipelineCache(VkDevice device, const VkPipel
     } else {
         size_t size = 0;
         uint8_t *buf = NULL;
+        pthread_rwlock_rdlock(&p->use); /* the saver may swap the cache (reload) */
         if (p->t->real.vkGetPipelineCacheData(device, p->cache, &size, NULL) == VK_SUCCESS && size && size <= PC_SEED_MAX &&
             (buf = malloc(size)) && p->t->real.vkGetPipelineCacheData(device, p->cache, &size, buf) != VK_SUCCESS)
             size = 0;
+        pthread_rwlock_unlock(&p->use);
         VkPipelineCacheCreateInfo seeded = *ci;
         seeded.initialDataSize = buf ? size : 0;
         seeded.pInitialData = buf;
@@ -1122,7 +1221,7 @@ static void VKAPI_CALL pc_DestroyPipelineCache(VkDevice device, VkPipelineCache 
             break;
         }
     }
-    if (cache != p->cache && !(app && app->extsync)) {
+    if (cache != p->cache && !(app && app->extsync) && !__atomic_load_n(&p->full, __ATOMIC_RELAXED)) {
         pthread_rwlock_wrlock(&p->use);
         if (p->t->real.vkMergePipelineCaches(device, p->cache, 1, &cache) == VK_SUCCESS)
             __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);

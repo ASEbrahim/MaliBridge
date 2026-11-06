@@ -318,6 +318,7 @@ typedef struct cbst {
     int have_vi;
     int vi_emu;       /* the vertex input names an emulated format */
     int drv_vi_ok;    /* native: the driver's dynamic vertex input is the noted one */
+    int xfb_dropped;  /* a vkCmdBeginTransformFeedbackEXT left out (nothing to bind): its End is too */
     uint64_t hash;
     vkey vi;
     ekey eds; /* the extended dynamic states set (VKB_VIDYN_EDS) */
@@ -1118,6 +1119,38 @@ static VKAPI_ATTR void VKAPI_CALL vi_FreeCommandBuffers(VkDevice dev, VkCommandP
     v->next.vkFreeCommandBuffers(dev, pool, n, cbs);
 }
 
+/* Transform feedback (a player log, Feed the Cups on the G925; a player log, WEBFISHING on the G615): Zink
+ * binds its pipeline, then begins transform feedback, then draws, and the bind is held here until
+ * the draw, so vkCmdBeginTransformFeedbackEXT reached the driver with no graphics pipeline bound
+ * in the command buffer (the Vulkan rule: the bound pipeline's last vertex stage declares Xfb) and
+ * Mali read through the missing pipeline (0xe78, 0xe60). The begin binds what the draw would, as a
+ * draw does; a pipeline bound while transform feedback is active is not allowed either, and with
+ * the bind done here the draw right after finds nothing left to bind. When nothing can be bound
+ * (a variant that failed: the draws are dropped too) the begin and its end are left out. */
+static VKAPI_ATTR void VKAPI_CALL vi_CmdBeginTransformFeedbackEXT(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *bufs,
+                                                                 const VkDeviceSize *offs)
+{
+    vkb_vidyn *v = V();
+    int ok = prepare(v, cb);
+    pthread_mutex_lock(&v->lock);
+    cbst *s = cb_get(v, cb, 0);
+    if (s) s->xfb_dropped = !ok;
+    pthread_mutex_unlock(&v->lock);
+    if (ok) v->next.vkCmdBeginTransformFeedbackEXT(cb, first, n, bufs, offs);
+}
+
+static VKAPI_ATTR void VKAPI_CALL vi_CmdEndTransformFeedbackEXT(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *bufs,
+                                                               const VkDeviceSize *offs)
+{
+    vkb_vidyn *v = V();
+    pthread_mutex_lock(&v->lock);
+    cbst *s = cb_get(v, cb, 0);
+    int dropped = s && s->xfb_dropped;
+    if (s) s->xfb_dropped = 0;
+    pthread_mutex_unlock(&v->lock);
+    if (!dropped) v->next.vkCmdEndTransformFeedbackEXT(cb, first, n, bufs, offs);
+}
+
 #define DRAW(name, params, args)                      \
     static VKAPI_ATTR void VKAPI_CALL vi_##name params \
     {                                                  \
@@ -1199,6 +1232,11 @@ void vkb_vidyn_device_init(vkb_srv_table *t, int mode)
     HOOK(vkCmdDrawMultiEXT, vi_vkCmdDrawMultiEXT);
     HOOK(vkCmdDrawMultiIndexedEXT, vi_vkCmdDrawMultiIndexedEXT);
     HOOK(vkCmdDrawIndirectByteCountEXT, vi_vkCmdDrawIndirectByteCountEXT);
+    const char *xb = vkb_srv_env("VKBRIDGE_XFB_BIND_FIRST"); /* =0: the begin as it was (the A/B) */
+    if (!(xb && *xb == '0')) {
+        HOOK(vkCmdBeginTransformFeedbackEXT, vi_CmdBeginTransformFeedbackEXT);
+        HOOK(vkCmdEndTransformFeedbackEXT, vi_CmdEndTransformFeedbackEXT);
+    }
     /* emulated: the client's entry point exists even where the driver has none */
     t->dt.vkCmdSetVertexInputEXT = vi_CmdSetVertexInputEXT;
     if (eds) {

@@ -139,7 +139,7 @@ static int enc_grow(vkb_enc *e, size_t add)
     return 1;
 }
 
-void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n)
+void vkb_enc_bytes_slow(vkb_enc *e, const void *p, size_t n)
 {
     if (!n || !enc_grow(e, n)) return;
     if (p) memcpy(e->buf + e->len, p, n);
@@ -147,14 +147,17 @@ void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n)
     e->len += n;
 }
 
-void vkb_enc_u8(vkb_enc *e, uint8_t v) { vkb_enc_bytes(e, &v, 1); }
-void vkb_enc_u32(vkb_enc *e, uint32_t v) { vkb_enc_bytes(e, &v, 4); }
-void vkb_enc_u64(vkb_enc *e, uint64_t v) { vkb_enc_bytes(e, &v, 8); }
-
 static void enc_align(vkb_enc *e)
 {
     size_t pad = (8 - (e->len & 7)) & 7;
-    if (pad) vkb_enc_bytes(e, NULL, pad);
+    if (!pad) return;
+    /* the padding is zeros: one 8-byte store (room for it checked), then len moves by pad */
+    if (!e->oom && e->cap - e->len >= 8) {
+        memset(e->buf + e->len, 0, 8);
+        e->len += pad;
+        return;
+    }
+    vkb_enc_bytes_slow(e, NULL, pad);
 }
 
 size_t vkb_enc_raw(vkb_enc *e, const void *p, size_t n)
@@ -377,7 +380,7 @@ void vkb_dec_init(vkb_dec *d, const void *buf, size_t len, vkb_arena *a, int *fd
     d->nfds = nfds;
 }
 
-void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
+void vkb_dec_bytes_slow(vkb_dec *d, void *dst, size_t n)
 {
     if (d->err || d->len - d->pos < n) {
         d->err = 1;
@@ -387,10 +390,6 @@ void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
     if (dst) memcpy(dst, d->buf + d->pos, n);
     d->pos += n;
 }
-
-uint8_t vkb_dec_u8(vkb_dec *d) { uint8_t v; vkb_dec_bytes(d, &v, 1); return v; }
-uint32_t vkb_dec_u32(vkb_dec *d) { uint32_t v; vkb_dec_bytes(d, &v, 4); return v; }
-uint64_t vkb_dec_u64(vkb_dec *d) { uint64_t v; vkb_dec_bytes(d, &v, 8); return v; }
 
 static void dec_align(vkb_dec *d)
 {

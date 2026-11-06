@@ -71,7 +71,7 @@ uint32_t vkb_caps_heap_max_mb(const char *value, int *ok)
 
 const VkExtensionProperties *vkb_caps_emu_extensions(const vkb_pd_caps *caps, uint32_t *n)
 {
-    static __thread VkExtensionProperties list[16];
+    static __thread VkExtensionProperties list[24];
     uint32_t c = 0;
     if (CAP_EMU(caps, VKB_EMU_MAINT5))
         list[c++] = (VkExtensionProperties){"VK_KHR_maintenance5", 1};
@@ -93,6 +93,11 @@ const VkExtensionProperties *vkb_caps_emu_extensions(const vkb_pd_caps *caps, ui
         list[c++] = (VkExtensionProperties){"VK_KHR_dynamic_rendering", 1};
     if (CAP_EMU(caps, VKB_EMU_TIMELINE))
         list[c++] = (VkExtensionProperties){"VK_KHR_timeline_semaphore", 2};
+    if (CAP_EMU(caps, VKB_EMU_IMAGELESS))
+        list[c++] = (VkExtensionProperties){"VK_KHR_imageless_framebuffer", 1};
+    /* answered by the server (server_memory.c memb_fill); the client maps its heaps (client/physdev.c) */
+    if (CAP_EMU(caps, VKB_EMU_MEM_BUDGET))
+        list[c++] = (VkExtensionProperties){"VK_EXT_memory_budget", 1};
     if (CAP_EMU(caps, VKB_EMU_DMABUF_AHB)) {
         list[c++] = (VkExtensionProperties){"VK_KHR_external_memory_fd", 1};
         list[c++] = (VkExtensionProperties){"VK_EXT_external_memory_dma_buf", 1};
@@ -383,6 +388,10 @@ void vkb_caps_patch_features_chain(const vkb_pd_caps *caps, VkBaseOutStructure *
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
         if (CAP_EMU(caps, VKB_EMU_TIMELINE))
             ((VkPhysicalDeviceVulkan12Features *)b)->timelineSemaphore = VK_TRUE;
+        set_feature(caps, VKB_EMU_IMAGELESS, &((VkPhysicalDeviceVulkan12Features *)b)->imagelessFramebuffer);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES:
+        set_feature(caps, VKB_EMU_IMAGELESS, &((VkPhysicalDeviceImagelessFramebufferFeatures *)b)->imagelessFramebuffer);
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
         set_feature(caps, VKB_EMU_DEPTH_CLIP,

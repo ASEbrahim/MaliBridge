@@ -183,6 +183,7 @@ int main(int argc, char **argv)
     vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ep);
     int have = 0, gpl = 0, push = 0, eds2 = 0;
     for (uint32_t i = 0; i < ne; i++) {
+        if (getenv("VKB_LIST_EXTS")) printf("ext: %s\n", ep[i].extensionName); /* the whole offered list (xclipse_zink_test) */
         have |= !strcmp(ep[i].extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
         gpl |= !strcmp(ep[i].extensionName, "VK_EXT_graphics_pipeline_library");
         push |= !strcmp(ep[i].extensionName, "VK_KHR_push_descriptor");

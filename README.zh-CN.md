@@ -19,6 +19,7 @@
   <a href="INSTALL.md"><b>安装指南（英文）</b></a> ·
   <a href="#我的设备能用吗"><b>我的设备能用吗？</b></a> ·
   <a href="#能运行的游戏"><b>能运行的游戏</b></a> ·
+  <a href="https://malibridge.com/"><b>玩家结果（MaliBridge Library）</b></a> ·
   <a href="#最佳设置与性能建议"><b>最佳设置</b></a> ·
   <a href="#获取帮助"><b>获取帮助</b></a> ·
   <a href="#常见问题"><b>常见问题</b></a>
@@ -54,9 +55,9 @@
 
 **[加入 Discord](https://discord.gg/9xC67qTjDq)**：测试版、帮助和更多额外内容（中国大陆可能无法直接访问）。
 
-**当前版本：v0.5.5**，基于 DroidDeck 0.6.9。更早的版本见 [Releases 页面](https://github.com/ASEbrahim/MaliBridge/releases)。
+**当前版本：v0.5.5.3**，基于 DroidDeck 0.6.9。更早的版本见 [Releases 页面](https://github.com/ASEbrahim/MaliBridge/releases)。
 
-MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配合 DroidDeck 使用的版本（DroidDeck 是在安卓上运行 Steam 客户端和 PC 游戏的应用）。在三星 Galaxy Tab S10+（Mali-G720）和 Galaxy Tab S11 Ultra（Mali-G925）上，我测试过的 36 款游戏达到了可玩或更好的水平，例如《半条命2》约 94 fps、《空洞骑士：丝之歌》、《星露谷物语》、Risk of Rain Returns、《黑暗之魂 重制版》、《盖瑞模组》。玩家还从另外 32 台 Mali 手机、平板和掌机发来了反馈。下面的表格共涉及 93 款不同的游戏，其中 50 款达到可玩或更好。MaliBridge 是免费的。
+MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配合 DroidDeck 使用的版本（DroidDeck 是在安卓上运行 Steam 客户端和 PC 游戏的应用）。在三星 Galaxy Tab S10+（Mali-G720）和 Galaxy Tab S11 Ultra（Mali-G925）上，我测试过的 36 款游戏达到了可玩或更好的水平，例如《半条命2》约 94 fps、《空洞骑士：丝之歌》、《星露谷物语》、Risk of Rain Returns、《黑暗之魂 重制版》、《盖瑞模组》。玩家还从另外 38 台 Mali 手机、平板和掌机发来了反馈。下面的表格共涉及 98 款不同的游戏。MaliBridge 是免费的。
 
 ## 我的设备能用吗？
 
@@ -75,23 +76,29 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 | Mali-G57 | 小米手机（联发科，G57 MC2） | r54p1 | **可用，有说明** | 《求生之路2》17-19 fps |
 | Mali-G57 | 三星 Galaxy F15 | r38p1 | **可用** | Steam 可以打开，玩家已确认 |
 | Mali-G68 | 三星 Galaxy A16 5G | r38p1 | **可用** | Steam 可以打开，玩家已确认 |
+| Mali-G57 | 三星 Galaxy A07（Helio G99） |  | **可用** | 《Tap Ninja》约 59 fps |
 | Mali-G68 | 三星 Galaxy A54 | r38p1 | **可用，有说明** | Steam 可以打开；菜单较慢 |
+| Mali-G68 | 三星 Galaxy A34 5G（天玑 1080） |  | **可用** | 《星球大战：共和国突击队》可玩，约 30 fps |
 | Mali-G76 | 三星 Galaxy S10+ 手机（Exynos 9820） | r38p1 beta | **可用，有说明** | Steam 可以打开，游戏能运行但比较慢 |
 | Mali-G77 | Retroid Pocket 4 Pro（天玑 1100） | r32p1 | **可用，有说明** | Steam 和 Big Picture 可以运行；部分画面会闪烁 |
 | Mali-G77 | 华为 Nova 7（麒麟 985） |  | **可用，有说明** | 《杀戮尖塔》1 和 2 可以运行；有一款游戏提示 “Direct3D isn't supported” |
 | Mali-G78 | 三星 Galaxy S21 | r38p0 | **可用** | 《Muse Dash》约 53 fps |
+| Mali-G610 | 小米 12T（天玑 8100-Ultra） | r32p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/34#issuecomment-6570084449)：Steam 可以运行，《半条命》能玩 |
 | Mali-G615 | POCO X6 Pro（天玑 8300-Ultra） |  | **可用，有说明** | [玩家反馈](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6311114838)：较轻的游戏可以运行（《侠盗猎魔：圣安地列斯》、《火爆狂飙：天堂》约 30 fps）；较重的游戏 12-14 fps |
 | Mali-G615 | 天玑 8350 手机 |  | **可用** | [玩家反馈](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6322050101)：《Rivals of Aether》约 55 fps |
 | Mali-G615 | 小米手机（G615 MC2） | r44p1 | **可用** | 《最终幻想 Resonance》约 46 fps |
 | Mali-G615 | Infinix 手机（G615 MC6，11.5 GB 内存） | r44p1 | **可用，有说明** | 《铁拳7》9-30 fps；手机的可用内存不足 |
 | Mali-G710 | 一加 Ace 2V（天玑 9000） | r32p1 | **可用，有说明** | [玩家反馈](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6335790759)：《RimWorld》能玩 1-2 小时；《半条命2》能启动。需要手动选择 DXVK 1.10.3 |
+| Immortalis-G715 | 小米 13T Pro（天玑 9200+） | r38p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669)：《死亡细胞》39-47 fps，《BALL x PIT》约 35 fps，《哈迪斯》约 17 fps；Steam 菜单 20-25 fps |
+| Immortalis-G715 | vivo X90s（天玑 9200+） | r38p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/51#issuecomment-6571868319)：从 v0.5.5 开始 Steam 不再黑屏；可以玩，但有点卡 |
 | Immortalis-G715 | Pixel 8 / 8 Pro（Tensor G3） | r54 | **可用** | [玩家反馈](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6306332804)：《茶杯头》60-100 fps，《哈迪斯》30-60 fps，《冤罪杀机》15-25 fps |
 | Immortalis-G715 | Pixel 9（Tensor G4） | r54p3 | **可用，有说明** | [玩家反馈](https://github.com/Droid-Deck/DroidDeck/pull/517#issuecomment-6220985381)：Steam 可以启动；游戏尚未确认 |
 | Immortalis-G720 | 三星 Galaxy Tab S10+（天玑 9300+） | r44p1 | **可用** | 深入测试 |
+| Immortalis-G720 | vivo X100 Pro（天玑 9300） |  | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19193192)：《茶杯头》约 100 fps；Steam 菜单约 15 fps，打开时会白屏闪一下；《极限竞速：地平线4》进入游戏时关闭 |
 | Immortalis-G720 | realme Neo7（天玑 9300+） | r44p1 | **可用** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/5)：《星露谷物语》约 59 fps，《Balatro》55-72 fps |
 | Immortalis-G720 | 小米 14T Pro（天玑 9300+） | r44p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19146763)：Steam、手柄和下载都正常；《心灵杀手》低画质 20-50 fps；偶尔有需要重启游戏的画面异常 |
 | Mali-G720 | POCO X8 Pro（天玑 8500） | r49p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497)：《印第安纳·琼斯与帝王之墓》约 30 fps；《Hob》会卡顿 |
-| Mali-G720 | POCO X7 Pro（天玑 8400-Ultra） | | **可用** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/23)：较轻的游戏可以运行（Stardew Valley、Rain World、Tukoni: Forest Keepers 等） |
+| Mali-G720 | POCO X7 Pro（天玑 8400-Ultra） | | **可用** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/23)：较轻的游戏可以运行（Stardew Valley、Rain World、Tukoni: Forest Keepers 等）；[《暗黑血统：创世纪》低画质 23-27 fps](https://github.com/ASEbrahim/MaliBridge/issues/62) |
 | Immortalis-G925 | 三星 Galaxy Tab S11 Ultra（天玑 9400） | r49p1 | **可用** | 深入测试 |
 | Immortalis-G925 | vivo X200（天玑 9400） |  | **可用** | [玩家反馈](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6314012693)：《欧洲卡车模拟2》约 20 fps，《模拟山羊》约 35 fps |
 | Mali-G925 | 小米平板 7S Pro（玄戒 O1） | r49p1 | **可用** | Steam 可以运行 |
@@ -115,10 +122,10 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 |---|---|---|
 | 天玑 9300 / 9300+（其他设备） | Immortalis-G720 MC12 | OPPO Find X7 |
 | 天玑 9400 / 9400+（其他设备） | Immortalis-G925 MC12 | OPPO Find X8 |
-| 天玑 7300、Helio G99 等 | Mali-G615 / G610 / G57 | 许多中端手机（GPU 较小：只适合较轻的游戏） |
-| Exynos 1280 / 2100 | Mali-G68 / G78 | Galaxy A53 |
+| 天玑 7300 等 | Mali-G615 / G610 | 许多中端手机（GPU 较小：只适合较轻的游戏） |
+| Exynos 1280 | Mali-G68 | Galaxy A53 |
 
-**非 Mali 芯片：** 骁龙使用 Adreno GPU，请直接使用官方 DroidDeck。三星较新的 Exynos 芯片使用 Xclipse GPU，其中一些手机可以用（表里有 Galaxy A55）。Galaxy S24+（Xclipse 940，[#43](https://github.com/ASEbrahim/MaliBridge/issues/43)）和 A56（Xclipse 540，[#29](https://github.com/ASEbrahim/MaliBridge/issues/29)）在旧版本上无法启动；v0.5.5 为它们做了改动，但我还没有收到确认。后续会支持更多设备。
+**非 Mali 芯片：** 骁龙使用 Adreno GPU，请直接使用官方 DroidDeck。三星较新的 Exynos 芯片使用 Xclipse GPU，其中一些手机可以用（表里有 Galaxy A55）。升级到 Android 17（One UI 9）的三星手机上，Steam 会一直停在加载画面；v0.5.5.3 应该能修复。我自己用 v0.5.5.3 测试时，Steam 在 Galaxy S26 FE（Android 17）和 Galaxy A56 上都能进入登录界面。Galaxy S24+（Xclipse 940，[#43](https://github.com/ASEbrahim/MaliBridge/issues/43)）和 A56（Xclipse 540，[#29](https://github.com/ASEbrahim/MaliBridge/issues/29)）的玩家还没有确认。
 
 不在表里的设备依然只算测试：结果取决于 GPU 及其驱动。欢迎发送日志（见[获取帮助](#获取帮助)）。
 
@@ -127,7 +134,7 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 1. 先在上面的表格里查一下你的芯片。
 2. 从[最新版本](https://github.com/ASEbrahim/MaliBridge/releases/latest)下载 `DroidDeck-MaliBridge-....apk` 并安装。安装后的应用名是 **DroidDeck Mali**，可以和官方 DroidDeck 同时存在。
 3. 打开 DroidDeck Mali（**Mali bridge** 默认开启，不确定的话到 **配置**（Setup）页面的“概览”里看一下），启动 **Steam** 会话并登录。
-4. 每个游戏都需要在“属性 → 兼容性”里选择 **Proton Experimental ARM64 (Compatible)**。
+4. 直接启动游戏。应用会自己选一个能用的 DroidDeck-Proton，不需要手动切换。
 
 **需要：** 64 位 Android 8.0 或更新；8 GB 内存以上（较大的游戏建议 12 GB 以上）；游戏之外约 8-10 GB 空闲空间。
 
@@ -265,10 +272,11 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 </details>
 
 <details>
-<summary><b>Immortalis-G720（天玑 9300）：realme Neo7、小米 14T Pro</b>（3 款游戏）</summary>
+<summary><b>Immortalis-G720（天玑 9300）：realme Neo7、vivo X100 Pro、小米 14T Pro</b>（4 款游戏）</summary>
 
 | 游戏 | 设备（GPU） | 结果 |
 |---|---|---|
+| Cuphead | vivo X100 Pro（G720） | [游戏中约 100 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19193192) |
 | Stardew Valley | realme Neo7（G720） | [约 59 fps](https://github.com/ASEbrahim/MaliBridge/issues/5) |
 | Balatro | realme Neo7（G720） | [55-72 fps；之前缺失的文字已修复](https://github.com/ASEbrahim/MaliBridge/issues/5) |
 | Alan Wake | 小米 14T Pro（G720） | [低画质 20-50 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19146763) |
@@ -276,17 +284,29 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 </details>
 
 <details>
-<summary><b>Mali-G720 MC7/MC8（天玑 8400/8500）：POCO X7 Pro、POCO X8 Pro</b>（7 款游戏）</summary>
+<summary><b>Mali-G720 MC7/MC8（天玑 8400/8500）：POCO X7 Pro、POCO X8 Pro</b>（8 款游戏）</summary>
 
 | 游戏 | 设备（GPU） | 结果 |
 |---|---|---|
 | Indiana Jones and the Emperor's Tomb | POCO X8 Pro（G720 MC8） | [使用 Stability FEX 预设时游戏中约 30 fps；Performance 预设会因 “invalid camera matrix” 错误停止](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497) |
+| Darksiders Genesis | POCO X7 Pro（G720 MC7） | [1600x720 低画质 23-27 fps，打过一场特效很多的 Boss 战](https://github.com/ASEbrahim/MaliBridge/issues/62) |
 | Good Company | POCO X7 Pro (G720 MC7) | [可以运行；需要用 PC 键盘操作](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Hob | POCO X8 Pro（G720 MC8） | [可玩，有些卡顿，正在处理](https://github.com/ASEbrahim/MaliBridge/issues/14) |
 | Japanese Rural Life Adventure | POCO X7 Pro (G720 MC7) | [可以玩](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Rain World | POCO X7 Pro (G720 MC7) | [可以玩](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Stardew Valley | POCO X7 Pro (G720 MC7) | [可以玩](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Tukoni: Forest Keepers | POCO X7 Pro (G720 MC7) | [可以玩](https://github.com/ASEbrahim/MaliBridge/issues/23) |
+
+</details>
+
+<details>
+<summary><b>Immortalis-G715（天玑 9200+）：小米 13T Pro</b>（3 款游戏）</summary>
+
+| 游戏 | 设备（GPU） | 结果 |
+|---|---|---|
+| Dead Cells | 小米 13T Pro（G715） | [39-47 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669) |
+| BALL x PIT | 小米 13T Pro（G715） | [约 35 fps，可玩](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669) |
+| Hades | 小米 13T Pro（G715） | [约 17 fps，有卡顿](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669) |
 
 </details>
 
@@ -332,6 +352,15 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 </details>
 
 <details>
+<summary><b>Mali-G610（天玑 8100）：小米 12T</b>（1 款游戏）</summary>
+
+| 游戏 | 设备（GPU） | 结果 |
+|---|---|---|
+| Half-Life | 小米 12T（G610） | [能玩](https://github.com/ASEbrahim/MaliBridge/issues/34#issuecomment-6570084449) |
+
+</details>
+
+<details>
 <summary><b>Mali-G615（天玑 8300/8350）：POCO X6 Pro 等</b>（7 款游戏）</summary>
 
 | 游戏 | 设备（GPU） | 结果 |
@@ -347,10 +376,20 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 </details>
 
 <details>
-<summary><b>Mali-G57（Helio G96）：Redmi Note 12S 和一款小米手机</b>（7 款游戏）</summary>
+<summary><b>Mali-G68（天玑 1080）：Galaxy A34 5G</b>（1 款游戏）</summary>
 
 | 游戏 | 设备（GPU） | 结果 |
 |---|---|---|
+| Star Wars Republic Commando | Galaxy A34 5G（G68） | 可玩，约 30 fps |
+
+</details>
+
+<details>
+<summary><b>Mali-G57（Helio G96/G99）：Redmi Note 12S、Galaxy A07 和一款小米手机</b>（8 款游戏）</summary>
+
+| 游戏 | 设备（GPU） | 结果 |
+|---|---|---|
+| Tap Ninja | Galaxy A07（G57） | 约 59 fps |
 | Space Menace | Redmi Note 12S（G57） | [60 fps，偶有小卡顿](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19166394) |
 | Death Road to Canada | Redmi Note 12S（G57） | [30-60 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19128201) |
 | Zombie Blocks 2 | Redmi Note 12S（G57） | [低画质约 30 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19128201) |
@@ -361,9 +400,11 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 
 </details>
 
+更多玩家结果（按设备和游戏）见 [MaliBridge Library](https://malibridge.com/)。
+
 ## 最佳设置与性能建议
 
-- **Proton：** 每个游戏都选 **Proton Experimental ARM64 (Compatible)**。列表中 Valve 官方的 “Proton (ARM64)” 和 “Steam Linux Runtime” 在 DroidDeck 里无法启动。同时有 Linux 版本的游戏（《传送门2》《半条命2》等）需要手动设置。
+- **Proton：** 不需要手动切换。应用会自己选一个能用的 DroidDeck-Proton（默认是 DroidDeck-Proton 11-11.10），也不会自己把你的游戏换到更新的版本。列表中 Valve 官方的 “Proton (ARM64)” 和 “Steam Linux Runtime” 在 DroidDeck 里无法启动。同时有 Linux 版本的游戏（《传送门2》《半条命2》等）需要手动选一个 DroidDeck-Proton。
 - **先用安全模式（默认）。** 它的兼容性最好。**性能模式**（Safe mode 关闭）在 Mali bridge 按钮下面；在我的平板上它只快 0-2%，在较弱的 GPU（Mali-G57、G68、G610）上，我看过的日志里没有提升。等游戏已经能正常运行后再试，如果出问题，先切回安全模式再反馈。
 - **DXVK: automatic**（默认）会在 GPU 太旧、跑不了 Proton 自带 DXVK 的手机上换用较旧的 DXVK。
 - **Steam menus: automatic**（默认）可以避免较旧的 Mali GPU 上 Steam 菜单黑屏。如果 Steam 还是黑屏，改成 **Steam menus: software**，游戏仍然使用 GPU。
@@ -412,22 +453,25 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 
 1. 让游戏关闭，然后在侧边菜单点 **停止**（Stop）。
 2. 点 **Send logs to MaliBridge**（在 **配置 > Diagnostics**、会话结束画面或侧边菜单里）。它会给你一个短代码，例如 `ML-7F3K`。
-3. 把代码贴到 Discord 或 [GitHub Issues](https://github.com/ASEbrahim/MaliBridge/issues) 里。
+3. 把代码贴到 Discord 的 **#help** 频道或 [GitHub Issues](https://github.com/ASEbrahim/MaliBridge/issues) 里。
 
 上传的内容（同意前应用会这样说明）：你的设备型号、你运行过的游戏名称，以及这次会话的日志。账户名、密码和令牌会先被移除。日志保存 90 天，只有开发者能看到。
 
-**也可以自己分享日志：** 在 **配置 > Diagnostics** 里点 **最新会话日志** 旁边的 **分享日志**，把生成的 zip 附到 issue 或 Discord 帖子里。
-
-**新建 issue：** 打开 [Issues](https://github.com/ASEbrahim/MaliBridge/issues)，写上手机型号、MaliBridge 版本、你做了什么、发生了什么（比如“Steam 一直没出现”或“游戏一启动就关闭”），以及日志代码或 zip。用中文或英文写都可以，机器翻译也没问题。
+**新建 issue：** 打开 [Issues](https://github.com/ASEbrahim/MaliBridge/issues)，写上手机型号、MaliBridge 版本、你做了什么、发生了什么（比如“Steam 一直没出现”或“游戏一启动就关闭”），以及日志代码。用中文或英文写都可以，机器翻译也没问题。
 
 **最有帮助的反馈：** 表格里没有的 Mali 设备、黑屏，以及一启动就关闭的游戏。每次会话只启动一次游戏，这样日志里只会有一次尝试。
+
+**游戏一启动就关闭，没有画面？** 再启动一次，然后发送日志。游戏这样关闭后，下一次启动会保存额外的日志，日志代码就能看出原因。
 
 [安装指南（英文）](INSTALL.md#if-something-goes-wrong)里有更详细的说明。
 
 ## 已知问题
 
-- Galaxy A16、A54、F15、Tab S9 FE、Tab S10 Lite 和 Anbernic RG556 上的 **OpenGL 游戏**还没有测试。
-- 一些边走边加载贴图的游戏（《黑暗之魂3》、Hob）在**移动时会短暂卡顿**。
+- **Galaxy Tab S9 FE（Mali-G68）上的 OpenGL 游戏**可能出现贴图错误，例如 OpenGL 模式下的《欧洲卡车模拟2》。正在处理。Galaxy A16、A54、F15、Tab S10 Lite 和 Anbernic RG556 上的 OpenGL 游戏还没有测试。
+- 一些边走边加载贴图的游戏（《黑暗之魂3》、Hob）在**移动时会短暂卡顿**。v0.5.5.3 会记录每次卡顿在等什么，所以卡顿的游戏的日志会有帮助。
+- 部分小米、POCO 和 vivo 手机上 **Steam 菜单反复关闭**，以及 POCO X8 Pro 上游戏回到 Steam（[#55](https://github.com/ASEbrahim/MaliBridge/issues/55)）。v0.5.5.3 会记录关闭的原因，出现后马上发送日志就行。
+- **手机内存不足时游戏被关闭。** v0.5.5.3 在部分游戏里可能有帮助。先关掉其他应用，每次会话只启动一个游戏。
+- **部分 Android 10 的华为手机**（P30、P40 Pro）可能卡在 Steam 安装步骤。v0.5.5.3 可能有帮助；如果还是卡住，日志会有帮助。
 - 在**部分 vivo 和 iQOO 手机**上，Steam 的菜单可能只有约 15 fps，打开菜单时会白屏闪一下。v0.5.5 为此做了改动，但还没有在手机上确认。如果你有这些手机，日志会有帮助。
 - **Mali-G925 上的《巫师3》（DX12）**约 29 fps，但有一次在过场动画里卡死。正在处理。
 - **Mali-G720 上的《Bright Memory: Infinite》**在 DirectX 11 下勉强运行，DirectX 12 模式无法运行。
@@ -437,7 +481,7 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 - **Risk of Rain 2**：在 G925 上有一次性能模式启动时，标题加载约 2 分钟没有画面，之后恢复正常。之后没有再出现。
 - **Mali-G925 上的 Steam 窗口**可能有些慢。游戏不受影响。
 - 天玑 9500 手机（Mali-G1-Ultra）的部分游戏有**绿色方块贴图问题**。正在处理。
-- **Just Cause 2** 无法启动：Steam 的防拷贝检查在 DroidDeck 里耗时太长。
+- **Just Cause 2、Mafia II 和 Space Marine** 可能一直停在 Steam 的 “Updating executable” 步骤：Steam 的防拷贝检查在 DroidDeck 里耗时太长。
 - **《生化危机2》**菜单上可能出现 “Failed to send play data to RE NET”。按 OK 即可，游戏正常运行，只影响 Capcom 的在线游玩统计。
 - **《黑暗之魂3》在较慢的设备上**可能提示 “Frame rate unsuitable for online play” 并回到标题画面。这是游戏自己的规则（低于约 20 fps）：在这些设备上请离线游玩。
 - **Outer Wilds、ASTRONEER 和 The Forest** 在 G925 上受 CPU 限制，降低分辨率或画质帮助不大。
@@ -449,6 +493,7 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 - 第一次进入新区域时更流畅。
 - 受 CPU 限制的游戏（The Forest、ASTRONEER、Outer Wilds）以及 Just Cause 2。
 - DirectX 12：《巫师3》过场动画卡死、DX12 下的 Stray、《艾尔登法环》、Bright Memory。
+- Steam 菜单反复关闭或一直黑屏的手机。
 - 更多设备：来自我没测试过的 Mali GPU 的反馈，是最快的途径。
 
 ## 常见问题

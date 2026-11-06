@@ -80,29 +80,48 @@ extern __thread const char *vkb_srv_current_cmd;
  * vkCreateGraphicsPipelines with nothing to go on). */
 static struct sigaction crash_prev[32];
 
+/* A line from the crash handler, as on_crash writes its own: the log, stderr, logcat. */
+void vkb_crash_log_raw(const char *line, size_t n)
+{
+    if (log_file && write(fileno(log_file), line, n) < 0) {}
+    if (write(2, line, n) < 0) {}
+#ifdef __ANDROID__
+    __android_log_write(ANDROID_LOG_ERROR, "vkbridge", line);
+#endif
+}
+
 static void on_crash(int sig, siginfo_t *si, void *uc)
 {
     /* Inside a guarded shader/pipeline compile (server_guard.c): that call fails instead. */
-    if (sig != SIGABRT) vkb_guard_fault(sig, si ? si->si_addr : NULL);
-    vkb_probe_mark_end(sig, 1); /* a startup probe in flight died of it (server_probe.c) */
-    char buf[1024];
-    const char *cmd = vkb_srv_current_cmd ? vkb_srv_current_cmd : "(no Vulkan call)";
-    /* Where: the faulting pc as library + offset (logcat may not keep debuggerd's tombstone), and
-     * inside a command buffer replay its position and the commands before it (after The412Banner's
-     * crash detail on the DroidDeck test branch). dladdr is not async-signal-safe; the process is
-     * going down anyway. */
     uintptr_t pc = 0;
 #if defined(__aarch64__)
     if (uc) pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc;
 #elif defined(__x86_64__) && defined(REG_RIP)
     if (uc) pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
 #endif
+    if (sig != SIGABRT) vkb_guard_fault(sig, si ? si->si_addr : NULL, si ? si->si_code : 0, pc);
+    vkb_probe_mark_end(sig, 1); /* a startup probe in flight died of it (server_probe.c) */
+    char buf[2048];
+    const char *cmd = vkb_srv_current_cmd ? vkb_srv_current_cmd : "(no Vulkan call)";
+    /* Where: the faulting pc as library + offset (logcat may not keep debuggerd's tombstone), and
+     * inside a command buffer replay its position and the commands before it (after The412Banner's
+     * crash detail on the DroidDeck test branch). dladdr is not async-signal-safe; the process is
+     * going down anyway. */
     Dl_info di;
     memset(&di, 0, sizeof(di));
     int found = pc && dladdr((void *)pc, &di) && di.dli_fname;
     const char *lib = found ? strrchr(di.dli_fname, '/') : NULL;
-    int n = snprintf(buf, sizeof(buf), "vkbridge-server E crashed with signal %d (code %d, address %p) in %s, pc %p (%s+0x%lx)\n", sig,
-                     si ? si->si_code : 0, si ? si->si_addr : NULL, cmd, (void *)pc,
+    /* The driver's own thread faulting after a device was lost: stopped, the server goes
+     * on (server_lost.c). Returns when that does not apply, or when its watchdog lets it die. */
+    vkb_lost_fault(sig, si ? si->si_addr : NULL, pc, found ? di.dli_fname : NULL, found ? (lib ? lib + 1 : di.dli_fname) : NULL,
+                   found ? (unsigned long)(pc - (uintptr_t)di.dli_fbase) : 0ul);
+    /* Whose call it was: the one server serves every program, and asynchronous calls (binds,
+     * submits) carry no reply that would tie the death to a program. */
+    const vkb_srv_proc *client = vkb_srv_crash_client();
+    char who[64] = "";
+    if (client) snprintf(who, sizeof(who), " from %s (pid %d)", client->comm[0] ? client->comm : "?", client->pid);
+    int n = snprintf(buf, sizeof(buf), "vkbridge-server E crashed with signal %d (code %d, address %p) in %s%s, pc %p (%s+0x%lx)\n", sig,
+                     si ? si->si_code : 0, si ? si->si_addr : NULL, cmd, who, (void *)pc,
                      found ? (lib ? lib + 1 : di.dli_fname) : "?", found ? (unsigned long)(pc - (uintptr_t)di.dli_fbase) : 0ul);
     if (vkb_srv_replay_cb && n > 0 && n < (int)sizeof(buf)) {
         uint32_t done = vkb_srv_replay_n, first = done > VKB_REPLAY_RING ? done - VKB_REPLAY_RING : 0;
@@ -116,13 +135,33 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
         buf[n++] = '\n';
         buf[n] = 0;
     }
+    if (n > 0 && n < (int)sizeof(buf) - 1) n += vkb_crashctx_where(buf + n, sizeof(buf) - (size_t)n, si ? si->si_addr : NULL);
     if (vkb_srv_crash_detail[0] && n > 0 && n < (int)sizeof(buf))
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "vkbridge-server E   %s\n", vkb_srv_crash_detail);
+    /* The call's arguments and what they name (server_crashctx.c): images, memory, the bound pipeline. */
+    if (n > 0 && n < (int)sizeof(buf) - 1) n += vkb_crashctx_describe(buf + n, sizeof(buf) - (size_t)n, cmd);
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
     if (log_file) {
         if (write(fileno(log_file), buf, (size_t)n) < 0) {}
     }
     if (write(2, buf, (size_t)n) < 0) {}
+    /* Last and on its own: the other threads' calls (read from structures other threads change). */
+    {
+        char oth[768];
+        int k = snprintf(oth, sizeof(oth), "vkbridge-server E   other calls in flight: ");
+        int m = vkb_srv_crash_others(oth + k, sizeof(oth) - (size_t)k - 1);
+        if (!m) m = snprintf(oth + k, sizeof(oth) - (size_t)k, "none");
+        k += m;
+        if (k > (int)sizeof(oth) - 2) k = (int)sizeof(oth) - 2;
+        oth[k++] = '\n';
+        if (log_file && write(fileno(log_file), oth, (size_t)k) < 0) {}
+        if (write(2, oth, (size_t)k) < 0) {}
+        if (n + k < (int)sizeof(buf)) {
+            memcpy(buf + n, oth, (size_t)k);
+            n += k;
+            buf[n] = 0;
+        }
+    }
 #ifdef __ANDROID__
     __android_log_write(ANDROID_LOG_FATAL, "vkbridge", buf);
     if (sig > 0 && sig < 32) {

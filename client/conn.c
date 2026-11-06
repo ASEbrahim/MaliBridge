@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Client transport: one Unix-socket connection per thread (the server mirrors it with one thread),
  * so calls from different threads run in parallel exactly as they would on a local driver.
@@ -38,6 +37,8 @@ int vkb_log_level(void)
     return log_level_v;
 }
 
+static void log_msg(int level, const char *msg);
+
 void vkb_log(int level, const char *fmt, ...)
 {
     if (level > vkb_log_level()) return;
@@ -46,6 +47,24 @@ void vkb_log(int level, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    log_msg(level, msg);
+}
+
+/* A line that is informational but always wanted (the default-on statistics: VKBRIDGE_WAIT_STATS):
+ * tagged info, written at any log level but VKBRIDGE_LOG_LEVEL below 0 (nothing at all). */
+void vkb_log_info_always(const char *fmt, ...)
+{
+    if (vkb_log_level() < 0) return;
+    char msg[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    log_msg(VKB_LOG_INFO, msg);
+}
+
+static void log_msg(int level, const char *msg)
+{
     static const char *const tags[] = {"error", "warning", "info", "debug"};
     char comm[32] = "?";
     FILE *cf = fopen("/proc/self/comm", "re");
@@ -511,15 +530,22 @@ int vkb_async_ran(uint64_t seq) { return __atomic_load_n(&synced_seq, __ATOMIC_A
 
 void vkb_call_begin(vkb_call *c, uint32_t cmd, uint32_t table)
 {
-    memset(c, 0, sizeof(*c));
+    /* Not a memset of the whole call plus a copy of the connection's encoder in and out (176 + 2 x 96 bytes per
+     * request; ~5% of the client's own CPU in a DXVK frame on the host): the decoder is cleared, and of the encoder
+     * only what lives between calls (the buffer and its capacity) moves; its fds[] is read only below nfds. */
+    c->d = (vkb_dec){0};
     c->cmd = cmd;
     c->table = table;
+    c->flags = 0;
     if (poll_next) c->flags |= VKB_CALL_POLL, poll_next = 0;
     c->conn = get_conn();
     if (c->conn && !c->conn->busy) {
         c->conn->busy = 1;
-        c->e = c->conn->enc;
-        vkb_enc_reset(&c->e);
+        c->e.buf = c->conn->enc.buf;
+        c->e.cap = c->conn->enc.cap;
+        c->e.len = 0;
+        c->e.nfds = 0;
+        c->e.oom = 0;
     } else {
         /* No connection, or a nested call: encode into a private buffer. */
         if (c->conn && c->conn->busy) VKB_ERR("internal: nested bridge call (%s)", vkb_cmd_names[cmd]);
@@ -533,7 +559,8 @@ static void release_enc(vkb_call *c)
     if (c->flags & 0x80000000u) {
         vkb_enc_free(&c->e);
     } else if (c->conn) {
-        c->conn->enc = c->e;
+        c->conn->enc.buf = c->e.buf;
+        c->conn->enc.cap = c->e.cap;
         c->conn->busy = 0;
         /* Don't keep a huge buffer around after one big message. */
         if (c->conn->enc.cap > (16u << 20)) {
@@ -585,40 +612,56 @@ static int slow_ms = -1;
 
 static int exec(vkb_call *c);
 
-/* VKBRIDGE_WAIT_STATS=<seconds> (a diagnostic): each thread logs, that often, the time it spent
- * in round trips (waiting for the server's reply, ordering included) by command, under its own
- * name (DXVK names its threads), to tell which thread pays for the bridge's waits. */
-static int wait_period = -1;
+/* VKBRIDGE_WAIT_STATS=<seconds>: each thread logs, that often, the time it spent in round trips
+ * (waiting for the server's reply, ordering included) by command, under its own name (DXVK names
+ * its threads), to tell which thread pays for the bridge's waits. On by default since 2026-11-04,
+ * every WAIT_STATS_DEFAULT s (0 turns it off): a player's log then says it without a switch. A
+ * thread's line is written only when its round trips took at least WAIT_STATS_MIN_PERMILLE of the
+ * period (a thread that hardly waits says nothing), at most WAIT_STATS_LINES lines a process; the
+ * lines are informational (tagged info at any log level). The round trip is timed once for this
+ * and the per-hitch sums (hitch.c): two clock reads. */
+#define WAIT_STATS_DEFAULT 10
+#define WAIT_STATS_MIN_PERMILLE 10 /* 1 %: 100 ms in 10 s */
+#define WAIT_STATS_LINES 2000
+static int wait_period = -1, wait_explicit;
+static uint32_t wait_lines;
 static __thread struct {
     uint64_t ns[VKB_CMD_COUNT];
     uint32_t n[VKB_CMD_COUNT];
     uint64_t start;
 } *tw;
 
-static void wait_note(uint32_t cmd, uint64_t ns)
+static void wait_note(uint32_t cmd, uint64_t ns, uint64_t now)
 {
     if (!tw && !(tw = calloc(1, sizeof(*tw)))) return;
-    uint64_t now = now_ns();
     if (!tw->start) tw->start = now;
     tw->ns[cmd] += ns;
     tw->n[cmd]++;
-    if (now - tw->start < (uint64_t)wait_period * 1000000000ull) return;
-    char name[17] = "";
-    prctl(PR_GET_NAME, name, 0, 0, 0);
+    uint64_t period = (uint64_t)wait_period * 1000000000ull;
+    if (now - tw->start < period) return;
     uint64_t total = 0, n = 0;
     for (uint32_t i = 0; i < VKB_CMD_COUNT; i++) total += tw->ns[i], n += tw->n[i];
-    char line[512];
-    int o = snprintf(line, sizeof(line), "waits over %.1fs, thread %s (%ld): %.1f ms in %llu round trips;", (now - tw->start) / 1e9, name,
-                     (long)syscall(SYS_gettid), total / 1e6, (unsigned long long)n);
-    for (int k = 0; k < 5; k++) {
-        uint32_t best = 0;
-        for (uint32_t i = 1; i < VKB_CMD_COUNT; i++)
-            if (tw->ns[i] > tw->ns[best]) best = i;
-        if (!tw->ns[best] || o >= (int)sizeof(line) - 64) break;
-        o += snprintf(line + o, sizeof(line) - (size_t)o, " %s %.1f ms (%u)", vkb_cmd_names[best], tw->ns[best] / 1e6, tw->n[best]);
-        tw->ns[best] = 0;
+    /* explicitly asked for (VKBRIDGE_WAIT_STATS set): every thread's line, as before */
+    int quiet = !wait_explicit && total * 1000 < (now - tw->start) * WAIT_STATS_MIN_PERMILLE;
+    uint32_t no = quiet ? 0 : __atomic_fetch_add(&wait_lines, 1, __ATOMIC_RELAXED);
+    if (!quiet && no < WAIT_STATS_LINES) {
+        char name[17] = "";
+        prctl(PR_GET_NAME, name, 0, 0, 0);
+        char line[512];
+        int o = snprintf(line, sizeof(line), "waits over %.1fs, thread %s (%ld): %.1f ms in %llu round trips;", (now - tw->start) / 1e9,
+                         name, (long)syscall(SYS_gettid), total / 1e6, (unsigned long long)n);
+        for (int k = 0; k < 5; k++) {
+            uint32_t best = 0;
+            for (uint32_t i = 1; i < VKB_CMD_COUNT; i++)
+                if (tw->ns[i] > tw->ns[best]) best = i;
+            if (!tw->ns[best] || o >= (int)sizeof(line) - 64) break;
+            o += snprintf(line + o, sizeof(line) - (size_t)o, " %s %.1f ms (%u)", vkb_cmd_names[best], tw->ns[best] / 1e6, tw->n[best]);
+            tw->ns[best] = 0;
+        }
+        if (no + 1 == WAIT_STATS_LINES)
+            snprintf(line + o, sizeof(line) - (size_t)o, " (the last of %u wait lines for this process)", WAIT_STATS_LINES);
+        vkb_log_info_always("%s", line);
     }
-    vkb_log(VKB_LOG_ERROR, "%s", line);
     memset(tw, 0, sizeof(*tw));
     tw->start = now;
 }
@@ -629,13 +672,16 @@ int vkb_call_exec(vkb_call *c)
         const char *v = getenv("VKBRIDGE_SLOW_MS");
         slow_ms = v ? atoi(v) : 0;
         v = getenv("VKBRIDGE_WAIT_STATS");
-        wait_period = v ? atoi(v) : 0;
+        wait_explicit = v && *v;
+        wait_period = wait_explicit ? atoi(v) : WAIT_STATS_DEFAULT;
     }
-    if ((!slow_ms && wait_period <= 0) || (c->flags & VKB_F_NOREPLY)) return exec(c);
+    int hitch = __atomic_load_n(&vkb_hitch_active, __ATOMIC_RELAXED);
+    if ((!slow_ms && wait_period <= 0 && !hitch) || (c->flags & VKB_F_NOREPLY)) return exec(c);
     uint64_t t0 = now_ns();
     int r = exec(c);
-    uint64_t ns = now_ns() - t0, us = ns / 1000;
-    if (wait_period > 0) wait_note(c->cmd, ns);
+    uint64_t t1 = now_ns(), ns = t1 - t0, us = ns / 1000;
+    if (hitch && r) vkb_hitch_rt(c->cmd, ns); /* the per-hitch sums (hitch.c) */
+    if (wait_period > 0) wait_note(c->cmd, ns, t1);
     if (slow_ms && us >= (uint64_t)slow_ms * 1000) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -749,8 +795,7 @@ static int exec(vkb_call *c)
      * overtakes it (its answer may be one the GPU had a little earlier). Ahead of a sync-fd export
      * with the server's order deadline on (Samsung's driver), on the flusher's instead: there a
      * submit the driver holds does not keep the export unread behind it, and the server's
-     * deadline applies. A round trip is timed from here when the per-hitch line is on (hitch.c). */
-    uint64_t ht0 = vkb_hitch_active && !(c->flags & VKB_F_NOREPLY) ? now_ns() : 0;
+     * deadline applies. (A round trip is timed around this, in vkb_call_exec.) */
     int qr = 0;
     if (c->flags & VKB_CALL_POLL) {
         /* the poll overtakes the queue */
@@ -798,7 +843,6 @@ static int exec(vkb_call *c)
         c->conn = NULL;
         return 0;
     }
-    if (ht0) vkb_hitch_rt(c->cmd, now_ns() - ht0);
     /* The decoder keeps fds in a per-call array. */
     static __thread int call_fds[VKB_MAX_FDS];
     memcpy(call_fds, fds, sizeof(int) * (size_t)nfds);

@@ -280,8 +280,17 @@ int main(int argc, char **argv)
     cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &cba, {0}};
     VkDynamicState dyn = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
-    VkPipeline pipe[2];
-    for (int d = 0; d < 2; d++) {
+    VkPipeline pipe[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    /* Dynamic strides are Vulkan 1.3's (the device is made without VK_EXT_extended_dynamic_state):
+     * on an older device (Mali r18-r40 at Vulkan 1.1) only the baked strides are drawn. */
+    int dyn_ok = props.apiVersion >= VK_API_VERSION_1_3;
+    /* DIVISOR_DYN_ANYWAY=1: draw them all the same (invalid usage on an older device; host robustness
+     * check: the server must refuse or survive it, not crash in the divisor emulation) */
+    const char *anyway = getenv("DIVISOR_DYN_ANYWAY");
+    if (anyway && *anyway == '1') dyn_ok = 1;
+    if (!dyn_ok) printf("SKIP dynamic strides: the device is Vulkan %u.%u (they need 1.3)\n", VK_API_VERSION_MAJOR(props.apiVersion),
+                        VK_API_VERSION_MINOR(props.apiVersion));
+    for (int d = 0; d < 1 + dyn_ok; d++) {
         VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 1, &dyn};
         VkGraphicsPipelineCreateInfo gpci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms,
                                              NULL, &cbs, d ? &ds : NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
@@ -294,7 +303,7 @@ int main(int argc, char **argv)
     VkCommandPool cpool;
     vkCreateCommandPool(dev, &cpci, NULL, &cpool);
 
-    for (int d = 0; d < 2; d++)
+    for (int d = 0; d < 1 + dyn_ok; d++)
         for (int f = 0; f < 2; f++) {
             uint32_t fi = f ? FI : 0, count = N - fi;
             const char *what = d ? (f ? "dynamic strides, firstInstance 4" : "dynamic strides, firstInstance 0")

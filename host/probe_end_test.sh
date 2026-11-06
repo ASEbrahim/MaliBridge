@@ -124,19 +124,36 @@ for kind in abort stall; do
 done
 
 # 6  stopped past the limit (8 s): 10 s stopped
-c=$work/c-stop
-start $c $work/s-stop $slow
-log=$work/s-stop/vkbridge-server.log
-waitfor "compile_aces takes 3 s longer on purpose" $log 300
-kill -STOP $srv; sleep 10; kill -CONT $srv
-waitdone $log 200
-start $c $work/s-stop2 $slow
-waitdone $work/s-stop2/vkbridge-server.log 300
+# The step needs the process to be stopped INSIDE the probe (the fake sleeps 3 s). On a loaded host
+# this script can be starved for more than those 3 s between the log line and the SIGSTOP, and the
+# probe has then ended before the stop: nothing to judge (this was the step's load flake). Like steps
+# 2, 3 and 7, check where the process was (a stopped process cannot move, its profile says
+# "running") and try again with a fresh cache when the stop came too late.
+inside=0
+wait_n=600
+for try in 1 2 3 4 5 6; do
+  c=$work/c-stop$try
+  start $c $work/s-stop$try $slow
+  log=$work/s-stop$try/vkbridge-server.log
+  waitfor "compile_aces takes 3 s longer on purpose" $log 600
+  kill -STOP $srv
+  if grep -q '"running": "compile_aces"' "$(prof $c)" 2>/dev/null; then inside=1; break; fi
+  kill -CONT $srv
+  stop
+done
+sleep 10; kill -CONT $srv
+# generous waits: under load the probes after the stop and the whole second run take far longer than idle
+waitdone $log 2400
+# the second run only has to finish the probe: its limit is raised, because compile_aces (3 s of the fake + its
+# pipeline compile) takes longer than the 8 s limit on a loaded host and was then judged a real hang
+start $c $work/s-stop2 $slow VKBRIDGE_PROBE_TIMEOUT_S=40
+waitdone $work/s-stop2/vkbridge-server.log 2400
+wait_n=150
 p=$(prof $c)
-grep -q "probe: compile_aces reached its time limit after [0-9.]* s, [0-9.]* s of them with the process stopped; not counted" $log &&
+[ $inside = 1 ] && grep -q "probe: compile_aces reached its time limit after [0-9.]* s, [0-9.]* s of them with the process stopped; not counted" $log &&
   grep -q "background probes done (.*); some left for the next start" $log && grep -q "probe: probing .* continuing an earlier run" $work/s-stop2/vkbridge-server.log &&
   grep -q '"name": "compile_aces", "status": "pass"' "$p" && grep -q '"complete": true' "$p" && ! grep -q "UE4 LUT pipelines get" $log $work/s-stop2/vkbridge-server.log
-step $? "stopped inside a probe past its limit: not a hang, run again at the next start ($(grep -m1 -o 'after [0-9.]* s, [0-9.]* s of them with the process stopped' $log))"
+step $? "stopped inside a probe past its limit: not a hang, run again at the next start ($(grep -m1 -o 'after [0-9.]* s, [0-9.]* s of them with the process stopped' $log); stopped on try $try)"
 
 # 7  killed after the session's clients left, three times in a row
 c=$work/c-gone

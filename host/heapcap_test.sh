@@ -26,6 +26,11 @@
 #      driver's (reserve 0, the old behaviour); 6000 MB free: 6000 - 1536 reserve; 3000 MB free with a
 #      512 MB reserve: 2488; 2000 MB free: the 1024 MB floor, never below; usage never under the budget's
 #      reading and the budget never above the driver's.
+#  10  the default cap follows the memory free when the process starts (VKBRIDGE_FAKE_MEMAVAIL_MB/QUWD):
+#      11350 MB of RAM with 2850 MB free -> 2560, 3507 -> 3072, 1500 -> 2048 (the floor), 4096 and 1 TB -> 4096 (no
+#      change, nothing logged); 7322 MB with 2185 free -> 2048; VKBRIDGE_HEAP_FOLLOW_FREE=0, an explicit
+#      VKBRIDGE_HEAP_MAX_MB=4096 in <cache dir>/env and the guest's =0 win; 15000 MB of RAM and performance mode: no
+#      cap as before. The lowered cap is logged once per process with the MB free.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -55,14 +60,15 @@ view() { v=$(timeout 60 env VKBRIDGE_LOG_LEVEL=2 "$@" "$out/gpuview_check" 2>&1)
 gpu_of() { echo "$1" | grep -m1 '^gpu '; }
 drv_of() { echo "$1" | grep -m1 '^driver '; }
 heaps_of() { echo "$1" | grep '^heap ' | sed 's/ budget_mb=.*//'; }
-# every device-local heap $2 MB with a budget at most that, the others as in $3 (native)
+# every device-local heap $2 MB with a budget at most that (when there is one), the others as in $3 (native)
 capped() {
   local out=$1 mb=$2 nat=$3 ok=0 n=0
   while read -r _ i size local budget _; do
     n=$((n+1))
     local ns; ns=$(echo "$nat" | grep "^heap $i " | grep -o 'size_mb=[0-9]*')
     if [ "${local#local=}" = 1 ]; then
-      [ "${size#size_mb=}" = "$mb" ] && [ "${budget#budget_mb=}" -le "$mb" ] 2>/dev/null || ok=1
+      # budget_mb=-: the device shows no VK_EXT_memory_budget (no Mali driver has it)
+      [ "${size#size_mb=}" = "$mb" ] && { [ "${budget#budget_mb=}" = - ] || [ "${budget#budget_mb=}" -le "$mb" ] 2>/dev/null; } || ok=1
     else
       [ "$size" = "$ns" ] || ok=1
     fi
@@ -123,7 +129,7 @@ view SteamAppId=4100 VKBRIDGE_HEAP_MAX_MB=0 VKBRIDGE_SPOOF_GPU=off; vg=$v; rg=$r
 step $? "preset file: 4100 heaps 2048 MB and amd ($rf$cf), 4101 as the driver's ($ro), the guest's =0/off win ($rg)"
 
 # 5
-fake="VKBRIDGE_PRESET_FAKE_BUILTIN=4200@RADV,Mali-G720:VKBRIDGE_HEAP_MAX_MB=3072 VKBRIDGE_SPOOF_GPU=nvidia;4201:VKBRIDGE_HEAP_MAX_MB=3072;4202@RADV:VKBRIDGE_SPOOF_GPU=voodoo VKBRIDGE_HEAP_MAX_MB=lots"
+fake="VKBRIDGE_PRESET_FAKE_BUILTIN=4200@RADV,llvmpipe,Mali-G720:VKBRIDGE_HEAP_MAX_MB=3072 VKBRIDGE_SPOOF_GPU=nvidia;4201:VKBRIDGE_HEAP_MAX_MB=3072;4202@RADV,llvmpipe:VKBRIDGE_SPOOF_GPU=voodoo VKBRIDGE_HEAP_MAX_MB=lots"
 start bi "$fake"
 view SteamAppId=4200; vb=$v; rb=$rc
 capped "$vb" 3072 "$nat"; cb=$?
@@ -156,7 +162,7 @@ dl='heap cap: safe mode with %s MB of RAM (12800 or less): device-local heaps sh
 r7= d7=
 for pair in 7680:3584 8704:4096 5000:2048 11377:4096 12800:4096; do
   ram=${pair%:*} want=${pair#*:}
-  start ram$ram VKBRIDGE_FAKE_MEMTOTAL_MB=$ram
+  start ram$ram VKBRIDGE_FAKE_MEMTOTAL_MB=$ram VKBRIDGE_FAKE_MEMAVAIL_MB=1000000
   view; c=1; [ $rc = 0 ] && capped "$v" $want "$nat" && c=0
   view; [ $rc = 0 ] && capped "$v" $want "$nat" || c=1
   [ $c = 0 ] && [ "${big:-0}" -gt $want ] && [ "$(grep -cF "$(printf "$dl" $ram $want)" "$log")" = 1 ] &&
@@ -165,12 +171,12 @@ for pair in 7680:3584 8704:4096 5000:2048 11377:4096 12800:4096; do
 done
 view VKBRIDGE_HEAP_MAX_MB=0; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] || r7="$r7 guest0"
 view VKBRIDGE_HEAP_MAX_MB=1024; [ $rc = 0 ] && capped "$v" 1024 "$nat" || r7="$r7 guest1024"
-start over VKBRIDGE_FAKE_MEMTOTAL_MB=12801
+start over VKBRIDGE_FAKE_MEMTOTAL_MB=12801 VKBRIDGE_FAKE_MEMAVAIL_MB=1000000
 view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap: safe mode' "$log" || r7="$r7 12801"
-start perf VKBRIDGE_FAKE_MEMTOTAL_MB=7680 VKBRIDGE_MODE=performance
+start perf VKBRIDGE_FAKE_MEMTOTAL_MB=7680 VKBRIDGE_FAKE_MEMAVAIL_MB=1000000 VKBRIDGE_MODE=performance
 view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap: safe mode' "$log" || r7="$r7 perf"
 mkdir -p $work/env0/c && echo "VKBRIDGE_HEAP_MAX_MB=0" > $work/env0/c/env
-start env0 VKBRIDGE_FAKE_MEMTOTAL_MB=7680
+start env0 VKBRIDGE_FAKE_MEMTOTAL_MB=7680 VKBRIDGE_FAKE_MEMAVAIL_MB=1000000
 view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap: safe mode' "$log" || r7="$r7 env0"
 [ -z "$r7" ]
 step $? "safe-mode default for 8 and 12 GB devices:$d7 MB, logged once; 12801 MB, performance mode, <cache dir>/env =0 and the guest's =0 off, the guest's 1024 wins${r7:+ (failed:$r7)}"
@@ -218,6 +224,33 @@ for b in $nb; do
 done
 [ $i -gt 0 ] && [ "${big:-0}" -gt 6000 ] || r9="$r9 heap-too-small($big)"
 step $([ -z "$r9" ] && echo 0 || echo 1) "memory budget follows free memory: 1 TB free or reserve 0 = the driver's ($nb), 6000 free -> $(budgets_of "$v_6g"), 3000 free with reserve 512 -> $(budgets_of "$v_3g"), 2000 free -> $(budgets_of "$v_2g") (the 1 GB floor)${r9:+ (failed:$r9)}"
+
+# 10
+fl='heap cap: process [0-9]* (gpuview_check) shown device-local heaps of at most %s MB, not %s: %s MB free when it started (VKBRIDGE_HEAP_FOLLOW_FREE=0 turns this off)'
+r10= d10=
+for t in 11350:2850:2560 11350:3507:3072 11350:1500:2048 11350:4096:4096 11350:1000000:4096 7322:2185:2048; do
+  IFS=: read -r ram fr want <<<"$t"
+  start fr$ram-$fr VKBRIDGE_FAKE_MEMTOTAL_MB=$ram VKBRIDGE_FAKE_MEMAVAIL_MB=$fr
+  view; c=1; [ $rc = 0 ] && capped "$v" $want "$nat" && c=0
+  cap=$( [ $ram = 7322 ] && echo 3584 || echo 4096 )
+  if [ $want -lt $cap ]; then [ "$(grep -c "$(printf "$fl" $want $cap $fr)" "$log")" = 1 ] || c=1
+  else grep -q 'shown device-local heaps of at most' "$log" && c=1; fi
+  [ $c = 0 ] || r10="$r10 $ram/$fr"
+  d10="$d10 $fr->$(echo "$v" | grep 'local=1' | grep -o 'size_mb=[0-9]*' | sed 's/size_mb=//' | paste -sd, -)"
+done
+start ffoff VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=2850 VKBRIDGE_HEAP_FOLLOW_FREE=0
+view; [ $rc = 0 ] && capped "$v" 4096 "$nat" && ! grep -q 'shown device-local heaps of at most' "$log" || r10="$r10 follow0"
+mkdir -p $work/ffexp/c && echo "VKBRIDGE_HEAP_MAX_MB=4096" > $work/ffexp/c/env
+start ffexp VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=2850
+view; [ $rc = 0 ] && capped "$v" 4096 "$nat" && ! grep -q 'shown device-local heaps of at most' "$log" || r10="$r10 explicit"
+start ffguest VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=2850
+view VKBRIDGE_HEAP_MAX_MB=0; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] || r10="$r10 guest0"
+start ff16 VKBRIDGE_FAKE_MEMTOTAL_MB=15000 VKBRIDGE_FAKE_MEMAVAIL_MB=2850
+view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap:' "$log" || r10="$r10 16gb"
+start ffperf VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=2850 VKBRIDGE_MODE=performance
+view; [ $rc = 0 ] && [ "$(heaps_of "$v")" = "$(heaps_of "$nat")" ] && ! grep -q 'heap cap:' "$log" || r10="$r10 perf"
+[ -z "$r10" ]
+step $? "default cap follows the memory free at the start (MB free -> heaps):$d10; FOLLOW_FREE=0, explicit 4096, guest 0, 15000 MB RAM, performance: as before${r10:+ (failed:$r10)}"
 stop
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

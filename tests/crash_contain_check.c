@@ -7,7 +7,9 @@
  * 0x40) inside the guarded call when a stage carries the marker specialization constant. Checks:
  *   device A: marked graphics + compute pipelines fail with VK_ERROR_INITIALIZATION_FAILED and
  *             null handles; the connection lives; a normal pipeline still draws (two strikes);
- *             the third crash poisons A: a normal pipeline then gets VK_ERROR_DEVICE_LOST
+ *             the third crash poisons A: a normal pipeline then gets VK_ERROR_DEVICE_LOST;
+ *             --unbound (the server's replay): a draw with no pipeline bound, a bind of
+ *             VK_NULL_HANDLE and its draw, a dispatch with no pipeline: left out, nothing drawn
  *   device B: (new) compute dispatch and draw correct
  * Three contained crashes per run: the server's process ceiling (64) allows twenty-one runs per server.
  *
@@ -247,7 +249,13 @@ static VkResult graphics_pipeline(int marked, VkPipeline *pipe)
     return vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe);
 }
 
-static int draw_ok(VkPipeline pipe)
+/* how: 0 binds pipe; 1 binds nothing (No Man's Sky after its pipelines failed); 2 binds VK_NULL_HANDLE.
+ * Returns 1 when the left half is magenta and the right half black; 2 when the whole image is the
+ * clear's black (the draw left out); 0 otherwise. */
+static int draw_as(VkPipeline pipe, int how);
+static int draw_ok(VkPipeline pipe) { return draw_as(pipe, 0) == 1; }
+
+static int draw_as(VkPipeline pipe, int how)
 {
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {W, H, 1}, 1, 1,
                              VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
@@ -277,7 +285,7 @@ static int draw_ok(VkPipeline pipe)
     VkClearValue clear = {.color = {.float32 = {0, 0, 0, 1}}};
     VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, g_rp, fb, {{0, 0}, {W, H}}, 1, &clear};
     vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    if (how != 1) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, how == 2 ? VK_NULL_HANDLE : pipe);
     VkViewport v = {0, 0, (float)W, (float)H, 0, 1};
     VkRect2D sc = {{0, 0}, {W / 2, H}};
     vkCmdSetViewport(cb, 0, 1, &v);
@@ -294,10 +302,21 @@ static int draw_ok(VkPipeline pipe)
     vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &c);
     if (!submit(cb)) return 0;
     read_back(rm);
+    int drawn = 1, clear_only = 1;
     for (uint32_t y = 0; y < H; y++)
-        for (uint32_t x = 0; x < W; x++)
-            if (p[y * W + x] != (x < W / 2 ? 0xFFFF00FFu : 0xFF000000u)) return 0; /* RGBA: magenta left, black right */
-    return 1;
+        for (uint32_t x = 0; x < W; x++) {
+            if (p[y * W + x] != (x < W / 2 ? 0xFFFF00FFu : 0xFF000000u)) drawn = 0; /* RGBA: magenta left, black right */
+            if (p[y * W + x] != 0xFF000000u) clear_only = 0;
+        }
+    return drawn ? 1 : clear_only ? 2 : 0;
+}
+
+/* A dispatch with no compute pipeline bound: the submit completes (the dispatch left out). */
+static int dispatch_unbound(void)
+{
+    VkCommandBuffer cb = begin();
+    vkCmdDispatch(cb, 1, 1, 1);
+    return submit(cb);
 }
 
 /* ------------------------------------------------------------------ */
@@ -411,6 +430,7 @@ static int again_mode(void)
 int main(int argc, char **argv)
 {
     int spin = argc > 1 && !strcmp(argv[1], "--spin"), spinfc2 = argc > 1 && !strcmp(argv[1], "--spinfc2");
+    int unbound = argc > 1 && !strcmp(argv[1], "--unbound");
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
         printf("FAIL loader: %s\n", dlerror());
@@ -469,6 +489,19 @@ int main(int argc, char **argv)
     snprintf(d, sizeof(d), "result %d (want %d)", r, VK_ERROR_DEVICE_LOST);
     check(r == VK_ERROR_DEVICE_LOST && pipe == VK_NULL_HANDLE, "A: poisoned after three: pipeline creation reports device lost", d);
     check(alive(), "A: other calls still work on the poisoned device (teardown possible)", "");
+    /* No Man's Sky went on after its pipelines failed, skipped the bind and drew; Mali's
+     * vkCmdDrawIndexed read through the missing pipeline (0x7a0) and the server died with every
+     * program. A draw or dispatch with no pipeline bound in its command buffer is left out by the
+     * server's replay (--unbound: host/unbound_draw_test.sh; the layer has no replay to leave it out). */
+    int k = unbound ? draw_as(VK_NULL_HANDLE, 1) : 2;
+    snprintf(d, sizeof(d), "draw result %d (want 2: submitted, nothing drawn)", k);
+    if (unbound) {
+        check(k == 2 && alive(), "A: a draw with no pipeline bound is left out; the server lives", d);
+        k = draw_as(VK_NULL_HANDLE, 2);
+        snprintf(d, sizeof(d), "draw result %d (want 2)", k);
+        check(k == 2 && alive(), "A: a bind of VK_NULL_HANDLE and the draw after it are left out", d);
+        check(dispatch_unbound() && alive(), "A: a dispatch with no pipeline bound is left out", "");
+    }
     vkDestroyDevice(dev, NULL);
 
     /* device B */

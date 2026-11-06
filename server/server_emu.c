@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Feature emulation: entry point. What the GPU lacks and the bridge can make up for is decided
  * here per physical device; the client reports those features as present, the server strips
@@ -8,6 +7,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "server_emu.h"
+#include "server_dshape.h"
 #include "vkb_emu_formats.h"
 
 #include <stddef.h>
@@ -67,6 +67,8 @@ static const struct {
     {"vidyn", {"VK_EXT_vertex_input_dynamic_state", NULL}},
     {"eds", {"VK_EXT_extended_dynamic_state", "VK_EXT_extended_dynamic_state2"}},
     {"timeline", {"VK_KHR_timeline_semaphore", NULL}},
+    {"imageless", {"VK_KHR_imageless_framebuffer", NULL}},
+    {"membudget", {"VK_EXT_memory_budget", NULL}},
 };
 
 /* A driver extension the clients are not shown: named in VKBRIDGE_FAKE_MISSING (as itself or
@@ -85,11 +87,28 @@ static const char *hide_list(void)
     return snap;
 }
 
-/* On the gate (server_apicap.c) by default: VK_EXT_extended_dynamic_state not offered and dynamic rendering emulated with render
- * passes; decided once, at the self-test. VKBRIDGE_A1_ZINK=0 turns it off, =1 turns it on anywhere.
- * Per client (vkb_emu_a1_for): Zink and Steam mode's own processes get it; any other client keeps the driver's state. */
+/*
+ * Steam mode's black screen on Arm job-manager Malis below r54 whose driver offers VK_EXT_extended_dynamic_state
+ * (Galaxy A16, Tab S9 FE, F15, A54 on r38p1, Vulkan 1.3; the RG556 on r40p0;
+ * Galaxy S10 / Note10+ phones on the r38p1 beta at Vulkan 1.1; the Immortalis-G715 (CSF) on the same r38p1
+ * driver; the gate: server_apicap.c vkb_black_gate). Every draw Zink makes there (Xwayland's
+ * glamor, Steam's own window) leaves its target black, while what is uploaded (a pixmap written by a
+ * copy) keeps its picture; only clears land., Tab S9 FE, r38p1, 2026-10-28:
+ * Vulkan 1.1 for Steam's processes alone, dynamic rendering as render passes alone, and
+ * synchronization2 hidden alone each stayed black; VK_EXT_extended_dynamic_state hidden from them
+ * (with dynamic rendering as render passes, as on the Galaxy S21 whose Vulkan 1.1 driver has neither)
+ * showed Steam's sign-in screen, and the bridge's own check read Xwayland's buffers lit (4 of 4).
+ * So on the gate (vkb_black_gate) by default: VK_EXT_extended_dynamic_state is not offered (Zink then
+ * sets that state in its pipelines; at Vulkan 1.3 it is core, so games shown 1.3 are not affected) and
+ * dynamic rendering is emulated with render passes (server_emu_dynrend.c, which also gives Zink
+ * vkCmdBindVertexBuffers2 without the extension). Decided once, at the self-test.
+ * VKBRIDGE_A1_ZINK=0 turns it off, =1 turns it on anywhere.
+ * Per client (vkb_emu_a1_for): Zink and Steam mode's own processes get it; any other client (DXVK,
+ * vkd3d, a native Vulkan game) keeps the driver's VK_EXT_extended_dynamic_state and, where the driver
+ * has it, its own dynamic rendering, as before the fix. VKBRIDGE_A1_ZINK=1 gives it to every client.
+ */
 static int a1_on, a1_forced;
-/* the driver has dynamic rendering of its own: the render-pass emulation is there for the Steam-mode fix only */
+/* the driver has dynamic rendering of its own: the render-pass emulation is there for the A1 fix only */
 static int a1_dynrend_native;
 /* In-process (the Vulkan layer): the one process it serves. The gate is for Steam mode's own
  * processes there; a game's process gets the driver's dynamic rendering unless VKBRIDGE_A1_ZINK=1. */
@@ -127,7 +146,7 @@ static int a1_decide(const vkb_dispatch *idt, VkPhysicalDevice pd)
     return on;
 }
 
-/* The Steam-mode fix for this client: Zink's instances and Steam mode's own processes, every client with
+/* The A1 fix for this client: Zink's instances and Steam mode's own processes, every client with
  * VKBRIDGE_A1_ZINK=1; NULL (a server-wide question, as promotion's) is answered as on. */
 int vkb_emu_a1_for(const vkb_srv_table *t)
 {
@@ -140,7 +159,7 @@ int vkb_emu_a1_for(const vkb_srv_table *t)
     return pr && vkb_steam_own_process(pr->comm);
 }
 
-/* The emulations a client outside the Steam-mode fix goes without: the render-pass one where the driver has
+/* The emulations a client outside the A1 fix goes without: the render-pass one where the driver has
  * dynamic rendering of its own. */
 uint32_t vkb_emu_a1_not_for(const vkb_srv_table *t)
 {
@@ -205,22 +224,64 @@ int vkb_emu_hiding_exts(void)
     return hide_list() != NULL || fake_list() != NULL || __atomic_load_n(&a1_on, __ATOMIC_ACQUIRE);
 }
 
-/* Zink on Samsung's Xclipse driver: VK_EXT_extended_dynamic_state2 left out for Zink; push descriptors too with =push (VKBRIDGE_XCLIPSE_ZINK) */
+/*
+ * Zink on Samsung's Xclipse driver (Galaxy A56, Xclipse 540, driver 24.0.471, v0.5.4.2 rc2 on Remote
+ * Test Lab, 2026-10-28): Steam's sign-in screen showed solid white bars below the first letters of
+ * its text and no QR code, the same in every capture; the A54 (Mali) drew it clean, and the host
+ * (RADV under the bridge, with the A56's memory sharing, safe-mode errata, missing BC/maintenance6
+ * and its driverID imitated) draws the same page right. Samsung's driver is AMD's (driverUUID
+ * "AMD-LINUX-DRV"), but it reports VK_DRIVER_ID_SAMSUNG_PROPRIETARY, so Zink skips what it does
+ * on AMD's own driver (zink_screen.c init_driver_workarounds): no VK_KHR_push_descriptor and no
+ * VK_EXT_extended_dynamic_state2 there, and without EDS2 Zink takes neither EDS3 nor
+ * VK_EXT_vertex_input_dynamic_state. Zink on the A56 drove all four, a set it never uses on AMD's
+ * driver. On the A56, rc4) leaving out EDS2 alone drew the screen clean and
+ * leaving out push descriptors alone did not, so Zink is not shown EDS2 on Samsung's driver: those
+ * states go in its pipelines, as on AMD's; push descriptors stay offered.
+ * Samsung's SPAL 25.x drivers (driverVersion 25.x: 0x06401362 = 25.1.866 on the Galaxy S26 FE's
+ * Xclipse 950, 0x06403003 / 0x06403015 = 25.3.3 / 25.3.21 on the S24+, S25 FE, A56 and A55 with
+ * Android 17): Xwayland's first composite of Steam's window never ended. The server thread spun on a
+ * CPU inside the driver's vkCmdPushDescriptorSetWithTemplate while replaying Xwayland's command
+ * buffer at vkEndCommandBuffer ("inside vkbPushDescRaw, command 25 of 40", S26 FE on Remote Test
+ * Lab, 2 of 2 runs); with push descriptors left out as well, Steam's sign-in drew, 2 of 2. Every
+ * 24.x driver seen (0x0600021b = 24.0.539, 0x06000230 = 24.0.560) draws with them, so on 25.x
+ * (and later) Zink is shown neither: it then uses ordinary descriptor sets, as on AMD's own driver.
+ * Only Zink instances (Xwayland, Steam and its web helper, OpenGL games); DXVK, vkd3d-proton and
+ * gamescope see the driver's list. VKBRIDGE_XCLIPSE_ZINK=0 turns it off, =1 turns on the driver's
+ * set on any driver (host tests: EDS2, both on SPAL 25.x), =eds2 leaves out EDS2 only (on any
+ * driver, SPAL 25.x included), =push leaves out push descriptors as well, on any driver (AMD's set).
+ * Decided per enumeration (the driverID is remembered per GPU).
+ */
 static const char *const xclipse_zink_hidden[] = {"VK_KHR_push_descriptor", "VK_EXT_extended_dynamic_state2"};
 
 /* Which of the two are left out: bit 0 push descriptors, bit 1 EDS2 (0: none) */
+#define XCLIPSE_SPAL_MAJOR 25u /* Samsung's driverVersion major from which push descriptors are left out too */
+
 static int xclipse_zink(const vkb_srv_table *t, const vkb_srv_table *inst, VkPhysicalDevice pd)
 {
     if (!inst || !inst->zink) return 0;
     const char *v = vkb_srv_env("VKBRIDGE_XCLIPSE_ZINK");
     if (v && !strcmp(v, "0")) return 0;
     int forced = v && (!strcmp(v, "1") || !strcmp(v, "push") || !strcmp(v, "eds2"));
-    if (!forced && vkb_driver_id(&t->real, pd, inst->api_version ? inst->api_version : VK_API_VERSION_1_1) != VK_DRIVER_ID_SAMSUNG_PROPRIETARY)
-        return 0;
-    int m = v && !strcmp(v, "push") ? 3 : 2;
-    VKB_ONCE(VKB_LOG_INFO, "xclipse: %s not offered to Zink (%s; VKBRIDGE_XCLIPSE_ZINK=0 turns it off)",
-             m == 3 ? "VK_EXT_extended_dynamic_state2 and VK_KHR_push_descriptor" : "VK_EXT_extended_dynamic_state2",
-             v && strcmp(v, "1") ? "VKBRIDGE_XCLIPSE_ZINK" : v ? "VKBRIDGE_XCLIPSE_ZINK=1" : "Samsung's driver");
+    int samsung = vkb_driver_id(&t->real, pd, inst->api_version ? inst->api_version : VK_API_VERSION_1_1) == VK_DRIVER_ID_SAMSUNG_PROPRIETARY;
+    if (!forced && !samsung) return 0;
+    uint32_t ver = 0;
+    if (samsung) {
+        VkPhysicalDeviceProperties p;
+        t->real.vkGetPhysicalDeviceProperties(pd, &p);
+        ver = p.driverVersion;
+    }
+    int spal = samsung && VK_VERSION_MAJOR(ver) >= XCLIPSE_SPAL_MAJOR;
+    int m = v && !strcmp(v, "push") ? 3 : v && !strcmp(v, "eds2") ? 2 : spal ? 3 : 2;
+    if (spal && m == 3 && (!v || !strcmp(v, "1")))
+        VKB_ONCE(VKB_LOG_INFO,
+                 "xclipse: VK_EXT_extended_dynamic_state2 and VK_KHR_push_descriptor not offered to Zink (Samsung's SPAL driver "
+                 "%u.%u.%u, driverVersion 0x%08x: Xwayland's first command buffer never ended with push descriptors on it; "
+                 "VKBRIDGE_XCLIPSE_ZINK=0 turns it off, =eds2 offers push descriptors again)",
+                 VK_VERSION_MAJOR(ver), VK_VERSION_MINOR(ver), VK_VERSION_PATCH(ver), ver);
+    else
+        VKB_ONCE(VKB_LOG_INFO, "xclipse: %s not offered to Zink (%s; VKBRIDGE_XCLIPSE_ZINK=0 turns it off)",
+                 m == 3 ? "VK_EXT_extended_dynamic_state2 and VK_KHR_push_descriptor" : "VK_EXT_extended_dynamic_state2",
+                 v && strcmp(v, "1") ? "VKBRIDGE_XCLIPSE_ZINK" : v ? "VKBRIDGE_XCLIPSE_ZINK=1" : "Samsung's driver");
     return m;
 }
 
@@ -392,6 +453,59 @@ static VKAPI_ATTR VkResult VKAPI_CALL dmabufmod_GetPhysicalDeviceImageFormatProp
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     return dmabufmod_next2(pd, info, props);
+}
+
+/* VKBRIDGE_FAKE_MISSING=linearstorage (host tests): Arm's r18p0 (Mali-G52, HUAWEI AQM-AL10) most
+ * likely refuses a LINEAR-tiling image with storage usage: gamescope's LINEAR-modifier query (BGRA8,
+ * SAMPLED | STORAGE | TRANSFER_SRC, MUTABLE_FORMAT) was answered VK_ERROR_FORMAT_NOT_SUPPORTED by the
+ * driver while LINEAR images of Zink's usage (0x6, 0x97) were made. Imitated at the driver boundary
+ * (the table the bridge's own calls use, beneath the dma-buf layers): the format queries and
+ * vkCreateImage (driver_create_image) refuse LINEAR with the storage bit. */
+int vkb_emu_linearstorage_refused(VkImageTiling tiling, VkImageUsageFlags usage)
+{
+    static int fake = -1;
+    if (fake < 0) fake = vkb_emu_faked("linearstorage");
+    return fake && tiling == VK_IMAGE_TILING_LINEAR && (usage & VK_IMAGE_USAGE_STORAGE_BIT);
+}
+
+static PFN_vkGetPhysicalDeviceImageFormatProperties linstor_next1;
+static PFN_vkGetPhysicalDeviceImageFormatProperties2 linstor_next2;
+
+static VKAPI_ATTR VkResult VKAPI_CALL linstor_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat format, VkImageType type,
+                                                                                    VkImageTiling tiling, VkImageUsageFlags usage,
+                                                                                    VkImageCreateFlags flags, VkImageFormatProperties *props)
+{
+    if (vkb_emu_linearstorage_refused(tiling, usage)) {
+        memset(props, 0, sizeof(*props));
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return linstor_next1(pd, format, type, tiling, usage, flags, props);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL linstor_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd,
+                                                                                     const VkPhysicalDeviceImageFormatInfo2 *info,
+                                                                                     VkImageFormatProperties2 *props)
+{
+    if (vkb_emu_linearstorage_refused(info->tiling, info->usage)) {
+        memset(&props->imageFormatProperties, 0, sizeof(props->imageFormatProperties));
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return linstor_next2(pd, info, props);
+}
+
+/* at instance creation, before the dispatch tables are copied: wraps the driver's own queries */
+void vkb_emu_linearstorage_instance_init(vkb_srv_table *t)
+{
+    if (!vkb_emu_faked("linearstorage")) return;
+    if (t->real.vkGetPhysicalDeviceImageFormatProperties && t->real.vkGetPhysicalDeviceImageFormatProperties != linstor_GetPhysicalDeviceImageFormatProperties) {
+        linstor_next1 = t->real.vkGetPhysicalDeviceImageFormatProperties;
+        t->real.vkGetPhysicalDeviceImageFormatProperties = linstor_GetPhysicalDeviceImageFormatProperties;
+    }
+    if (t->real.vkGetPhysicalDeviceImageFormatProperties2 && t->real.vkGetPhysicalDeviceImageFormatProperties2 != linstor_GetPhysicalDeviceImageFormatProperties2) {
+        linstor_next2 = t->real.vkGetPhysicalDeviceImageFormatProperties2;
+        t->real.vkGetPhysicalDeviceImageFormatProperties2 = linstor_GetPhysicalDeviceImageFormatProperties2;
+    }
+    VKB_ONCE(VKB_LOG_INFO, "imitating r18p0's refusal of LINEAR images with storage usage (VKBRIDGE_FAKE_MISSING=linearstorage)");
 }
 
 void vkb_emu_instance_install(vkb_srv_table *t)
@@ -590,7 +704,7 @@ int vkb_emu_driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd)
 
 /* The driver has extended dynamic state 1 and 2 that Zink may use: both extensions (or Vulkan 1.3,
  * where both are core), not imitated missing (VKBRIDGE_FAKE_MISSING=eds) and not taken away by the
- * Steam-mode fix (a1_decide: on those drivers Zink's draws are lost when it uses the driver's EDS1). Where
+ * A1 fix (a1_decide: on those drivers Zink's draws are lost when it uses the driver's EDS1). Where
  * this says no, Zink gets both from the server (server_vidyn.c, vkb_eds_mode). */
 int vkb_emu_driver_eds(const vkb_dispatch *d, VkPhysicalDevice pd)
 {
@@ -623,6 +737,29 @@ int vkb_emu_bgr10_for(const vkb_srv_table *inst, VkPhysicalDevice pd)
     return !vkb_emu_driver_vi_dyn(&inst->real, pd);
 }
 
+/* Whether this instance's clients get the bridge's VK_EXT_memory_budget (VKB_EMU_MEM_BUDGET): DXVK's and
+ * vkd3d-proton's, whose use of the budget is known (DXVK dxvk_adapter.cpp getMemoryHeapInfo and
+ * dxvk_memory.cpp updateMemoryHeapBudgets; vkd3d-proton only logs it). Zink, gamescope and native
+ * Vulkan games read heapUsage their own ways and keep the driver's list.
+ * And only a process that started short of memory (vkb_srv_proc.start_short: less free than the safe-mode
+ * default heap cap at its first query, server_presets.c heap_follow_free). With the extension DXVK keeps
+ * 1% of the heap out of its own budget and asks for the budget every 500 ms on its submit thread (a
+ * round trip); a process that started with enough memory, and every process on a device without the
+ * default cap (more than 12800 MB of RAM, performance mode, an explicit VKBRIDGE_HEAP_MAX_MB), is not
+ * offered it and runs exactly as before. The processes the system killed or that died short of memory
+ * (a player log 2850 MB free at the start, QUWD 3507, 8SUS 3045, EMS5 3270 under a 4096 MB cap) started so;
+ * the owner's tablets: no cap on the 16 GB Ultra, 3 of 4 S10+ starts with 4096 MB free or more.
+ * VKBRIDGE_EMU_MEMBUDGET=1: offered to every DXVK/vkd3d process (A/B), =0: to none. */
+int vkb_emu_membudget_for(const vkb_srv_table *t)
+{
+    if (!t) return 0;
+    const vkb_srv_table *inst = t->is_device && t->parent ? t->parent : t;
+    if (!inst->dxvk && !inst->vkd3d) return 0;
+    const char *v = vkb_srv_env("VKBRIDGE_EMU_MEMBUDGET");
+    if (v && !strcmp(v, "1")) return 1;
+    return inst->proc && __atomic_load_n(&inst->proc->start_short, __ATOMIC_RELAXED);
+}
+
 uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *missing)
 {
     VkPhysicalDeviceFeatures f;
@@ -631,8 +768,9 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
     VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));
     idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
-    int divisor = 0, depth_clip = 0, maint5 = 0, robust2 = 0, maint6 = 0, lson_khr = 0, lson_ext = 0, push = 0, dynrend = 0, rp2 = 0;
+    int divisor = 0, depth_clip = 0, maint5 = 0, robust2 = 0, maint6 = 0, lson_khr = 0, lson_ext = 0, push = 0, dynrend = 0, rp2 = 0, imageless = 0, membudget = 0;
     for (uint32_t i = 0; i < n; i++) {
+        if (!strcmp(e[i].extensionName, "VK_EXT_memory_budget")) membudget = 1;
         if (!strcmp(e[i].extensionName, "VK_EXT_vertex_attribute_divisor") ||
             !strcmp(e[i].extensionName, "VK_KHR_vertex_attribute_divisor"))
             divisor = 1;
@@ -645,6 +783,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (!strcmp(e[i].extensionName, "VK_EXT_load_store_op_none")) lson_ext = 1;
         if (!strcmp(e[i].extensionName, "VK_KHR_dynamic_rendering")) dynrend = 1;
         if (!strcmp(e[i].extensionName, "VK_KHR_create_renderpass2")) rp2 = 1;
+        if (!strcmp(e[i].extensionName, "VK_KHR_imageless_framebuffer")) imageless = 1;
     }
     free(e);
     /* VKBRIDGE_FAKE_MISSING=bc,divisor,clip,cull,depthclip pretends the GPU lacks them (host tests);
@@ -666,6 +805,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         if (token(fake, "push")) push = 0;
         if (token(fake, "loadstorenone")) lson_khr = 0;
         if (token(fake, "dynrend")) dynrend = 0;
+        if (token(fake, "membudget")) membudget = 0;
     }
     uint32_t emu = 0;
     VkPhysicalDeviceProperties props;
@@ -829,8 +969,19 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
      * (server_timeline.c). */
     int timeline_missing = vkb_timeline_missing(idt, pd);
     if (timeline_missing) emu |= VKB_EMU_TIMELINE;
+    /* Zink requires VK_KHR_imageless_framebuffer (Mesa 26.0.8, DroidDeck's Ubuntu runtime: "failed to load
+     * driver: zink" and Steam's UI gone); Mali r18-r26 (Vulkan 1.1) lack it. A real framebuffer is
+     * made per set of views at the render pass (server_emu_imageless.c). Hidden from the clients
+     * (VKBRIDGE_FAKE_MISSING=imageless, VKBRIDGE_SERVER_HIDE_EXTS: the host's Mali profiles) counts as lacking. */
+    int imageless_missing = (!imageless && props.apiVersion < VK_API_VERSION_1_2) || vkb_emu_ext_hidden_by_env("VK_KHR_imageless_framebuffer");
+    if (imageless_missing && !env_off("VKBRIDGE_EMU_IMAGELESS")) emu |= VKB_EMU_IMAGELESS;
+    /* VK_EXT_memory_budget: no Mali driver has it (every player's log says -EXT_memory_budget), so DXVK and
+     * vkd3d-proton were never told how much memory is free. The server answers the budget itself
+     * (server_memory.c memb_fill); offered to DXVK and vkd3d-proton only (vkb_emu_membudget_for). */
+    if (!membudget && !env_off("VKBRIDGE_EMU_MEMBUDGET")) emu |= VKB_EMU_MEM_BUDGET;
     uint32_t miss = 0;
     if (timeline_missing) miss |= VKB_EMU_TIMELINE;
+    if (!membudget) miss |= VKB_EMU_MEM_BUDGET;
     if (!f.textureCompressionBC) miss |= VKB_EMU_BCN;
     if (!divisor) miss |= VKB_EMU_DIVISOR;
     if (!f.shaderClipDistance) miss |= VKB_EMU_CLIP_DISTANCE;
@@ -846,6 +997,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (emu & VKB_EMU_MAINT6) miss |= VKB_EMU_MAINT6;
     if (emu & VKB_EMU_PUSH_DESC) miss |= VKB_EMU_PUSH_DESC;
     if (dynrend_missing) miss |= VKB_EMU_DYN_RENDER;
+    if (imageless_missing) miss |= VKB_EMU_IMAGELESS;
     if (bgr10_missing) miss |= VKB_EMU_BGR10_VTX;
     if (uf11_missing) miss |= VKB_EMU_UF11_VTX;
     if (!texel_single) miss |= VKB_EMU_TEXEL_ALIGN;
@@ -933,6 +1085,13 @@ void vkb_emu_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, uint32
     if (emu & VKB_EMU_MAINT6) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES);
     if (emu & VKB_EMU_DYN_RENDER) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES);
     if (emu & VKB_EMU_TIMELINE) chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
+    if (emu & VKB_EMU_IMAGELESS) {
+        /* the driver never sees an imageless framebuffer (server_emu_imageless.c) */
+        chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES);
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+                ((VkPhysicalDeviceVulkan12Features *)b)->imagelessFramebuffer = VK_FALSE;
+    }
     if (emu & VKB_EMU_ROBUSTNESS2) {
         chain_remove(ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
         /* What robustness the GPU has stays on; robustBufferAccess2 asks for at least that. */
@@ -1185,6 +1344,8 @@ void vkb_emu_device_destroy(vkb_srv_table *dev)
 {
     if (!dev->emu) return;
     vkb_emu_uninstall(dev);
+    vkb_dshape_forget_owner(dev->emu);
+    vkb_emu_bcsink_free(dev->emu);
     pthread_mutex_destroy(&dev->emu->lock);
     free(dev->emu);
     dev->emu = NULL;

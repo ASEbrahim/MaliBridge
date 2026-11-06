@@ -39,8 +39,9 @@ struct sigaction g_prev[32];
 
 void on_fault(int sig, siginfo_t *si, void *uc) {
     int saved = errno;
-    /* returns only when this thread is not inside a guarded call */
-    vkb_guard_fault(sig, si ? si->si_addr : nullptr);
+    /* returns only when this thread is not inside a guarded call; code and pc 0: in the game's process the
+     * layer logs the CONTAINED line only, as before (fault_detail in server_guard.c is the server's) */
+    vkb_guard_fault(sig, si ? si->si_addr : nullptr, 0, 0);
     errno = saved;
     if (sig <= 0 || sig >= 32)
         return;

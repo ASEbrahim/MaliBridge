@@ -6,14 +6,14 @@ MaliBridge runs inside **DroidDeck Mali**, a build that works with DroidDeck (th
 Steam client and PC games on Android). Get it only from MaliBridge's
 [Releases page](https://github.com/ASEbrahim/MaliBridge/releases/latest) (or the app's own **Updates**
 page): copies on other sites or sent by message are not ours. It installs as its own app, next to
-the official DroidDeck if you have it. The current version is v0.5.5, built on DroidDeck 0.6.9.
+the official DroidDeck if you have it. The current version is v0.5.5.3, built on DroidDeck 0.6.9.
 
 On a Galaxy Tab S10+ or S11 Ultra it works well. On other Mali devices it's still a test, so expect
 rough edges and please report what you find. Not sure about your device? Check the
 [Does my device work?](README.md#does-my-device-work) table.
 
-**Quick version:** install, start a Steam session (the Mali bridge is on by default), and set each
-game to **Proton Experimental ARM64 (Compatible)**.
+**Quick version:** install, start a Steam session (the Mali bridge is on by default), and play. The
+app picks a working DroidDeck-Proton by itself, so there is nothing to switch.
 
 ## What you need
 
@@ -47,13 +47,14 @@ game to **Proton Experimental ARM64 (Compatible)**.
 
 ## Settings to check
 
-- **Compatibility tool.** In Steam, open a game's Properties → Compatibility and choose
-  **Proton Experimental ARM64 (Compatible)**. That is DroidDeck's build, and it is the one that
-  works. Valve's own "Proton (ARM64)" entries and "Steam Linux Runtime" also appear in the list,
-  but they can't start inside DroidDeck: they need a sandbox that Android doesn't allow.
+- **Compatibility tool.** You don't need to change it. The app picks a working DroidDeck-Proton by
+  itself (the default is DroidDeck-Proton 11-11.10) and doesn't download or switch Proton on its
+  own after that. Valve's own "Proton (ARM64)" entries and "Steam Linux Runtime" also appear in
+  Steam's list, but they can't start inside DroidDeck, because they need a sandbox that Android
+  doesn't allow.
 - **Games with a Linux version too** (Portal 2, Half-Life 2 and others): Steam may pick the Linux
-  version, which doesn't start here yet. Set these to Proton Experimental ARM64 (Compatible) by
-  hand, as above.
+  version, which doesn't start here yet. Set these to a DroidDeck-Proton by hand, in the game's
+  Properties → Compatibility.
 - **In-game graphics settings.** Most games in the tables run on their default settings. The ones
   I changed:
 
@@ -120,18 +121,17 @@ try it in safe mode before reporting it, and say which mode you used.
 
 ## If something goes wrong
 
-The quickest help is on **[Discord](https://discord.gg/9xC67qTjDq)**: post what happened there with your logs.
+The quickest help is on **[Discord](https://discord.gg/9xC67qTjDq)**: post what happened in **#help** with your logs.
 
-**Easiest:** let the game close, tap **Stop** in the side menu, then tap **Send logs to MaliBridge** (in Setup > Diagnostics, on the session's end
-screen, or in the side menu). It uploads the session's logs and gives you a short code like `ML-7F3K`: paste
-that code in your GitHub issue or on Discord. What it sends, as the app says before you agree: your
+Let the game close, tap **Stop** in the side menu, then tap **Send logs to MaliBridge** (in Setup > Diagnostics, on the session's end
+screen, or in the side menu). It uploads the session's logs and gives you a short code like `ML-7F3K`. Post
+that code in **#help** on [Discord](https://discord.gg/9xC67qTjDq) or in your GitHub issue. Stopping the session first matters: if Android closed
+the game because it ran out of memory, that is only written to the logs when the session ends. Launch the game once per
+session, so the logs show a single attempt. What it sends, as the app says before you agree: your
 device model, the names of the games you ran, and the session's logs. Account names, passwords and
 tokens are removed first. The logs are kept for 90 days and only the developer sees them.
 
-**Or share the zip yourself:** after **Stop**, in DroidDeck Mali's **Setup > Diagnostics**, tap
-**Share logs** next to **Latest session logs**. Stopping the session first matters: if Android closed the game because it ran
-out of memory, that is only written to the logs when the session ends. Launch the game once per
-session, so the logs show a single attempt. Attach the zip to a [GitHub issue](https://github.com/ASEbrahim/MaliBridge/issues) and include:
+**In a [GitHub issue](https://github.com/ASEbrahim/MaliBridge/issues)**, include the code and:
 
 - your device model, and
 - what you did and what happened, for example "Steam never appeared" or "the game closed
@@ -158,7 +158,7 @@ shows the GPU too. Then look up the chip in the
 [Does my device work?](README.md#does-my-device-work) table. On the Galaxy Tab S10+ and S11 Ultra
 it works well. On other Mali devices it is still a test: it depends on the GPU and its driver, so
 try it and send logs (see "If something goes wrong"). Snapdragon chips have Adreno GPUs, which the
-official DroidDeck supports. Wider device support is on the way.
+official DroidDeck supports.
 
 **How much storage does it need?**
 Plan on about **8-10 GB before any games**: the Linux runtime (about 5 GB), the Steam client
@@ -177,13 +177,15 @@ removes DroidDeck Mali's Steam login and games. Older builds showed up as plain
 install over each other as normal.
 
 **Which Proton should I pick?**
-**Proton Experimental ARM64 (Compatible)**, in the game's Properties → Compatibility. Valve's
+None. The app picks a working DroidDeck-Proton by itself, so you don't need to switch. Valve's
 own "Proton (ARM64)" and "Steam Linux Runtime" entries can't start inside DroidDeck. For games
-that also have a Linux version (Portal 2, Half-Life 2, ...), set this by hand.
+that also have a Linux version (Portal 2, Half-Life 2, ...), set a DroidDeck-Proton by hand in the
+game's Properties → Compatibility.
 
 **A game closes right after I press Play. What now?**
-Check the compatibility tool first (the question above). If that is right, stop the session and
-send the logs. The logs show whether the game reached the GPU at all.
+Start it once more, then stop the session and send the logs. When a game closes without showing
+anything, its next start saves extra logs, so the code shows why. The logs also show whether the
+game reached the GPU at all.
 
 **Steam stays on "Waiting for Steam's first frame".**
 Stop the session and send the logs. They usually show what is missing on your device.

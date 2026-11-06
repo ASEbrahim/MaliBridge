@@ -17,6 +17,7 @@ It runs on the device's own driver, with no custom GPU driver to install.</p>
   <a href="INSTALL.md"><b>Install guide</b></a> ·
   <a href="#does-my-device-work"><b>Does my device work?</b></a> ·
   <a href="#games-that-run"><b>Games that run</b></a> ·
+  <a href="https://malibridge.com/"><b>Player results (MaliBridge Library)</b></a> ·
   <a href="#best-settings-and-performance-tips"><b>Best settings</b></a> ·
   <a href="#getting-help"><b>Getting help</b></a> ·
   <a href="INSTALL.md#faq"><b>FAQ</b></a> ·
@@ -52,15 +53,15 @@ It runs on the device's own driver, with no custom GPU driver to install.</p>
 
 **[Join the Discord](https://discord.gg/9xC67qTjDq)**: test builds, help and extras.
 
-**Current version: v0.5.5**, built on DroidDeck 0.6.9. Older versions are on the
+**Current version: v0.5.5.3**, built on DroidDeck 0.6.9. Older versions are on the
 [Releases page](https://github.com/ASEbrahim/MaliBridge/releases).
 
 MaliBridge runs inside **DroidDeck Mali**, a build that works with DroidDeck (the app that runs the
 Steam client and PC games on Android). On a Samsung Galaxy Tab S10+ (Mali-G720) and Galaxy Tab S11
 Ultra (Mali-G925), 36 games I've tested are playable or better, for example Half-Life 2 at about
 94 fps, Hollow Knight: Silksong, Stardew Valley, Risk of Rain Returns, Dark Souls Remastered and
-Garry's Mod. Players have sent reports from 32 other Mali phones, tablets and handhelds. The tables
-below cover 93 different games, 50 of them playable or better. It is free.
+Garry's Mod. Players have sent reports from 38 other Mali phones, tablets and handhelds. The tables
+below cover 98 different games. It is free.
 
 ## Does my device work?
 
@@ -83,23 +84,29 @@ ship different driver versions, so a report is still useful.
 | Mali-G57 | Xiaomi phone (MediaTek, G57 MC2) | r54p1 | **Works, with notes** | Left 4 Dead 2 at 17-19 fps |
 | Mali-G57 | Samsung Galaxy F15 | r38p1 | **Works** | Steam opens, player confirmed |
 | Mali-G68 | Samsung Galaxy A16 5G | r38p1 | **Works** | Steam opens, player confirmed |
+| Mali-G57 | Samsung Galaxy A07 (Helio G99) |  | **Works** | Tap Ninja about 59 fps |
 | Mali-G68 | Samsung Galaxy A54 | r38p1 | **Works, with notes** | Steam opens; menus are slow |
+| Mali-G68 | Samsung Galaxy A34 5G (Dimensity 1080) |  | **Works** | Star Wars Republic Commando playable, about 30 fps |
 | Mali-G76 | Samsung Galaxy S10+ phone (Exynos 9820) | r38p1 beta | **Works, with notes** | Steam opens and a game ran, slowly |
 | Mali-G77 | Retroid Pocket 4 Pro (Dimensity 1100) | r32p1 | **Works, with notes** | Steam and Big Picture run; some screens flicker |
 | Mali-G77 | Huawei Nova 7 (Kirin 985) |  | **Works, with notes** | Slay the Spire 1 and 2 run; one game says "Direct3D isn't supported" |
 | Mali-G78 | Samsung Galaxy S21 | r38p0 | **Works** | Muse Dash about 53 fps |
+| Mali-G610 | Xiaomi 12T (Dimensity 8100-Ultra) | r32p1 | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/34#issuecomment-6570084449): Steam runs and Half-Life plays |
 | Mali-G615 | POCO X6 Pro (Dimensity 8300-Ultra) |  | **Works, with notes** | [Player report](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6311114838): Lighter games run (GTA San Andreas, Burnout Paradise about 30 fps); heavier ones 12-14 fps |
 | Mali-G615 | Dimensity 8350 phone |  | **Works** | [Player report](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6322050101): Rivals of Aether about 55 fps |
 | Mali-G615 | Xiaomi phone (G615 MC2) | r44p1 | **Works** | Final Fantasy Resonance about 46 fps |
 | Mali-G615 | Infinix phone (G615 MC6, 11.5 GB RAM) | r44p1 | **Works, with notes** | Tekken 7 9-30 fps; the phone ran out of free memory |
 | Mali-G710 | OnePlus Ace 2V (Dimensity 9000) | r32p1 | **Works, with notes** | [Player report](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6335790759): RimWorld plays for 1-2 hours; Half-Life 2 starts. Needs DXVK 1.10.3 picked by hand |
+| Immortalis-G715 | Xiaomi 13T Pro (Dimensity 9200+) | r38p1 | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669): Dead Cells 39-47 fps, BALL x PIT about 35 fps, Hades about 17 fps; Steam's menus 20-25 fps |
+| Immortalis-G715 | vivo X90s (Dimensity 9200+) | r38p1 | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/51#issuecomment-6571868319): Steam's black screen is gone since v0.5.5; playable but a bit laggy |
 | Immortalis-G715 | Pixel 8 / 8 Pro (Tensor G3) | r54 | **Works** | [Player reports](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6306332804): Cuphead 60-100 fps, Hades 30-60, Dishonored 15-25 |
 | Immortalis-G715 | Pixel 9 (Tensor G4) | r54p3 | **Works, with notes** | [Player report](https://github.com/Droid-Deck/DroidDeck/pull/517#issuecomment-6220985381): Steam starts; games not confirmed yet |
 | Immortalis-G720 | Samsung Galaxy Tab S10+ (Dimensity 9300+) | r44p1 | **Works** | Tested in depth |
+| Immortalis-G720 | vivo X100 Pro (Dimensity 9300) |  | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19193192): Cuphead about 100 fps; Steam's menus about 15 fps with a white flash; Forza Horizon 4 closes when going into the game |
 | Immortalis-G720 | realme Neo7 (Dimensity 9300+) | r44p1 | **Works** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/5): Stardew Valley about 59 fps, Balatro 55-72 fps |
 | Immortalis-G720 | Xiaomi 14T Pro (Dimensity 9300+) | r44p1 | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19146763): Steam, controller and downloads work; Alan Wake 20-50 fps on Low; some graphics glitches that need a game restart |
 | Mali-G720 | POCO X8 Pro (Dimensity 8500) | r49p1 | **Works, with notes** | [Player reports](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497): Indiana Jones and the Emperor's Tomb about 30 fps; Hob has freezes |
-| Mali-G720 | POCO X7 Pro (Dimensity 8400-Ultra) |  | **Works** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/23): Lighter games run (Stardew Valley, Rain World, Tukoni: Forest Keepers and more) |
+| Mali-G720 | POCO X7 Pro (Dimensity 8400-Ultra) |  | **Works** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/23): Lighter games run (Stardew Valley, Rain World, Tukoni: Forest Keepers and more); [Darksiders Genesis 23-27 fps on Low](https://github.com/ASEbrahim/MaliBridge/issues/62) |
 | Immortalis-G925 | Samsung Galaxy Tab S11 Ultra (Dimensity 9400) | r49p1 | **Works** | Tested in depth |
 | Immortalis-G925 | vivo X200 (Dimensity 9400) |  | **Works** | [Player report](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6314012693): Euro Truck Simulator 2 about 20 fps, Goat Simulator about 35 fps |
 | Mali-G925 | Xiaomi Pad 7S Pro (XRing O1) | r49p1 | **Works** | Steam runs |
@@ -123,14 +130,15 @@ More device reports and tests from players are in the Discord, along with test b
 |---|---|---|
 | Dimensity 9300 / 9300+ (other devices) | Immortalis-G720 MC12 | OPPO Find X7 |
 | Dimensity 9400 / 9400+ (other devices) | Immortalis-G925 MC12 | OPPO Find X8 |
-| Dimensity 7300, Helio G99 and similar | Mali-G615 / G610 / G57 | many mid-range phones (smaller GPUs: expect light games only) |
-| Exynos 1280 / 2100 | Mali-G68 / G78 | Galaxy A53 |
+| Dimensity 7300 and similar | Mali-G615 / G610 | many mid-range phones (smaller GPUs: expect light games only) |
+| Exynos 1280 | Mali-G68 | Galaxy A53 |
 
 **Not Mali:** Snapdragon chips have Adreno GPUs (use the official DroidDeck). Samsung's newer Exynos
-chips have Xclipse GPUs, and some of those phones work (the Galaxy A55 is in the table). The Galaxy S24+
-(Xclipse 940, [#43](https://github.com/ASEbrahim/MaliBridge/issues/43)) and A56 (Xclipse 540,
-[#29](https://github.com/ASEbrahim/MaliBridge/issues/29)) didn't start on older versions; v0.5.5 has
-changes for them that I haven't had confirmed yet. Wider device support is on the way.
+chips have Xclipse GPUs, and some of those phones work (the Galaxy A55 is in the table). On Samsung
+phones updated to Android 17 (One UI 9), Steam stayed on its loading screen; v0.5.5.3 should fix that.
+In my own tests with v0.5.5.3, Steam reached its sign-in screen on a Galaxy S26 FE (Android 17) and a
+Galaxy A56. Players with the Galaxy S24+ (Xclipse 940, [#43](https://github.com/ASEbrahim/MaliBridge/issues/43))
+and A56 (Xclipse 540, [#29](https://github.com/ASEbrahim/MaliBridge/issues/29)) haven't confirmed it yet.
 
 On a device that isn't in the table, it's still a test: it depends on the GPU and its driver.
 Logs from your device help a lot (see [Getting help](#getting-help)).
@@ -140,7 +148,7 @@ Logs from your device help a lot (see [Getting help](#getting-help)).
 1. Check your chip in the tables above.
 2. Download `DroidDeck-MaliBridge-....apk` from the [latest release](https://github.com/ASEbrahim/MaliBridge/releases/latest) and install it. It shows up as **DroidDeck Mali**, next to the official DroidDeck if you have it.
 3. Open DroidDeck Mali (the **Mali bridge** is on by default; check **Setup** if unsure), start a **Steam** session and sign in.
-4. For each game, pick **Proton Experimental ARM64 (Compatible)** in its Properties → Compatibility.
+4. Start a game. The app picks a working DroidDeck-Proton by itself, so there is nothing to switch.
 
 The [install guide](INSTALL.md) has every step, what you need (Android version, RAM, storage), the
 settings to check, and which games to try first.
@@ -297,10 +305,11 @@ and SOMA closes when its first load ends.
 </details>
 
 <details>
-<summary><b>Immortalis-G720 (Dimensity 9300): realme Neo7, Xiaomi 14T Pro</b> (3 games)</summary>
+<summary><b>Immortalis-G720 (Dimensity 9300): realme Neo7, vivo X100 Pro, Xiaomi 14T Pro</b> (4 games)</summary>
 
 | Game | Device (GPU) | Result |
 |---|---|---|
+| Cuphead | vivo X100 Pro (G720) | [about 100 fps in play](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19193192) |
 | Stardew Valley | realme Neo7 (G720) | [about 59 fps](https://github.com/ASEbrahim/MaliBridge/issues/5) |
 | Balatro | realme Neo7 (G720) | [55-72 fps; its missing text has since been fixed](https://github.com/ASEbrahim/MaliBridge/issues/5) |
 | Alan Wake | Xiaomi 14T Pro (G720) | [20-50 fps on Low](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19146763) |
@@ -308,17 +317,29 @@ and SOMA closes when its first load ends.
 </details>
 
 <details>
-<summary><b>Mali-G720 MC7/MC8 (Dimensity 8400/8500): POCO X7 Pro, POCO X8 Pro</b> (7 games)</summary>
+<summary><b>Mali-G720 MC7/MC8 (Dimensity 8400/8500): POCO X7 Pro, POCO X8 Pro</b> (8 games)</summary>
 
 | Game | Device (GPU) | Result |
 |---|---|---|
 | Indiana Jones and the Emperor's Tomb | POCO X8 Pro (G720 MC8) | [about 30 fps in play with the Stability FEX preset; the Performance presets stop it with an "invalid camera matrix" error](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497) |
+| Darksiders Genesis | POCO X7 Pro (G720 MC7) | [23-27 fps on Low at 1600x720, through a boss fight full of effects](https://github.com/ASEbrahim/MaliBridge/issues/62) |
 | Good Company | POCO X7 Pro (G720 MC7) | [runs; needs the PC keyboard to play](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Hob | POCO X8 Pro (G720 MC8) | [playable, with some freezes being looked into](https://github.com/ASEbrahim/MaliBridge/issues/14) |
 | Japanese Rural Life Adventure | POCO X7 Pro (G720 MC7) | [works](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Rain World | POCO X7 Pro (G720 MC7) | [works](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Stardew Valley | POCO X7 Pro (G720 MC7) | [works](https://github.com/ASEbrahim/MaliBridge/issues/23) |
 | Tukoni: Forest Keepers | POCO X7 Pro (G720 MC7) | [works](https://github.com/ASEbrahim/MaliBridge/issues/23) |
+
+</details>
+
+<details>
+<summary><b>Immortalis-G715 (Dimensity 9200+): Xiaomi 13T Pro</b> (3 games)</summary>
+
+| Game | Device (GPU) | Result |
+|---|---|---|
+| Dead Cells | Xiaomi 13T Pro (G715) | [39-47 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669) |
+| BALL x PIT | Xiaomi 13T Pro (G715) | [about 35 fps, playable](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669) |
+| Hades | Xiaomi 13T Pro (G715) | [about 17 fps, with stutter](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19352669) |
 
 </details>
 
@@ -364,6 +385,15 @@ and SOMA closes when its first load ends.
 </details>
 
 <details>
+<summary><b>Mali-G610 (Dimensity 8100): Xiaomi 12T</b> (1 game)</summary>
+
+| Game | Device (GPU) | Result |
+|---|---|---|
+| Half-Life | Xiaomi 12T (G610) | [plays](https://github.com/ASEbrahim/MaliBridge/issues/34#issuecomment-6570084449) |
+
+</details>
+
+<details>
 <summary><b>Mali-G615 (Dimensity 8300/8350): POCO X6 Pro and others</b> (7 games)</summary>
 
 | Game | Device (GPU) | Result |
@@ -379,10 +409,20 @@ and SOMA closes when its first load ends.
 </details>
 
 <details>
-<summary><b>Mali-G57 (Helio G96): Redmi Note 12S and a Xiaomi phone</b> (7 games)</summary>
+<summary><b>Mali-G68 (Dimensity 1080): Galaxy A34 5G</b> (1 game)</summary>
 
 | Game | Device (GPU) | Result |
 |---|---|---|
+| Star Wars Republic Commando | Galaxy A34 5G (G68) | playable, about 30 fps |
+
+</details>
+
+<details>
+<summary><b>Mali-G57 (Helio G96/G99): Redmi Note 12S, Galaxy A07 and a Xiaomi phone</b> (8 games)</summary>
+
+| Game | Device (GPU) | Result |
+|---|---|---|
+| Tap Ninja | Galaxy A07 (G57) | about 59 fps |
 | Space Menace | Redmi Note 12S (G57) | [60 fps, small stutters now and then](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19166394) |
 | Death Road to Canada | Redmi Note 12S (G57) | [30-60 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19128201) |
 | Zombie Blocks 2 | Redmi Note 12S (G57) | [about 30 fps on Low](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19128201) |
@@ -393,12 +433,15 @@ and SOMA closes when its first load ends.
 
 </details>
 
+More player results, by device and game, are on the [MaliBridge Library](https://malibridge.com/).
+
 
 ## Best settings and performance tips
 
-- **Proton:** pick **Proton Experimental ARM64 (Compatible)** for every game. Valve's own "Proton
-  (ARM64)" and "Steam Linux Runtime" can't start inside DroidDeck. Games with a Linux version too
-  (Portal 2, Half-Life 2 and others) need it set by hand.
+- **Proton:** you don't need to switch. The app picks a working DroidDeck-Proton by itself (the
+  default is DroidDeck-Proton 11-11.10), and it doesn't move your games to a newer one on its own. Valve's own "Proton (ARM64)" and "Steam Linux Runtime"
+  can't start inside DroidDeck. Games with a Linux version too (Portal 2, Half-Life 2 and others)
+  need a DroidDeck-Proton set by hand.
 - **Start with Safe mode (the default).** It is the most compatible setting. **Performance mode**
   (Safe mode: off) is an option under the Mali bridge button; on my tablets it was only 0-2% faster,
   and on weaker GPUs (Mali-G57, G68, G610) the logs I've read show no gain. Try it once a game works
@@ -474,31 +517,40 @@ percent are within noise.
 
 **Send logs to MaliBridge.** Let the game close, tap **Stop** in the side menu,
 then tap **Send logs to MaliBridge** (in **Setup > Diagnostics**, on the session's end screen, or in
-the side menu). It gives you a short code like `ML-7F3K`: paste it on Discord or in a
+the side menu). It gives you a short code like `ML-7F3K`: post it in **#help** on Discord or in a
 [GitHub issue](https://github.com/ASEbrahim/MaliBridge/issues). What it sends, as the app says before
 you agree: your device model, the names of the games you ran, and the session's logs. Account names,
 passwords and tokens are removed first. The logs are kept for 90 days and only the developer sees
 them.
 
-**Or share the logs yourself:** in **Setup > Diagnostics**, tap **Share logs** next to **Latest
-session logs**, and attach the zip to your issue or Discord post.
-
 **Opening an issue:** go to [Issues](https://github.com/ASEbrahim/MaliBridge/issues), and include
 your device model, the MaliBridge version, what you did and what happened (for example "Steam never
-appeared" or "the game closed right after starting"), and your logs code or zip. Chinese or English
+appeared" or "the game closed right after starting"), and your logs code. Chinese or English
 is fine, and so is machine translation.
 
 **Reports that help most:** any Mali device not in the tables above, black screens, and games that
 close at start. Launch the game once per session, so the logs show a single attempt.
 
+**A game closes right after starting, with no picture?** Start it once more, then send logs. When a
+game closes like that, its next start saves extra logs, so the code shows why.
+
 The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 
 ## Known issues
 
-- **OpenGL games** on the Galaxy A16, A54, F15, Tab S9 FE, Tab S10 Lite and Anbernic RG556 are not
-  tested yet.
+- **OpenGL games on the Galaxy Tab S9 FE** (Mali-G68) can show broken textures, for example Euro
+  Truck Simulator 2 in OpenGL mode. Being looked into. On the Galaxy A16, A54, F15, Tab S10 Lite and
+  Anbernic RG556, OpenGL games are not tested yet.
 - **Short freezes while moving** in some games that stream their textures in as you walk (Dark
-  Souls III, Hob).
+  Souls III, Hob). v0.5.5.3 writes down what each freeze was waiting on, so logs from a game that
+  freezes help.
+- **Steam's menu closing over and over** on some Xiaomi, POCO and vivo phones, and games going back
+  to Steam on the POCO X8 Pro ([#55](https://github.com/ASEbrahim/MaliBridge/issues/55)). v0.5.5.3
+  writes down why it closes, so send logs right after it happens.
+- **Games closing when the phone runs low on memory.** v0.5.5.3 might help in some games. Close
+  other apps first and launch one game per session.
+- **Some Huawei phones on Android 10** (P30, P40 Pro) can stop at Steam setup. v0.5.5.3 might help;
+  if it still stops, logs help.
 - **Steam's menus on some vivo and iQOO phones** can run at about 15 fps, with a white flash when a menu opens.
   v0.5.5 has a change for this that is not checked on a phone yet. If you have one of these phones, logs help.
 - **The Witcher 3 (DX12) on the Mali-G925** runs at about 29 fps, but one session froze in a cutscene.
@@ -514,7 +566,8 @@ The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 - **The Steam window on the Mali-G925** can feel slow. Games are not affected.
 - **Green-square texture artifacts** in some games on Dimensity 9500 phones (Mali-G1-Ultra). Being
   looked into.
-- **Just Cause 2** does not start: Steam's copy protection check takes too long inside DroidDeck.
+- **Just Cause 2, Mafia II and Space Marine** can stay on Steam's "Updating executable" step: Steam's
+  copy protection check takes too long inside DroidDeck.
 - **Resident Evil 2** can show "Failed to send play data to RE NET" on its menu. Press OK: the game
   plays normally. Only Capcom's online play statistics are affected.
 - **Dark Souls III on slower devices** can say "Frame rate unsuitable for online play" and return to
@@ -529,6 +582,7 @@ The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 - Smoother first visits to new areas.
 - The games limited by the CPU (The Forest, ASTRONEER, Outer Wilds) and Just Cause 2.
 - DirectX 12: The Witcher 3's cutscene freeze, Stray in DX12, Elden Ring, Bright Memory.
+- Phones where Steam's menus close over and over or stay black.
 - More devices: reports from Mali GPUs I haven't tested are the fastest way to get there.
 
 ## More
@@ -568,7 +622,7 @@ runs the Steam client and PC games on Android. It is not part of the official Dr
 - [HWCPipe](https://github.com/ARM-software/HWCPipe) by Arm, MIT.
 - [etc2_encode](https://github.com/leegao/etc2_encode) by Lee Gao, MIT.
 - Code from Lee Gao's [SPIRV-Tools fork](https://github.com/leegao/SPIRV-Tools), Apache-2.0.
-- The Vulkan layer in v0.5.5 is Lee Gao's work, from [pull request #13](https://github.com/ASEbrahim/MaliBridge/pull/13).
+- The Vulkan layer (since v0.5.5) is Lee Gao's work, from [pull request #13](https://github.com/ASEbrahim/MaliBridge/pull/13).
 
 **Thanks** for ideas, findings and testing that shaped MaliBridge (no code copied unless listed
 above): Mondyro (the Dimensity 9500 texture fix, [#24](https://github.com/ASEbrahim/MaliBridge/issues/24)), Lee Gao ([compat_layer](https://github.com/leegao/compat_layer), bionic-vulkan-wrapper,

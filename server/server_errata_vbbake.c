@@ -626,6 +626,18 @@ static VKAPI_ATTR void VKAPI_CALL bk_FreeCommandBuffers(VkDevice dev, VkCommandP
     b->next.vkFreeCommandBuffers(dev, pool, n, cbs);
 }
 
+/* vkCmdBeginTransformFeedbackEXT binds the variant first, as a draw does: the bind is held until
+ * the draw, and transform feedback begun with no pipeline bound is invalid (Mali read through the
+ * missing pipeline: a player log, there under the vertex-input layer's held bind,
+ * server_vidyn.c); a pipeline may not be bound while it is active either. */
+static VKAPI_ATTR void VKAPI_CALL bk_CmdBeginTransformFeedbackEXT(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *bufs,
+                                                                 const VkDeviceSize *offs)
+{
+    vkb_errata_vbbake *b = B();
+    prepare(b, cb);
+    b->next.vkCmdBeginTransformFeedbackEXT(cb, first, n, bufs, offs);
+}
+
 #define DRAW(name, params, args)                      \
     static VKAPI_ATTR void VKAPI_CALL bk_##name params \
     {                                                  \
@@ -689,6 +701,8 @@ void vkb_errata_vbbake_install(vkb_srv_table *t, vkb_errata_dev *e)
     ERRATA_HOOK(t, vkCmdDrawMultiEXT, bk_vkCmdDrawMultiEXT);
     ERRATA_HOOK(t, vkCmdDrawMultiIndexedEXT, bk_vkCmdDrawMultiIndexedEXT);
     ERRATA_HOOK(t, vkCmdDrawIndirectByteCountEXT, bk_vkCmdDrawIndirectByteCountEXT);
+    const char *xb = vkb_srv_env("VKBRIDGE_XFB_BIND_FIRST"); /* =0: the begin as it was (the A/B) */
+    if (!(xb && *xb == '0')) ERRATA_HOOK(t, vkCmdBeginTransformFeedbackEXT, bk_CmdBeginTransformFeedbackEXT);
 }
 
 /* At device destroy (server_errata.c): the totals, then the tables (the device takes what
@@ -748,8 +762,11 @@ static VKAPI_ATTR void VKAPI_CALL im_CmdBindVertexBuffers2(VkCommandBuffer cb, u
     m->next.vkCmdBindVertexBuffers2(cb, first, n, bufs, off, size, st);
     if (!st || !n || !s) return;
     VkDeviceSize last = st[n - 1];
+    /* a whole-buffer binding goes again as pSizes NULL (as server_errata_cmd.c does): VK_WHOLE_SIZE in
+     * pSizes is maintenance5's, and on a driver without it (a Mali profile's maint5) it reads zeros */
     for (uint32_t k = 0; k < NB; k++)
-        if (c.have_buf >> k & 1) m->next.vkCmdBindVertexBuffers2(cb, k, 1, &c.buf[k], &c.off[k], &c.size[k], &last);
+        if (c.have_buf >> k & 1)
+            m->next.vkCmdBindVertexBuffers2(cb, k, 1, &c.buf[k], &c.off[k], c.size[k] == VK_WHOLE_SIZE ? NULL : &c.size[k], &last);
     __atomic_add_fetch(&m->wrong, 1, __ATOMIC_RELAXED);
 }
 

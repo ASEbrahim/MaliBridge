@@ -21,6 +21,8 @@
  *   arm    driverID ARM_PROPRIETARY, driverVersion r44p1, driverInfo "v1.r44p1-01eac0"
  *   arm11  as arm, as a Vulkan 1.1 driver without VK_KHR_driver_properties (driverID unknown)
  *   samsung  vendorID 0x144D and driverID SAMSUNG_PROPRIETARY, the rest the driver's (Xclipse)
+ *   samsung:<driverVersion>  the same with that driverVersion (hex, e.g. samsung:0x06401362, Samsung's
+ *            SPAL 25.1.866): the driver-version gates (server_emu.c xclipse_zink) see it
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -148,6 +150,7 @@ enum { FAKE_OFF, FAKE_PANVK, FAKE_ARM, FAKE_ARM11, FAKE_SAMSUNG };
 
 static struct {
     int on;
+    uint32_t version; /* samsung:<driverVersion>, 0: the driver's */
     PFN_vkGetInstanceProcAddr gipa;
     PFN_vkGetPhysicalDeviceProperties props;
     PFN_vkGetPhysicalDeviceProperties2 props2, props2khr;
@@ -158,6 +161,7 @@ static void fake_props(VkPhysicalDeviceProperties *p)
 {
     if (fk.on == FAKE_SAMSUNG) {
         p->vendorID = 0x144D;
+        if (fk.version) p->driverVersion = fk.version;
         return;
     }
     p->vendorID = ARM_VENDOR;
@@ -266,12 +270,19 @@ PFN_vkGetInstanceProcAddr vkb_driverid_imitate_gipa(PFN_vkGetInstanceProcAddr gi
     if (!v || !*v) return gipa;
     fk.on = !strcmp(v, "panvk") ? FAKE_PANVK : !strcmp(v, "arm") ? FAKE_ARM : !strcmp(v, "arm11") ? FAKE_ARM11
             : !strcmp(v, "samsung") ? FAKE_SAMSUNG : FAKE_OFF;
+    if (!strncmp(v, "samsung:", 8)) {
+        char *end = NULL;
+        unsigned long ver = strtoul(v + 8, &end, 16);
+        if (end && end != v + 8 && !*end && ver && ver <= 0xffffffffu) fk.on = FAKE_SAMSUNG, fk.version = (uint32_t)ver;
+    }
     if (!fk.on) {
-        VKB_WARN("VKBRIDGE_FAKE_DRIVER=%s means nothing (panvk, arm, arm11 or samsung)", v);
+        VKB_WARN("VKBRIDGE_FAKE_DRIVER=%s means nothing (panvk, arm, arm11, samsung or samsung:<hex driverVersion>)", v);
         return gipa;
     }
     fk.gipa = gipa;
-    if (fk.on == FAKE_SAMSUNG) VKB_INFO("imitating Samsung's driver (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x144D, driverID SAMSUNG_PROPRIETARY", v);
+    if (fk.on == FAKE_SAMSUNG)
+        VKB_INFO("imitating Samsung's driver (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x144D, driverID SAMSUNG_PROPRIETARY%s", v,
+                 fk.version ? ", driverVersion as given" : "");
     else
         VKB_INFO("imitating %s (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x13B5", fk.on == FAKE_PANVK ? "Mesa PanVK 26.3.0" : fk.on == FAKE_ARM ? "Arm's driver r44p1"
                                                                           : "Arm's driver r44p1 as Vulkan 1.1 without VK_KHR_driver_properties", v);

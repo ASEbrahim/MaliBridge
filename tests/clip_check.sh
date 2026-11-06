@@ -23,7 +23,9 @@ fi
 srv=../server
 cc -O1 -Wall -Wextra -o "$out/clip_check" clip_check.c $srv/spirv_clip.c $srv/spirv_pervertex.c $srv/spirv_edit.c
 for s in corpus/clip_*.spvasm corpus/pervertex_gs_whole.spvasm; do
-    $run spirv-as --target-env vulkan1.1 -o "$out/$(basename "$s" .spvasm).spv" "$PWD/$s"
+    ids=
+    case $s in *opline*) ids=--preserve-numeric-ids ;; esac # its OpLine names the block variable's id
+    $run spirv-as --target-env vulkan1.1 $ids -o "$out/$(basename "$s" .spvasm).spv" "$PWD/$s"
 done
 cases=("$PWD"/corpus/ultrakill_unity_vs_clipblock.spv "$PWD"/corpus/drg_dxvk_gs.spv "$out"/pervertex_gs_whole.spv "$out"/clip_*.spv)
 # The inputs must be valid already: a failure after the rewrite is then the rewrite's.
@@ -36,7 +38,8 @@ cc -O1 -Wall -Wextra -Wno-missing-field-initializers -I../third_party/Vulkan-Hea
 fs=$out/clip_fs.spv
 draws() {
     local r=0
-    for d in "VS block:$out/clip_vs_block.spv:-" "VS whole stores:$out/clip_vs_whole.spv:-" \
+    for d in "VS block:$out/clip_vs_block.spv:-" "VS block, line info:$out/clip_vs_block_opline.spv:-" \
+             "VS whole stores:$out/clip_vs_whole.spv:-" \
              "VS block -> GS block:$out/clip_vs_block.spv:$out/clip_gs_block.spv" \
              "VS block -> loose GS:$out/clip_vs_block.spv:$out/pervertex_gs_whole.spv"; do
         IFS=: read -r name vs gs <<<"$d"

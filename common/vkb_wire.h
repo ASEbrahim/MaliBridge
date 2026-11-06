@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "gen/vkb_gen.h"
 
 #define VKB_MAX_FDS 16
@@ -38,10 +39,23 @@ struct vkb_enc {
 void vkb_enc_init(vkb_enc *e);
 void vkb_enc_reset(vkb_enc *e);   /* keeps the buffer */
 void vkb_enc_free(vkb_enc *e);
-void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n);
-void vkb_enc_u8(vkb_enc *e, uint8_t v);
-void vkb_enc_u32(vkb_enc *e, uint32_t v);
-void vkb_enc_u64(vkb_enc *e, uint64_t v);
+/* The primitives are inline with the common case (room in the buffer, no earlier failure) open-coded: every field of
+ * every request goes through them, and as calls into another file each ended in a memcpy library call even for one
+ * byte (27% of the client's own CPU in a DXVK frame on the host, 2026-11-02; tests/wire_check.c has the cost per
+ * field). Same bytes on the wire; the slow path is the function that was here. */
+void vkb_enc_bytes_slow(vkb_enc *e, const void *p, size_t n);
+static inline void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n)
+{
+    if (__builtin_expect(p && n && !e->oom && n <= e->cap - e->len, 1)) {
+        memcpy(e->buf + e->len, p, n);
+        e->len += n;
+        return;
+    }
+    vkb_enc_bytes_slow(e, p, n);
+}
+static inline void vkb_enc_u8(vkb_enc *e, uint8_t v) { vkb_enc_bytes(e, &v, 1); }
+static inline void vkb_enc_u32(vkb_enc *e, uint32_t v) { vkb_enc_bytes(e, &v, 4); }
+static inline void vkb_enc_u64(vkb_enc *e, uint64_t v) { vkb_enc_bytes(e, &v, 8); }
 size_t vkb_enc_raw(vkb_enc *e, const void *p, size_t n);          /* 8-aligned; returns offset */
 void vkb_enc_patch_u64(vkb_enc *e, size_t off, uint64_t v);
 void vkb_enc_str(vkb_enc *e, const char *s);
@@ -64,10 +78,20 @@ struct vkb_dec {
     uint32_t fd_taken;   /* bitmask of fds handed out */
 };
 void vkb_dec_init(vkb_dec *d, const void *buf, size_t len, vkb_arena *a, int *fds, int nfds);
-void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n);
-uint8_t vkb_dec_u8(vkb_dec *d);
-uint32_t vkb_dec_u32(vkb_dec *d);
-uint64_t vkb_dec_u64(vkb_dec *d);
+/* Inline like the encoder's (see there): the server decodes every field of every request through these. */
+void vkb_dec_bytes_slow(vkb_dec *d, void *dst, size_t n);
+static inline void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
+{
+    if (__builtin_expect(dst && !d->err && n <= d->len - d->pos, 1)) {
+        memcpy(dst, d->buf + d->pos, n);
+        d->pos += n;
+        return;
+    }
+    vkb_dec_bytes_slow(d, dst, n);
+}
+static inline uint8_t vkb_dec_u8(vkb_dec *d) { uint8_t v; vkb_dec_bytes(d, &v, 1); return v; }
+static inline uint32_t vkb_dec_u32(vkb_dec *d) { uint32_t v; vkb_dec_bytes(d, &v, 4); return v; }
+static inline uint64_t vkb_dec_u64(vkb_dec *d) { uint64_t v; vkb_dec_bytes(d, &v, 8); return v; }
 void vkb_dec_raw_into(vkb_dec *d, void *dst, size_t n);
 void vkb_dec_raw_tail(vkb_dec *d, void *dst, size_t n);
 const void *vkb_dec_raw_view(vkb_dec *d, size_t n);

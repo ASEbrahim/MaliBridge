@@ -126,6 +126,11 @@ static uint32_t id_words(const spv_inst *in)
     case 246 /* LoopMerge */: return 2;
     case SpvOpSelectionMerge: return 1;
     case SpvOpBranchConditional: return 3;
+    /* OpLine: file (an OpString), then line and column literals; No Man's Sky's vertex shaders
+     * carry source lines, and a line number equal to gl_PerVertex's id read as a use of the block
+     * left ClipDistance a built-in (Mali's compiler crashed on the pipeline) */
+    case SpvOpLine: return 1;
+    case SpvOpNoLine: return 0;
     default: return UINT16_MAX;
     }
 }

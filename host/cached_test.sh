@@ -110,7 +110,7 @@ step $? "hostptr strategy: no cached readback ($(grep -m1 -o 'cached readback: n
 
 # 7
 stop
-bad=$(cat $logs | grep -cE "command stream:|malformed request|unknown command id|the driver has no|bad batch entry")
+bad=$(cat $logs | grep -cE "command stream:|malformed request|unknown command id|the driver has no |bad batch entry")
 [ "${bad:-0}" = 0 ]
 step $? "no protocol errors"
 

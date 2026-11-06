@@ -1645,6 +1645,7 @@ void vkb_sv_vkBindImageMemory(vkb_srv_call *c)
     vkb_dec_bytes(d, &memoryOffset, sizeof(memoryOffset));
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkBindImageMemory) { vkb_srv_missing(c, "vkBindImageMemory"); return; }
+    vkb_srv_note_bind_image(image, memory, memoryOffset);
     VkResult r_ = c->dt->vkBindImageMemory(device, image, memory, memoryOffset);
     vkb_enc_bytes(e, &r_, sizeof(r_));
 }
@@ -1668,6 +1669,7 @@ void vkb_sv_vkBindImageMemory2(vkb_srv_call *c)
     }
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkBindImageMemory2) { vkb_srv_missing(c, "vkBindImageMemory2"); return; }
+    vkb_srv_note_bind_image2(bindInfoCount, pBindInfos);
     VkResult r_ = c->dt->vkBindImageMemory2(device, bindInfoCount, pBindInfos);
     vkb_enc_bytes(e, &r_, sizeof(r_));
 }
@@ -1981,6 +1983,7 @@ void vkb_sv_vkCmdBindPipeline(vkb_srv_call *c)
     vkb_dec_bytes(d, &pipeline, sizeof(pipeline));
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkCmdBindPipeline) { vkb_srv_missing(c, "vkCmdBindPipeline"); return; }
+    if (vkb_srv_note_bind_pipeline(pipelineBindPoint, pipeline)) return;
     c->dt->vkCmdBindPipeline(commandBuffer, pipelineBindPoint, pipeline);
 }
 
@@ -3770,6 +3773,7 @@ void vkb_sv_vkCmdSetLineWidth(vkb_srv_call *c)
     vkb_dec_bytes(d, &lineWidth, sizeof(lineWidth));
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkCmdSetLineWidth) { vkb_srv_missing(c, "vkCmdSetLineWidth"); return; }
+    vkb_srv_note_line_width(lineWidth);
     c->dt->vkCmdSetLineWidth(commandBuffer, lineWidth);
 }
 
@@ -4664,7 +4668,9 @@ void vkb_sv_vkCreateGraphicsPipelines(vkb_srv_call *c)
     VkPipeline *pPipelines = has_pPipelines ? (VkPipeline *)vkb_dec_alloc_zero(d, (size_t)n_pPipelines * sizeof(VkPipeline)) : NULL;
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkCreateGraphicsPipelines) { vkb_srv_missing(c, "vkCreateGraphicsPipelines"); return; }
+    vkb_srv_pipe_snap snap_[VKB_PIPE_SNAP]; vkb_srv_note_pipelines_pre(snap_, createInfoCount, pCreateInfos);
     VkResult r_ = c->dt->vkCreateGraphicsPipelines(device, pipelineCache, createInfoCount, pCreateInfos, NULL, pPipelines);
+    if (r_ >= 0) vkb_srv_note_pipelines(snap_, createInfoCount, pPipelines);
     vkb_enc_bytes(e, &r_, sizeof(r_));
     {
         uint32_t rn_ = n_pPipelines;
@@ -4697,7 +4703,9 @@ void vkb_sv_vkCreateImage(vkb_srv_call *c)
     VkImage *pImage = has_pImage ? &pImage_v : NULL;
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkCreateImage) { vkb_srv_missing(c, "vkCreateImage"); return; }
+    VkFormat asked_format_ = pCreateInfo ? pCreateInfo->format : VK_FORMAT_UNDEFINED; VkImageTiling asked_tiling_ = pCreateInfo ? pCreateInfo->tiling : VK_IMAGE_TILING_OPTIMAL;
     VkResult r_ = c->dt->vkCreateImage(device, pCreateInfo, NULL, pImage);
+    if (r_ == VK_SUCCESS && pCreateInfo && pImage) vkb_srv_note_image(c, device, pCreateInfo, *pImage, asked_format_, asked_tiling_);
     vkb_enc_bytes(e, &r_, sizeof(r_));
     vkb_enc_u8(e, pImage != NULL);
     if (pImage) vkb_enc_raw(e, pImage, sizeof(*pImage));

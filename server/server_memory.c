@@ -989,6 +989,11 @@ static VkResult alloc_exportable(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb
     uint64_t len = (ai->allocationSize + 4095) & ~4095ull;
     int fd = export_pages(t, len, ai->memoryTypeIndex, m);
     if (fd < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (vkb_srv_args_now.kind == VKB_ARGS_ALLOC) {
+        struct stat pst;
+        vkb_srv_args_now.d = fstat(fd, &pst) == 0 ? (uint64_t)pst.st_ino : 0;
+        vkb_srv_args_now.p = "export emulation";
+    }
     VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
     if (!dt->vkGetMemoryFdPropertiesKHR ||
         dt->vkGetMemoryFdPropertiesKHR(t->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) != VK_SUCCESS)
@@ -1273,10 +1278,151 @@ static void budget_follow_props2(VkPhysicalDeviceMemoryProperties2 *mp)
     }
 }
 
+/*
+ * VK_EXT_memory_budget where the driver has none (VKB_EMU_MEM_BUDGET: every Mali in the players' logs says
+ * -EXT_memory_budget, so the budget above never ran there). Offered to DXVK and vkd3d-proton only, and only
+ * in a process that started with less memory free than the default heap cap (vkb_emu_membudget_for); every
+ * other process is not offered it and runs as before. The driver never sees the structure (taken out of the
+ * chain around its call).
+ *   Normally: heapBudget = the heap's size, heapUsage = 0. DXVK then tells the game exactly what it tells it
+ *   without the extension (dxvk_adapter.cpp getMemoryHeapInfo: Budget = heapBudget, CurrentUsage =
+ *   max(heapUsage, DXVK's allocated) - allocated + DXVK's used = its used), and the client clamps the budget to
+ *   the heap it shows. Row 111's rule (live + MemAvailable - 1.5 GB) is below the heap on nearly every
+ *   mem: line of every Mali log, the Ultra 16 GB and the S10+ included, so it is not used as it stands.
+ *   Low memory: MemAvailable under VKBRIDGE_BUDGET_LOW_MB (768) for VKBRIDGE_BUDGET_LOW_HOLD_MS (2000 ms), until
+ *   it is over that + 256 MB again; or swap used up with little free (memb_swap_short). No run on
+ *   the owner's tablets went under 768 MB (lowest 834); the two vivo runs the system killed (a player log,
+ *   QUWD) sat at 330-750 MB in their last minutes. Then each
+ *   device-local heap: heapBudget = max(1 GB, this process's GPU memory + MemAvailable - reserve), at most
+ *   the heap (reserve: VKBRIDGE_BUDGET_RESERVE_MB, 1536, row 111's), heapUsage = this process's GPU memory
+ *   (the server's count, `pids` on the mem: lines). DXVK then frees its empty chunks and defragments, and
+ *   a game that reads the DXGI budget sees itself over it.
+ * VKBRIDGE_BUDGET_LOW_MB=0 or VKBRIDGE_BUDGET_RESERVE_MB=0: never low; VKBRIDGE_EMU_MEMBUDGET=0: the extension
+ * not offered. VKBRIDGE_FAKE_MEMAVAIL_FILE=<file with MB> (host tests): MemAvailable read from it at each call.
+ */
+#define MEMB_LOW_DEFAULT_MB 768
+#define MEMB_LEAVE_EXTRA_MB 256
+#define MEMB_HOLD_DEFAULT_MS 2000
+
+static uint64_t memb_env_u64(const char *name, uint64_t dflt)
+{
+    const char *v = vkb_srv_env(name);
+    return v && *v ? (uint64_t)strtoull(v, NULL, 10) : dflt;
+}
+
+static uint64_t memb_avail_kb(void)
+{
+    const char *ff = getenv("VKBRIDGE_FAKE_MEMAVAIL_FILE");
+    if (ff && *ff) {
+        double mb = 0;
+        FILE *f = fopen(ff, "re");
+        if (f) {
+            if (fscanf(f, "%lf", &mb) != 1) mb = 0;
+            fclose(f);
+        }
+        return mb > 0 && mb < 1e12 ? (uint64_t)(mb * 1024.0) : 0;
+    }
+    return budget_avail_kb();
+}
+
+/* Swap used up while little is free: Ultra 12 GB, the app closed by Android's low-memory killer at
+ * 834 MB free had swap free 0 for minutes with 834-1431 MB free, never under 768; Pixel 9a (killed)
+ * 0-10 MB of 3661 (game died) 380 of 8191. SwapFree under 5% of SwapTotal with MemAvailable under an
+ * eighth of RAM (vkb_mem_low's line); leaving: over 10% or over a sixth. The owner's tablets: once (an
+ * Ultra 12 GB run, 973 MB free, swap 0), real pressure too. Read only when that little is free. */
+static int memb_swap_short(uint64_t avail_mb, int leaving)
+{
+    static uint64_t total_mb;
+    if (!total_mb) total_mb = vkb_memtotal_mb();
+    if (!total_mb || avail_mb >= (leaving ? total_mb / 6 : total_mb / 8)) return 0;
+    uint64_t st = vkb_swaptotal_mb();
+    return st && vkb_swapfree_mb() < (leaving ? st / 10 : st / 20);
+}
+
+/* The low-memory state for the budget (one for the server: MemAvailable is the system's). */
+static int memb_low(uint64_t avail_mb)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static int low;
+    static uint64_t below_since;
+    uint64_t low_mb = memb_env_u64("VKBRIDGE_BUDGET_LOW_MB", MEMB_LOW_DEFAULT_MB);
+    uint64_t hold_ns = memb_env_u64("VKBRIDGE_BUDGET_LOW_HOLD_MS", MEMB_HOLD_DEFAULT_MS) * 1000000ull;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec) | 1;
+    int entered = 0, left = 0;
+    pthread_mutex_lock(&lock);
+    if (!low_mb || avail_mb == UINT64_MAX) {
+        left = low;
+        low = 0;
+        below_since = 0;
+    } else if (avail_mb < low_mb || memb_swap_short(avail_mb, 0)) {
+        if (!below_since) below_since = now;
+        if (!low && now - below_since >= hold_ns) low = entered = 1;
+    } else {
+        below_since = 0;
+        if (low && avail_mb > low_mb + MEMB_LEAVE_EXTRA_MB && !memb_swap_short(avail_mb, 1)) low = 0, left = 1;
+    }
+    int r = low;
+    pthread_mutex_unlock(&lock);
+    if (entered)
+        VKB_INFO("memory budget: %llu MB free (under %llu MB%s): DXVK and vkd3d-proton are told this process's GPU memory plus the "
+                 "free memory less the reserve (VKBRIDGE_BUDGET_LOW_MB=0 turns this off)",
+                 (unsigned long long)avail_mb, (unsigned long long)low_mb, avail_mb < low_mb ? "" : ", or swap used up");
+    if (left) VKB_INFO("memory budget: %llu MB free again: the heaps' sizes are the budget again", (unsigned long long)avail_mb);
+    return r;
+}
+
+static void memb_fill(const vkb_srv_table *t, const VkPhysicalDeviceMemoryProperties *mp, VkPhysicalDeviceMemoryBudgetPropertiesEXT *bp)
+{
+    memset(bp->heapBudget, 0, sizeof(bp->heapBudget));
+    memset(bp->heapUsage, 0, sizeof(bp->heapUsage));
+    for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) bp->heapBudget[h] = mp->memoryHeaps[h].size;
+    uint64_t avail = memb_avail_kb() << 10;
+    /* 0 is a real value under pressure (Pixel 9a: MemAvailable 0 for minutes); unknown only without MemTotal */
+    if (!memb_low(avail || vkb_memtotal_mb() ? avail >> 20 : UINT64_MAX)) return;
+    uint64_t reserve = memb_env_u64("VKBRIDGE_BUDGET_RESERVE_MB", BUDGET_RESERVE_DEFAULT_MB) << 20;
+    if (!reserve) return;
+    const vkb_srv_table *inst = t->is_device && t->parent ? t->parent : t;
+    int64_t pid_b = 0, total, images, bc_images, bc_src;
+    vkb_memstat_query(inst->proc ? inst->proc->pid : 0, &pid_b, &total, &images, &bc_images, &bc_src);
+    uint64_t live = pid_b > 0 ? (uint64_t)pid_b : 0;
+    for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+        if (!(mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        uint64_t want = live + avail > reserve ? live + avail - reserve : 0;
+        if (want < BUDGET_FLOOR_BYTES) want = BUDGET_FLOOR_BYTES;
+        if (want < bp->heapBudget[h]) bp->heapBudget[h] = want;
+        bp->heapUsage[h] = live;
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 6)
+            VKB_INFO("memory budget: heap %u told %llu MB of %llu MB (%llu MB free, this process's GPU memory %llu MB, reserve %llu MB)", h,
+                     (unsigned long long)(bp->heapBudget[h] >> 20), (unsigned long long)(mp->memoryHeaps[h].size >> 20),
+                     (unsigned long long)(avail >> 20), (unsigned long long)(live >> 20), (unsigned long long)(reserve >> 20));
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2 *mp)
 {
-    vkb_srv_current_table()->real.vkGetPhysicalDeviceMemoryProperties2(pd, mp);
+    vkb_srv_table *t = vkb_srv_current_table();
+    VkBaseOutStructure *own = NULL, *prev = NULL;
+    if (t) {
+        const vkb_srv_table *inst = t->is_device && t->parent ? t->parent : t;
+        if (__atomic_load_n(&inst->membudget_pd, __ATOMIC_ACQUIRE) == pd)
+            for (VkBaseOutStructure *p = (VkBaseOutStructure *)mp; p->pNext; p = p->pNext)
+                if (p->pNext->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) {
+                    prev = p;
+                    own = p->pNext;
+                    prev->pNext = own->pNext; /* the driver has no such structure */
+                    break;
+                }
+    }
+    t->real.vkGetPhysicalDeviceMemoryProperties2(pd, mp);
     if (fake_lazy()) fake_lazy_props(&mp->memoryProperties);
+    if (own) {
+        prev->pNext = own; /* back where it was: the reply encodes the chain */
+        memb_fill(t, &mp->memoryProperties, (VkPhysicalDeviceMemoryBudgetPropertiesEXT *)own);
+        return;
+    }
     budget_follow_props2(mp);
 }
 
@@ -2176,6 +2322,26 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
     uint64_t t0 = asked >= BIG_ALLOC || vkb_hitch_on(t->proc) ? vkb_hitch_now() : 0;
     uint32_t asked_type = ai.memoryTypeIndex;
     uint8_t ded = vkb_memstat_dedicated(&ai); /* before the strategies drop the struct from the chain */
+    uint64_t ded_image = 0; /* for the crash line's record (server_crashctx.c) */
+    for (const VkBaseInStructure *b = ai.pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+            ded_image = (uint64_t)(uintptr_t)((const VkMemoryDedicatedAllocateInfo *)b)->image;
+    const char *rec_path = "plain";
+    {
+        /* for the crash line: what this allocation is, before any driver call */
+        uint64_t ino = 0;
+        int wants_export = 0;
+        for (const VkBaseInStructure *b = ai.pNext; b; b = b->pNext) {
+            if (b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR && ((const VkImportMemoryFdInfoKHR *)b)->fd >= 0) {
+                struct stat st;
+                if (fstat(((const VkImportMemoryFdInfoKHR *)b)->fd, &st) == 0) ino = (uint64_t)st.st_ino;
+            }
+            if (b->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO && ((const VkExportMemoryAllocateInfo *)b)->handleTypes)
+                wants_export = 1;
+        }
+        vkb_srv_note_alloc(ai.allocationSize, ai.memoryTypeIndex, ded_image,
+                           mode != VKB_ALLOC_PLAIN ? "shared" : ino ? "fd import" : wants_export ? "exportable" : "plain", ino);
+    }
     if (mode == VKB_ALLOC_SHARED || mode == VKB_ALLOC_SHARED_CACHED) {
         uint32_t s = t->pd ? t->pd->info.strategy : VKB_MEM_NONE;
         /* Cached pages only in a type the self-test passed them in (the client asks only then). */
@@ -2186,6 +2352,7 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
                      ai.memoryTypeIndex);
         int opaque = vkb_opaque_shared_info(t, &ai); /* server_opaque.c */
         r = alloc_shared(c->dt, dev, s, &ai, client_fd, cached, &m, &out_fd);
+        rec_path = vkb_mem_strategy_name(s);
         if (r == VK_SUCCESS && opaque) vkb_opaque_shared_done(m, out_fd);
         char path[48];
         snprintf(path, sizeof(path), "shared (%s%s)", vkb_mem_strategy_name(s), cached ? ", cached" : "");
@@ -2202,7 +2369,8 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
         /* dma-buf memory over AHardwareBuffers (server_dmabuf_ahb.c): its own path, whole */
         int dab = t->dab ? vkb_dab_allocate(t, &ai, m, &r) : 0;
         if (dab) {
-            log_alloc(t, &ai, ai.memoryTypeIndex, ded, dab == 1 ? "dma-buf export over an AHardwareBuffer" : "dma-buf import of an AHardwareBuffer", r);
+            rec_path = dab == 1 ? "dma-buf export over an AHardwareBuffer" : "dma-buf import of an AHardwareBuffer";
+            log_alloc(t, &ai, ai.memoryTypeIndex, ded, rec_path, r);
             if (r != VK_SUCCESS) {
                 close_import_fds(ai.pNext);
                 free(m);
@@ -2278,6 +2446,7 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             r = c->dt->vkAllocateMemory(dev, &ai, NULL, &m->mem);
     plain_done:
         log_alloc(t, &ai, type, ded, path, r);
+        rec_path = path;
         if (r != VK_SUCCESS) {
             close_import_fds(ai.pNext);
             free(m);
@@ -2288,6 +2457,7 @@ allocated:
     if (m) {
         m->stat_ded = ded;
         vkb_mem_track(t, m);
+        vkb_crashctx_memory(m->mem, m->size, m->type, ded_image, rec_path);
     }
     alloc_timed(t, asked, asked_type, ded, t0, r);
     vkb_enc_u32(&c->r, (uint32_t)r);

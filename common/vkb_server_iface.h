@@ -7,6 +7,7 @@
 #define VKB_SERVER_IFACE_H
 
 #include "vkb_wire.h"
+#include "vkb_crashctx.h"
 
 struct vkb_srv_table;
 struct vkb_srv_conn;

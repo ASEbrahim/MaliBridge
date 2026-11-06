@@ -61,7 +61,7 @@ start submit VKBRIDGE_REPORT_STUCK_S=3 VKBRIDGE_TEST_DELAY_CMD=vkQueueSubmit VKB
 run_stall
 sleep 10
 j1=$(stuck_json)
-l1=$(grep -o "syncfd_check[^|]*: vkQueueSubmit has run [0-9]* s in the GPU driver and not returned (still running)" "$sess/malibridge-report.md" | head -1)
+l1=$(grep -o "syncfd_check[^|]*: vkQueueSubmit has run [0-9]* s in the GPU driver and not returned (still running[;)]" "$sess/malibridge-report.md" | head -1)
 read -r c1 s1 w1 <<<"$j1"
 [ "$c1" = vkQueueSubmit ] && [ "${s1:-0}" -ge 3 ] && [ "$w1" = false ] && [ -n "$l1" ]
 step $? "1 held vkQueueSubmit: named while it runs (json: $j1; md: ${l1:-no line})"
@@ -76,7 +76,7 @@ start wait VKBRIDGE_REPORT_STUCK_S=3 VKBRIDGE_TEST_DELAY_CMD=vkDeviceWaitIdle VK
 run_stall
 sleep 10
 j3=$(stuck_json)
-l3=$(grep -o "vkDeviceWaitIdle has waited [0-9]* s for the GPU and not returned (still waiting)" "$sess/malibridge-report.md" | head -1)
+l3=$(grep -o "vkDeviceWaitIdle has waited [0-9]* s for the GPU and not returned (still waiting[;)]" "$sess/malibridge-report.md" | head -1)
 read -r c3 s3 w3 <<<"$j3"
 [ "$c3" = vkDeviceWaitIdle ] && [ "$w3" = true ] && [ -n "$l3" ]
 step $? "3 held vkDeviceWaitIdle: said as a wait for the GPU (json: $j3; md: ${l3:-no line})"
@@ -89,6 +89,16 @@ sleep 10
 j4=$(stuck_json)
 [ "$j4" = null ] && ! grep -q "and not returned" "$sess/malibridge-report.md"
 step $? "4 VKBRIDGE_REPORT_STUCK_S=0: never named (json: $j4)"
+wait $prog 2>/dev/null; prog=
+
+# 5: X5: the End of a command buffer held inside one replayed command: the report says which
+start endrep VKBRIDGE_REPORT_STUCK_S=3 VKBRIDGE_TEST_DELAY_CMD=vkCmdSetViewport VKBRIDGE_TEST_DELAY_MS=14000
+timeout 60 "$out/syncfd_check" endstall >"$sess/check.log" 2>&1 & prog=$!
+sleep 10
+l5=$(grep -o "vkEndCommandBuffer has run [0-9]* s in the GPU driver and not returned (still running; inside vkCmdSetViewport, command 4 of 5; after: vkBeginCommandBuffer, vkCmdPipelineBarrier, vkCmdPipelineBarrier" "$sess/malibridge-report.md" | head -1)
+j5=$(grep -o '"where": "inside vkCmdSetViewport, command 4 of 5[^"]*"' "$sess/malibridge-report.json" | head -1)
+[ -n "$l5" ] && [ -n "$j5" ]
+step $? "5 End held inside a replayed command: the report names it (md: ${l5:-no line}; json: ${j5:-none})"
 wait $prog 2>/dev/null; prog=
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; fi

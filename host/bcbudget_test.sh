@@ -13,7 +13,15 @@
 #      memory stays near 16 MB;
 #   5  memory requirements asked before each image (--query, vkGetDeviceImageMemoryRequirements):
 #      nothing decoded over the budget, no image needs more memory than it was told;
-#   6  nothing set: no budget (the default), as 1.
+#   6  nothing set: no budget (the default), as 1; auto on this (non-Mali) GPU: none either;
+#   7  auto as a Mali-G720-Immortalis MC12 (VKBRIDGE_TEST_BC_GPU_NAME): 32:4 from 12 cores, the burst
+#      frame under 40% of 1's, every texture at its PSNR floor, the decoded ones' extra memory under
+#      auto's cap (64-256 MB);
+#   8  small textures as GTA V streams them (200 of 256x256 in a frame, 8 a frame after): no budget,
+#      then auto as a Mali-G615 MC6 (11.2:1.4 from 6 cores x 0.7): burst frame under 40%, some images
+#      encoded fast, the same floors and cap;
+#   9  the same as a Mali-G1-Ultra MC12: 32:4, never encoded fast in place (its fast search showed the
+#      D9500's green squares), only decoded.
 # 2, 4 and 5 run with VKBRIDGE_BC_TX_BUDGET=32:4.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
@@ -88,10 +96,35 @@ dec=$(totals | grep -o "[0-9]* ([0-9.]*) decoded" | cut -d' ' -f1)
 [ $res = 0 ] && [ "${dec:-1}" = 0 ] && [ "$(val query_bigger)" = 0 ]
 step $? "5 --query: ${dec:-?} decoded over the budget, $(val query_bigger) images bigger than queried ($(tail -1 "$o"))"
 
-# 6 the default: off
+# 6 the default: off; auto on this GPU (not a Mali): no budget either
 run default --
-[ $res = 0 ] && ! grep -q "BC budget: transcoding" "$slog" && [ -z "$(totals)" ]
-step $? "6 nothing set: no budget (burst frame $(val burst_ms) ms, hitch cause $(cause_of "$slog" "$(val burst_frame)"))"
+[ $res = 0 ] && ! grep -q "BC budget: transcoding\|BC budget: auto" "$slog" && [ -z "$(totals)" ]
+st=$?
+run autohost VKBRIDGE_BC_TX_BUDGET=auto --
+[ $st = 0 ] && [ $res = 0 ] && ! grep -q "BC budget: transcoding\|BC budget: auto" "$slog" && [ -z "$(totals)" ]
+step $? "6 nothing set, and auto on a GPU that is not a Mali: no budget (burst frame $(val burst_ms) ms, hitch cause $(cause_of "$slog" "$(val burst_frame)"))"
 
-if [ $fails = 0 ]; then echo "OK: a 32-texture BC burst ${off_ms} -> ${ms} ms in its frame under a $bud budget (off by default), load ${off_load} -> ${load} ms; contents at their floors; cap and query pins hold"
+# auto <step> <gpu name> <rate> <burst> <fast: 1 some, 0 none, - either> <reference burst ms> [bcburst_check args]
+auto() {
+  local step=$1 gpu=$2 rate=$3 burst=$4 want=$5 ref=$6; shift 6
+  run "auto$step" VKBRIDGE_BC_TX_BUDGET=auto "VKBRIDGE_TEST_BC_GPU_NAME=$gpu" -- "$@"
+  local f ms c fast dec live
+  f=$(val burst_frame); ms=$(val burst_ms); c=$(cause_of "$slog" "$f")
+  fast=$(totals | grep -o "([0-9]* with the fast search everywhere)" | grep -o "[0-9]*")
+  dec=$(totals | grep -o "[0-9]* ([0-9.]*) decoded" | cut -d' ' -f1)
+  live=$(totals | grep -o "cost [0-9]* MB more" | cut -d' ' -f2)
+  [ $res = 0 ] && lt "$ms" "$(awk -v a="$ref" 'BEGIN { print a * 0.4 }')" && [ "$(val below_floor)" = 0 ] &&
+    grep -q "BC budget: auto for $gpu: .*transcoding $rate million texels a second, $burst at once" "$slog" &&
+    case $want in 1) [ "${fast:-0}" -gt 0 ];; 0) [ "${fast:-1}" = 0 ];; *) [ -n "$fast" ];; esac && [ "${live:-999}" -le 256 ]
+  step $? "$step auto as $gpu: $rate:$burst, burst frame ${ms} ms (was $ref; hitch: ${c:-none}), load $(val load_ms) ms; ${fast:-?} encoded fast, ${dec:-?} decoded (+${live:-?} MB); min PSNR $(val min_psnr) dB"
+}
+auto 7 "Mali-G720-Immortalis MC12" 32.0 4.0 - "$off_ms"
+# small textures, as GTA V streams them (~28 KB each): 200 of 256x256 in one frame, then 8 a frame
+run off256 VKBRIDGE_BC_TX_BUDGET=0 -- --size 256 --burst 200 --stream 8
+off256=$(val burst_ms)
+step $res "8a no budget, 200 textures of 256x256 in a frame: ${off256} ms, load $(val load_ms) ms"
+auto 8b "Mali-G615 MC6" 11.2 1.4 1 "$off256" --size 256 --burst 200 --stream 8
+auto 9 "Mali-G1-Ultra MC12" 32.0 4.0 0 "$off256" --size 256 --burst 200 --stream 8
+
+if [ $fails = 0 ]; then echo "OK: a 32-texture BC burst ${off_ms} -> ${ms} ms in its frame under a $bud budget (off by default; auto sized to Mali GPUs), load ${off_load} -> ${load} ms; contents at their floors; cap and query pins hold"
 else echo "FAILED: $fails step(s)"; exit 1; fi

@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Connections: one thread per client thread, requests executed in order, replies sent back.
  * A command buffer's recorded commands arrive in one message at vkEndCommandBuffer and are
@@ -7,17 +6,25 @@
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
+#include "server_emu.h"
 
+#include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
 static pthread_mutex_t tables_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Written under tables_lock, with release stores; read by vkb_table_get (every request on every connection)
+ * with an acquire load and no lock: the connections' threads all took this one mutex per request (one atomic
+ * exchange on a line two cores share, twice). A reader gets the pointer or NULL as before, and what t holds
+ * when it was registered, as the lock gave. */
 static vkb_srv_table *tables[VKB_MAX_TABLES];
 static uint32_t next_table_id = 1;
 
@@ -50,6 +57,7 @@ void vkb_srv_note_pipeline_layout(const VkPipelineLayoutCreateInfo *ci)
 vkb_srv_table *vkb_srv_current_table(void) { return tls_table; }
 void vkb_srv_set_current_table(vkb_srv_table *t) { tls_table = t; }
 vkb_srv_proc *vkb_srv_current_proc(void) { return tls_proc; }
+const vkb_srv_proc *vkb_srv_crash_client(void) { return tls_proc; }
 
 /* Server side of the generated encoders' helpers: handles are already the server's values. */
 uint64_t vkb_remote(const void *h) { return (uint64_t)(uintptr_t)h; }
@@ -69,7 +77,7 @@ uint32_t vkb_table_register(vkb_srv_table *t)
     }
     if (id) {
         t->id = id;
-        tables[id] = t;
+        __atomic_store_n(&tables[id], t, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&tables_lock);
     return id;
@@ -78,17 +86,14 @@ uint32_t vkb_table_register(vkb_srv_table *t)
 void vkb_table_unregister(vkb_srv_table *t)
 {
     pthread_mutex_lock(&tables_lock);
-    if (t->id && t->id < VKB_MAX_TABLES && tables[t->id] == t) tables[t->id] = NULL;
+    if (t->id && t->id < VKB_MAX_TABLES && tables[t->id] == t) __atomic_store_n(&tables[t->id], NULL, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&tables_lock);
 }
 
 vkb_srv_table *vkb_table_get(uint32_t id)
 {
     if (!id || id >= VKB_MAX_TABLES) return NULL;
-    pthread_mutex_lock(&tables_lock);
-    vkb_srv_table *t = tables[id];
-    pthread_mutex_unlock(&tables_lock);
-    return t;
+    return __atomic_load_n(&tables[id], __ATOMIC_ACQUIRE);
 }
 
 void vkb_srv_reply_status(vkb_srv_call *c, uint32_t status)
@@ -147,6 +152,42 @@ void vkb_srv_close_after_send(vkb_srv_call *c, int fd)
 
 /* ------------------------------------------------------------------ process cleanup */
 
+/* A device its program left (at its exit, or under an instance it destroyed first): what vkDestroyDevice
+ * would have done, beneath the program. t is off the table list already; the caller frees it. */
+static void device_cleanup(vkb_srv_table *t)
+{
+    vkb_async_device_destroy(t);
+    vkb_vidyn_device_destroy(t); /* as vkDestroyDevice: off the server's list (, PR #39) */
+    vkb_emu_device_quiesce(t);
+    vkb_cbfail_device_destroy(t);
+    vkb_syncfb_device_destroy(t);
+    if (t->real.vkDeviceWaitIdle) t->real.vkDeviceWaitIdle(t->device);
+    vkb_sparse_device_destroy(t);
+    vkb_bvmap_device_destroy(t);
+    vkb_gprof_device_destroy(t);
+    vkb_trace_device_destroy(t);
+    vkb_spvfix_device_destroy(t);
+    vkb_dsmap_device_destroy(t);
+    vkb_nulldesc_device_destroy(t);
+    vkb_pools_device_destroy(t);
+    vkb_pcache_device_destroy(t);
+    vkb_emu_device_destroy(t);
+    vkb_errata_device_destroy(t);
+    vkb_timeline_device_destroy(t); /* as vkDestroyDevice: its fences and records (left here before) */
+    vkb_promote_device_destroy(t); /* its SPIR-V lowering slot, kept by the device handle */
+    vkb_hang_device_destroy(t);  /* its watcher thread calls the driver */
+    vkb_guard_device_destroy(t); /* as vkDestroyDevice does: no table left pointing at t */
+    vkb_report_device_destroy(t);
+    vkb_mem_free_all(t);
+    vkb_dab_device_destroy(t); /* as vkDestroyDevice (left here before) */
+    vkb_lost_device_destroy(t);
+    /* what the process left alive in the driver (pools, pipelines...): destroyed now, or
+     * the driver keeps its memory in the server for the rest of the session */
+    vkb_children_device_destroy(t, 1);
+    t->real.vkDestroyDevice(t->device, NULL);
+    vkb_qlock_device_destroy(t); /* server_qlock.c: the device's queue locks */
+}
+
 void vkb_proc_cleanup(vkb_srv_proc *p)
 {
     /* Devices first, then their instances. */
@@ -155,7 +196,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
             pthread_mutex_lock(&tables_lock);
             vkb_srv_table *t = tables[i];
             int mine = t && t->proc == p && t->is_device == (pass == 0);
-            if (mine) tables[i] = NULL;
+            if (mine) __atomic_store_n(&tables[i], NULL, __ATOMIC_RELEASE);
             pthread_mutex_unlock(&tables_lock);
             if (!mine) continue;
             /* As in vkDestroyDevice, the call's table is the device's: the wrappers its teardown
@@ -163,42 +204,30 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
              * took the last device made, gone once that one was destroyed: the dedicated_import
              * record of the null descriptors' buffer locked a NULL mutex (Tab S10+, v0.5.1 rc1). */
             vkb_srv_set_current_table(t);
+            if (vkb_lost_stopped(t)) {
+                /* stopped (server_lost.c): a driver thread of it faulted after its loss, a driver fault in its
+                 * vkEndCommandBuffer was contained, or the memory fault watchdog ended its program: never touched again */
+                VKB_WARN("process %d exited without destroying %s %u, which is left as it is (it was stopped after a driver fault)",
+                         p->pid, t->is_device ? "device" : "instance", t->id);
+                pthread_mutex_lock(&tables_lock);
+                __atomic_store_n(&tables[i], t, __ATOMIC_RELEASE); /* vkb_table_get reads without the lock */
+                pthread_mutex_unlock(&tables_lock);
+                vkb_srv_set_current_table(NULL);
+                continue;
+            }
             if (t->is_device && vkb_syncfd_device_destroy(t)) {
                 /* a sync-fd export still in the driver (server_syncfd.c): the device and t are left */
                 VKB_WARN("process %d exited without destroying device %u, which is left alive (a sync-fd export in the driver)", p->pid,
                          t->id);
                 pthread_mutex_lock(&tables_lock);
-                tables[i] = t; /* kept registered: its id is not reused under that call */
+                __atomic_store_n(&tables[i], t, __ATOMIC_RELEASE); /* kept registered: its id is not reused under that call */
                 pthread_mutex_unlock(&tables_lock);
                 vkb_srv_set_current_table(NULL);
                 continue;
             }
             if (t->is_device) {
                 VKB_INFO("process %d exited without destroying device %u; cleaning up", p->pid, t->id);
-                vkb_async_device_destroy(t);
-                vkb_vidyn_device_destroy(t); /* as vkDestroyDevice does */
-                vkb_emu_device_quiesce(t);
-                vkb_cbfail_device_destroy(t);
-                vkb_syncfb_device_destroy(t);
-                if (t->real.vkDeviceWaitIdle) t->real.vkDeviceWaitIdle(t->device);
-                vkb_sparse_device_destroy(t);
-                vkb_bvmap_device_destroy(t);
-                vkb_gprof_device_destroy(t);
-                vkb_trace_device_destroy(t);
-                vkb_spvfix_device_destroy(t);
-                vkb_dsmap_device_destroy(t);
-                vkb_nulldesc_device_destroy(t);
-                vkb_pools_device_destroy(t);
-                vkb_pcache_device_destroy(t);
-                vkb_emu_device_destroy(t);
-                vkb_errata_device_destroy(t);
-                vkb_promote_device_destroy(t); /* its SPIR-V lowering slot, kept by the device handle */
-                vkb_hang_device_destroy(t);  /* its watcher thread calls the driver */
-                vkb_guard_device_destroy(t); /* as vkDestroyDevice does: no table left pointing at t */
-                vkb_report_device_destroy(t);
-                vkb_mem_free_all(t);
-                t->real.vkDestroyDevice(t->device, NULL);
-                vkb_qlock_device_destroy(t); /* server_qlock.c: the device's queue locks */
+                device_cleanup(t);
             } else {
                 VKB_INFO("process %d exited without destroying instance %u; cleaning up", p->pid, t->id);
                 t->real.vkDestroyInstance(t->instance, NULL);
@@ -208,6 +237,49 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
             free(t);
         }
     }
+}
+
+/*
+ * vkDestroyInstance with a device of it still alive (server_instance.c): the program skipped
+ * vkDestroyDevice (invalid, but done: tests/divisor_check.c's early end, a game that tears down out of
+ * order). The server's later cleanup of that device went through a loader that no longer knew it, and
+ * the loader aborted ("vkDestroyDevice: Invalid device") - the one server, with every program on it.
+ * Its devices are cleaned up first now, as at the program's exit. Returns 0 when one of them is to be
+ * left as it is (stopped after a driver fault, a sync-fd export in the driver): the instance is then
+ * left too.
+ */
+int vkb_srv_instance_orphans(vkb_srv_table *inst)
+{
+    int ok = 1;
+    for (uint32_t i = 1; i < VKB_MAX_TABLES; i++) {
+        pthread_mutex_lock(&tables_lock);
+        vkb_srv_table *t = tables[i];
+        int mine = t && t->is_device && t->parent == inst;
+        if (mine && vkb_lost_stopped(t)) {
+            ok = 0;
+            mine = 0;
+        }
+        if (mine) __atomic_store_n(&tables[i], NULL, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&tables_lock);
+        if (!mine) continue;
+        if (vkb_syncfd_device_destroy(t)) {
+            /* a sync-fd export still in the driver: the device, and so the instance, are left alive */
+            pthread_mutex_lock(&tables_lock);
+            __atomic_store_n(&tables[i], t, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&tables_lock);
+            ok = 0;
+            continue;
+        }
+        VKB_WARN("vkDestroyInstance %u with device %u still alive (pid %d): the device is destroyed first", inst->id, t->id,
+                 t->proc ? t->proc->pid : 0);
+        vkb_srv_table *was = vkb_srv_current_table();
+        vkb_srv_set_current_table(t);
+        device_cleanup(t);
+        vkb_srv_set_current_table(was);
+        pthread_mutex_destroy(&t->lock);
+        free(t);
+    }
+    return ok;
 }
 
 static vkb_srv_proc *proc_join(uint64_t token, int pid)
@@ -267,6 +339,13 @@ static void proc_leave(vkb_srv_proc *p)
 static vkb_srv_conn *conns_all[CONNS_MAX];
 static pthread_mutex_t conns_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Another connection's process: its own thread sets it at its hello, without conns_lock (ThreadSanitizer,
+ * 11-05: vkb_srv_running_longest's read raced that write), so the scans read it as it was published. */
+static inline const vkb_srv_proc *conn_proc(const vkb_srv_conn *c)
+{
+    return __atomic_load_n(&c->proc, __ATOMIC_ACQUIRE);
+}
+
 static void conns_track(vkb_srv_conn *c, int on)
 {
     pthread_mutex_lock(&conns_lock);
@@ -278,6 +357,33 @@ static void conns_track(vkb_srv_conn *c, int on)
     pthread_mutex_unlock(&conns_lock);
 }
 
+/* Crash handler (server_main.c): the calls other connection threads are inside of, so that a driver
+ * fault racing another thread's call on a shared object shows both. Reads without the lock: a
+ * connection is untracked before it is freed, and a value read stale only misnames a call. */
+int vkb_srv_crash_others(char *buf, size_t cap)
+{
+    int n = 0, listed = 0;
+    int self = (int)syscall(SYS_gettid);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    buf[0] = 0;
+    for (int i = 0; i < CONNS_MAX && n >= 0 && (size_t)n < cap; i++) {
+        const vkb_srv_conn *c = __atomic_load_n(&conns_all[i], __ATOMIC_ACQUIRE);
+        if (!c) continue;
+        uint32_t run = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
+        int tid = __atomic_load_n(&c->tid, __ATOMIC_RELAXED);
+        if (!run || run > VKB_CMD_COUNT || tid == self) continue;
+        uint64_t since = __atomic_load_n(&c->running_ns, __ATOMIC_RELAXED);
+        const vkb_srv_proc *p = conn_proc(c);
+        n += snprintf(buf + n, cap - (size_t)n, "%s%s (pid %d, thread %d) %s %llu ms", listed++ ? "; " : "", p ? p->comm : "?",
+                      p ? p->pid : 0, tid, vkb_cmd_names[run - 1], (unsigned long long)(now > since ? (now - since) / 1000000ull : 0));
+    }
+    if (n < 0) n = 0;
+    if ((size_t)n >= cap) n = (int)cap - 1;
+    return n;
+}
+
 /* Coarse (a few ms): it is read for every request, and only stalls of seconds are reported. */
 static uint64_t mono_now_ns(void)
 {
@@ -286,20 +392,192 @@ static uint64_t mono_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* Logs which earlier asynchronous request of the process is still running, on which connection, and for how long. */
+/* The commands before position `pos` (1-based) of a replay, oldest first: "A, B, C" (up to `want`, the ring holds 16). */
+static int replay_before(const vkb_srv_conn *c, uint32_t pos, uint32_t want, char *buf, size_t cap)
+{
+    int n = 0;
+    if (want > VKB_REPLAY_RING - 1) want = VKB_REPLAY_RING - 1;
+    for (uint32_t k = want; k > 0; k--) {
+        if (pos <= k) continue; /* before the first command */
+        uint32_t id = __atomic_load_n(&c->replay_ring[(pos - k - 1) % VKB_REPLAY_RING], __ATOMIC_RELAXED);
+        if (id >= VKB_CMD_COUNT || n >= (int)cap - 48) continue;
+        n += snprintf(buf + n, cap - (size_t)n, "%s%s", n ? ", " : "", vkb_cmd_names[id]);
+    }
+    return n;
+}
+
+/*
+ * Where a connection's vkEndCommandBuffer is: the command of the recorded stream it is replaying
+ * ("inside vkCmdCopyBufferToImage, command 14 of 31 (after: ...)") or the driver's own End after
+ * the stream. Written for a stall: the server's "running: vkEndCommandBuffer for 337 s" named the
+ * whole request, and Galaxy S24+ and A56, Xclipse 940 and 540, Xwayland, the
+ * driver's End not returning could not say which of its commands the Samsung driver sat in.
+ * Returns the length (0: not replaying).
+ */
+static int replay_where(const vkb_srv_conn *c, char *buf, size_t cap)
+{
+    uint32_t pos = __atomic_load_n(&c->replay_pos, __ATOMIC_RELAXED), total = __atomic_load_n(&c->replay_total, __ATOMIC_RELAXED);
+    if (!pos || cap < 64) return 0;
+    char before[256];
+    int bn = replay_before(c, pos, 5, before, sizeof(before));
+    before[bn < 0 ? 0 : bn] = 0;
+    if (pos > total)
+        return snprintf(buf, cap, "in the driver's own End, after the stream of %u command(s)%s%s", total, bn ? "; the last: " : "", before);
+    uint32_t id = __atomic_load_n(&c->replay_ring[(pos - 1) % VKB_REPLAY_RING], __ATOMIC_RELAXED);
+    return snprintf(buf, cap, "inside %s, command %u of %u%s%s", id < VKB_CMD_COUNT ? vkb_cmd_names[id] : "?", pos, total,
+                    bn ? "; after: " : "", before);
+}
+
+/* The system calls a stalled thread is most likely in, by the kernel's numbers for this build. */
+static const char *syscall_name(long nr)
+{
+#if defined(__aarch64__)
+    switch (nr) {
+    case 29: return "ioctl";
+    case 98: return "futex";
+    case 73: return "ppoll";
+    case 63: return "read";
+    case 64: return "write";
+    case 101: return "nanosleep";
+    case 115: return "clock_nanosleep";
+    case 124: return "sched_yield";
+    case 22: return "epoll_pwait";
+    case 212: return "recvmsg";
+    default: return NULL;
+    }
+#elif defined(__x86_64__)
+    switch (nr) {
+    case 16: return "ioctl";
+    case 202: return "futex";
+    case 7: return "poll";
+    case 271: return "ppoll";
+    case 0: return "read";
+    case 1: return "write";
+    case 35: return "nanosleep";
+    case 230: return "clock_nanosleep";
+    case 24: return "sched_yield";
+    case 281: return "epoll_pwait";
+    case 47: return "recvmsg";
+    default: return NULL;
+    }
+#else
+    (void)nr;
+    return NULL;
+#endif
+}
+
+/*
+ * One look at a thread that has sat in a request for seconds, from another thread: whether it is
+ * on a CPU (spinning in user space), asleep on a futex (a lock or condition inside the driver), or
+ * in an ioctl (the kernel: a wait for the GPU), which file that ioctl is on, and where in which
+ * library the thread's program counter is. /proc/self/task/<tid>/syscall is the process's own; a
+ * kernel or SELinux that refuses it just gives no text. Used only by stall lines and the report,
+ * never in a request. Returns the length (0: nothing).
+ */
+static int thread_probe(int tid, char *buf, size_t cap)
+{
+    if (tid <= 0 || cap < 96) return 0;
+    char path[64], raw[320];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t got = read(fd, raw, sizeof(raw) - 1);
+    close(fd);
+    if (got <= 0) return 0;
+    raw[got] = 0;
+    int n = snprintf(buf, cap, "its thread (%d) ", tid);
+    /* "running", or "-1 <sp> <pc>" (blocked outside a system call), or "<nr> <6 args> <sp> <pc>" */
+    unsigned long long a[6] = {0}, sp = 0, pc = 0;
+    long nr = -1;
+    int have_pc = 0;
+    if (!strncmp(raw, "running", 7)) {
+        n += snprintf(buf + n, cap - (size_t)n, "is on a CPU (not waiting in the kernel)");
+    } else {
+        char *e = raw;
+        nr = strtol(raw, &e, 0);
+        if (nr < 0) {
+            sp = strtoull(e, &e, 0);
+            pc = strtoull(e, &e, 0);
+            have_pc = pc != 0;
+            n += snprintf(buf + n, cap - (size_t)n, "is in no system call");
+        } else {
+            for (int i = 0; i < 6; i++) a[i] = strtoull(e, &e, 0);
+            sp = strtoull(e, &e, 0);
+            pc = strtoull(e, &e, 0);
+            have_pc = pc != 0;
+            const char *nm = syscall_name(nr);
+            n += nm ? snprintf(buf + n, cap - (size_t)n, "is in %s", nm) : snprintf(buf + n, cap - (size_t)n, "is in system call %ld", nr);
+            int on_fd = nm && (!strcmp(nm, "ioctl") || !strcmp(nm, "read") || !strcmp(nm, "write") || !strcmp(nm, "recvmsg"));
+            if (on_fd && n > 0 && (size_t)n < cap - 64) {
+                char lp[48], tgt[96];
+                snprintf(lp, sizeof(lp), "/proc/self/fd/%llu", a[0]);
+                ssize_t l = readlink(lp, tgt, sizeof(tgt) - 1);
+                if (l > 0) {
+                    tgt[l] = 0;
+                    n += snprintf(buf + n, cap - (size_t)n, " on fd %llu (%s)", a[0], tgt);
+                }
+                if (!strcmp(nm, "ioctl")) n += snprintf(buf + n, cap - (size_t)n, ", request 0x%llx", a[1]);
+            }
+        }
+    }
+    (void)sp;
+    if (have_pc && n > 0 && (size_t)n < cap - 80) {
+        Dl_info di;
+        memset(&di, 0, sizeof(di));
+        if (dladdr((void *)(uintptr_t)pc, &di) && di.dli_fname) {
+            const char *lib = strrchr(di.dli_fname, '/');
+            n += snprintf(buf + n, cap - (size_t)n, ", at %s+0x%lx", lib ? lib + 1 : di.dli_fname, (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+        }
+    }
+    /* CPU time used so far: a spinning thread has grown, a sleeping one has not (stat fields 14 and 15, in ticks) */
+    snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        got = read(fd, raw, sizeof(raw) - 1);
+        close(fd);
+        char *q = got > 0 ? (raw[got] = 0, strrchr(raw, ')')) : NULL;
+        if (q) {
+            unsigned long ut = 0, st = 0;
+            char state = 0;
+            if (sscanf(q + 1, " %c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &state, &ut, &st) == 3 && n > 0 && (size_t)n < cap - 64) {
+                long hz = sysconf(_SC_CLK_TCK);
+                if (hz <= 0) hz = 100;
+                n += snprintf(buf + n, cap - (size_t)n, "; state %c, CPU %.1f s user + %.1f s system", state, (double)ut / (double)hz,
+                              (double)st / (double)hz);
+            }
+        }
+    }
+    return n > 0 ? (n < (int)cap ? n : (int)cap - 1) : 0;
+}
+
+/*
+ * A request of the process has waited `s` seconds for the process's earlier asynchronous ones:
+ * which of them is still running, on which connection, and for how long (an async vkQueueSubmit
+ * blocked in the driver stops every other thread of the process at its next call, and the app
+ * then shows that call as the one stuck: a player log's Xwayland "in" vkGetSemaphoreFdKHR).
+ */
 static void order_stall(vkb_srv_proc *p, uint32_t cmd, int s, uint64_t barrier, uint64_t watermark)
 {
-    char line[512];
+    char line[1280];
     int n = 0;
     uint64_t now = mono_now_ns();
     pthread_mutex_lock(&conns_lock);
-    for (int i = 0; i < CONNS_MAX && n < (int)sizeof(line) - 96; i++) {
+    for (int i = 0; i < CONNS_MAX && n < (int)sizeof(line) - 640; i++) {
         vkb_srv_conn *c = conns_all[i];
-        if (!c || c->proc != p) continue;
+        if (!c || conn_proc(c) != p) continue;
         uint32_t r = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
         uint64_t since = __atomic_load_n(&c->running_ns, __ATOMIC_RELAXED);
         if (!r || r - 1 >= VKB_CMD_COUNT) continue;
-        n += snprintf(line + n, sizeof(line) - (size_t)n, " %s for %.1f s;", vkb_cmd_names[r - 1], since && now > since ? (now - since) / 1e9 : 0.0);
+        double run_s = since && now > since ? (now - since) / 1e9 : 0.0;
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " %s for %.1f s", vkb_cmd_names[r - 1], run_s);
+        /* A command buffer's replay: which recorded command it is in, and, once a request has
+         * run 5 s, what its thread is doing (futex, ioctl on which file, CPU time) */
+        char where[420], probe[300];
+        int wn = r - 1 == VKB_CMD_vkEndCommandBuffer ? replay_where(c, where, sizeof(where)) : 0;
+        if (wn > 0) n += snprintf(line + n, sizeof(line) - (size_t)n, " (%s)", where);
+        if (run_s >= 5.0 && thread_probe(__atomic_load_n(&c->tid, __ATOMIC_RELAXED), probe, sizeof(probe)) > 0)
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " [%s]", probe);
+        n += snprintf(line + n, sizeof(line) - (size_t)n, ";");
     }
     pthread_mutex_unlock(&conns_lock);
     if (s < 0)
@@ -317,15 +595,18 @@ static void order_stall(vkb_srv_proc *p, uint32_t cmd, int s, uint64_t barrier, 
  * seconds (0: none running) and its name. The report's line for a call the driver has not
  * returned from (Xwayland's vkGetSemaphoreFdKHR for 400 s on the Galaxy A55, while the
  * loading screen said only "Waiting for Steam's first frame"). */
-double vkb_srv_running_longest(int pid, const char **name)
+double vkb_srv_running_longest(int pid, const char **name, char *detail, size_t cap)
 {
     double best = 0;
+    const vkb_srv_conn *bc = NULL;
     *name = NULL;
+    if (detail && cap) detail[0] = 0;
     uint64_t now = mono_now_ns();
     pthread_mutex_lock(&conns_lock);
     for (int i = 0; i < CONNS_MAX; i++) {
         vkb_srv_conn *c = conns_all[i];
-        if (!c || !c->proc || c->proc->pid != pid) continue;
+        const vkb_srv_proc *cp = c ? conn_proc(c) : NULL;
+        if (!cp || cp->pid != pid) continue;
         uint32_t r = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
         uint64_t since = __atomic_load_n(&c->running_ns, __ATOMIC_RELAXED);
         if (!r || r - 1 >= VKB_CMD_COUNT || !since || now <= since) continue;
@@ -333,10 +614,87 @@ double vkb_srv_running_longest(int pid, const char **name)
         if (s > best) {
             best = s;
             *name = vkb_cmd_names[r - 1];
+            bc = c;
         }
+    }
+    /* where inside it, under the lock (the connection is not freed while it is listed) */
+    if (bc && detail && cap > 64) {
+        char where[420], probe[300];
+        int wn = __atomic_load_n(&bc->running, __ATOMIC_RELAXED) == VKB_CMD_vkEndCommandBuffer + 1 ? replay_where(bc, where, sizeof(where)) : 0;
+        int pn = best >= 5.0 ? thread_probe(__atomic_load_n(&bc->tid, __ATOMIC_RELAXED), probe, sizeof(probe)) : 0;
+        snprintf(detail, cap, "%s%s%s%s", wn > 0 ? where : "", wn > 0 && pn > 0 ? "; " : "", pn > 0 ? probe : "", "");
     }
     pthread_mutex_unlock(&conns_lock);
     return best;
+}
+
+/* Requests that wait by design (for the GPU, or under the compile watchdog of their own): never
+ * taken as stuck by the memory-fault stall watchdog (server_guard.c). */
+static int waits_by_design(uint32_t cmd)
+{
+    return cmd == VKB_CMD_vkWaitForFences || cmd == VKB_CMD_vkWaitSemaphores || cmd == VKB_CMD_vkQueueWaitIdle ||
+           cmd == VKB_CMD_vkDeviceWaitIdle || cmd == VKB_CMD_vkGetQueryPoolResults || cmd == VKB_CMD_vkCreateGraphicsPipelines ||
+           cmd == VKB_CMD_vkCreateComputePipelines;
+}
+
+/* The requests running for `min_s` seconds or more that do not wait by design, one per process
+ * (its longest): what a driver lock left held at a contained fault would show (server_guard.c). */
+int vkb_srv_stuck(double min_s, vkb_srv_stuck_req *out, int max)
+{
+    int n = 0;
+    uint64_t now = mono_now_ns();
+    pthread_mutex_lock(&conns_lock);
+    for (int i = 0; i < CONNS_MAX; i++) {
+        vkb_srv_conn *c = conns_all[i];
+        const vkb_srv_proc *cp = c ? conn_proc(c) : NULL;
+        if (!cp) continue;
+        uint32_t r = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
+        uint64_t since = __atomic_load_n(&c->running_ns, __ATOMIC_RELAXED);
+        if (!r || r - 1 >= VKB_CMD_COUNT || waits_by_design(r - 1) || !since || now <= since) continue;
+        double sec = (now - since) / 1e9;
+        if (sec < min_s) continue;
+        int k = 0;
+        while (k < n && out[k].pid != cp->pid) k++;
+        if (k == n) {
+            if (n == max) continue;
+            n++;
+            out[k].secs = 0;
+        }
+        if (sec <= out[k].secs) continue;
+        out[k].pid = cp->pid;
+        snprintf(out[k].comm, sizeof(out[k].comm), "%s", cp->comm);
+        out[k].cmd = vkb_cmd_names[r - 1];
+        out[k].secs = sec;
+        out[k].probe[0] = 0;
+        thread_probe(__atomic_load_n(&c->tid, __ATOMIC_RELAXED), out[k].probe, sizeof(out[k].probe));
+    }
+    pthread_mutex_unlock(&conns_lock);
+    return n;
+}
+
+/* Ends a program's session without touching the driver: its devices are stopped (refused, never
+ * destroyed: server_lost.c) and its connections shut down, so the program sees the server gone
+ * and ends; a thread of it stuck in the driver stays where it is. Returns its devices stopped. */
+int vkb_srv_end_proc(int pid, const char *why)
+{
+    int devs = 0;
+    pthread_mutex_lock(&tables_lock);
+    for (uint32_t i = 1; i < VKB_MAX_TABLES; i++) {
+        vkb_srv_table *t = tables[i];
+        if (t && t->is_device && t->proc && t->proc->pid == pid) {
+            vkb_lost_stop(t, why);
+            devs++;
+        }
+    }
+    pthread_mutex_unlock(&tables_lock);
+    pthread_mutex_lock(&conns_lock);
+    for (int i = 0; i < CONNS_MAX; i++) {
+        vkb_srv_conn *c = conns_all[i];
+        const vkb_srv_proc *cp = c ? conn_proc(c) : NULL;
+        if (cp && cp->pid == pid) shutdown(c->sock, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&conns_lock);
+    return devs;
 }
 
 /* Waits until every async request of the process up to `barrier` has run; with `ms` > 0 at most that
@@ -790,6 +1148,52 @@ static int is_stream_cmd(uint32_t id)
     return !strncmp(n, "vkCmd", 5) || id == VKB_CMD_vkBeginCommandBuffer || id == VKB_CMD_vkbPushDescRaw;
 }
 
+static void test_delay(uint32_t cmd);
+
+/* A draw needs a graphics pipeline, a dispatch a compute one, bound earlier in the same command
+ * buffer (pipelines are never inherited; the bridge offers no shader objects). One the app records
+ * without is invalid, and Mali's driver reads through the missing pipeline: Mali-G615 MC2
+ * r44p1, No Man's Sky - after the third contained compile crash the device's pipelines failed
+ * (server_guard.c), the game skipped the binds and drew, and vkCmdDrawIndexed faulted at 0x7a0,
+ * taking the one server and every program down. Such a draw or dispatch is left out (it could not
+ * have drawn anything) and said; so is a vkCmdBindPipeline of VK_NULL_HANDLE, which RADV crashes on
+ * (crash_contain_check), and the draws after it. Valid streams are replayed as before: one table
+ * read per replayed command, and a thread-local read per draw. VKBRIDGE_UNBOUND_DRAWS=keep (host
+ * tests, the A/B): every draw goes to the driver as before (the table emptied at the start). */
+static uint8_t needs_pipeline[VKB_CMD_COUNT] = {
+    [VKB_CMD_vkCmdDraw] = 1, [VKB_CMD_vkCmdDrawIndexed] = 1, [VKB_CMD_vkCmdDrawIndirect] = 1, [VKB_CMD_vkCmdDrawIndexedIndirect] = 1,
+    [VKB_CMD_vkCmdDrawIndirectCount] = 1, [VKB_CMD_vkCmdDrawIndexedIndirectCount] = 1, [VKB_CMD_vkCmdDrawIndirectByteCountEXT] = 1,
+    [VKB_CMD_vkCmdDrawMultiEXT] = 1, [VKB_CMD_vkCmdDrawMultiIndexedEXT] = 1,
+    [VKB_CMD_vkCmdDispatch] = 2, [VKB_CMD_vkCmdDispatchBase] = 2, [VKB_CMD_vkCmdDispatchIndirect] = 2,
+    /* the bound pipeline's last vertex stage declares Xfb (a Vulkan rule); Mali reads through a missing one
+     * (a player log 0xe78 0xe60). Its vkCmdEndTransformFeedbackEXT is left out with it. */
+    [VKB_CMD_vkCmdBeginTransformFeedbackEXT] = 1,
+};
+static uint64_t unbound_left_out;
+
+static void unbound_say(const vkb_srv_call *c, VkCommandBuffer cb, uint32_t id, int compute)
+{
+    uint64_t k = __atomic_add_fetch(&unbound_left_out, 1, __ATOMIC_RELAXED);
+    if (k > 4 && (k & (k - 1))) return;
+    const vkb_srv_proc *p = c->table ? c->table->proc : NULL;
+    VKB_WARN("%s with no %s pipeline bound in command buffer %p (%s, pid %d): left out, the driver would read through the "
+             "missing pipeline (a pipeline the program asked for that failed?); %llu so far", vkb_cmd_names[id],
+             compute ? "compute" : "graphics", (void *)cb, p ? p->comm : "?", p ? p->pid : 0, (unsigned long long)k);
+}
+
+/* Where the replay is, for the stall lines (conn->replay_*): two relaxed stores per command, no waits. */
+static inline void replay_at(vkb_srv_conn *conn, uint32_t pos, uint32_t id)
+{
+    if (!conn) return;
+    __atomic_store_n(&conn->replay_ring[(pos - 1) % VKB_REPLAY_RING], (uint16_t)id, __ATOMIC_RELAXED);
+    __atomic_store_n(&conn->replay_pos, pos, __ATOMIC_RELAXED);
+}
+
+static inline void replay_end(vkb_srv_conn *conn)
+{
+    if (conn) __atomic_store_n(&conn->replay_pos, 0, __ATOMIC_RELAXED);
+}
+
 void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
 {
     VkCommandBuffer cb = (VkCommandBuffer)(uintptr_t)vkb_dec_u64(&c->d);
@@ -799,13 +1203,43 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
+    if (c->table && vkb_lost_is(c->table)) {
+        /* A lost device records nothing more (server_lost.c): nothing of it runs again, and an image
+         * whose bind fault was contained (server_guard.c) has no memory for a command to name. */
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+            VKB_WARN("command buffer %p: device %u is lost; its %zu bytes of commands are not handed to the driver", (void *)cb,
+                     c->table->id, len);
+        failed_set(cb, 1);
+        vkb_enc_u32(&c->r, (uint32_t)VK_ERROR_DEVICE_LOST);
+        return;
+    }
     VkResult begin_r = VK_SUCCESS;
     size_t pos = 0;
     vkb_enc scratch;
     vkb_enc_init(&scratch);
     uint32_t ncmds = 0;
+    int xfb_left_out = 0; /* a vkCmdBeginTransformFeedbackEXT left out: its end is too */
+    if (vkb_emu_bc_batch_open) vkb_emu_bcn_batch_drop(); /* never left open by a stream; to be sure */
     vkb_srv_replay_cb = cb;
     vkb_srv_replay_n = 0;
+    vkb_srv_replay_gfx = vkb_srv_replay_comp = 0; /* pipelines are bound anew in every command buffer */
+    vkb_srv_replay_lw_set = 0;
+    if (c->conn) {
+        /* how many commands the stream holds (headers only), for "command 14 of 31" */
+        uint32_t total = 0;
+        for (size_t q = 0; s && q + 8 <= len; total++) {
+            uint32_t qn;
+            memcpy(&qn, s + q + 4, 4);
+            q += 8;
+            if (qn > len - q) {
+                total++;
+                break;
+            }
+            q += ((size_t)qn + 7) & ~(size_t)7;
+        }
+        __atomic_store_n(&c->conn->replay_total, total, __ATOMIC_RELAXED);
+    }
     while (s && pos + 8 <= len) {
         uint32_t id, n;
         memcpy(&id, s + pos, 4);
@@ -814,7 +1248,9 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         if (id >= VKB_CMD_COUNT || !is_stream_cmd(id) || n > len - pos) {
             VKB_ERR("command stream: bad entry (id %u, %u bytes) after %u commands", id, n, ncmds);
             c->status = VKB_ST_BAD_MESSAGE;
+            vkb_emu_bcn_batch_drop();
             vkb_srv_replay_cb = VK_NULL_HANDLE;
+            replay_end(c->conn);
             vkb_enc_free(&scratch);
             return;
         }
@@ -830,6 +1266,26 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         vkb_srv_current_cmd = vkb_cmd_names[id];
         vkb_srv_replay_ring[ncmds % VKB_REPLAY_RING] = vkb_cmd_names[id];
         vkb_srv_replay_n = ncmds + 1;
+        replay_at(c->conn, ncmds + 1, id);
+        uint8_t need = needs_pipeline[id];
+        if (need && !(need == 1 ? vkb_srv_replay_gfx : vkb_srv_replay_comp)) {
+            unbound_say(c, cb, id, need == 2);
+            if (id == VKB_CMD_vkCmdBeginTransformFeedbackEXT) xfb_left_out = 1;
+            pos += (n + 7) & ~(size_t)7;
+            ncmds++;
+            continue;
+        }
+        if (id == VKB_CMD_vkCmdEndTransformFeedbackEXT && xfb_left_out) {
+            xfb_left_out = 0; /* its begin was left out */
+            pos += (n + 7) & ~(size_t)7;
+            ncmds++;
+            continue;
+        }
+        test_delay(id);
+        /* BC uploads back to back share one barrier pair (server_emu_bcn.c): any other command first
+         * gets the batch's copies */
+        if (vkb_emu_bc_batch_open && id != VKB_CMD_vkCmdCopyBufferToImage && id != VKB_CMD_vkCmdCopyBufferToImage2)
+            vkb_emu_bcn_batch_flush();
         vkb_srv_handlers[id](&sub);
         vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
         scratch = sub.r;
@@ -840,7 +1296,9 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
                  * a command buffer that was not begun would hand the driver one in the wrong state. */
                 VKB_ERR("command stream: command buffer %p not begun; its %zu bytes of commands are dropped", (void *)cb, len);
                 failed_set(cb, 1);
+                vkb_emu_bcn_batch_drop();
                 vkb_srv_replay_cb = VK_NULL_HANDLE;
+                replay_end(c->conn);
                 vkb_enc_free(&scratch);
                 vkb_enc_u32(&c->r, (uint32_t)VK_ERROR_OUT_OF_HOST_MEMORY);
                 return;
@@ -858,7 +1316,9 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
             VKB_ERR("command buffer %p: the driver would not begin it (%d); its %zu bytes of commands are dropped "
                     "and submits leave it out", (void *)cb, begin_r, len);
             failed_set(cb, 1);
+            vkb_emu_bcn_batch_drop();
             vkb_srv_replay_cb = VK_NULL_HANDLE;
+            replay_end(c->conn);
             vkb_enc_free(&scratch);
             vkb_enc_u32(&c->r, (uint32_t)begin_r);
             return;
@@ -867,10 +1327,17 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         ncmds++;
     }
     vkb_enc_free(&scratch);
+    if (vkb_emu_bc_batch_open) vkb_emu_bcn_batch_flush();
     vkb_srv_current_cmd = "vkEndCommandBuffer (the driver's, after the stream)";
+    if (c->conn) {
+        __atomic_store_n(&c->conn->replay_total, ncmds, __ATOMIC_RELAXED); /* a stream cut short counts what ran */
+        __atomic_store_n(&c->conn->replay_pos, ncmds + 1, __ATOMIC_RELAXED);
+    }
+    test_delay(VKB_CMD_COUNT);
     VkResult r = c->dt->vkEndCommandBuffer(cb);
     vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
     vkb_srv_replay_cb = VK_NULL_HANDLE;
+    replay_end(c->conn);
     if (r == VK_SUCCESS && test_end_fail()) {
         r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
         VKB_WARN("VKBRIDGE_TEST_END_FAIL: vkEndCommandBuffer failed on purpose");
@@ -903,7 +1370,8 @@ void vkb_sv_vkbHello(vkb_srv_call *c)
         return;
     }
     if (!c->conn->proc) {
-        c->conn->proc = proc_join(token, (int)pid);
+        /* published for the other threads' scans (conn_proc): the process record is complete before it */
+        __atomic_store_n(&c->conn->proc, proc_join(token, (int)pid), __ATOMIC_RELEASE);
         if (c->conn->proc->conns == 1) {
             VKB_INFO("process %u is %s", pid, comm ? comm : "?");
             if (comm) {
@@ -1062,24 +1530,32 @@ static int srv_recv(vkb_srv_conn *conn, vkb_msg_hdr *h, uint8_t **payload, int *
 }
 
 /* Runs one request whose payload is in c->d: dispatch table lookup, then the handler. */
-/* VKBRIDGE_TEST_DELAY_CMD=<command> VKBRIDGE_TEST_DELAY_MS=<ms> (host tests): the first such request waits that long first. */
+/* VKBRIDGE_TEST_DELAY_CMD=<command> VKBRIDGE_TEST_DELAY_MS=<ms> (host tests): the first such request
+ * of the server waits that long before it runs, as a call blocked in the driver would. A recorded
+ * command of a replayed stream (vkCmdSetViewport) is held the same way just before it is replayed,
+ * and "driver-end" holds the driver's own End after the stream: the stall lines' replay position. */
+static int test_want = -2; /* the command id held next, VKB_CMD_COUNT for the driver's End, -1 none */
+static uint32_t test_ms;
+
 static void test_delay(uint32_t cmd)
 {
-    static int want = -2;
-    static uint32_t ms;
-    if (want == -2) {
+    if (__atomic_load_n(&test_want, __ATOMIC_RELAXED) == -1) return;
+    if (__atomic_load_n(&test_want, __ATOMIC_ACQUIRE) == -2) {
         const char *n = getenv("VKBRIDGE_TEST_DELAY_CMD"), *v = getenv("VKBRIDGE_TEST_DELAY_MS");
         int w = -1;
+        if (n && v && !strcmp(n, "driver-end")) w = (int)VKB_CMD_COUNT;
         for (uint32_t i = 0; n && v && i < VKB_CMD_COUNT; i++)
             if (vkb_cmd_names[i] && !strcmp(vkb_cmd_names[i], n)) w = (int)i;
-        ms = v ? (uint32_t)atoi(v) : 0;
-        __atomic_store_n(&want, w, __ATOMIC_RELEASE);
+        test_ms = v ? (uint32_t)atoi(v) : 0;
+        __atomic_store_n(&test_want, w, __ATOMIC_RELEASE);
     }
+    int want = __atomic_load_n(&test_want, __ATOMIC_ACQUIRE);
     if (want < 0 || cmd != (uint32_t)want) return;
     int expected = (int)cmd;
-    if (!__atomic_compare_exchange_n(&want, &expected, -1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
-    VKB_INFO("test: %s held %u ms (VKBRIDGE_TEST_DELAY_CMD)", vkb_cmd_names[cmd], ms);
-    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    if (!__atomic_compare_exchange_n(&test_want, &expected, -1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    if (cmd == VKB_CMD_COUNT) VKB_INFO("test: the driver's End held %u ms (VKBRIDGE_TEST_DELAY_CMD)", test_ms);
+    else VKB_INFO("test: %s held %u ms (VKBRIDGE_TEST_DELAY_CMD)", vkb_cmd_names[cmd], test_ms);
+    struct timespec ts = {test_ms / 1000, (long)(test_ms % 1000) * 1000000L};
     while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
 }
 
@@ -1110,12 +1586,21 @@ static void run_request(vkb_srv_conn *conn, vkb_srv_call *c, uint32_t cmd, uint3
             return;
         }
         c->dt = &c->table->dt;
+        if (vkb_lost_refuse(c->table)) {
+            /* its driver thread was stopped after a loss (server_lost.c): nothing reaches the driver */
+            static int told;
+            if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+                VKB_WARN("%s on device %u refused: the device was stopped after its loss", vkb_cmd_names[cmd], table);
+            c->status = VKB_ST_BAD_TABLE;
+            return;
+        }
     }
     uint64_t t1 = st_period ? mono_ns() : 0;
     vkb_srv_set_current_table(c->table);
     if (vkb_verbose) VKB_DBG("-> %s", vkb_cmd_names[cmd]);
     vkb_srv_current_cmd = vkb_cmd_names[cmd];
     vkb_srv_crash_detail[0] = 0;
+    vkb_srv_args_now.kind = VKB_ARGS_NONE;
     __atomic_store_n(&conn->running_ns, mono_now_ns(), __ATOMIC_RELAXED);
     __atomic_store_n(&conn->running, cmd + 1, __ATOMIC_RELEASE);
     test_delay(cmd);
@@ -1179,18 +1664,27 @@ void vkb_sv_vkbBatch(vkb_srv_call *c)
     vkb_srv_bad_message(c);
 }
 
-static void *conn_main(void *arg)
-{
-    vkb_srv_conn *conn = arg;
-    conns_track(conn, 1);
+/* A connection thread's loop state, kept outside the loop's frame: after a fault the request guard
+ * contained (vkb_guard_serve) the recovery reads what was running and the loop goes on from here. */
+typedef struct conn_state {
+    vkb_srv_conn *conn;
     vkb_srv_call c;
-    vkb_enc_init(&c.r);
     int fds[VKB_MAX_FDS];
+    vkb_msg_hdr h;     /* the request running (busy) */
+    volatile int busy; /* 0 between requests; 1 a request; 2 a batch of asynchronous ones */
+    int ended;         /* the connection is gone: the loop returned for good */
+} conn_state;
+
+static void conn_loop(void *arg)
+{
+    conn_state *st = arg;
+    vkb_srv_conn *conn = st->conn;
     for (;;) {
-        vkb_msg_hdr h;
         int nfds = 0;
         uint8_t *payload;
-        if (srv_recv(conn, &h, &payload, fds, &nfds) < 0) break;
+        st->busy = 0;
+        if (srv_recv(conn, &st->h, &payload, st->fds, &nfds) < 0) break;
+        vkb_msg_hdr h = st->h;
         tls_proc = conn->proc; /* set by its hello */
         uint64_t wait_ns = 0;
         if (conn->proc && h.cmd < VKB_CMD_COUNT && h.cmd != VKB_CMD_vkbHello) {
@@ -1204,36 +1698,111 @@ static void *conn_main(void *arg)
             if (st_period) wait_ns = mono_ns() - t0;
         }
         if (h.cmd == VKB_CMD_vkbBatch && (h.flags & VKB_F_NOREPLY) && !nfds && conn->proc) {
-            run_batch(conn, &c, payload, h.size, wait_ns);
+            st->busy = 2;
+            run_batch(conn, &st->c, payload, h.size, wait_ns);
             order_done(conn->proc, h.seq);
             continue;
         }
-        vkb_dec_init(&c.d, payload, h.size, &conn->arena, fds, nfds);
-        run_request(conn, &c, h.cmd, h.table, wait_ns);
+        st->busy = 1;
+        vkb_dec_init(&st->c.d, payload, h.size, &conn->arena, st->fds, nfds);
+        run_request(conn, &st->c, h.cmd, h.table, wait_ns);
         vkb_srv_order_finish(); /* not taken by the handler (an error before the driver's call): owed still */
-        vkb_dec_close_untaken(&c.d);
+        vkb_dec_close_untaken(&st->c.d);
         order_done(conn->proc, h.seq);
         if (!(h.flags & VKB_F_NOREPLY)) {
-            vkb_msg_hdr rh = {VKB_MAGIC, c.status == VKB_ST_OK ? (uint32_t)c.r.len : 0, c.status, 0,
-                              c.status == VKB_ST_OK ? (uint32_t)c.r.nfds : 0, 0, 0, 0};
-            if (c.r.oom) {
+            vkb_msg_hdr rh = {VKB_MAGIC, st->c.status == VKB_ST_OK ? (uint32_t)st->c.r.len : 0, st->c.status, 0,
+                              st->c.status == VKB_ST_OK ? (uint32_t)st->c.r.nfds : 0, 0, 0, 0};
+            if (st->c.r.oom) {
                 rh.cmd = VKB_ST_BAD_MESSAGE;
                 rh.size = 0;
                 rh.nfds = 0;
             }
-            if (vkb_send_msg(conn->sock, &rh, c.r.buf, c.r.fds, (int)rh.nfds) < 0) {
-                for (int i = 0; i < c.nclose; i++) close(c.close_after[i]);
+            if (vkb_send_msg(conn->sock, &rh, st->c.r.buf, st->c.r.fds, (int)rh.nfds) < 0) {
+                for (int i = 0; i < st->c.nclose; i++) close(st->c.close_after[i]);
                 break;
             }
         } else {
-            async_report(&c, h.cmd);
+            async_report(&st->c, h.cmd);
         }
-        for (int i = 0; i < c.nclose; i++) close(c.close_after[i]);
+        for (int i = 0; i < st->c.nclose; i++) close(st->c.close_after[i]);
         vkb_arena_reset(&conn->arena);
+    }
+    st->busy = 0;
+    st->ended = 1;
+}
+
+/*
+ * After the request guard (server_guard.c vkb_guard_serve) caught a driver fault in one of this
+ * connection's requests: said and the device stopped (vkb_guard_request_contained), then the thread's
+ * own state put back - the replay's, the request's running mark, its order (the program's other
+ * connections wait on its sequence number), and its answer: VKB_ST_BAD_TABLE, the refusal of a
+ * stopped device's calls, which the client answers with VK_ERROR_DEVICE_LOST (an asynchronous request
+ * has no answer; a batch's later requests are dropped). Returns 0 when the connection cannot go on.
+ */
+static int conn_recover(conn_state *st, const vkb_guard_caught *f)
+{
+    vkb_srv_conn *conn = st->conn;
+    vkb_srv_table *t = vkb_srv_current_table();
+    const char *call = vkb_srv_current_cmd;
+    char where[160];
+    where[0] = 0;
+    if (vkb_srv_replay_cb) {
+        uint32_t pos = __atomic_load_n(&conn->replay_pos, __ATOMIC_RELAXED), total = __atomic_load_n(&conn->replay_total, __ATOMIC_RELAXED);
+        if (pos && pos <= total)
+            snprintf(where, sizeof(where), "command %u of %u of command buffer %p's replay", pos, total, (void *)vkb_srv_replay_cb);
+        else
+            snprintf(where, sizeof(where), "after the %u command(s) of command buffer %p's replay", total, (void *)vkb_srv_replay_cb);
+    } else if (st->busy == 2) {
+        snprintf(where, sizeof(where), "a request of an asynchronous batch; the rest of the batch is dropped");
+    }
+    if (!call) call = st->h.cmd < VKB_CMD_COUNT ? vkb_cmd_names[st->h.cmd] : "?";
+    vkb_guard_request_contained(t, call, where[0] ? where : NULL, f);
+    /* the thread's state as between two requests */
+    if (vkb_emu_bc_batch_open) vkb_emu_bcn_batch_drop();
+    vkb_srv_replay_cb = VK_NULL_HANDLE;
+    vkb_srv_replay_n = 0;
+    replay_end(conn);
+    __atomic_store_n(&conn->running, 0, __ATOMIC_RELEASE);
+    vkb_srv_current_cmd = NULL;
+    vkb_srv_set_current_table(NULL);
+    vkb_srv_order_done(); /* nothing more is waited for on its behalf */
+    int go_on = 1;
+    if (st->busy) {
+        vkb_dec_close_untaken(&st->c.d);
+        order_done(conn->proc, st->h.seq);
+        if (st->busy == 1 && !(st->h.flags & VKB_F_NOREPLY)) {
+            vkb_msg_hdr rh = {VKB_MAGIC, 0, t ? VKB_ST_BAD_TABLE : VKB_ST_BAD_MESSAGE, 0, 0, 0, 0, 0};
+            if (vkb_send_msg(conn->sock, &rh, NULL, NULL, 0) < 0) go_on = 0;
+        }
+        for (int i = 0; i < st->c.nclose && i < (int)(sizeof(st->c.close_after) / sizeof(st->c.close_after[0])); i++)
+            close(st->c.close_after[i]);
+        st->c.nclose = 0;
+    }
+    vkb_enc_reset(&st->c.r);
+    vkb_arena_reset(&conn->arena);
+    st->busy = 0;
+    return go_on;
+}
+
+static void *conn_main(void *arg)
+{
+    vkb_srv_conn *conn = arg;
+    __atomic_store_n(&conn->tid, (int)syscall(SYS_gettid), __ATOMIC_RELAXED);
+    conns_track(conn, 1);
+    conn_state *st = calloc(1, sizeof(*st));
+    if (st) {
+        st->conn = conn;
+        vkb_enc_init(&st->c.r);
+        vkb_guard_caught f;
+        while (!st->ended && vkb_guard_serve(conn_loop, st, &f))
+            if (!conn_recover(st, &f)) break;
     }
     conns_track(conn, 0);
     close(conn->sock);
-    vkb_enc_free(&c.r);
+    if (st) {
+        vkb_enc_free(&st->c.r);
+        free(st);
+    }
     free(conn->rb);
     for (int i = 0; i < conn->fdn; i++) close(conn->fdq[i]);
     vkb_arena_free(&conn->arena);
@@ -1245,6 +1814,11 @@ static void *conn_main(void *arg)
 void vkb_srv_serve(int lfd)
 {
     stats_add(0, 0, 0);
+    const char *ub = vkb_srv_env_global("VKBRIDGE_UNBOUND_DRAWS");
+    if (ub && !strcmp(ub, "keep")) {
+        memset(needs_pipeline, 0, sizeof(needs_pipeline));
+        VKB_WARN("VKBRIDGE_UNBOUND_DRAWS=keep: draws and dispatches with no pipeline bound reach the driver");
+    }
     for (;;) {
         int s = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
         if (s < 0) {

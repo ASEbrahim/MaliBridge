@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Contains driver crashes while a shader or pipeline is compiled. Mali r44p1's compiler has died
  * on unusual SPIR-V several times (SIGSEGV at 0x40 in vkCreateGraphicsPipelines, the ULTRAKILL
@@ -59,10 +58,13 @@
 #include "vkb_server.h"
 #include "server_emu.h"
 #include "spirv_gsfold.h"
+#include "spirv_caps.h"
 
 #include <errno.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,13 +94,31 @@ typedef struct vkb_guard {
     double limit; /* this device's interrupt (s; < 0: none), chosen at its creation: its game's preset counts */
     int feedback;  /* pipeline creation feedback asked of the driver (cache_feedback) */
     uint64_t built, hits; /* pipelines the driver built with feedback; of those, found in the pipeline cache */
+    /* memory calls: the driver's, and the faults contained in them */
+    PFN_vkAllocateMemory alloc;
+    PFN_vkBindImageMemory bind_img;
+    PFN_vkBindImageMemory2 bind_img2;
+    PFN_vkBindBufferMemory bind_buf;
+    PFN_vkBindBufferMemory2 bind_buf2;
+    int mem_crashes;
+    /* the driver's vkEndCommandBuffer of a client's replayed command buffer */
+    PFN_vkEndCommandBuffer end;
+    int end_crashes;
+    /* the capability check (cap_*): decided at the device's creation */
+    uint32_t lacks;   /* what the driver lacks of what SPIR-V can ask (spirv_caps.h bits) */
+    uint32_t refuse;  /* of those, what a pipeline is refused for */
+    uint32_t ndyn;    /* dynamic states the driver gave no entry point to set */
+    VkDynamicState dyn[24];
 } vkb_guard;
 
 typedef struct guard_arm {
     sigjmp_buf jb;
     volatile int sig;
     void *volatile addr;
+    volatile int code;        /* si_code of the fault (SEGV_ACCERR 2 for a player log/5PA6), 0 for the watchdog's interrupt */
+    volatile uintptr_t pc;    /* the faulting pc, 0 when unknown */
     volatile int timed_out; /* set by the watchdog before it signals the thread */
+    int base;               /* a connection thread's base arm (vkb_guard_serve): any fault no specific arm took */
     struct guard_arm *prev;
 } guard_arm;
 
@@ -117,9 +137,12 @@ static void guard_env(void)
         /* =spin: marked pipelines spin instead (compile watchdog); =spinfc2: only until their
          * float_controls2 is stripped (the first fallback then compiles); =slow: they take
          * VKBRIDGE_TEST_SLOW_S (3) seconds, then compile (the compute retry); =gs: every pipeline
-         * with a geometry stage faults, marked or not ('s r38p1 beta: server_errata_gs.c) */
+         * with a geometry stage faults, marked or not ('s r38p1 beta: server_errata_gs.c); =clip:
+         * every pipeline a stage of which reaches the driver with a clip or cull distance built-in or
+         * capability faults at 0x40, as Mali's compiler did without shaderClipDistance (ULTRAKILL; No
+         * Man's Sky: 0x18 / 0x40) */
         s = getenv("VKBRIDGE_TEST_CRASH_PIPELINE");
-        test_crash = s && *s && *s != '0' ? (!strcmp(s, "spin") ? 2 : !strcmp(s, "spinfc2") ? 3 : !strcmp(s, "slow") ? 4 : !strcmp(s, "gs") ? 5 : 1) : 0;
+        test_crash = s && *s && *s != '0' ? (!strcmp(s, "spin") ? 2 : !strcmp(s, "spinfc2") ? 3 : !strcmp(s, "slow") ? 4 : !strcmp(s, "gs") ? 5 : !strcmp(s, "clip") ? 6 : 1) : 0;
         if (guard_off) VKB_INFO("driver crash containment off (VKBRIDGE_NO_CRASH_GUARD)");
         if (test_crash) VKB_WARN("VKBRIDGE_TEST_CRASH_PIPELINE: marked pipelines fault on purpose");
     }
@@ -127,14 +150,63 @@ static void guard_env(void)
 
 /* From the crash handler; async-signal-safe up to the jump (TLS reads, plain stores). Returns only
  * when the faulting thread is not inside a guarded call. */
-void vkb_guard_fault(int sig, void *addr)
+void vkb_guard_fault(int sig, void *addr, int code, uintptr_t pc)
 {
     guard_arm *a = tls_arm;
     if (!a) return;
+    /* the base arm stops containing past the process limit, as the specific ones do (armable) */
+    if (a->base && (guard_off || __atomic_load_n(&process_crashes, __ATOMIC_RELAXED) >= PROCESS_MAX)) return;
     tls_arm = a->prev;
     a->sig = sig;
     a->addr = addr;
+    a->code = code;
+    a->pc = pc;
     siglongjmp(a->jb, 1);
+}
+
+/*
+ * After a contained fault (not the watchdog's interrupt): what the uncontained crash line says, which
+ * the CONTAINED line alone did not (t12-t15: next RE7/RE8 log would have carried only "signal 11
+ * (address ..)" and could not tell which hypothesis of a player log/5PA6 holds): the fault's code and pc as
+ * library + offset (the same driver site, libGLES_mali.so+0xa177bc, or another), what the address lies in
+ * (/proc/self/maps: scudo's reservation, /dev/mali0, a dma-buf, nothing), the call's arguments (the
+ * allocation's path and dma-buf, the bind's image and memory) and the other programs' calls in flight
+ * (an import or a destroy racing it). Runs after the jump, in the thread's own context.
+ */
+static void fault_detail(const char *call, const guard_arm *a)
+{
+    if (a->timed_out || (!a->code && !a->pc)) return;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER; /* vkb_crashctx_where has static buffers */
+    static char buf[2048];
+    pthread_mutex_lock(&lock);
+    Dl_info di;
+    memset(&di, 0, sizeof(di));
+    int found = a->pc && dladdr((void *)a->pc, &di) && di.dli_fname;
+    const char *lib = found ? strrchr(di.dli_fname, '/') : NULL;
+    int n = snprintf(buf, sizeof(buf), "vkbridge-server E   fault: code %d%s, pc %p (%s+0x%lx)\n", a->code,
+                     a->sig == SIGSEGV && a->code == SEGV_ACCERR ? " (SEGV_ACCERR)" : a->sig == SIGSEGV && a->code == SEGV_MAPERR ? " (SEGV_MAPERR)" : "",
+                     (void *)a->pc, found ? (lib ? lib + 1 : di.dli_fname) : "?", found ? (unsigned long)(a->pc - (uintptr_t)di.dli_fbase) : 0ul);
+    if (n > 0 && n < (int)sizeof(buf) - 1) n += vkb_crashctx_where(buf + n, sizeof(buf) - (size_t)n, a->addr);
+    if (n > 0 && n < (int)sizeof(buf) - 1) n += vkb_crashctx_describe(buf + n, sizeof(buf) - (size_t)n, call);
+    if (n > 0 && n < (int)sizeof(buf) - 1) {
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "vkbridge-server E   other calls in flight: ");
+        int m = n > 0 && n < (int)sizeof(buf) - 1 ? vkb_srv_crash_others(buf + n, sizeof(buf) - (size_t)n) : 0;
+        if (!m && n > 0 && n < (int)sizeof(buf) - 1) m = snprintf(buf + n, sizeof(buf) - (size_t)n, "none");
+        n += m;
+    }
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    buf[n] = 0;
+    /* one log line per line of the crash handler's text, without its "vkbridge-server E " lead */
+    for (char *l = buf; *l;) {
+        char *e = strchr(l, '\n');
+        if (e) *e = 0;
+        const char *body = !strncmp(l, "vkbridge-server E ", 18) ? l + 18 : l;
+        if (*body) VKB_ERR("%s", body);
+        if (!e) break;
+        l = e + 1;
+    }
+    pthread_mutex_unlock(&lock);
 }
 
 static vkb_guard *find(VkDevice device)
@@ -163,6 +235,7 @@ static void contained(vkb_guard *g, const char *call, const guard_arm *a)
             "(%d on this device, %d in the process%s%s)",
             a->sig, a->addr, call, g->t->id, mine, total, g->poisoned ? "; device poisoned: no more pipelines on it" : "",
             total >= PROCESS_MAX ? "; containment now off, the next fault kills the process" : "");
+    fault_detail(call, a);
     VKB_ERR("  driver locks held at the fault stay held: a hang in a later driver call would be this crash's doing");
 }
 
@@ -184,9 +257,20 @@ static int marked(const VkPipelineShaderStageCreateInfo *s)
 /* Also when containment is off: the test then sees the process die as before. */
 static double mono_s(void);
 
+static uint32_t stage_needs(const VkPipelineShaderStageCreateInfo *st);
+
 static void test_fault(const VkPipelineShaderStageCreateInfo *stages, uint32_t n, size_t stride)
 {
     if (!test_crash) return;
+    if (test_crash == 6) {
+        for (uint32_t i = 0; i < n; i++)
+            if (stage_needs((const VkPipelineShaderStageCreateInfo *)((const char *)stages + i * stride)) & (VKB_SPVCAP_CLIP | VKB_SPVCAP_CULL)) {
+                VKB_WARN("test: a clip/cull distance built-in reached the driver: faulting on purpose (imitated Mali compiler) in a %s call",
+                         tls_arm ? "guarded" : "UNGUARDED");
+                *(volatile int *)(uintptr_t)0x40 = 1;
+            }
+        return;
+    }
     for (uint32_t i = 0; i < n && test_crash == 5; i++)
         if (((const VkPipelineShaderStageCreateInfo *)((const char *)stages + i * stride))->stage == VK_SHADER_STAGE_GEOMETRY_BIT) {
             VKB_WARN("test: faulting on purpose on a geometry stage in a %s call", tls_arm ? "guarded" : "UNGUARDED");
@@ -241,6 +325,7 @@ typedef struct watch_slot {
 typedef struct mod_hash {
     VkShaderModule m;
     uint64_t hash;
+    uint32_t needs; /* what the module asks of the device (spirv_caps.h), from its SPIR-V when it was made */
 } mod_hash;
 
 /* Module code by hash, oldest dropped past CODE_BYTES: what a fallback compile rebuilds a stage
@@ -330,6 +415,7 @@ static void mod_remember(VkShaderModule m, const VkShaderModuleCreateInfo *ci)
 {
     if (!m || !ci || !ci->pCode) return;
     uint64_t h = spirv_hash(ci->pCode, ci->codeSize);
+    uint32_t needs = vkb_spv_caps(ci->pCode, ci->codeSize); /* the preamble only: before the lock */
     unsigned b = (unsigned)(((uintptr_t)m >> 4) * 2654435761u) % MOD_BUCKETS;
     pthread_mutex_lock(&watch_lock);
     for (unsigned i = 0; i < MOD_BUCKETS; i++) {
@@ -337,6 +423,7 @@ static void mod_remember(VkShaderModule m, const VkShaderModuleCreateInfo *ci)
         if (e->m && e->m != m && i < MOD_BUCKETS - 1) continue;
         e->m = m;
         e->hash = h;
+        e->needs = needs;
         break;
     }
     if (!code_find(h)) {
@@ -391,6 +478,31 @@ static uint64_t code_hash(const VkPipelineShaderStageCreateInfo *st)
     }
     pthread_mutex_unlock(&watch_lock);
     return h;
+}
+
+/* What the stage's SPIR-V asks of the device (spirv_caps.h): an inline module scanned now, a module
+ * by what was found when it was made; 0 if unknown. */
+static uint32_t stage_needs(const VkPipelineShaderStageCreateInfo *st)
+{
+    for (const VkBaseInStructure *b = st->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+            const VkShaderModuleCreateInfo *ci = (const VkShaderModuleCreateInfo *)b;
+            return vkb_spv_caps(ci->pCode, ci->codeSize);
+        }
+    if (!st->module) return 0;
+    unsigned b = (unsigned)(((uintptr_t)st->module >> 4) * 2654435761u) % MOD_BUCKETS;
+    uint32_t needs = 0;
+    pthread_mutex_lock(&watch_lock);
+    for (unsigned i = 0; i < MOD_BUCKETS; i++) {
+        mod_hash *e = &mods[(b + i) % MOD_BUCKETS];
+        if (!e->m) break;
+        if (e->m == st->module) {
+            needs = e->needs;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&watch_lock);
+    return needs;
 }
 
 /* What the stage compiles: the SPIR-V hash (the name of its dump) and, kept apart, the entry
@@ -824,6 +936,8 @@ static void on_timeout_sig(int sig)
     tls_arm = a->prev;
     a->sig = sig;
     a->addr = NULL;
+    a->code = 0;
+    a->pc = 0;
     siglongjmp(a->jb, 1);
 }
 
@@ -989,6 +1103,7 @@ __attribute__((noinline)) static VkResult armed_gfx(vkb_guard *g, VkDevice devic
 {
     guard_arm arm;
     arm.prev = tls_arm;
+    arm.base = 0;
     arm.timed_out = 0;
     watch_slot *volatile w = NULL;
     *timed = 0;
@@ -1063,6 +1178,157 @@ static int is_lut_pipeline(const VkGraphicsPipelineCreateInfo *info, const uint6
     return 0;
 }
 
+/* ------------------------------------------------------------------ the capability check */
+
+/*
+ * A pipeline whose SPIR-V asks for what the driver lacks never reaches the driver's compiler, which
+ * has died on such input: ULTRAKILL's Unity vertex shader (gl_ClipDistance in gl_PerVertex, Mali r44p1
+ * without shaderClipDistance: SIGSEGV at 0x40) and No Man's Sky's glslang vertex shaders (a player log G925
+ * r49p1: 0x18 x3 G615 r44p1: 0x40 x3, the device poisoned, then the server died in a draw).
+ * Both times the bridge's clip rewrite (spirv_clip.c) had not taken the built-in out, and nothing
+ * stopped the rest. The check sits here, the last layer before the driver: what reaches it is what the
+ * emulations made of the program's pipeline, so anything an emulation takes care of never gets here.
+ *
+ * Decided at the device's creation (vkb_guard_device_init): what the driver lacks of what SPIR-V can
+ * ask (its VkPhysicalDeviceFeatures; VKBRIDGE_FAKE_MISSING=clip/cull imitates it on a host), and the
+ * dynamic states the driver gave no entry point to set (its vkCmdSetCullMode etc. NULL). Per pipeline:
+ * each stage's needs, found when its module was made (spirv_caps.c, the module's preamble). Nothing in
+ * any draw or submit.
+ *   - A clip or cull distance built-in or capability on a driver without the feature: the pipeline is
+ *     refused (VK_ERROR_INITIALIZATION_FAILED, what a contained compile crash answers: DXVK and
+ *     vkd3d-proton log a failed pipeline and skip its draws) and said loudly. No working session in the
+ *     players' logs shows one (the rewrite's "could not be demoted" is only in NMS's two, both crashed).
+ *   - Anything else the driver lacks (64-bit or 16-bit integers, 64-bit floats, cube arrays, sample
+ *     shading, storage image formats ..., a dynamic state with no setter): said once per kind and passed
+ *     on as before - no crash of a driver is known for those, and a driver that takes them anyway draws.
+ * VKBRIDGE_CAP_GATE=strict refuses those too; =log refuses nothing (says what would be); =0 turns the
+ * check off. VKBRIDGE_NO_CRASH_GUARD=1 turns it off with the rest of this file.
+ */
+static int cap_gate = -1; /* 0 off, 1 refuse clip/cull, 2 strict, 3 log only */
+
+static void cap_env(void)
+{
+    if (cap_gate >= 0) return;
+    const char *e = vkb_srv_env_global("VKBRIDGE_CAP_GATE");
+    int v = 1;
+    if (e && *e == '0') v = 0;
+    else if (e && !strcmp(e, "strict")) v = 2;
+    else if (e && !strcmp(e, "log")) v = 3;
+    if (v != 1) VKB_INFO("capability check: %s (VKBRIDGE_CAP_GATE=%s)", v == 0 ? "off" : v == 2 ? "strict: every lack refused" : "log only", e);
+    cap_gate = v;
+}
+
+static int cap_active(const vkb_guard *g) { return cap_gate > 0 && (g->lacks || g->ndyn); }
+
+static const struct {
+    VkDynamicState state;
+    size_t setter; /* offsetof(vkb_dispatch, ...) */
+    const char *name;
+} cap_dyn[] = {
+#define D(s, f) {VK_DYNAMIC_STATE_##s, offsetof(vkb_dispatch, f), #f}
+    D(CULL_MODE, vkCmdSetCullMode), D(FRONT_FACE, vkCmdSetFrontFace), D(PRIMITIVE_TOPOLOGY, vkCmdSetPrimitiveTopology),
+    D(VIEWPORT_WITH_COUNT, vkCmdSetViewportWithCount), D(SCISSOR_WITH_COUNT, vkCmdSetScissorWithCount),
+    D(VERTEX_INPUT_BINDING_STRIDE, vkCmdBindVertexBuffers2), D(DEPTH_TEST_ENABLE, vkCmdSetDepthTestEnable),
+    D(DEPTH_WRITE_ENABLE, vkCmdSetDepthWriteEnable), D(DEPTH_COMPARE_OP, vkCmdSetDepthCompareOp),
+    D(DEPTH_BOUNDS_TEST_ENABLE, vkCmdSetDepthBoundsTestEnable), D(STENCIL_TEST_ENABLE, vkCmdSetStencilTestEnable),
+    D(STENCIL_OP, vkCmdSetStencilOp), D(RASTERIZER_DISCARD_ENABLE, vkCmdSetRasterizerDiscardEnable),
+    D(DEPTH_BIAS_ENABLE, vkCmdSetDepthBiasEnable), D(PRIMITIVE_RESTART_ENABLE, vkCmdSetPrimitiveRestartEnable),
+    D(PATCH_CONTROL_POINTS_EXT, vkCmdSetPatchControlPointsEXT), D(LOGIC_OP_EXT, vkCmdSetLogicOpEXT),
+    D(VERTEX_INPUT_EXT, vkCmdSetVertexInputEXT),
+#undef D
+};
+
+static void cap_device(vkb_guard *g, vkb_srv_table *t)
+{
+    cap_env();
+    if (!cap_gate) return;
+    const vkb_srv_table *inst = t->parent;
+    if (inst && inst->real.vkGetPhysicalDeviceFeatures && t->physical) {
+        VkPhysicalDeviceFeatures f;
+        memset(&f, 0, sizeof(f));
+        inst->real.vkGetPhysicalDeviceFeatures(t->physical, &f);
+        if (!f.shaderClipDistance || vkb_emu_faked("clip")) g->lacks |= VKB_SPVCAP_CLIP;
+        if (!f.shaderCullDistance || vkb_emu_faked("cull")) g->lacks |= VKB_SPVCAP_CULL;
+        if (!f.shaderFloat64) g->lacks |= VKB_SPVCAP_F64;
+        if (!f.shaderInt64) g->lacks |= VKB_SPVCAP_I64;
+        if (!f.shaderInt16) g->lacks |= VKB_SPVCAP_I16;
+        if (!f.geometryShader) g->lacks |= VKB_SPVCAP_GEOM;
+        if (!f.tessellationShader) g->lacks |= VKB_SPVCAP_TESS;
+        if (!f.imageCubeArray) g->lacks |= VKB_SPVCAP_CUBE_ARRAY;
+        if (!f.sampleRateShading) g->lacks |= VKB_SPVCAP_SAMPLE_RATE;
+        if (!f.shaderImageGatherExtended) g->lacks |= VKB_SPVCAP_GATHER_EXT;
+        if (!f.shaderStorageImageMultisample) g->lacks |= VKB_SPVCAP_MS_STORAGE;
+        if (!f.shaderStorageImageExtendedFormats) g->lacks |= VKB_SPVCAP_EXT_FORMATS;
+        if (!f.shaderStorageImageReadWithoutFormat) g->lacks |= VKB_SPVCAP_READ_NOFMT;
+        if (!f.shaderStorageImageWriteWithoutFormat) g->lacks |= VKB_SPVCAP_WRITE_NOFMT;
+    }
+    g->refuse = cap_gate == 3 ? 0 : cap_gate == 2 ? g->lacks : g->lacks & (VKB_SPVCAP_CLIP | VKB_SPVCAP_CULL);
+    for (size_t i = 0; i < sizeof(cap_dyn) / sizeof(cap_dyn[0]) && g->ndyn < sizeof(g->dyn) / sizeof(g->dyn[0]); i++)
+        if (!*(void *const *)((const char *)&t->real + cap_dyn[i].setter)) g->dyn[g->ndyn++] = cap_dyn[i].state;
+    if (g->lacks) {
+        char txt[600];
+        vkb_spv_caps_text(g->lacks, txt, sizeof(txt));
+        VKB_INFO("capability check: device %u's driver lacks %s; %s", t->id, txt,
+                 g->refuse ? "a pipeline that still asks for clip/cull distances at the driver is refused" : "said, not refused");
+    }
+}
+
+static const char *cap_dyn_name(VkDynamicState d)
+{
+    for (size_t i = 0; i < sizeof(cap_dyn) / sizeof(cap_dyn[0]); i++)
+        if (cap_dyn[i].state == d) return cap_dyn[i].name;
+    return "?";
+}
+
+/* 1 when the pipeline of these stages (and dynamic states) is refused; says what it lacks (call NULL: quiet) */
+static int cap_refuses(vkb_guard *g, const char *call, const VkPipelineShaderStageCreateInfo *stages, uint32_t n, size_t stride,
+                       const VkPipelineDynamicStateCreateInfo *ds)
+{
+    static uint32_t said_bits, said_dyn; /* the kinds passed on that were said already (once per process) */
+    static uint64_t refused;
+    int refuse = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const VkPipelineShaderStageCreateInfo *st = (const VkPipelineShaderStageCreateInfo *)((const char *)stages + i * stride);
+        uint32_t miss = stage_needs(st) & g->lacks;
+        if (!miss) continue;
+        uint32_t bad = miss & g->refuse;
+        if (bad) refuse = 1;
+        if (!call) continue;
+        uint32_t fresh = miss & ~bad & ~__atomic_fetch_or(&said_bits, miss & ~bad, __ATOMIC_RELAXED);
+        uint64_t k = bad ? __atomic_add_fetch(&refused, 1, __ATOMIC_RELAXED) : 0;
+        if (!fresh && !(bad && (k <= 8 || !(k & (k - 1))))) continue;
+        char txt[600];
+        vkb_spv_caps_text(bad ? bad : fresh, txt, sizeof(txt));
+        const vkb_srv_proc *p = g->t->proc;
+        if (bad)
+            VKB_ERR("capability check: %s on device %u (%s, pid %d): stage 0x%x (SPIR-V h-%016llx) asks for %s, which the driver lacks "
+                    "and no emulation took out - refused before the driver (VK_ERROR_INITIALIZATION_FAILED): Mali's compiler died on "
+                    "this (ULTRAKILL, No Man's Sky); %llu refused so far",
+                    call, g->t->id, p && p->comm[0] ? p->comm : "?", p ? p->pid : 0, (unsigned)st->stage, (unsigned long long)code_hash(st),
+                    txt, (unsigned long long)k);
+        else
+            VKB_WARN("capability check: %s on device %u (%s, pid %d): stage 0x%x (SPIR-V h-%016llx) asks for %s, which the driver lacks - "
+                     "passed on as before (no driver crash known for it; VKBRIDGE_CAP_GATE=strict refuses it; said once)",
+                     call, g->t->id, p && p->comm[0] ? p->comm : "?", p ? p->pid : 0, (unsigned)st->stage, (unsigned long long)code_hash(st), txt);
+    }
+    for (uint32_t i = 0; ds && g->ndyn && i < ds->dynamicStateCount; i++)
+        for (uint32_t k = 0; k < g->ndyn; k++) {
+            if (ds->pDynamicStates[i] != g->dyn[k]) continue;
+            if (cap_gate == 2) refuse = 1;
+            uint32_t bit = 1u << (k & 31);
+            if (call && (cap_gate == 2 || !(__atomic_fetch_or(&said_dyn, bit, __ATOMIC_RELAXED) & bit)))
+                VKB_WARN("capability check: %s on device %u: dynamic state %d asked for, the driver gave no %s to set it - %s",
+                         call, g->t->id, (int)g->dyn[k], cap_dyn_name(g->dyn[k]),
+                         cap_gate == 2 ? "refused (VKBRIDGE_CAP_GATE=strict)" : "passed on as before (said once)");
+        }
+    return refuse;
+}
+
+static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *infos,
+                            const VkAllocationCallbacks *a, VkPipeline *out);
+static VkResult compute_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *infos,
+                                const VkAllocationCallbacks *a, VkPipeline *out);
+
 static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *infos,
                             const VkAllocationCallbacks *a, VkPipeline *out)
 {
@@ -1071,6 +1337,22 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
     if (g->poisoned) {
         for (uint32_t i = 0; out && i < n; i++) out[i] = VK_NULL_HANDLE;
         return VK_ERROR_DEVICE_LOST;
+    }
+    if (cap_active(g)) {
+        unsigned char small[16], *ref = n <= 16 ? small : calloc(n, 1);
+        uint32_t nref = 0;
+        for (uint32_t i = 0; ref && i < n; i++)
+            nref += ref[i] = (unsigned char)cap_refuses(g, "vkCreateGraphicsPipelines", infos[i].pStages, infos[i].stageCount,
+                                                        sizeof(*infos[i].pStages), infos[i].pDynamicState);
+        if (nref) {
+            /* the others are built one by one, as asked; the refused get null handles */
+            for (uint32_t i = 0; i < n; i++)
+                if (ref[i]) out[i] = VK_NULL_HANDLE;
+                else if (gfx_guarded(device, cache, 1, &infos[i], a, &out[i]) != VK_SUCCESS) out[i] = VK_NULL_HANDLE;
+            if (ref != small) free(ref);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (ref != small) free(ref);
     }
     if (!armable()) {
         for (uint32_t i = 0; i < n; i++) test_fault(infos[i].pStages, infos[i].stageCount, sizeof(*infos[i].pStages));
@@ -1197,6 +1479,7 @@ __attribute__((noinline)) static VkResult armed_compute(vkb_guard *g, VkDevice d
 {
     guard_arm arm;
     arm.prev = tls_arm;
+    arm.base = 0;
     arm.timed_out = 0;
     watch_slot *volatile w = NULL;
     *timed = 0;
@@ -1248,6 +1531,16 @@ static VkResult compute_guarded(VkDevice device, VkPipelineCache cache, uint32_t
     if (g->poisoned) {
         for (uint32_t i = 0; out && i < n; i++) out[i] = VK_NULL_HANDLE;
         return VK_ERROR_DEVICE_LOST;
+    }
+    if (cap_active(g)) {
+        uint32_t nref = 0;
+        for (uint32_t i = 0; i < n; i++) nref += cap_refuses(g, "vkCreateComputePipelines", &infos[i].stage, 1, sizeof(infos[i].stage), NULL);
+        if (nref) {
+            for (uint32_t i = 0; i < n; i++)
+                if (cap_refuses(g, NULL, &infos[i].stage, 1, sizeof(infos[i].stage), NULL)) out[i] = VK_NULL_HANDLE;
+                else if (compute_guarded(device, cache, 1, &infos[i], a, &out[i]) != VK_SUCCESS) out[i] = VK_NULL_HANDLE;
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
     }
     if (!armable()) {
         if (n) test_fault(&infos[0].stage, n, sizeof(*infos));
@@ -1333,6 +1626,7 @@ static VkResult module_guarded(VkDevice device, const VkShaderModuleCreateInfo *
     }
     guard_arm arm;
     arm.prev = tls_arm;
+    arm.base = 0;
     arm.timed_out = 0;
     watch_slot *volatile w = NULL;
     if (sigsetjmp(arm.jb, 1)) {
@@ -1532,6 +1826,356 @@ static VkResult VKAPI_CALL gd_CreateComputePipelines(VkDevice device, VkPipeline
 
 /* ------------------------------------------------------------------ the startup probe */
 
+/* ------------------------------------------------------------------ memory calls */
+
+/*
+ * Faults in the driver's vkAllocateMemory and vkBind*Memory are contained the same way (* Mali-G615 r44p1 faulted in vkBindImageMemory at the same driver pc in vkAllocateMemory,
+ * SEGV_ACCERR both; the cause inside the driver is not known). The arm is a sigsetjmp without the
+ * signal mask (no system call: a few stores per call; these calls are made when resources are
+ * made, not per frame), and the signal is unblocked on the way back. What the program then sees:
+ *   - an allocation fails with VK_ERROR_OUT_OF_DEVICE_MEMORY, which programs handle; a device's
+ *     second contained memory fault takes the device as lost (server_lost.c);
+ *   - a bind takes its device as lost at once: the image or buffer is left without memory (and a
+ *     bind is asynchronous, the program was told VK_SUCCESS), so nothing of it may reach the GPU;
+ *     the program's next submission or wait says VK_ERROR_DEVICE_LOST and it ends as after any
+ *     loss, the other programs go on.
+ * The same caveat as for compiles: a lock the driver held at the fault stays held. The process
+ * limit (PROCESS_MAX) and VKBRIDGE_NO_CRASH_GUARD=1 apply.
+ *
+ * The stall watchdog (started at the first contained memory fault; nothing runs before one): a
+ * later driver call that waits on such a lock never comes back, and without it the program, or
+ * every program, would freeze with no end screen where the uncontained fault ended the session.
+ * Once a second, the requests running for VKBRIDGE_MEM_STALL_S (30) seconds that do not wait by
+ * design (fence/semaphore/idle waits, query results with a wait, pipeline compiles: those have
+ * their own limits) are looked at:
+ *   - one program stuck: its session is ended without touching the driver - its devices are
+ *     stopped (refused, never destroyed, as after a driver thread's fault: server_lost.c) and its
+ *     connections shut down, so it sees the server gone and ends; the others go on;
+ *   - a second program stuck (at once, or after one was ended): the lock is the driver's for every
+ *     program; the server ends (abort, with the stuck calls in its crash line), as the fault
+ *     itself would have ended it before the containment, and the app shows its end screen.
+ * VKBRIDGE_MEM_STALL_S=0 turns the watchdog off.
+ */
+/* the driver's memory calls by table id, kept past the guard's own end (a layer above may still
+ * hold the wrapper): a call without a guard goes to the driver unguarded */
+static PFN_vkAllocateMemory mn_alloc[MAX_TABLES];
+static PFN_vkBindImageMemory mn_bind_img[MAX_TABLES];
+static PFN_vkBindImageMemory2 mn_bind_img2[MAX_TABLES];
+static PFN_vkBindBufferMemory mn_bind_buf[MAX_TABLES];
+static PFN_vkBindBufferMemory2 mn_bind_buf2[MAX_TABLES];
+static PFN_vkEndCommandBuffer mn_end[MAX_TABLES];
+
+static uint32_t cur_id(void)
+{
+    vkb_srv_table *t = vkb_srv_current_table();
+    return t && t->id < MAX_TABLES ? t->id : 0;
+}
+
+#define MEM_ARM(g, call, failed, body) GUARD_ARM(g, call, mem_contained, failed, body)
+#define GUARD_ARM(g, call, on_fault, failed, body)                                                        \
+    do {                                                                                                  \
+        if (!(g) || (tls_arm && !tls_arm->base) || !armable()) {                                          \
+            body;                                                                                         \
+            break;                                                                                        \
+        }                                                                                                 \
+        guard_arm arm;                                                                                    \
+        arm.prev = tls_arm;                                                                               \
+        arm.base = 0;                                                                                     \
+        arm.timed_out = 0;                                                                                \
+        if (sigsetjmp(arm.jb, 0)) {                                                                       \
+            sigset_t un;                                                                                  \
+            sigemptyset(&un);                                                                             \
+            sigaddset(&un, arm.sig);                                                                      \
+            pthread_sigmask(SIG_UNBLOCK, &un, NULL); /* the handler's own block: the jump kept it */     \
+            on_fault(g, call, &arm, failed);                                                              \
+            failed;                                                                                       \
+            break;                                                                                        \
+        }                                                                                                 \
+        tls_arm = &arm;                                                                                   \
+        body;                                                                                             \
+        tls_arm = arm.prev;                                                                               \
+    } while (0)
+
+static const char *mem_fault_call; /* the last contained memory fault, for the watchdog's lines */
+static uint32_t mem_fault_dev;
+static double mem_stall_s = 30;
+
+static void *mem_watch_main(void *arg)
+{
+    (void)arg;
+    int ended = 0; /* the program ended for a stall: its stuck thread stays in the driver for good */
+    for (;;) {
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, NULL);
+        vkb_srv_stuck_req st[8];
+        int n = vkb_srv_stuck(mem_stall_s, st, 8), fresh = 0, k = -1;
+        for (int i = 0; i < n; i++)
+            if (st[i].pid != ended) fresh++, k = k < 0 ? i : k;
+        if (!fresh) continue;
+        if (!ended && fresh == 1) {
+            VKB_ERR("memory fault watchdog: %s (pid %d) has been in %s for %.0f s, after a driver fault in %s on device %u was "
+                    "contained: most likely waiting on a driver lock that fault left held (%s). Its session ends: its devices are left as they are, the "
+                    "other programs go on", st[k].comm, st[k].pid, st[k].cmd, st[k].secs, mem_fault_call ? mem_fault_call : "?",
+                    mem_fault_dev, st[k].probe[0] ? st[k].probe : "its thread not readable");
+            int d = vkb_srv_end_proc(st[k].pid, "a call of its program stuck in the driver after a contained memory fault");
+            VKB_ERR("memory fault watchdog: %d device(s) of pid %d stopped, its connections closed", d, st[k].pid);
+            ended = st[k].pid;
+            continue;
+        }
+        char msg[800];
+        snprintf(msg, sizeof(msg),
+                 "memory fault watchdog: %s (pid %d) has been in %s for %.0f s%s, after a driver fault in %s on device %u was "
+                 "contained: a second program stuck behind it, so the lock is the driver's for every program; the server ends now, as the fault would "
+                 "have ended it",
+                 st[k].comm, st[k].pid, st[k].cmd, st[k].secs, ended ? " (a program was ended for this before)" : " (and another program)",
+                 mem_fault_call ? mem_fault_call : "?", mem_fault_dev);
+        VKB_ERR("%s", msg); /* then the crash line of the abort names the calls still in the driver */
+        abort();
+    }
+    return NULL;
+}
+
+static void mem_watch_start(void)
+{
+    static int started;
+    if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL)) return;
+    const char *e = vkb_srv_env_global("VKBRIDGE_MEM_STALL_S");
+    if (e && *e) mem_stall_s = atof(e);
+    if (mem_stall_s <= 0) {
+        VKB_INFO("memory fault watchdog: off (VKBRIDGE_MEM_STALL_S=%s)", e);
+        return;
+    }
+    pthread_t th;
+    if (pthread_create(&th, NULL, mem_watch_main, NULL) != 0) {
+        VKB_WARN("memory fault watchdog: no thread");
+        return;
+    }
+    pthread_detach(th);
+    VKB_INFO("memory fault watchdog: on (a call stuck %.0f s ends its program; a second program stuck ends the server)", mem_stall_s);
+}
+
+static void mem_contained(vkb_guard *g, const char *call, const guard_arm *a, ...)
+{
+    mem_fault_call = call;
+    mem_fault_dev = g->t->id;
+    mem_watch_start();
+    int mine = __atomic_add_fetch(&g->mem_crashes, 1, __ATOMIC_RELAXED);
+    int total = __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+    int bind = strncmp(call, "vkBind", 6) == 0;
+    const vkb_srv_proc *p = g->t->proc;
+    VKB_ERR("CONTAINED driver crash: signal %d (address %p) in %s on device %u (%s, pid %d) - %s, the other programs go on "
+            "(%d memory fault(s) on this device, %d contained in the process%s)",
+            a->sig, a->addr, call, g->t->id, p && p->comm[0] ? p->comm : "?", p ? p->pid : 0,
+            bind ? "the device is taken as lost" : mine >= 2 ? "the allocation fails and the device is taken as lost"
+                                                            : "the allocation fails (VK_ERROR_OUT_OF_DEVICE_MEMORY)",
+            mine, total, total >= PROCESS_MAX ? "; containment now off, the next fault kills the process" : "");
+    fault_detail(call, a);
+    VKB_ERR("  driver locks held at the fault stay held: a hang in a later driver call would be this crash's doing");
+    if (bind || mine >= 2) vkb_lost_mark(g->t, bind ? "a driver fault in a memory bind was contained" : "two driver faults in its allocations were contained");
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL gd_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a,
+                                                        VkDeviceMemory *out)
+{
+    vkb_guard *g = find(device);
+    __typeof__(mn_alloc[0]) next = g ? g->alloc : mn_alloc[cur_id()];
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    MEM_ARM(g, "vkAllocateMemory", (*out = VK_NULL_HANDLE, r = VK_ERROR_OUT_OF_DEVICE_MEMORY), r = next(device, ai, a, out));
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL gd_BindImageMemory(VkDevice device, VkImage img, VkDeviceMemory mem, VkDeviceSize off)
+{
+    vkb_guard *g = find(device);
+    __typeof__(mn_bind_img[0]) next = g ? g->bind_img : mn_bind_img[cur_id()];
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    VkResult r = VK_ERROR_DEVICE_LOST;
+    MEM_ARM(g, "vkBindImageMemory", r = VK_ERROR_DEVICE_LOST, r = next(device, img, mem, off));
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL gd_BindImageMemory2(VkDevice device, uint32_t n, const VkBindImageMemoryInfo *bi)
+{
+    vkb_guard *g = find(device);
+    __typeof__(mn_bind_img2[0]) next = g ? g->bind_img2 : mn_bind_img2[cur_id()];
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    VkResult r = VK_ERROR_DEVICE_LOST;
+    MEM_ARM(g, "vkBindImageMemory2", r = VK_ERROR_DEVICE_LOST, r = next(device, n, bi));
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL gd_BindBufferMemory(VkDevice device, VkBuffer buf, VkDeviceMemory mem, VkDeviceSize off)
+{
+    vkb_guard *g = find(device);
+    __typeof__(mn_bind_buf[0]) next = g ? g->bind_buf : mn_bind_buf[cur_id()];
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    VkResult r = VK_ERROR_DEVICE_LOST;
+    MEM_ARM(g, "vkBindBufferMemory", r = VK_ERROR_DEVICE_LOST, r = next(device, buf, mem, off));
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL gd_BindBufferMemory2(VkDevice device, uint32_t n, const VkBindBufferMemoryInfo *bi)
+{
+    vkb_guard *g = find(device);
+    __typeof__(mn_bind_buf2[0]) next = g ? g->bind_buf2 : mn_bind_buf2[cur_id()];
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    VkResult r = VK_ERROR_DEVICE_LOST;
+    MEM_ARM(g, "vkBindBufferMemory2", r = VK_ERROR_DEVICE_LOST, r = next(device, n, bi));
+    return r;
+}
+
+/*
+ * The driver's vkEndCommandBuffer of a client's command buffer, at the end of its replay (server_conn.c).
+ * Xiaomi XRing O3, Mali-G2-Ultra r56p0 beta, Animal Well through vkd3d-proton: the server died
+ * twice at the same driver pc, a read of address 0x18 in the driver's End of vkd3d-proton's query-reset
+ * command buffer (begin, vkCmdResetQueryPool, the query mirror's barrier and fill: valid commands, the
+ * cause inside the driver is not known), and took Steam with it. Such a fault is now contained: the end
+ * fails (submits leave the command buffer out), and the device is stopped (server_lost.c: taken as lost,
+ * its requests refused, never reached again nor destroyed) - the driver's state of that command buffer
+ * and its pool is broken, and the program's teardown (pool reset and destroy, vkDestroyDevice) would walk
+ * it again. Its program sees its device lost and ends; the other programs go on; the device's memory
+ * comes back when the session ends. The memory fault watchdog (above) covers a driver lock the fault left
+ * held. Only ends inside a client's replay are armed (the server's own command buffers end as before);
+ * the arm is the memory calls' (no system call). VKBRIDGE_END_GUARD=0 turns it off, and the process
+ * limit and VKBRIDGE_NO_CRASH_GUARD=1 apply.
+ */
+static void end_contained(vkb_guard *g, const char *call, const guard_arm *a, ...)
+{
+    mem_fault_call = call;
+    mem_fault_dev = g->t->id;
+    mem_watch_start();
+    int mine = __atomic_add_fetch(&g->end_crashes, 1, __ATOMIC_RELAXED);
+    int total = __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+    const vkb_srv_proc *p = g->t->proc;
+    VKB_ERR("CONTAINED driver crash: signal %d (address %p) in %s on device %u (%s, pid %d) - the command buffer is not recorded "
+            "and the device is stopped (taken as lost, not reached again), its program ends, the other programs go on "
+            "(%d on this device, %d contained in the process%s)",
+            a->sig, a->addr, call, g->t->id, p && p->comm[0] ? p->comm : "?", p ? p->pid : 0, mine, total,
+            total >= PROCESS_MAX ? "; containment now off, the next fault kills the process" : "");
+    char tail[640];
+    int n = 0;
+    uint32_t done = vkb_srv_replay_n, first = done > VKB_REPLAY_RING ? done - VKB_REPLAY_RING : 0;
+    for (uint32_t i = first; i < done && n >= 0 && n < (int)sizeof(tail) - 1; i++) {
+        const char *name = vkb_srv_replay_ring[i % VKB_REPLAY_RING];
+        n += snprintf(tail + n, sizeof(tail) - (size_t)n, "%s%s", n ? " " : "", name ? name : "?");
+    }
+    if (n <= 0) snprintf(tail, sizeof(tail), "(no commands)");
+    VKB_ERR("  replaying command buffer %p, %u command(s); %s: %s", (void *)vkb_srv_replay_cb, done,
+            first ? "the last of the stream" : "the stream", tail);
+    fault_detail(call, a);
+    VKB_ERR("  driver locks held at the fault stay held: a hang in a later driver call would be this crash's doing");
+    vkb_lost_stop(g->t, "a driver fault in vkEndCommandBuffer was contained");
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL gd_EndCommandBuffer(VkCommandBuffer cb)
+{
+    uint32_t id = cur_id();
+    vkb_guard *g = __atomic_load_n(&guards[id], __ATOMIC_ACQUIRE);
+    if (g && g->t != vkb_srv_current_table()) g = NULL;
+    PFN_vkEndCommandBuffer next = g ? g->end : mn_end[id];
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    if (!vkb_srv_replay_cb) return next(cb); /* the server's own command buffers */
+    if (g && vkb_lost_stopped(g->t)) return VK_ERROR_DEVICE_LOST; /* a fault earlier in this replay stopped it */
+    VkResult r = VK_ERROR_DEVICE_LOST;
+    GUARD_ARM(g, "vkEndCommandBuffer", end_contained, r = VK_ERROR_DEVICE_LOST, r = next(cb));
+    return r;
+}
+
+/*
+ * One guard around every driver call a connection thread makes for its client (Mali-G1-Ultra
+ * faulted at 0x32 in vkQueueSubmit2; No Man's Sky's last crash: a near-null read in
+ * the driver's vkCmdDraw / vkCmdDrawIndexed inside a replay; the divisor emulation's call through a
+ * missing entry point): each ended the one server with Steam, the compositor and every program. The
+ * specific arms above cover the calls whose failure a program can take (a pipeline, an allocation, an
+ * End); everything else a connection thread does for its client now has this one beneath them.
+ *
+ * Cost: none per request. The arm is set once when the thread starts serving (and again after a
+ * contained fault): the connection's whole loop runs inside it, so no request, submit or draw does
+ * anything more than before. The specific arms nest on top of it as before (GUARD_ARM ignores it).
+ *
+ * A fault it catches (server_conn.c conn_recover then): the program's device is stopped as after a
+ * fault in its End (server_lost.c: taken as lost, its requests refused - the client answers
+ * VK_ERROR_DEVICE_LOST, as for any refused call - never reached again nor destroyed): the driver's state
+ * of what it was doing is broken, and its teardown would walk it again. The request is answered with
+ * that refusal (no reply left hanging), the stall watchdog above covers a lock the fault left held, the
+ * other programs go on. A fault in an instance-level request (no device) refuses that request only.
+ * The crash line's account is logged (the call, inside a replay its command N of M and the stream's
+ * tail, the fault's code, pc as library + offset, address, arguments, other calls in flight).
+ * VKBRIDGE_REQ_GUARD=0 turns it off (the A/B: the fault ends the server as before); the process limit
+ * (PROCESS_MAX) and VKBRIDGE_NO_CRASH_GUARD=1 apply. Bridge code that held a lock of its own at the fault
+ * leaves it held too: the same stall watchdog.
+ */
+int vkb_guard_serve(void (*loop)(void *), void *arg, vkb_guard_caught *f)
+{
+    static int off = -1;
+    guard_env();
+    if (off < 0) {
+        const char *e = vkb_srv_env_global("VKBRIDGE_REQ_GUARD");
+        off = e && *e == '0';
+        if (off && !guard_off) VKB_INFO("request guard off (VKBRIDGE_REQ_GUARD=0): a driver fault on a connection thread ends the server");
+    }
+    if (off || guard_off || tls_arm) {
+        loop(arg);
+        return 0;
+    }
+    guard_arm arm;
+    memset(&arm, 0, sizeof(arm));
+    arm.base = 1;
+    arm.prev = NULL;
+    if (sigsetjmp(arm.jb, 1)) { /* the mask as it was here: the handler's block of the signal is undone */
+        tls_arm = NULL;
+        f->sig = arm.sig;
+        f->code = arm.code;
+        f->addr = arm.addr;
+        f->pc = arm.pc;
+        return 1;
+    }
+    tls_arm = &arm;
+    loop(arg);
+    tls_arm = NULL;
+    return 0;
+}
+
+int vkb_guard_request_contained(vkb_srv_table *t, const char *call, const char *where, const vkb_guard_caught *f)
+{
+    int total = __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+    int dev = t && t->is_device;
+    const vkb_srv_proc *p = t ? t->proc : vkb_srv_crash_client();
+    mem_fault_call = call;
+    mem_fault_dev = t ? t->id : 0;
+    mem_watch_start();
+    VKB_ERR("CONTAINED driver crash: signal %d (address %p) in %s%s%s%s on %s %u (%s, pid %d) - %s, the other programs go on "
+            "(%d contained in the process%s)",
+            f->sig, f->addr, call ? call : "?", where ? " (" : "", where ? where : "", where ? ")" : "", dev ? "device" : "table",
+            t ? t->id : 0, p && p->comm[0] ? p->comm : "?", p ? p->pid : 0,
+            dev ? "the device is stopped (taken as lost, not reached again): its program gets VK_ERROR_DEVICE_LOST and ends"
+                : "the request is refused",
+            total, total >= PROCESS_MAX ? "; containment now off, the next fault kills the process" : "");
+    if (vkb_srv_replay_cb) {
+        char tail[640];
+        int n = 0;
+        uint32_t done = vkb_srv_replay_n, first = done > VKB_REPLAY_RING ? done - VKB_REPLAY_RING : 0;
+        for (uint32_t i = first; i < done && n >= 0 && n < (int)sizeof(tail) - 1; i++) {
+            const char *name = vkb_srv_replay_ring[i % VKB_REPLAY_RING];
+            n += snprintf(tail + n, sizeof(tail) - (size_t)n, "%s%s", n ? " " : "", name ? name : "?");
+        }
+        if (n <= 0) snprintf(tail, sizeof(tail), "(no commands)");
+        VKB_ERR("  replaying command buffer %p, command %u of its stream; %s: %s", (void *)vkb_srv_replay_cb, done,
+                first ? "the last of the stream" : "the stream", tail);
+    }
+    guard_arm a;
+    memset(&a, 0, sizeof(a));
+    a.sig = f->sig;
+    a.addr = f->addr;
+    a.code = f->code;
+    a.pc = f->pc;
+    fault_detail(call ? call : "?", &a);
+    VKB_ERR("  driver locks held at the fault stay held: a hang in a later driver call would be this crash's doing");
+    if (dev) vkb_lost_stop(t, "a driver fault in one of its program's calls was contained");
+    return total;
+}
+
 const uint32_t *vkb_guard_lut_standin(size_t *size)
 {
     *size = sizeof(lut_standin_fs);
@@ -1549,6 +2193,7 @@ int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *ar
     watch_env();
     guard_arm arm;
     arm.prev = tls_arm;
+    arm.base = 0;
     arm.timed_out = 0;
     watch_slot *volatile w = NULL;
     if (sigsetjmp(arm.jb, 1)) {
@@ -1587,6 +2232,7 @@ void vkb_guard_device_init(vkb_srv_table *t)
         if (lim != timeout_s) VKB_INFO("compile watchdog: device %u interrupts after %.0f s (%s)", t->id, lim, why);
     }
     g->feedback = cache_feedback(t);
+    cap_device(g, t);
     g->gfx = t->real.vkCreateGraphicsPipelines;
     g->compute = t->real.vkCreateComputePipelines;
     g->module = t->real.vkCreateShaderModule;
@@ -1594,6 +2240,29 @@ void vkb_guard_device_init(vkb_srv_table *t)
     t->real.vkCreateGraphicsPipelines = t->dt.vkCreateGraphicsPipelines = gd_CreateGraphicsPipelines;
     t->real.vkCreateComputePipelines = t->dt.vkCreateComputePipelines = gd_CreateComputePipelines;
     t->real.vkCreateShaderModule = t->dt.vkCreateShaderModule = gd_CreateShaderModule;
+    /* the memory calls (VKBRIDGE_MEM_GUARD=0: not) */
+    const char *eg = vkb_srv_env_global("VKBRIDGE_END_GUARD");
+    if (!(eg && *eg == '0') && t->real.vkEndCommandBuffer) {
+        g->end = mn_end[t->id] = t->real.vkEndCommandBuffer;
+        if (t->dt.vkEndCommandBuffer == t->real.vkEndCommandBuffer) t->dt.vkEndCommandBuffer = gd_EndCommandBuffer;
+        t->real.vkEndCommandBuffer = gd_EndCommandBuffer;
+    }
+    const char *mg = vkb_srv_env_global("VKBRIDGE_MEM_GUARD");
+    if (mg && *mg == '0') return;
+#define MEM_HOOK(field, fn, save)                                                                    \
+    do {                                                                                             \
+        if (t->real.field) {                                                                         \
+            g->save = mn_##save[t->id] = t->real.field;                                              \
+            if (t->dt.field == t->real.field) t->dt.field = (fn);                                   \
+            t->real.field = (fn);                                                                    \
+        }                                                                                            \
+    } while (0)
+    MEM_HOOK(vkAllocateMemory, gd_AllocateMemory, alloc);
+    MEM_HOOK(vkBindImageMemory, gd_BindImageMemory, bind_img);
+    MEM_HOOK(vkBindImageMemory2, gd_BindImageMemory2, bind_img2);
+    MEM_HOOK(vkBindBufferMemory, gd_BindBufferMemory, bind_buf);
+    MEM_HOOK(vkBindBufferMemory2, gd_BindBufferMemory2, bind_buf2);
+#undef MEM_HOOK
 }
 
 void vkb_guard_device_destroy(vkb_srv_table *t)
@@ -1608,5 +2277,19 @@ void vkb_guard_device_destroy(vkb_srv_table *t)
     t->real.vkCreateGraphicsPipelines = g->gfx;
     t->real.vkCreateComputePipelines = g->compute;
     t->real.vkCreateShaderModule = g->module;
+#define MEM_UNHOOK(field, fn, save)                                                                  \
+    do {                                                                                             \
+        if (g->save) {                                                                               \
+            if (t->dt.field == (fn)) t->dt.field = g->save;                                         \
+            if (t->real.field == (fn)) t->real.field = g->save;                                     \
+        }                                                                                            \
+    } while (0)
+    MEM_UNHOOK(vkAllocateMemory, gd_AllocateMemory, alloc);
+    MEM_UNHOOK(vkBindImageMemory, gd_BindImageMemory, bind_img);
+    MEM_UNHOOK(vkBindImageMemory2, gd_BindImageMemory2, bind_img2);
+    MEM_UNHOOK(vkBindBufferMemory, gd_BindBufferMemory, bind_buf);
+    MEM_UNHOOK(vkBindBufferMemory2, gd_BindBufferMemory2, bind_buf2);
+    MEM_UNHOOK(vkEndCommandBuffer, gd_EndCommandBuffer, end);
+#undef MEM_UNHOOK
     free(g);
 }

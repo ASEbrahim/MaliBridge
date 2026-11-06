@@ -100,7 +100,9 @@ private:
         p.exts = query_device_extensions(t->real, pd, nullptr);
 
         uint32_t missing = 0;
-        p.caps.emu = vkb_emu_detect(&t->real, pd, &missing);
+        /* the bridge's VK_EXT_memory_budget is answered by the server's MemoryProperties2 (server_memory.c),
+         * which the layer does not route: not offered here */
+        p.caps.emu = vkb_emu_detect(&t->real, pd, &missing) & ~VKB_EMU_MEM_BUDGET;
         p.caps.missing = missing;
 
         t->real.vkGetPhysicalDeviceProperties(pd, &p.caps.real_props);

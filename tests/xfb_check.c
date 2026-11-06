@@ -13,6 +13,13 @@
  * must keep what was there, and the counters must hold the bytes written.
  *
  *   xfb_check       the vertex shader captures its own outputs (Xfb in the vertex stage)
+ *   xfb_check zink  Zink's shape: an instance of engine "mesa zink", the vertex input
+ *                   dynamic (VK_EXT_vertex_input_dynamic_state, which the server gives Zink and whose
+ *                   pipelines it binds at the draw: server_vidyn.c), the capture buffers bound before
+ *                   the pipeline, vkCmdSetVertexInputEXT, then begin - as zink_draw.cpp records them.
+ *   xfb_check nopipe  a pipeline the program asked for that failed (its handle VK_NULL_HANDLE) bound, then
+ *                   transform feedback begun, a draw, ended: the server leaves the begin, the draw and
+ *                   the end out (Mali reads through the missing pipeline); only the submission is checked.
  *   xfb_check gs    DXVK's shape: a plain vertex shader, a pass-through point geometry shader that
  *                   captures, rasterizer discard. A server that emulates anything folds that
  *                   geometry stage into the vertex shader (server_emu_shader.c, Mali's slow geometry
@@ -48,7 +55,7 @@ I(vkCreateGraphicsPipelines); I(vkCreateCommandPool); I(vkAllocateCommandBuffers
 I(vkCmdBindPipeline); I(vkCmdPushConstants); I(vkCmdDraw); I(vkCmdEndRenderPass); I(vkEndCommandBuffer); I(vkQueueSubmit);
 I(vkQueueWaitIdle); I(vkCreateBuffer); I(vkGetBufferMemoryRequirements); I(vkBindBufferMemory); I(vkMapMemory); I(vkCmdFillBuffer);
 I(vkCmdCopyBuffer); I(vkCmdPipelineBarrier); I(vkDestroyDevice); I(vkCmdBindTransformFeedbackBuffersEXT);
-I(vkCmdBeginTransformFeedbackEXT); I(vkCmdEndTransformFeedbackEXT); I(vkCmdDrawIndirectByteCountEXT);
+I(vkCmdBeginTransformFeedbackEXT); I(vkCmdEndTransformFeedbackEXT); I(vkCmdDrawIndirectByteCountEXT); I(vkCmdSetVertexInputEXT);
 #undef I
 
 static VkPhysicalDeviceMemoryProperties mp;
@@ -122,14 +129,22 @@ static int record_ok(const uint8_t *b0, const uint8_t *b1, uint32_t r, float v, 
     return 1;
 }
 
+/* Zink's order after the capture buffers: the pipeline, its (empty) vertex input */
+static void bind_zink(VkCommandBuffer cb, VkPipeline pipe)
+{
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdSetVertexInputEXT(cb, 0, NULL, 0, NULL);
+}
+
 int main(int argc, char **argv)
 {
-    int gs = argc > 1 && !strcmp(argv[1], "gs");
+    int gs = argc > 1 && !strcmp(argv[1], "gs"), zink = argc > 1 && !strcmp(argv[1], "zink"),
+        nopipe = argc > 1 && !strcmp(argv[1], "nopipe");
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) return printf("FAIL loader\n"), 2;
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
     vkCreateInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "xfb_check", 1, "vkbridge", 1, VK_API_VERSION_1_1};
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "xfb_check", 1, zink ? "mesa zink" : "vkbridge", 1, VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL};
     VkInstance inst;
     if (vkCreateInstance(&ici, NULL, &inst)) return printf("FAIL instance\n"), 1;
@@ -147,10 +162,12 @@ int main(int argc, char **argv)
     vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof(*ep));
     vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ep);
-    int has = 0;
+    int has = 0, has_vi = 0;
     for (uint32_t i = 0; i < ne; i++) has |= !strcmp(ep[i].extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+    for (uint32_t i = 0; i < ne; i++) has_vi |= !strcmp(ep[i].extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     free(ep);
     if (!has) return printf("OK: skipped (no VK_EXT_transform_feedback)\n"), 77;
+    if (zink && !has_vi) return printf("FAIL zink: no VK_EXT_vertex_input_dynamic_state for a Zink instance\n"), 1;
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &xf};
     vkGetPhysicalDeviceFeatures2(pd, &f2);
@@ -173,11 +190,12 @@ int main(int argc, char **argv)
     while (qf < nq && !(qp[qf].queueFlags & VK_QUEUE_GRAPHICS_BIT)) qf++;
     float prio = 1;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, qf, 1, &prio};
-    VkPhysicalDeviceTransformFeedbackFeaturesEXT exf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, NULL, VK_TRUE, VK_FALSE};
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vif = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, NULL, VK_TRUE};
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT exf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, zink ? &vif : NULL, VK_TRUE, VK_FALSE};
     VkPhysicalDeviceFeatures2 ef = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &exf};
     ef.features.geometryShader = gs ? VK_TRUE : VK_FALSE;
-    const char *exts[] = {VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &ef, 0, 1, &qci, 0, NULL, 1, exts, NULL};
+    const char *exts[] = {VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME};
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &ef, 0, 1, &qci, 0, NULL, zink ? 2 : 1, exts, NULL};
     if (vkCreateDevice(pd, &dci, NULL, &dev)) return printf("FAIL device\n"), 1;
 #define D(n) n = (PFN_##n)vkGetDeviceProcAddr(dev, #n)
     D(vkGetDeviceQueue); D(vkCreateImage); D(vkGetImageMemoryRequirements); D(vkAllocateMemory); D(vkBindImageMemory);
@@ -186,8 +204,9 @@ int main(int argc, char **argv)
     D(vkCmdBindPipeline); D(vkCmdPushConstants); D(vkCmdDraw); D(vkCmdEndRenderPass); D(vkEndCommandBuffer); D(vkQueueSubmit);
     D(vkQueueWaitIdle); D(vkCreateBuffer); D(vkGetBufferMemoryRequirements); D(vkBindBufferMemory); D(vkMapMemory); D(vkCmdFillBuffer);
     D(vkCmdCopyBuffer); D(vkCmdPipelineBarrier); D(vkDestroyDevice); D(vkCmdBindTransformFeedbackBuffersEXT);
-    D(vkCmdBeginTransformFeedbackEXT); D(vkCmdEndTransformFeedbackEXT); D(vkCmdDrawIndirectByteCountEXT);
+    D(vkCmdBeginTransformFeedbackEXT); D(vkCmdEndTransformFeedbackEXT); D(vkCmdDrawIndirectByteCountEXT); D(vkCmdSetVertexInputEXT);
 #undef D
+    if (zink && !vkCmdSetVertexInputEXT) return printf("FAIL zink: no vkCmdSetVertexInputEXT\n"), 1;
     if (!vkCmdBindTransformFeedbackBuffersEXT || !vkCmdBeginTransformFeedbackEXT || !vkCmdEndTransformFeedbackEXT || !vkCmdDrawIndirectByteCountEXT)
         return printf("FAIL the transform feedback commands are missing from vkGetDeviceProcAddr\n"), 1;
     VkQueue q;
@@ -250,8 +269,10 @@ int main(int argc, char **argv)
     VkPipelineColorBlendAttachmentState cba = {0};
     cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &cba, {0}};
-    VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, gs ? 2 : 1, st, &vi, &ia, NULL, &vp, &rs, &ms, NULL,
-                                        &cbs, NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
+    VkDynamicState dyn_vi = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;
+    VkPipelineDynamicStateCreateInfo dsi = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 1, &dyn_vi};
+    VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, gs ? 2 : 1, st, zink ? NULL : &vi, &ia, NULL, &vp, &rs, &ms, NULL,
+                                        &cbs, zink ? &dsi : NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
     VkPipeline pipe;
     VkResult pr = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gci, NULL, &pipe);
     if (pr) return printf("FAIL pipeline: %d\n", pr), 1;
@@ -286,13 +307,30 @@ int main(int argc, char **argv)
     VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {1, 1}}, 0, NULL};
     const VkDeviceSize zero_off[2] = {0, 4}; /* counters: buffer 0's at 0, buffer 1's at 4 */
 
+    if (nopipe) {
+        vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE); /* the failed pipeline's handle */
+        VkBuffer nb[2] = {cap[0], cap[1]};
+        VkDeviceSize no[2] = {0, OFF1};
+        vkCmdBindTransformFeedbackBuffersEXT(cb, 0, 2, nb, no, NULL);
+        vkCmdBeginTransformFeedbackEXT(cb, 0, 0, NULL, NULL);
+        vkCmdDraw(cb, 5, 1, 0, 0);
+        vkCmdEndTransformFeedbackEXT(cb, 0, 0, NULL, NULL);
+        vkCmdEndRenderPass(cb);
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo nsi = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+        if (vkQueueSubmit(q, 1, &nsi, VK_NULL_HANDLE) || vkQueueWaitIdle(q)) return printf("FAIL submit\n"), 1;
+        vkDestroyDevice(dev, NULL);
+        return printf("OK: transform feedback with no pipeline bound: submitted and finished\n"), 0;
+    }
     /* pass 1: sizes given, no counters to resume from */
     float pass = 0;
     vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    if (!zink) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkBuffer b01[2] = {cap[0], cap[1]};
     VkDeviceSize offs[2] = {0, OFF1}, sizes[2] = {BUF0, BUF1 - OFF1};
     vkCmdBindTransformFeedbackBuffersEXT(cb, 0, 2, b01, offs, sizes);
+    if (zink) bind_zink(cb, pipe);
     vkCmdBeginTransformFeedbackEXT(cb, 0, 0, NULL, NULL);
     vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &pass);
     vkCmdDraw(cb, 5, 2, 3, 1);
@@ -305,8 +343,9 @@ int main(int argc, char **argv)
     /* pass 2: no sizes, resumed from the counters */
     pass = 1;
     vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    if (!zink) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindTransformFeedbackBuffersEXT(cb, 0, 2, b01, offs, NULL);
+    if (zink) bind_zink(cb, pipe);
     vkCmdBeginTransformFeedbackEXT(cb, 0, 2, cc, zero_off);
     vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &pass);
     vkCmdDraw(cb, 3, 1, 20, 0);
@@ -319,9 +358,10 @@ int main(int argc, char **argv)
                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
         pass = 2;
         vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        if (!zink) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         VkBuffer b23[2] = {cap[2], cap[3]};
         vkCmdBindTransformFeedbackBuffersEXT(cb, 0, 2, b23, offs, sizes);
+        if (zink) bind_zink(cb, pipe);
         vkCmdBeginTransformFeedbackEXT(cb, 0, 0, NULL, NULL);
         vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &pass);
         vkCmdDrawIndirectByteCountEXT(cb, 1, 0, cnt, 0, 0, STRIDE0);
@@ -379,7 +419,7 @@ int main(int argc, char **argv)
     }
     vkQueueWaitIdle(q);
     vkDestroyDevice(dev, NULL);
-    if (fails) return printf("FAILED: %d of %d checks (%s)\n", fails, draw_bc ? 4 : 3, gs ? "geometry stage" : "vertex stage"), 1;
-    printf("OK: %d checks passed (%s captures)\n", draw_bc ? 4 : 3, gs ? "geometry stage" : "vertex stage");
+    if (fails) return printf("FAILED: %d of %d checks (%s)\n", fails, draw_bc ? 4 : 3, gs ? "geometry stage" : zink ? "vertex stage, Zink's shape" : "vertex stage"), 1;
+    printf("OK: %d checks passed (%s captures)\n", draw_bc ? 4 : 3, gs ? "geometry stage" : zink ? "vertex stage, Zink's shape" : "vertex stage");
     return 0;
 }

@@ -14,8 +14,8 @@ pass=0; fail=0
 result() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "  ok   $2"; else fail=$((fail+1)); echo "  FAIL $2"; fi; }
 # A server-side protocol error fails the run even when the desktop driver shrugs it off.
 server_errors() {
-  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG" 2>/dev/null)
-  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG")"; return 1; }
+  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no |named ahead failed|bad batch entry" "$VKB_SERVER_LOG" 2>/dev/null)
+  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no |named ahead failed|bad batch entry" "$VKB_SERVER_LOG")"; return 1; }
 }
 run_mode() {
   local m=$1

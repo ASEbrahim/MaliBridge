@@ -29,6 +29,7 @@ typedef struct div_info {
     VkPipeline zero_base;          /* variant whose vertex shader reads BaseInstance as 0 */
     VkShaderModule zero_vs;        /* its vertex shader, between creation steps */
     uint32_t vs_stage;
+    int refuse;                    /* cannot be drawn here: refused at its creation (vkb_emu_divisor_refused) */
 } div_info;
 
 typedef struct pipe_rec {
@@ -115,6 +116,20 @@ void vkb_emu_divisor_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipe
     if (!(e->flags & VKB_EMU_DIVISOR)) return;
     out->dynamic_stride = has_dynamic(ci, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
     out->dynamic_input = has_dynamic(ci, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT);
+    /* Strides taken at bind or record time are rebound with the driver's vkCmdBindVertexBuffers2 (prepare()).
+     * A driver without it (Vulkan 1.1, no VK_EXT_extended_dynamic_state: Mali r18-r40) cannot draw such a
+     * pipeline through this emulation, and the call through the missing entry point ended the server at
+     * pc 0 (host, the common Mali profile; a client using dynamic strides there is wrong, but must not take
+     * the other programs down): the pipeline is refused instead (capability check, server_guard.c). */
+    if ((out->dynamic_stride || out->dynamic_input) && !vkb_emu_real()->vkCmdBindVertexBuffers2) {
+        out->refuse = 1;
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+            VKB_ERR("divisor emulation: a pipeline with %s on a driver without vkCmdBindVertexBuffers2 (no extended dynamic state): "
+                    "the emulation cannot rebind its strides - refused (VK_ERROR_INITIALIZATION_FAILED)",
+                    out->dynamic_stride ? "dynamic vertex strides" : "dynamic vertex input");
+        return;
+    }
     /* Pieces linked from libraries bring their own records. */
     for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext) {
         if (b->sType != VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR) continue;
@@ -189,6 +204,7 @@ void vkb_emu_divisor_created(vkb_emu_device *e, VkDevice device, VkPipelineCache
 }
 
 size_t vkb_emu_divisor_info_size(void) { return sizeof(div_info); }
+int vkb_emu_divisor_refused(const div_info *info) { return info->refuse; }
 
 static VKAPI_ATTR void VKAPI_CALL emu_DestroyPipeline(VkDevice device, VkPipeline p, const VkAllocationCallbacks *pAllocator)
 {
@@ -276,6 +292,11 @@ static VKAPI_ATTR void VKAPI_CALL emu_CmdSetVertexInputEXT(VkCommandBuffer cb, u
 static void prepare(vkb_emu_device *e, VkCommandBuffer cb, gfx_state *g, const div_info *di, uint32_t first_instance, uint32_t inst)
 {
     const vkb_dispatch *r = vkb_emu_real();
+    if ((di->dynamic_stride || di->dynamic_input) && !r->vkCmdBindVertexBuffers2) {
+        /* refused at creation (vkb_emu_divisor_pipeline); never through a missing entry point */
+        VKB_ONCE(VKB_LOG_ERROR, "divisor emulation: dynamic strides without the driver's vkCmdBindVertexBuffers2; the rebind is left out (logged once)");
+        return;
+    }
     for (uint32_t k = 0; k < MAX_BIND; k++) {
         uint32_t bit = 1u << k;
         if (!(g->bound & bit)) continue;

@@ -57,4 +57,4 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: Please stop the Steam session first, then use Settings → Share logs and attach the zip here.
+      description: Please stop the Steam session first, then tap Send logs to MaliBridge in the app and paste the code (ML-XXXX) here. You can also post it in #help on Discord (https://discord.gg/9xC67qTjDq).

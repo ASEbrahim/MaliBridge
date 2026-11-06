@@ -70,6 +70,10 @@ static inline VkFormat vkb_bgr10_rgba(VkFormat f)
                                             * gamescope and Zink; server_timeline.c) */
 #define VKB_EMU_DMABUF_AHB     (1u << 24)  /* VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf over AHardwareBuffers where the
                                             * driver has no dma-buf memory (Kirin, Maleoon, Venus: gamescope; server_dmabuf_ahb.c) */
+#define VKB_EMU_IMAGELESS      (1u << 25)  /* VK_KHR_imageless_framebuffer: a real framebuffer per set of views at the render pass
+                                            * (Mali r18-r26, Vulkan 1.1: Zink requires it; server_emu_imageless.c) */
+#define VKB_EMU_MEM_BUDGET     (1u << 26)  /* VK_EXT_memory_budget answered by the server where the driver has none (every Mali):
+                                            * DXVK and vkd3d-proton clients only (server_memory.c memb_fill) */
 #define VKB_EMU_ROBUST2_ACCESS (1u << 19)  /* robustBufferAccess2/robustImageAccess2 reported where the driver's robustness2
                                             * has nullDescriptor only (Mali-G715 r54p3); core robustness on instead (DXVK 3) */
 
@@ -159,11 +163,21 @@ typedef struct vkb_hitch_wait {
 enum { VKB_HITCH_W_APP, VKB_HITCH_W_PRESENT, VKB_HITCH_W_RT, VKB_HITCH_W_COUNT };
 
 typedef struct vkb_hitch_msg {
-    uint64_t frame;                /* presents so far in the process (0: turned on) */
+    uint64_t frame;                /* presents so far in the process (0: turned on, or a window: kind) */
     uint64_t t_prev, t_start, t_end; /* the frame before's start, this frame's start and end (its present) */
     uint32_t threshold_ms, pad;
     vkb_hitch_wait w[VKB_HITCH_W_COUNT]; /* the app's fence/semaphore/idle waits, the swapchain's own, other round trips */
+    /* From here on newer (an older peer's message ends before it: vkb_dec_raw_tail reads zeros; an
+     * older server takes a window for frame 0, "turned on", which it already is). */
+    uint32_t kind;                 /* VKB_HITCH_K_*: 0 a frame over the threshold (or turned on) */
+    uint32_t frames;               /* VKB_HITCH_K_WINDOW: presents in [t_start, t_end] */
+    uint64_t worst_ns;             /* ... the longest of them */
+    uint32_t over;                 /* ... how many took the threshold or longer */
+    uint32_t pad2;
 } vkb_hitch_msg;
+
+#define VKB_HITCH_K_FRAME 0u
+#define VKB_HITCH_K_WINDOW 1u      /* about a second of presents (client/hitch.c): the server's per-second frames line */
 
 #define VKB_PRESENT_TIMEOUT_NONE 0xffffffffu
 

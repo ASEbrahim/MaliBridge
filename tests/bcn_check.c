@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * bcn_check: uploads random blocks of every BC format (every BC6H and BC7 mode forced in turn),
  * blits the texture to RGBA32F and compares each texel with bcdec's CPU decode. Then the shapes
@@ -28,7 +27,9 @@
  * and copies are placed on that block's edges.
  * `bcn_check transcode zink`: the same quality check (every BC format, PSNR floors, "exact" fails) with the BC
  * images made as Zink makes them: usage SAMPLED|TRANSFER_SRC|TRANSFER_DST|COLOR_ATTACHMENT (0x17), flags
- * MUTABLE_FORMAT|EXTENDED_USAGE (0x108). The bridge must transcode them (they were all decoded).
+ * MUTABLE_FORMAT|EXTENDED_USAGE (0x108). The bridge must transcode them (they were all decoded). Then blocks
+ * drawn into uncompressed views of such images, as Mesa uploads BC data from a pixel buffer, must show in the texture
+ * (test_zink_upload; a player log). `bcn_check upload` (the bridge decoding) runs that on decoded images after the decoding checks.
  * `bcn_check pcache [file]`: what the driver's pipeline cache spares on two of the transcoders
  * (compute pipelines), in this process and from the data an earlier run left in file.
  */
@@ -88,7 +89,9 @@ F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCmdCopyImage2); F(vkCre
 F(vkCreateDescriptorSetLayout); F(vkCreatePipelineLayout); F(vkCreateComputePipelines); F(vkCreateDescriptorPool);
 F(vkAllocateDescriptorSets); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
 F(vkCreateRenderPass); F(vkDestroyRenderPass); F(vkCreateFramebuffer); F(vkDestroyFramebuffer); F(vkCmdBeginRenderPass);
-F(vkCmdEndRenderPass);
+F(vkCmdEndRenderPass); F(vkCreateGraphicsPipelines); F(vkDestroyPipelineLayout); F(vkDestroyDescriptorSetLayout);
+F(vkDestroyDescriptorPool); F(vkCmdDraw); F(vkCmdSetViewport); F(vkCmdSetScissor); F(vkCmdClearAttachments); F(vkCmdBeginRendering);
+F(vkCmdEndRendering);
 F(vkCmdDispatch); F(vkCreatePipelineCache); F(vkGetPipelineCacheData); F(vkDestroyPipelineCache); F(vkDestroyPipeline);
 #undef F
 
@@ -1790,100 +1793,255 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
     }
 }
 
-/* Zink renders into uncompressed views of its BC images (R32G32B32A32_UINT of a 128-bit-block image, the
- * "uncompressed view shows decoded texels" warning of a player log): image flags BLOCK_TEXEL_VIEW_COMPATIBLE |
- * MUTABLE_FORMAT | EXTENDED_USAGE, usage 0x17 with COLOR_ATTACHMENT. The bridge transcodes such images, which
- * cannot be rendered to, so the view must not reach the driver as a view of the transcoded image: a render pass
- * clearing it must run (the device stays alive, a view of the transcoded ASTC image as an attachment would not
- * be valid), the same for a view whose VkImageViewUsageCreateInfo asks COLOR_ATTACHMENT, a sampled-only view
- * is made too, and the BC texture is unchanged by all of it (its levels compared again by PSNR). */
-static void test_zink_views(VkFormat f, VkFormat view_fmt, const char *name)
+/* Zink renders BC blocks into uncompressed views of its BC images. Mesa's st_CompressedTexSubImage with a pixel
+ * buffer bound draws the blocks, one texel a block, into an R32G32B32A32_UINT (16-byte blocks) or R16G16B16A16_UINT
+ * (8-byte blocks) view of the level (Zink's images: BLOCK_TEXEL_VIEW_COMPATIBLE | MUTABLE_FORMAT | EXTENDED_USAGE,
+ * COLOR_ATTACHMENT). What is drawn there must be what the BC texture shows afterwards: SOMA's terrain was
+ * black on v0.5.5.2, where the draw went to a stand-in image and stayed there, and garbled on v0.5.5.1,
+ * where the blocks were drawn as colours into the decoded image. Here: level 0 (60x44, 15x11 blocks) gets the first
+ * upload, then new blocks drawn in a viewport inside it and one block value cleared into a rect (vkCmdClearAttachments);
+ * level 1 (30x22, 8x6 blocks: not a halving of 15x11) is drawn whole (with render passes, with the viewport set before
+ * the pass began). Each level is compared with the blocks it should
+ * hold (PSNR; in a decoding run exactly), so blocks left as they were in the drawn region, or the rest of level 0
+ * changed, fail. With render passes, then (dynr) with vkCmdBeginRendering, as Zink records on Vulkan 1.3 (natively, or
+ * through the bridge's render passes where the driver lacks it). A view that is only sampled is made too. */
+static int dynr_ok; /* the device was made with dynamicRendering (Vulkan 1.3) */
+static int zink_decoded; /* argument "upload" (decoding run): test_zink_upload on decoded images too */
+
+static void test_zink_upload(VkFormat f, VkFormat view_fmt, const char *name, int dynr)
 {
-    enum { S = 256 };
-    const int kinds[1] = {IMG_PHOTO};
-    level lv = {S, S, S / 4, S / 4, image_blocks(f, kinds[0], S, S, 0, 0)};
-    size_t n = (size_t)lv.bw * lv.bh * block_bytes(f);
-    VkDeviceMemory um, im;
-    void *upp;
-    VkBuffer up = host_buffer(n, &um, &upp);
-    memcpy(upp, lv.blocks, n);
-    VkImage img = make_image(f, S, S, 1, 1, VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT, NULL, 0, &im);
+    enum { W = 60, H = 44, NL = 2 };
+    static const uint32_t vs_code[] = {
+#include "bcsink_vert.inc"
+    };
+    static const uint32_t fs_code[] = {
+#include "bcsink_frag.inc"
+    };
+    const int bytes = block_bytes(f), kind = image_for(f);
+    level first[NL], drawn[NL], want[NL];
+    for (int m = 0; m < NL; m++) {
+        uint32_t w = W >> m, h = H >> m, bw = (w + 3) / 4, bh = (h + 3) / 4;
+        first[m] = (level){w, h, bw, bh, image_blocks(f, kind, w, h, 0, 0)};
+        drawn[m] = (level){w, h, bw, bh, image_blocks(f, kind, w, h, 23, 37)};
+        want[m] = (level){w, h, bw, bh, malloc((size_t)bw * bh * bytes)};
+        memcpy(want[m].blocks, first[m].blocks, (size_t)bw * bh * bytes);
+    }
+    /* level 0: drawn in blocks [3, 11) x [2, 7), one block of `drawn` cleared into [0, 3) x [8, 11); level 1: drawn whole */
+    const VkRect2D vp0 = {{3, 2}, {8, 5}}, clr = {{0, 8}, {3, 3}};
+    for (uint32_t y = 0; y < first[0].bh; y++)
+        for (uint32_t x = 0; x < first[0].bw; x++) {
+            size_t i = ((size_t)y * first[0].bw + x) * bytes;
+            if (x >= 3 && x < 11 && y >= 2 && y < 7) memcpy(want[0].blocks + i, drawn[0].blocks + i, bytes);
+            if (x < 3 && y >= 8) memcpy(want[0].blocks + i, drawn[0].blocks, bytes);
+        }
+    memcpy(want[1].blocks, drawn[1].blocks, (size_t)drawn[1].bw * drawn[1].bh * bytes);
+
+    VkDeviceMemory um, dm[NL], im;
+    void *upp, *dp[NL];
+    size_t n0 = (size_t)first[0].bw * first[0].bh * bytes, n1 = (size_t)first[1].bw * first[1].bh * bytes;
+    VkBuffer up = host_buffer(n0 + n1, &um, &upp);
+    memcpy(upp, first[0].blocks, n0);
+    memcpy((uint8_t *)upp + n0, first[1].blocks, n1);
+    VkBuffer db[NL];
+    for (int m = 0; m < NL; m++) {
+        size_t n = (size_t)drawn[m].bw * drawn[m].bh * bytes;
+        db[m] = host_buffer(n, &dm[m], &dp[m]);
+        memcpy(dp[m], drawn[m].blocks, n);
+    }
+    VkImage img = make_image(f, W, H, NL, 1, VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT, NULL, 0, &im);
     if (!img) {
         printf("FAIL %s: cannot create the image\n", name);
         failures++;
         return;
     }
-    VkCommandBuffer cb = begin();
-    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {S, S, 1}};
-    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    submit(cb);
-    VkImageViewUsageCreateInfo uc = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
-    VkImageViewUsageCreateInfo us = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT};
-    const VkImageViewUsageCreateInfo *usage[3] = {NULL, &uc, &us};
-    const char *what[3] = {"the image's usage", "COLOR_ATTACHMENT view usage", "sampled-only view usage"};
-    int bad = 0;
-    VkAttachmentDescription ad = {0, view_fmt, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
-                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_UNDEFINED,
-                                  VK_IMAGE_LAYOUT_GENERAL};
+    VkAttachmentDescription ad = {0, view_fmt, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference ar = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ar, NULL, NULL, 0, NULL};
     VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &ad, 1, &sp, 0, NULL};
     VkRenderPass rp;
-    if (vkCreateRenderPass(dev, &rpi, NULL, &rp) != VK_SUCCESS) {
-        printf("FAIL %s: no render pass\n", name);
+    VkShaderModuleCreateInfo vsi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(vs_code), vs_code};
+    VkShaderModuleCreateInfo fsi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(fs_code), fs_code};
+    VkShaderModule vsm, fsm;
+    VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &lb};
+    VkDescriptorSetLayout dsl;
+    VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 1, &pr};
+    VkPipelineLayout pl;
+    if (vkCreateRenderPass(dev, &rpi, NULL, &rp) || vkCreateShaderModule(dev, &vsi, NULL, &vsm) || vkCreateShaderModule(dev, &fsi, NULL, &fsm) ||
+        vkCreateDescriptorSetLayout(dev, &lci, NULL, &dsl) || vkCreatePipelineLayout(dev, &pli, NULL, &pl)) {
+        printf("FAIL %s: no render pass, shaders or layouts\n", name);
         failures++;
         return;
     }
-    for (int k = 0; k < 3; k++) {
-        VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, usage[k], 0, img, VK_IMAGE_VIEW_TYPE_2D, view_fmt,
-                                     {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-        VkImageView v;
-        if (vkCreateImageView(dev, &vci, NULL, &v) != VK_SUCCESS) {
-            printf("FAIL %s: no view (%s)\n", name, what[k]);
+    VkPipelineShaderStageCreateInfo st[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", NULL},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fsm, "main", NULL}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
+                                                 VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_FALSE,
+                                                 VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba = {VK_FALSE, 0, 0, 0, 0, 0, 0, 0xf};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, 0, 1, &cba};
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
+    VkPipelineRenderingCreateInfo prci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &view_fmt, VK_FORMAT_UNDEFINED,
+                                          VK_FORMAT_UNDEFINED};
+    VkGraphicsPipelineCreateInfo gpi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, dynr ? &prci : NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs,
+                                        &ms, NULL, &cb, &ds, pl, dynr ? VK_NULL_HANDLE : rp, 0, VK_NULL_HANDLE, -1};
+    VkPipeline pipe;
+    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipe)) {
+        printf("FAIL %s: no graphics pipeline\n", name);
+        failures++;
+        return;
+    }
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NL};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, NL, 1, &ps};
+    VkDescriptorPool dpool;
+    vkCreateDescriptorPool(dev, &dpi, NULL, &dpool);
+    VkDescriptorSet sets[NL];
+    VkDescriptorSetLayout dsls[NL] = {dsl, dsl};
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dpool, NL, dsls};
+    vkAllocateDescriptorSets(dev, &dai, sets);
+    for (int m = 0; m < NL; m++) {
+        VkDescriptorBufferInfo bi = {db[m], 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[m], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
+        vkUpdateDescriptorSets(dev, 1, &wr, 0, NULL);
+    }
+    VkImageView views[NL];
+    VkFramebuffer fbs[NL];
+    int bad = 0;
+    for (int m = 0; m < NL; m++) {
+        VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img, VK_IMAGE_VIEW_TYPE_2D, view_fmt,
+                                     {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)m, 1, 0, 1}};
+        views[m] = VK_NULL_HANDLE;
+        fbs[m] = VK_NULL_HANDLE;
+        if (vkCreateImageView(dev, &vci, NULL, &views[m]) != VK_SUCCESS) {
+            printf("FAIL %s: no view of level %d\n", name, m);
             bad++;
             continue;
         }
-        if (k == 2) { /* sampled only: made, nothing more to do with it here */
-            vkDestroyImageView(dev, v, NULL);
-            continue;
-        }
-        VkFramebufferCreateInfo fi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &v, S / 4, S / 4, 1};
-        VkFramebuffer fb;
-        if (vkCreateFramebuffer(dev, &fi, NULL, &fb) != VK_SUCCESS) {
-            printf("FAIL %s: no framebuffer (%s)\n", name, what[k]);
+        VkFramebufferCreateInfo fi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &views[m], first[m].bw, first[m].bh, 1};
+        if (!dynr && vkCreateFramebuffer(dev, &fi, NULL, &fbs[m]) != VK_SUCCESS) {
+            printf("FAIL %s: no framebuffer for level %d\n", name, m);
             bad++;
-            vkDestroyImageView(dev, v, NULL);
-            continue;
         }
-        VkClearValue cv;
-        memset(&cv, 0, sizeof(cv));
-        cv.color.uint32[0] = 0x11223344u + (uint32_t)k;
-        VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {S / 4, S / 4}}, 1, &cv};
-        VkCommandBuffer c2 = begin();
-        vkCmdBeginRenderPass(c2, &bi, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdEndRenderPass(c2);
-        vkEndCommandBuffer(c2);
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &c2, 0, NULL};
+    }
+    /* a view only sampled */
+    VkImageViewUsageCreateInfo us = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT};
+    VkImageViewCreateInfo sci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &us, 0, img, VK_IMAGE_VIEW_TYPE_2D, view_fmt,
+                                 {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, 1}};
+    VkImageView sampled;
+    if (vkCreateImageView(dev, &sci, NULL, &sampled) != VK_SUCCESS) {
+        printf("FAIL %s: no sampled-only view\n", name);
+        bad++;
+    } else {
+        vkDestroyImageView(dev, sampled, NULL);
+    }
+    if (!bad) {
+        VkCommandBuffer c = begin();
+        barrier_all(c, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy r[NL] = {{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, H, 1}},
+                                   {n0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {0, 0, 0}, {W / 2, H / 2, 1}}};
+        vkCmdCopyBufferToImage(c, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, NL, r);
+        /* as Zink: the BC image to COLOR_ATTACHMENT_OPTIMAL for the draw, SHADER_READ_ONLY after it (here TRANSFER_SRC) */
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img,
+                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, NL, 0, 1}};
+        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        for (int m = 0; m < NL; m++) {
+            VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fbs[m], {{0, 0}, {first[m].bw, first[m].bh}}, 0, NULL};
+            VkRenderingAttachmentInfo ra = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, views[m], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                            VK_RESOLVE_MODE_NONE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD,
+                                            VK_ATTACHMENT_STORE_OP_STORE, {{{0}}}};
+            VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, rbi.renderArea, 1, 0, 1, &ra, NULL, NULL};
+            /* level 1 with render passes: the viewport set before the pass begins, as Zink leaves it when it did not change */
+            int pre_vp = m == 1 && !dynr;
+            if (pre_vp) {
+                VkViewport pv = {0, 0, (float)first[1].bw, (float)first[1].bh, 0, 1};
+                VkRect2D ps = {{0, 0}, {first[1].bw, first[1].bh}};
+                vkCmdSetViewport(c, 0, 1, &pv);
+                vkCmdSetScissor(c, 0, 1, &ps);
+            }
+            if (dynr) vkCmdBeginRendering(c, &ri);
+            else vkCmdBeginRenderPass(c, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &sets[m], 0, NULL);
+            int32_t pc[4] = {0, 0, (int32_t)first[m].bw, bytes == 8};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+            VkRect2D area = m ? (VkRect2D){{0, 0}, {first[1].bw, first[1].bh}} : vp0;
+            VkViewport v = {(float)area.offset.x, (float)area.offset.y, (float)area.extent.width, (float)area.extent.height, 0, 1};
+            VkRect2D sc = {{0, 0}, {first[m].bw, first[m].bh}};
+            if (!pre_vp) {
+                vkCmdSetViewport(c, 0, 1, &v);
+                vkCmdSetScissor(c, 0, 1, &sc);
+            }
+            vkCmdDraw(c, 3, 1, 0, 0);
+            if (!m) {
+                VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {{{0}}}};
+                const uint8_t *blk = drawn[0].blocks;
+                if (bytes == 16) {
+                    memcpy(ca.clearValue.color.uint32, blk, 16);
+                } else {
+                    for (int k = 0; k < 4; k++) ca.clearValue.color.uint32[k] = (uint32_t)blk[2 * k] | ((uint32_t)blk[2 * k + 1] << 8);
+                }
+                VkClearRect cr = {clr, 0, 1};
+                vkCmdClearAttachments(c, 1, &ca, 1, &cr);
+            }
+            if (dynr) vkCmdEndRendering(c);
+            else vkCmdEndRenderPass(c);
+        }
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        vkEndCommandBuffer(c);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &c, 0, NULL};
         VkResult q = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
         VkResult w = q == VK_SUCCESS ? vkQueueWaitIdle(queue) : q;
-        vkFreeCommandBuffers(dev, pool, 1, &c2);
+        vkFreeCommandBuffers(dev, pool, 1, &c);
         if (w != VK_SUCCESS) {
-            printf("FAIL %s: rendering into the view (%s) failed (%d)\n", name, what[k], w);
+            printf("FAIL %s: the draws into the uncompressed views failed (%d)\n", name, w);
             bad++;
         }
-        vkDestroyFramebuffer(dev, fb, NULL);
-        vkDestroyImageView(dev, v, NULL);
     }
+    double p[NL] = {0, 0};
+    for (int m = 0; !bad && m < NL; m++) {
+        char what[160];
+        snprintf(what, sizeof(what), "%s, level %d", name, m);
+        bad += compare_level(img, f, (uint32_t)m, 0, &want[m], tx ? 0 : 2.5f / 255.0f, what) != 0;
+        p[m] = last_psnr;
+    }
+    if (tx)
+        printf("%s %s%s: blocks drawn into uncompressed %d views (level 0 in a viewport and a cleared rect, level 1 whole) show in the "
+               "texture: PSNR %.1f / %.1f dB\n", bad ? "FAIL" : "PASS", name, dynr ? ", dynamic rendering" : "", (int)view_fmt, p[0], p[1]);
+    else
+        printf("%s %s%s: blocks drawn into uncompressed %d views (level 0 in a viewport and a cleared rect, level 1 whole) show in the "
+               "decoded texture\n", bad ? "FAIL" : "PASS", name, dynr ? ", dynamic rendering" : "", (int)view_fmt);
+    failures += bad != 0;
+    for (int m = 0; m < NL; m++) {
+        if (fbs[m]) vkDestroyFramebuffer(dev, fbs[m], NULL);
+        if (views[m]) vkDestroyImageView(dev, views[m], NULL);
+        vkDestroyBuffer(dev, db[m], NULL);
+        vkFreeMemory(dev, dm[m], NULL);
+        free(first[m].blocks);
+        free(drawn[m].blocks);
+        free(want[m].blocks);
+    }
+    vkDestroyPipeline(dev, pipe, NULL);
+    vkDestroyPipelineLayout(dev, pl, NULL);
+    vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+    vkDestroyDescriptorPool(dev, dpool, NULL);
+    vkDestroyShaderModule(dev, vsm, NULL);
+    vkDestroyShaderModule(dev, fsm, NULL);
     vkDestroyRenderPass(dev, rp, NULL);
-    /* the BC texture itself, after the renders: unchanged */
-    int cmp = compare_level(img, f, 0, 0, &lv, 0, name);
-    if (last_psnr >= 99) cmp = 1; /* decoded: the bridge did not transcode it */
-    printf("%s %s: uncompressed %d views of the image (usage, COLOR_ATTACHMENT, sampled) made and rendered to; texture PSNR %.1f dB\n",
-           bad || cmp ? "FAIL" : "PASS", name, (int)view_fmt, last_psnr);
-    failures += bad || cmp;
-    free(lv.blocks);
     vkDestroyImage(dev, img, NULL);
     vkDestroyBuffer(dev, up, NULL);
     vkFreeMemory(dev, um, NULL);
@@ -2876,6 +3034,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "bc7")) bc7_only = 1;
         else if (!strcmp(argv[i], "mixcopy")) mix_only = 1;
         else if (!strcmp(argv[i], "zink")) zink_only = zink_style = 1;
+        else if (!strcmp(argv[i], "upload")) zink_decoded = 1;
         else if (!strcmp(argv[i], "pcache")) pcache_file = i + 1 < argc ? argv[++i] : "bcn_check-pcache.bin";
         else gpu = atoi(argv[i]);
     }
@@ -2904,6 +3063,20 @@ int main(int argc, char **argv)
     VkPhysicalDeviceFeatures en = {0};
     en.textureCompressionBC = VK_TRUE;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 0, NULL, &en};
+    /* dynamicRendering where the device has it (test_zink_upload records with it too) */
+    VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    if (props.apiVersion >= VK_API_VERSION_1_3) {
+        PFN_vkGetPhysicalDeviceFeatures2 gf2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2");
+        VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
+        if (gf2) gf2(pd, &q2);
+        if (f13.dynamicRendering) {
+            VkPhysicalDeviceVulkan13Features want13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+            want13.dynamicRendering = VK_TRUE;
+            f13 = want13;
+            dci.pNext = &f13;
+            dynr_ok = 1;
+        }
+    }
     if (vkCreateDevice(pd, &dci, NULL, &dev)) return 2;
 #undef G
 #define G(n) n = (PFN_##n)vkGetDeviceProcAddr(dev, #n)
@@ -2913,6 +3086,12 @@ int main(int argc, char **argv)
     G(vkCmdPipelineBarrier); G(vkCmdCopyBufferToImage); G(vkCmdBlitImage); G(vkCmdCopyImageToBuffer); G(vkDestroyImage);
     G(vkDestroyBuffer); G(vkFreeMemory); G(vkCreateImageView); G(vkDestroyImageView); G(vkCmdCopyImage); G(vkFreeCommandBuffers);
     G(vkCreateRenderPass); G(vkDestroyRenderPass); G(vkCreateFramebuffer); G(vkDestroyFramebuffer); G(vkCmdBeginRenderPass); G(vkCmdEndRenderPass);
+    G(vkCreateGraphicsPipelines); G(vkDestroyPipelineLayout); G(vkDestroyDescriptorSetLayout); G(vkDestroyDescriptorPool); G(vkCmdDraw);
+    G(vkCmdSetViewport); G(vkCmdSetScissor); G(vkCmdClearAttachments);
+    if (dynr_ok) {
+        G(vkCmdBeginRendering);
+        G(vkCmdEndRendering);
+    }
     if (props.apiVersion >= VK_API_VERSION_1_3) {
         G(vkCmdCopyBufferToImage2);
         G(vkCmdCopyImage2);
@@ -2987,9 +3166,13 @@ int main(int argc, char **argv)
         test_quality(VK_FORMAT_BC7_UNORM_BLOCK, "BC7, Zink usage", soft, 4);
         test_quality(VK_FORMAT_BC4_UNORM_BLOCK, "BC4, Zink usage", photo, 3);
         test_quality(VK_FORMAT_BC5_UNORM_BLOCK, "BC5, Zink usage", normal, 1);
-        test_zink_views(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC3, Zink uncompressed views");
-        test_zink_views(VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC7, Zink uncompressed views");
-        test_zink_views(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R32G32_UINT, "BC1, Zink uncompressed views");
+        for (int d = 0; d <= dynr_ok; d++) {
+            test_zink_upload(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC3, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC7, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC5, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R16G16B16A16_UINT, "BC1, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_R16G16B16A16_UINT, "BC4, Zink upload through a pixel buffer", d);
+        }
         printf("%s\n", failures ? "FAILED" : "OK");
         return failures ? 1 : 0;
     }
@@ -3085,6 +3268,15 @@ int main(int argc, char **argv)
         test_large(VK_FORMAT_BC5_UNORM_BLOCK, "BC5");
     }
     test_many_cbs();
+    if (!tx && zink_decoded) { /* `bcn_check upload`: Zink's BC uploads through a pixel buffer into the bridge's decoded images (transcoded
+                                * ones: `bcn_check transcode zink`; not on a driver's own BC, which lavapipe does not render into) */
+        zink_style = 1;
+        for (int d = 0; d <= dynr_ok; d++) {
+            test_zink_upload(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC3, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R16G16B16A16_UINT, "BC1 RGBA, Zink upload through a pixel buffer", d);
+        }
+        zink_style = 0;
+    }
     printf("%s\n", failures ? "FAILED" : "OK");
     return failures ? 1 : 0;
 }

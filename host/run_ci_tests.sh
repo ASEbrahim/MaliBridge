@@ -12,6 +12,14 @@ export VKB_RUN_DIR VKBRIDGE_SOCKET=$VKB_RUN_DIR/server.sock VKB_SERVER_LOG=$VKB_
 unset VKBRIDGE_CACHE_DIR VKB_SERVER_PID
 . ./server_start.sh
 trap 'vkb_server_stop; cp -f "$VKB_SERVER_LOG" out/ci-server.log 2>/dev/null; rm -rf "$VKB_RUN_DIR"' EXIT
+# The Mali profile (mali_profile.sh): what the strictest real Mali lacks taken away from lavapipe
+# (VKB_MALI_PROFILE, default common; off = lavapipe as it is). mp_test <profile> <reason> before a check that
+# needs another one, mp_test - after it (the shared server restarted each time).
+. ./mali_profile.sh
+mp_test() {
+  if [ "$1" = - ]; then mp_apply "${VKB_MALI_PROFILE:-common}"; else [ "${VKB_MALI_PROFILE:-common}" = off ] || mp_apply "$1"; fi
+  if [ "$vkb_cur_mode" = mali ]; then . ./mali_env.sh >/dev/null; else . ./bridge_env.sh >/dev/null; fi
+}
 pass=0; fail=0
 result() {
   if [ "$1" = 0 ]; then
@@ -23,19 +31,20 @@ result() {
     # The server's log (protocol errors) and the check's own log (if it exists) reveal why.
     echo "  server log (last 100 lines):"
     tail -n 100 "$VKB_SERVER_LOG" 2>/dev/null | sed 's/^/    /'
-    echo "  server protocol errors: $(grep -cE 'command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry' "$VKB_SERVER_LOG" 2>/dev/null)"
+    echo "  server protocol errors: $(grep -cE 'command stream:|malformed request|unknown command id|the driver has no |named ahead failed|bad batch entry' "$VKB_SERVER_LOG" 2>/dev/null)"
   fi
 }
 # A server-side protocol error fails the run even when the driver shrugs it off (a missing count in
 # vkBeginCommandBuffer's encoding passed every check on RADV and crashed Mali).
 server_errors() {
-  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG" 2>/dev/null)
-  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG")"; return 1; }
+  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no |named ahead failed|bad batch entry" "$VKB_SERVER_LOG" 2>/dev/null)
+  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no |named ahead failed|bad batch entry" "$VKB_SERVER_LOG")"; return 1; }
 }
 run_mode() {
   local mode=$1
   echo "== $mode"
   : > "$VKB_SERVER_LOG"
+  vkb_cur_mode=$mode
   if [ "$mode" = mali ]; then . ./mali_env.sh >/dev/null; else unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API; . ./bridge_env.sh >/dev/null; fi
   timeout 120 ./out/vkbridge-smoke >out/ci-smoke.log 2>&1; result $? "smoke ($(tail -1 out/ci-smoke.log))"
   if [ "$mode" = mali ]; then
@@ -90,7 +99,7 @@ run_mode() {
     # BC decoded as the fallback does (exact). The transcoded variant needs a GPU that samples
     # ETC2/ASTC, which lavapipe does not: it is left to the full suite.
     VKB_BC_TRANSCODE=0 . ./mali_env.sh >/dev/null
-    timeout 600 ./out/bcn_check >out/ci-bcn-decode.log 2>&1; result $? "bcn_check, BC decoded ($(tail -1 out/ci-bcn-decode.log))"
+    timeout 600 ./out/bcn_check upload >out/ci-bcn-decode.log 2>&1; result $? "bcn_check, BC decoded, Zink uploads through a pixel buffer too ($(tail -1 out/ci-bcn-decode.log))"
     # The texture cap (VKBRIDGE_TEX_MAXDIM): BC textures over 512 created without their top levels
     # (memory, every level's colour through views at each LOD, barriers, copies, textureSize); with
     # ",all" a sampled-only RGBA8 one too (clears, blits and readbacks across the cut); with
@@ -111,7 +120,9 @@ run_mode() {
       { [ "$mode" != mali ] || [ "$(grep -c 'null descriptor stand-in made' "$VKB_SERVER_LOG")" -ge 6 ]; }
     result $? "nulldesc_check ($(tail -1 out/ci-nulldesc.log)$([ "$mode" = mali ] && echo "; $(grep -c 'null descriptor stand-in made' "$VKB_SERVER_LOG") stand-in shapes"))"
   fi
+  mp_test r32-r34 # opaque fds need VK_KHR_external_memory_fd: no r18-r26 Mali has it
   if [ -x out/opaque_check ]; then timeout 60 ./out/opaque_check >out/ci-opaque.log 2>&1; result $? "opaque_check ($(tail -1 out/ci-opaque.log))"; fi
+  mp_test -
   # NV12 textures as DXVK makes them (MUTABLE | EXTENDED_USAGE): on mali the refusal is imitated
   # (planarext) and the client makes them without the flag; 77: the driver has no NV12.
   if [ -x out/planar_check ]; then
@@ -227,23 +238,51 @@ run_mode() {
   if [ "$mode" = plain ]; then
     # Version promotion: a 1.1 / 1.2 driver offered as 1.3 (or 1.2 when a piece is missing), core
     # structures and names through the extensions, SPIR-V lowered (the corpus spirv-val clean)
+    mp_test r56 # promotes a driver with every 1.3 piece (no 1.1 Mali has them); its step 9 needs the real 1.4
     timeout 600 ./promote_test.sh >out/ci-promote.log 2>&1; result $? "promote_test ($(tail -1 out/ci-promote.log))" "out/ci-promote.log"
+    mp_test -
     # shm_barrier: barriers between shared-memory writes and reads in compute shaders
     timeout 600 ./shmbarrier_test.sh >out/ci-shmbarrier.log 2>&1; result $? "shmbarrier_test ($(tail -1 out/ci-shmbarrier.log))" "out/ci-shmbarrier.log"
     # wave32: 32-lane subgroups emulated in compute shaders on lavapipe's 8-wide ones
     timeout 600 ./wave32_test.sh >out/ci-wave32.log 2>&1; result $? "wave32_test ($(tail -1 out/ci-wave32.log))" "out/ci-wave32.log"
     # vb_bake: the G68's last-stride-to-every-binding bug imitated, the variants over it
+    mp_test r44 # vbstride_check needs Vulkan 1.3 (vkCmdBindVertexBuffers2)
     timeout 300 ./vbbake_test.sh >out/ci-vbbake.log 2>&1; result $? "vbbake_test ($(tail -1 out/ci-vbbake.log))" "out/ci-vbbake.log"
+    mp_test -
     # MK-11 stencil_layout: a separate stencil layout ignored, the fix's combined one
     timeout 300 ./stencillayout_test.sh >out/ci-stencillayout.log 2>&1; result $? "stencillayout_test ($(tail -1 out/ci-stencillayout.log))" "out/ci-stencillayout.log"
     # Dynamic rendering as render passes: the driver's own, emulated at 1.2, switched off, promoted
+    mp_test r44 # steps 1-2 need a driver with dynamic rendering at 1.2+
     timeout 300 ./dynrend_test.sh >out/ci-dynrend.log 2>&1; result $? "dynrend_test ($(tail -1 out/ci-dynrend.log))" "out/ci-dynrend.log"
+    mp_test -
+    # Imageless framebuffers made by the bridge (Mali r18-r26: Zink requires them); the test picks its profiles
+    timeout 600 ./imageless_test.sh >out/ci-imageless.log 2>&1; result $? "imageless_test ($(tail -1 out/ci-imageless.log))" "out/ci-imageless.log"
     # The G715 r54p3's robustness2 (nullDescriptor only): both robust-access features taken off
+    mp_test r54 # r54p3's robustness2 without robust access; older families have no VK_EXT_robustness2
     timeout 600 ./robust2_test.sh >out/ci-robust2.log 2>&1; result $? "robust2_test ($(tail -1 out/ci-robust2.log))" "out/ci-robust2.log"
+    mp_test -
     # MK-20 fp16_hide: a wrong 16-bit driver has shaderFloat16 hidden (storage kept)
+    mp_test r56 # a profile below 1.4 installs the promotion's feature query, which drops fp16_hide's (latent bug)
     timeout 600 ./fp16_test.sh >out/ci-fp16.log 2>&1; result $? "fp16_test ($(tail -1 out/ci-fp16.log))" "out/ci-fp16.log"
+    mp_test -
     # Asynchronous pipeline compiles with a slow compiler imitated
     timeout 300 ./asyncpipe_test.sh >out/ci-asyncpipe.log 2>&1; result $? "asyncpipe_test ($(tail -1 out/ci-asyncpipe.log))" "out/ci-asyncpipe.log"
+    # A lost device stays its program's; driver faults in allocations and binds contained
+    timeout 300 ./lost_test.sh >out/ci-lost.log 2>&1; result $? "lost_test ($(tail -1 out/ci-lost.log))" "out/ci-lost.log"
+    timeout 300 ./memfault_test.sh >out/ci-memfault.log 2>&1; result $? "memfault_test ($(tail -1 out/ci-memfault.log))" "out/ci-memfault.log"
+    timeout 300 ./endcb_test.sh >out/ci-endcb.log 2>&1; result $? "endcb_test ($(tail -1 out/ci-endcb.log))" "out/ci-endcb.log"
+    timeout 300 ./xfb_bind_test.sh >out/ci-xfb-bind.log 2>&1; result $? "xfb_bind_test ($(tail -1 out/ci-xfb-bind.log))" "out/ci-xfb-bind.log"
+    # One guard around a connection's driver calls (No Man's Sky's draw fault's submit fault) and the
+    # capability check before the driver (ULTRAKILL / No Man's Sky: a clip distance built-in Mali's compiler died on)
+    timeout 300 ./reqguard_test.sh >out/ci-reqguard.log 2>&1; result $? "reqguard_test ($(tail -1 out/ci-reqguard.log))" "out/ci-reqguard.log"
+    timeout 60 ./out/capgate_unit ../tests/corpus >out/ci-capgate-unit.log 2>&1; result $? "capgate_unit ($(tail -1 out/ci-capgate-unit.log))" "out/ci-capgate-unit.log"
+    timeout 300 ./capgate_test.sh >out/ci-capgate.log 2>&1; result $? "capgate_test ($(tail -1 out/ci-capgate.log))" "out/ci-capgate.log"
+    # What a process gone without destroying its device leaves in the server: destroyed, the heap flat
+    timeout 300 ./exitheap_test.sh >out/ci-exitheap.log 2>&1; result $? "exitheap_test ($(tail -1 out/ci-exitheap.log))" "out/ci-exitheap.log"
+    # the wire primitives (inline encoder/decoder fields) against a byte-wise model; no driver
+    timeout 300 ./out/wire_check >out/ci-wire.log 2>&1; result $? "wire_check ($(tail -1 out/ci-wire.log))" "out/ci-wire.log"
+    # The bridge's VK_EXT_memory_budget where the driver has none (every Mali): its values per MemAvailable
+    timeout 300 ./membudget_test.sh >out/ci-membudget.log 2>&1; result $? "membudget_test ($(tail -1 out/ci-membudget.log))" "out/ci-membudget.log"
   fi
 }
 # The KHR-only divisor drivers (host/run_tests.sh has them) are left out: they need a driver whose
@@ -254,5 +293,5 @@ run_mode plain
 server_errors; result $? "no protocol errors in the server log (plain)"
 run_mode mali
 server_errors; result $? "no protocol errors in the server log (mali)"
-echo "== $pass passed, $fail failed"
+echo "== $pass passed, $fail failed (Mali profile ${VKB_MALI_PROFILE:-common})"
 [ "$fail" = 0 ]

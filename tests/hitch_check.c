@@ -21,12 +21,19 @@
  * Prints "action <name> frame <n>" (n: the present that ends the slow frame, counted from 1, as
  * the hitch line's frame=) and "OK: ..." / "FAILED: ..." last. --engine names the instance's
  * engine (DXVK: the client's DXVK config check runs at the first present).
+ *
+ *   --steady MS      after the plan, ordinary frames (about 60 a second, each waited for with
+ *                    vkWaitForFences) for MS ms: the frames lines' smooth windows, the wait lines
+ *   --bench F R      instead of the plan: F frames of R round trips each (vkGetPipelineCacheData's
+ *                    size, which the server answers) and no sleep; prints the frames' wall and CPU
+ *                    time ("BENCH ..."), what the default-on statistics cost (host/hitch_test.sh)
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,7 +61,22 @@ I(vkWaitForFences); I(vkResetFences); I(vkCreateShaderModule); I(vkCreateDescrip
 I(vkCreateComputePipelines); I(vkDestroyPipeline); I(vkGetPhysicalDeviceMemoryProperties); I(vkAllocateMemory); I(vkFreeMemory);
 I(vkCreateImage); I(vkGetImageMemoryRequirements); I(vkBindImageMemory); I(vkCreateBuffer); I(vkGetBufferMemoryRequirements);
 I(vkBindBufferMemory); I(vkMapMemory); I(vkCmdCopyBufferToImage); I(vkResetCommandBuffer); I(vkDestroyImage); I(vkDestroyBuffer);
+I(vkCreatePipelineCache); I(vkGetPipelineCacheData);
 #undef I
+
+static double mono_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static double cpu_s(void)
+{
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+}
 
 static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
 {
@@ -193,10 +215,12 @@ int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *engine = "vkbridge";
-    int first = 1;
+    int first = 1, steady_ms = 0, bench_frames = 0, bench_rt = 0;
     while (first < argc && argv[first][0] == '-') {
         if (!strcmp(argv[first], "--engine") && first + 1 < argc) engine = argv[++first];
         else if (!strcmp(argv[first], "--ms") && first + 1 < argc) hold_ms = atoi(argv[++first]);
+        else if (!strcmp(argv[first], "--steady") && first + 1 < argc) steady_ms = atoi(argv[++first]);
+        else if (!strcmp(argv[first], "--bench") && first + 2 < argc) bench_frames = atoi(argv[++first]), bench_rt = atoi(argv[++first]);
         first++;
     }
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
@@ -224,6 +248,7 @@ int main(int argc, char **argv)
     G(vkCreateComputePipelines); G(vkDestroyPipeline); G(vkGetPhysicalDeviceMemoryProperties); G(vkAllocateMemory); G(vkFreeMemory);
     G(vkCreateImage); G(vkGetImageMemoryRequirements); G(vkBindImageMemory); G(vkCreateBuffer); G(vkGetBufferMemoryRequirements);
     G(vkBindBufferMemory); G(vkMapMemory); G(vkCmdCopyBufferToImage); G(vkResetCommandBuffer); G(vkDestroyImage); G(vkDestroyBuffer);
+    G(vkCreatePipelineCache); G(vkGetPipelineCacheData);
 #undef G
     uint32_t n = 1;
     vkEnumeratePhysicalDevices(inst, &n, &pd);
@@ -303,9 +328,26 @@ int main(int argc, char **argv)
     vkCreateFence(dev, &fci, NULL, &acq_fence);
     vkCreateFence(dev, &fci, NULL, &work_fence);
 
-    /* the plan: 3 ordinary frames, then per action one slow frame and 3 ordinary ones */
-    int nact = argc - first, total = 3 + nact * 4, presents = 0, failed = 0;
-    for (int f = 0; f < total && !failed; f++) {
+    VkPipelineCache pcache = VK_NULL_HANDLE;
+    if (bench_frames) {
+        VkPipelineCacheCreateInfo pcci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        if (vkCreatePipelineCache(dev, &pcci, NULL, &pcache)) {
+            printf("FAILED: setup: vkCreatePipelineCache\n");
+            return 2;
+        }
+    }
+    double b_wall0 = 0, b_cpu0 = 0;
+    /* the plan: 3 ordinary frames, then per action one slow frame and 3 ordinary ones (--bench: its
+     * frames, after 20 to warm up; --steady: then ordinary frames for that long) */
+    int nact = bench_frames ? 0 : argc - first, total = bench_frames ? bench_frames + 20 : 3 + nact * 4, presents = 0, failed = 0;
+    double steady_end = 0;
+    for (int f = 0; !failed; f++) {
+        if (f >= total) {
+            if (!steady_ms || bench_frames) break;
+            if (!steady_end) steady_end = mono_s() + steady_ms / 1000.0;
+            if (mono_s() >= steady_end) break;
+        }
+        if (bench_frames && f == 20) b_wall0 = mono_s(), b_cpu0 = cpu_s();
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(dev, sc, 5000000000ull, VK_NULL_HANDLE, acq_fence, &idx);
         if (r < 0) {
@@ -315,7 +357,7 @@ int main(int argc, char **argv)
         vkWaitForFences(dev, 1, &acq_fence, VK_TRUE, 5000000000ull);
         vkResetFences(dev, 1, &acq_fence);
         int k = f - 3;
-        if (k >= 0 && k % 4 == 0) {
+        if (k >= 0 && k % 4 == 0 && k / 4 < nact) {
             const char *a = argv[first + k / 4];
             if (!act(a)) {
                 printf("FAILED: action %s\n", a);
@@ -333,10 +375,31 @@ int main(int argc, char **argv)
             printf("FAILED: present %d at frame %d\n", r, f);
             return 1;
         }
+        if (bench_frames) {
+            for (int i = 0; i < bench_rt; i++) {
+                size_t sz = 0;
+                vkGetPipelineCacheData(dev, pcache, &sz, NULL);
+            }
+            continue;
+        }
+        if (f >= total) { /* --steady: about 60 frames a second, each waited for */
+            VkSubmitInfo wi = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            vkQueueSubmit(queue, 1, &wi, work_fence);
+            vkWaitForFences(dev, 1, &work_fence, VK_TRUE, 5000000000ull);
+            vkResetFences(dev, 1, &work_fence);
+            usleep(16000);
+            continue;
+        }
         usleep(5000); /* ordinary frames: a few ms */
     }
     vkDeviceWaitIdle(dev);
     if (failed) return 1;
+    if (bench_frames) {
+        double wall = mono_s() - b_wall0, cpu = cpu_s() - b_cpu0;
+        printf("BENCH frames=%d rt=%d wall_us_per_frame=%.1f cpu_us_per_frame=%.1f wall_ns_per_rt=%.0f cpu_ns_per_rt=%.0f\n", bench_frames,
+               bench_rt, wall * 1e6 / bench_frames, cpu * 1e6 / bench_frames, bench_rt ? wall * 1e9 / ((double)bench_frames * bench_rt) : 0.0,
+               bench_rt ? cpu * 1e9 / ((double)bench_frames * bench_rt) : 0.0);
+    }
     printf("OK: %d frames, %d slow on purpose\n", presents, nact);
     return 0;
 }

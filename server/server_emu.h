@@ -12,7 +12,7 @@
                              VKB_EMU_MAINT6 | VKB_EMU_LOADSTORE_NONE | VKB_EMU_PUSH_DESC | VKB_EMU_TEXEL_ALIGN | \
                              VKB_EMU_DESC_LIMITS | VKB_EMU_OPAQUE_FD | VKB_EMU_MULTI_DRAW | VKB_EMU_ROBUST2_ACCESS | \
                              VKB_EMU_DYN_RENDER | VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX | VKB_EMU_TIMELINE | \
-                             VKB_EMU_DMABUF_AHB)
+                             VKB_EMU_DMABUF_AHB | VKB_EMU_IMAGELESS | VKB_EMU_MEM_BUDGET)
 
 #define VKB_EMU_BUCKETS 1024
 
@@ -28,6 +28,7 @@ typedef struct vkb_emu_image {
     uint32_t drop;            /* VKBRIDGE_TEX_MAXDIM: the app's top levels not created (app level m is level m - drop here) */
     int linear_mod;           /* a modifier-list dma-buf image made plain LINEAR (reports the LINEAR modifier) */
     int64_t bc_fallback;      /* BC decoded over VKBRIDGE_BC_TX_BUDGET: the bytes that costs over transcoding it */
+    int bc_fast;              /* BC transcoded with the fast search at every level (the auto budget, short of texels) */
     VkImageUsageFlags client_usage; /* BC: the usage the app asked for (the transcoded image has no COLOR_ATTACHMENT) */
     struct bc_sink *sinks;    /* BC transcoded: stand-ins for uncompressed views the app may render to (server_emu_bcn.c) */
     struct vkb_emu_image *next;
@@ -51,6 +52,7 @@ typedef struct vkb_emu_device {
     void *shaders;   /* server_emu_shader.c */
     void *polygon;   /* server_emu_polygon.c */
     void *texcap;    /* server_texcap.c */
+    void *bcsink;    /* server_emu_bcn.c: blocks drawn into uncompressed views of BC images; freed with the device */
 } vkb_emu_device;
 
 /* command buffer state (server_emu_cmdstate.c) */
@@ -65,6 +67,9 @@ void *vkb_emu_cb_dynrend(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
 /* dynamic rendering as render passes (server_emu_dynrend.c) */
 void vkb_emu_dynrend_install(vkb_srv_table *dev);
 void vkb_emu_dynrend_uninstall(vkb_srv_table *dev);
+/* imageless framebuffers on a driver without them (server_emu_imageless.c) */
+void vkb_emu_imageless_install(vkb_srv_table *dev);
+void vkb_emu_imageless_uninstall(vkb_srv_table *dev);
 void vkb_emu_dynrend_cb_reset(vkb_emu_device *e, void *fbs);
 void vkb_emu_dynrend_cb_free(vkb_emu_device *e, void *fbs);
 VkCommandPool vkb_emu_cb_origin(vkb_emu_device *e, VkCommandBuffer cb, int *secondary, uint32_t *begin_flags);
@@ -84,6 +89,7 @@ VkDeviceSize vkb_emu_buffer_size(vkb_emu_device *e, VkBuffer b); /* 0: not track
 /* vertex attribute divisor (server_emu_divisor.c) */
 typedef struct div_info div_info;
 size_t vkb_emu_divisor_info_size(void);
+int vkb_emu_divisor_refused(const div_info *info); /* the emulation cannot draw it: the pipeline is refused */
 void vkb_emu_divisor_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, div_info *out);
 void vkb_emu_divisor_created(vkb_emu_device *e, VkDevice device, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo *ci,
                              VkPipeline p, div_info *info);
@@ -102,6 +108,12 @@ int vkb_emu_bcn_blocks_readback(vkb_emu_device *e, VkImage img);
 /* The command buffer's decode scratch goes back to the device (the buffer is begun again, reset or freed). */
 void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch);
 VkDeviceSize vkb_emu_bcn_scratch_live(void);
+/* Back-to-back BC uploads of a replayed command stream share one barrier pair (server_emu_bcn.c):
+ * vkb_emu_bc_batch_open is set while one waits for its copies; the replay (server_conn.c) flushes
+ * it before any other command and before the driver's End, or drops it with a stream cut short. */
+extern __thread int vkb_emu_bc_batch_open;
+void vkb_emu_bcn_batch_flush(void);
+void vkb_emu_bcn_batch_drop(void);
 /* the startup probe builds each transcoder on the driver (server_probe.c) */
 int vkb_emu_bcn_transcoders(void);
 const char *vkb_emu_bcn_transcoder_name(int i, uint32_t *probe_flag);
@@ -138,6 +150,7 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci, int que
 /* after the driver's vkCreateImage for that create info: r the tracked image, NULL if it failed */
 void vkb_emu_bcn_image_made(vkb_emu_device *e, vkb_emu_image *r);
 void vkb_emu_image_release(vkb_emu_device *e, vkb_emu_image *img);
+void vkb_emu_bcsink_free(vkb_emu_device *e);
 /* Rewrites a graphics pipeline's shaders; temporary modules are appended to mods. */
 void vkb_emu_shader_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
                              uint32_t *nmods, uint32_t cap);
@@ -149,6 +162,7 @@ int vkb_emu_dumping(void);
 void vkb_emu_shader_drop_second_output(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
                                        uint32_t *nmods, uint32_t cap);
 int vkb_emu_bgr10_for(const vkb_srv_table *inst, VkPhysicalDevice pd); /* VKB_EMU_BGR10_VTX for this instance's clients */
+int vkb_emu_membudget_for(const vkb_srv_table *t); /* VKB_EMU_MEM_BUDGET for this client: DXVK and vkd3d-proton */
 int vkb_emu_driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd); /* the driver has VK_EXT_vertex_input_dynamic_state */
 int vkb_emu_driver_eds(const vkb_dispatch *d, VkPhysicalDevice pd); /* the driver has usable extended dynamic state 1 and 2 */
 void vkb_emu_shader_call_end(void); /* frees the stages rewritten during this vkCreateGraphicsPipelines */
@@ -171,6 +185,9 @@ int vkb_emu_faked(const char *t);
 int vkb_emu_planar_ext_refused(VkFormat f, VkImageCreateFlags flags);
 /* VKBRIDGE_FAKE_MISSING=dmabufmod: a DRM-modifier dma-buf storage / mutable image (query or modifier-list create chain), refused as r32p1 likely does */
 int vkb_emu_dmabufmod_refused(VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, const void *chain);
+/* VKBRIDGE_FAKE_MISSING=linearstorage: a LINEAR image with storage usage, refused as r18p0 (Kirin 810) likely does */
+int vkb_emu_linearstorage_refused(VkImageTiling tiling, VkImageUsageFlags usage);
+void vkb_emu_linearstorage_instance_init(vkb_srv_table *t);
 void vkb_emu_vb_sizes_resolve(vkb_emu_device *e, uint32_t n, const VkBuffer *buffers, const VkDeviceSize *offsets,
                               const VkDeviceSize *sizes);
 int vkb_emu_ext_hidden(const char *name);
@@ -189,10 +206,11 @@ int vkb_dab_on(void);
 int vkb_dab_linear_modifier(void); /* the LINEAR modifier offered (LINEAR passed the start's check) */
 int vkb_dab_hides(const char *name); /* a driver extension its clients are not shown (where the path is on) */
 const char *const *vkb_dab_driver_exts(uint32_t *n);
+void vkb_dab_linear_usage(vkb_srv_table *t, VkImageCreateInfo *ci); /* a LINEAR-modifier image's usage where the driver refuses the asked one */
 void vkb_dab_instance_install(vkb_srv_table *t);
 void vkb_dab_device_init(vkb_srv_table *t, uint32_t emu);
 void vkb_dab_device_destroy(vkb_srv_table *t);
-void vkb_dab_image_create(vkb_emu_device *e, VkImageCreateInfo *ci, vkb_dab_note *n);
+VkResult vkb_dab_image_create(vkb_emu_device *e, VkImageCreateInfo *ci, vkb_dab_note *n); /* LINEAR-only mode: a dma-buf image that cannot be LINEAR refused */
 void vkb_dab_image_created(vkb_emu_device *e, VkImage image, const VkImageCreateInfo *ci, const vkb_dab_note *n);
 void vkb_dab_image_destroyed(vkb_emu_device *e, VkImage image);
 /* 0: not a dma-buf allocation of its; 1 an export, 2 an import, made or refused (*res) */

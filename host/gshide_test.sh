@@ -62,7 +62,7 @@ hidden() {
   for k in v10.geometryShader f2.geometryShader geometryStreams v10.maxGeometryOutputVertices p2.maxGeometryOutputVertices \
            maxGeometryShaderInvocations subgroupGeometry; do [ "$(f $k)" = 0 ] || return 1; done
   [ "$(f tessellationShader)" = "$(echo "$native" | grep -o 'tessellationShader=[0-9]*' | cut -d= -f2)" ] &&
-    [ "$(f subgroupVertex)" = 1 ] && echo "$got" | grep -q "^device: .*: 0$" &&
+    [ "$(f subgroupVertex)" = "$(echo "$native" | grep -o 'subgroupVertex=[0-9]*' | cut -d= -f2)" ] && echo "$got" | grep -q "^device: .*: 0$" &&
     echo "$new" | grep -q "errata: gs_hide: gshide_check enabled geometryShader anyway; taken off its device"
 }
 trap 'stop; rm -f "$sock"; [ -n "$KEEP" ] && echo "kept $work" || rm -rf "$work"' EXIT
@@ -106,7 +106,13 @@ step $? "r38p1 beta, VKBRIDGE_GS_HIDE_PROCS=* from <cache dir>/env: hidden ($(su
 stop
 
 # 2
-if ! docker image inspect vkb-arch-gamescope >/dev/null 2>&1 || [ ! -x /usr/bin/x11perf ] || [ -z "${WAYLAND_DISPLAY:-}" ]; then
+skip2=
+nodma=$(grep -h -m1 "memory sharing: dmabuf unavailable" "$work"/a/s/vkbridge-server.log 2>/dev/null)
+[ -n "$nodma" ] && skip2="the host driver exports no dma-bufs (lavapipe: gamescope's vkAllocateMemory for its textures fails; needs a real GPU)"
+if [ -n "$skip2" ]; then
+  echo "  SKIP steps 2a-2c (3 steps): $skip2"
+  skipped=3
+elif ! docker image inspect vkb-arch-gamescope >/dev/null 2>&1 || [ ! -x /usr/bin/x11perf ] || [ -z "${WAYLAND_DISPLAY:-}" ]; then
   echo "  (skipped: gamescope + Xwayland steps need the vkb-arch-gamescope image, /usr/bin/x11perf and a Wayland desktop)"
 else
   cat > "$work/inner.sh" <<'EOF'
@@ -159,4 +165,4 @@ EOF
   step $? "the S10 / Note10+ phone's setup (beta, job manager, Vulkan 1.1): gs_hide and a1 on, Xwayland draws every x11perf test ($n) and lives"
 fi
 
-if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi
+if [ $fails = 0 ]; then echo "OK: $steps steps${skipped:+ (SKIP: $skipped steps, $skip2)}"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

@@ -270,6 +270,11 @@ static VkImage img;
 static VkBuffer rbuf, ibuf, indbuf;
 static uint32_t *rb;
 static VkCommandPool cpool;
+/* llvmpipe (Mesa 26.1, reproduced without the bridge) draws nothing from a linked pipeline once the
+ * libraries it was linked from are destroyed, which the spec allows: there they are kept until the
+ * end, and the case that destroys them is a SKIP that says so, not a pass. */
+static int keep_libs;
+static VkPipeline kept_libs[4];
 
 typedef struct {
     VkPipeline p;
@@ -381,7 +386,10 @@ static int make_gpl(pipe *p, VkRenderPass prp, VkPipelineLayout ppl)
     gp.layout = ppl;
     gp.basePipelineIndex = -1;
     VkResult r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, NULL, &p->p);
-    for (int i = 0; i < 4; i++) vkDestroyPipeline(dev, lib[i], NULL);
+    for (int i = 0; i < 4; i++) {
+        if (keep_libs) kept_libs[i] = lib[i];
+        else vkDestroyPipeline(dev, lib[i], NULL);
+    }
     return r;
 }
 
@@ -514,6 +522,7 @@ int main(int argc, char **argv)
         return 0;
     }
     int geom = f2.features.geometryShader;
+    keep_libs = gpl && strstr(props.deviceName, "llvmpipe") != NULL;
     printf("GPU: %s, Vulkan %u.%u; extended dynamic state %d, multi-viewport with ViewportIndex %d, geometry %d, pipeline libraries %d, "
            "maxViewports %u\n", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), eds, multi,
            geom, gpl, props.limits.maxViewports);
@@ -817,7 +826,10 @@ int main(int argc, char **argv)
         cb = begin();
         v[0] = VP(0, 32, 32, -32), s[0] = FULL;
         draw(cb, &P[GPL], 1, v, s, 0.3f, D_DRAW);
-        finish(cb, CASE("graphics pipeline library, linked (the libraries gone): negative viewport"), 0);
+        finish(cb, CASE(keep_libs ? "graphics pipeline library, linked (libraries kept: llvmpipe): negative viewport"
+                                  : "graphics pipeline library, linked (the libraries gone): negative viewport"), 0);
+        if (keep_libs)
+            printf("SKIP graphics pipeline library with the libraries destroyed after linking: llvmpipe draws nothing then (same without the bridge)\n");
         cb = begin();
         v[0] = VP(0, 0, 16, 32), s[0] = SC(0, 0, 16, 32);
         draw(cb, &P[GPL], 1, v, s, 0.3f, D_DRAW);
@@ -829,9 +841,11 @@ int main(int argc, char **argv)
     }
     for (int i = 0; i < NP; i++)
         if (have[i]) vkDestroyPipeline(dev, P[i].p, NULL);
+    for (int i = 0; i < 4; i++)
+        if (kept_libs[i]) vkDestroyPipeline(dev, kept_libs[i], NULL);
     vkDeviceWaitIdle(dev);
     vkDestroyDevice(dev, NULL);
     vkDestroyInstance(inst, NULL);
-    printf("%d checks, %d failed\n", checks, failures);
+    printf("%d checks, %d failed%s\n", checks, failures, keep_libs ? " (1 SKIPPED: GPL with libraries destroyed after linking, llvmpipe bug)" : "");
     return failures ? 1 : 0;
 }

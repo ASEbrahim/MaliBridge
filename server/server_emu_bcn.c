@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * BC1-BC7 textures on a GPU without them (textureCompressionBC missing; DXVK and vkd3d-proton
  * refuse such a device). The image the app creates in a BC format is created decoded instead
@@ -36,6 +35,7 @@
  * need a BC encoder), and copies between transcoded images of different block sizes.
  */
 #define _GNU_SOURCE
+#include "server_bc_auto.h"
 #include "server_emu.h"
 #include "vkb_emu_formats.h"
 #include "bc_spv.h"
@@ -85,6 +85,23 @@ typedef struct bcn_cb {      /* a command buffer's scratch */
     VkDeviceSize used;
     chunk *stage;            /* blocks copied out of uncompressed images, apart from the decode scratch */
     uint32_t nstage, capstage;
+    /* blocks drawn into uncompressed views (bc_sink): the render pass (rendering) being recorded */
+    VkRect2D vp;             /* the viewports of the last vkCmdSetViewport, as one rect (while sink views exist) */
+    int vp_known;
+    uint32_t npass;          /* sink attachments of the render pass instance being recorded */
+    struct pass_sink {
+        VkImage bc;
+        struct bc_sink *sink;
+        uint32_t layer0, layers;
+        VkImageLayout fin;   /* the layout the attachment is left in (the app's image as it sees it, and the sink) */
+    } pass[4];
+    VkRect2D area;           /* its renderArea */
+    VkRect2D drawn[8];       /* what the viewports set and the rects cleared in it cover (more: their bounding box) */
+    uint32_t ndrawn;
+    int vp_in, clear_in;     /* a viewport was set in it, a rect cleared in it */
+    VkRect2D pre;            /* the viewport in effect when it began (pre_known), for draws before any is set in it */
+    int pre_known;
+    int whole;               /* the renderArea (a clear at load, secondary command buffers, nothing known) */
 } bcn_cb;
 
 #define WARM_THREADS 2
@@ -115,6 +132,12 @@ typedef struct bcn_state {
     uint64_t *pin;           /* shapes whose memory requirements were asked before an image (budget_take), PIN_SLOTS */
     uint32_t npin;
     int pin_full;
+    /* VKBRIDGE_BC_TX_BUDGET=auto (budget_auto): this GPU's rate and burst, whether short images may be
+     * encoded fast instead of decoded, and how the numbers were found */
+    double auto_rate, auto_burst;
+    int auto_fast;
+    char auto_why[96];
+    int batch;               /* VKBRIDGE_BC_BATCH (default 1): back-to-back uploads share one barrier pair (bc_batch) */
 } bcn_state;
 
 typedef struct pc_t {
@@ -298,6 +321,7 @@ static uint32_t raw_texel(int raw, VkFormat decoded, uint32_t *flags)
 static uint32_t level_quality(const bcn_state *s, const vkb_emu_image *img, uint32_t mip)
 {
     if (s->quality != QUALITY_AUTO) return s->quality;
+    if (img->bc_fast) return 0; /* the auto budget, short of texels: fast everywhere (budget_take) */
     uint32_t w = img->extent.width >> mip, h = img->extent.height >> mip;
     return (uint64_t)(w ? w : 1) * (h ? h : 1) >= AUTO_FAST_TEXELS ? 0 : 1;
 }
@@ -457,21 +481,54 @@ static VkFormat packed_format(const bcn_state *s, const VkImageCreateInfo *ci, c
  * before making one (vkGetDeviceImageMemoryRequirements: vkd3d's placed resources) are always
  * transcoded: the size it was told is the size it gets. BC1 -> ASTC direct (VKBRIDGE_BC1_ASTC) counts
  * at its low cost but is never decoded. */
-/* Off unless asked for: on in Dark Souls III's built-in preset (presets_builtin.inc), where the
- * transcode freezes were seen; anywhere else from a preset file, <cache dir>/env or the server's
- * environment. 32:4 is the value to ask for: host, G720-calibrated (FEAT-bc-budget.md), a
- * 32-texture burst 313 -> 86 ms. */
+/* auto (2026-11-04): on Mali GPUs a bucket sized to the GPU
+ * (budget_auto), on other GPUs no budget. Off by default (BUDGET_DEFAULT) until the Ultra A/B. A number
+ * means what it did before (Dark Souls III's built-in preset sets 32:4 on the G925 / G720, where
+ * the transcode freezes were seen; 32:4 is host, G720-calibrated, FEAT-bc-budget.md, a 32-texture
+ * burst 313 -> 86 ms); 0 or off: no budget. Under auto, three things differ from a number:
+ *   - an image's texels at levels the default search encodes (auto quality: under 1024x1024) count
+ *     AUTO_DEFAULT_COST times (the default search is 1.3-4x the fast one's GPU time on the tablets;
+ *     the weights below were measured on 4096 chains, encoded fast);
+ *   - an image the bucket is short for is first encoded with the fast search at every level when
+ *     that fits (no memory cost; 0.2-2 dB PSNR on those levels), and only decoded when even that
+ *     does not (not on the Immortalis G1 / G2 class: their fast search is what showed the D9500's
+ *     green squares, DroidDeck#218);
+ *   - the decoded images' extra memory is capped lower (AUTO_FALLBACK: a 48th of the heap, 64-256 MB:
+ *     8 GB phones are where memory runs out). */
 #define BUDGET_DEFAULT "0"
 #define PIN_SLOTS 4096 /* per device; full: no more decoding over the budget on it */
+#define AUTO_DEFAULT_COST 2.0
+#define AUTO_HIGH_COST 3.0
 
 typedef struct budget_cfg {
     double rate, burst; /* million texels a second, million texels */
+    int is_auto;
 } budget_cfg;
 
-static int budget_get(budget_cfg *c)
+/* VKBRIDGE_TEST_BC_GPU_NAME (host tests, the server's environment only): the device name budget_auto
+ * reads ('_' for a space, for scripts that split words). */
+static const char *auto_name(const char *real)
+{
+    static char name[64];
+    const char *t = getenv("VKBRIDGE_TEST_BC_GPU_NAME");
+    if (!t || !*t) return real;
+    snprintf(name, sizeof(name), "%s", t);
+    for (char *c = name; *c; c++)
+        if (*c == '_') *c = ' ';
+    return name;
+}
+
+/* The budget for an image on s's device: 0 none, else c filled. */
+static int budget_get(const bcn_state *s, budget_cfg *c)
 {
     const char *v = vkb_srv_env("VKBRIDGE_BC_TX_BUDGET");
     if (!v || !*v) v = BUDGET_DEFAULT;
+    c->is_auto = 0;
+    if (!strcmp(v, "auto")) {
+        if (!s || !(s->auto_rate > 0)) return 0;
+        c->rate = s->auto_rate, c->burst = s->auto_burst, c->is_auto = 1;
+        return 1;
+    }
     char *end;
     double r = strtod(v, &end), b = 0;
     if (*end == ':' || *end == ',') b = strtod(end + 1, NULL);
@@ -507,6 +564,21 @@ static uint64_t image_texels(const VkImageCreateInfo *ci)
     return n * (ci->imageType == VK_IMAGE_TYPE_3D ? 1 : ci->arrayLayers);
 }
 
+/* auto: the image's texels weighted by each level's search (fast 1, default AUTO_DEFAULT_COST, high
+ * AUTO_HIGH_COST), as level_quality picks it; all_fast: as if every level were fast. */
+static double image_cost_q(const bcn_state *s, const VkImageCreateInfo *ci, int all_fast)
+{
+    double n = 0;
+    for (uint32_t m = 0; m < ci->mipLevels && m < 32; m++) {
+        uint64_t w = ci->extent.width >> m, h = ci->extent.height >> m, d = ci->extent.depth >> m;
+        w = w ? w : 1, h = h ? h : 1;
+        double t = (double)(w * h * (ci->imageType == VK_IMAGE_TYPE_3D ? (d ? d : 1) : 1));
+        uint32_t q = all_fast ? 0 : s->quality != QUALITY_AUTO ? s->quality : w * h >= AUTO_FAST_TEXELS ? 0 : 1;
+        n += t * (q == 0 ? 1.0 : q == 2 ? AUTO_HIGH_COST : AUTO_DEFAULT_COST);
+    }
+    return n * (ci->imageType == VK_IMAGE_TYPE_3D ? 1 : ci->arrayLayers);
+}
+
 /* What decoding an image costs in memory over transcoding it to t, in bytes. */
 static int64_t fallback_bytes(const bcn_state *s, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl, VkFormat t)
 {
@@ -525,16 +597,17 @@ static int64_t fallback_bytes(const bcn_state *s, const VkImageCreateInfo *ci, c
 
 /* VKBRIDGE_BC_TX_FALLBACK_MB: the most decoded-over-the-budget images may cost over transcoded
  * ones, all devices; by default a 16th of the largest device-local heap, 128-512 MB. */
-static int64_t fallback_cap(const bcn_state *s)
+static int64_t fallback_cap(const bcn_state *s, int is_auto)
 {
     const char *v = vkb_srv_env("VKBRIDGE_BC_TX_FALLBACK_MB");
     if (v && *v) return (int64_t)atol(v) << 20;
     VkDeviceSize heap = 0;
     for (uint32_t i = 0; i < s->mp.memoryHeapCount; i++)
         if ((s->mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && s->mp.memoryHeaps[i].size > heap) heap = s->mp.memoryHeaps[i].size;
-    int64_t cap = (int64_t)(heap / 16);
-    if (cap < (128ll << 20)) cap = 128ll << 20;
-    if (cap > (512ll << 20)) cap = 512ll << 20;
+    /* auto: a 48th, 64-256 MB (AUTO_FALLBACK); a number: a 16th, 128-512 MB */
+    int64_t cap = (int64_t)(heap / (is_auto ? 48 : 16)), lo = (is_auto ? 64ll : 128ll) << 20, hi = (is_auto ? 256ll : 512ll) << 20;
+    if (cap < lo) cap = lo;
+    if (cap > hi) cap = hi;
     return cap;
 }
 
@@ -577,20 +650,22 @@ static struct {
     int started;
     double tokens;          /* million texels (BC7 -> ASTC equivalents) in the bucket */
     uint64_t t_ns, win_ns;  /* the last refill; the start of the per-second line's window */
-    uint32_t n_tx, n_fb, n_cap, n_pin;
+    uint32_t n_tx, n_fb, n_cap, n_pin, n_fast;
     double mtex_tx, mtex_fb;
-    uint64_t fb_total, tx_total, cap_total;
+    uint64_t fb_total, tx_total, cap_total, fast_total;
     double mtex_fb_total, mtex_tx_total;
 } g_bud = {PTHREAD_MUTEX_INITIALIZER};
 static int64_t g_fb_live;     /* bytes decoded images over the budget cost over transcoded ones, all devices (atomic) */
 static __thread int64_t tls_fb; /* ... of the image being created, for vkb_emu_bcn_image_made */
+static __thread int tls_fast;   /* ... it is to be encoded fast everywhere (auto) */
 
-/* 1: transcode the image to t; 0: decode it (over the budget). */
+/* 1: transcode the image to t (*fast: with the fast search at every level); 0: decode it (over the budget). */
 static int budget_take(vkb_emu_device *e, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl, VkFormat t, int query)
 {
     bcn_state *s = e->bcn;
     budget_cfg c;
-    if (!budget_get(&c)) return 1;
+    tls_fast = 0; /* an earlier image's, if its creation ended before vkb_emu_bcn_image_made */
+    if (!budget_get(s, &c)) return 1;
     uint64_t key = shape_key(ci);
     if (query) {
         pinned(s, key, 1);
@@ -599,36 +674,46 @@ static int budget_take(vkb_emu_device *e, const VkImageCreateInfo *ci, const VkI
     int txfam = tx_family(family(ci->format), t);
     /* BC1 -> ASTC direct has no search: it counts, but is never decoded (that would cost 2x its memory for little) */
     int pin = txfam == TX_BC1_ASTC || pinned(s, key, 0);
-    double cost = (double)image_texels(ci) * tx_weight(txfam) / 1e6;
-    int64_t extra = fallback_bytes(s, ci, fl, t), cap = fallback_cap(s);
+    double w = tx_weight(txfam);
+    double cost = c.is_auto && txfam != TX_BC1_ASTC ? image_cost_q(s, ci, 0) * w / 1e6 : (double)image_texels(ci) * w / 1e6;
+    double cost_fast = c.is_auto && s->auto_fast && txfam != TX_BC1_ASTC ? image_cost_q(s, ci, 1) * w / 1e6 : cost;
+    int64_t extra = fallback_bytes(s, ci, fl, t), cap = fallback_cap(s, c.is_auto);
     uint64_t now = vkb_hitch_now();
-    int tx = 1;
+    int tx = 1, fast = 0;
     pthread_mutex_lock(&g_bud.lock);
     if (!g_bud.started) {
         g_bud.started = 1, g_bud.tokens = c.burst, g_bud.t_ns = g_bud.win_ns = now;
-        VKB_INFO("BC budget: transcoding %.1f million texels a second, %.1f at once (BC7 -> ASTC 4x4 equivalents); images over it are "
-                 "decoded, up to %lld MB more memory (VKBRIDGE_BC_TX_BUDGET, VKBRIDGE_BC_TX_FALLBACK_MB)", c.rate, c.burst, (long long)(cap >> 20));
+        if (c.is_auto)
+            VKB_INFO("BC budget: auto for %s: transcoding %.1f million texels a second, %.1f at once (BC7 -> ASTC 4x4 equivalents, the "
+                     "default search counted %.0fx); short of it, images are %sdecoded, up to %lld MB more memory "
+                     "(VKBRIDGE_BC_TX_BUDGET=0 turns it off, a number sets it)", s->auto_why, c.rate, c.burst, AUTO_DEFAULT_COST,
+                     s->auto_fast ? "encoded with the fast search at every level when that fits, else " : "", (long long)(cap >> 20));
+        else
+            VKB_INFO("BC budget: transcoding %.1f million texels a second, %.1f at once (BC7 -> ASTC 4x4 equivalents); images over it are "
+                     "decoded, up to %lld MB more memory (VKBRIDGE_BC_TX_BUDGET, VKBRIDGE_BC_TX_FALLBACK_MB)", c.rate, c.burst, (long long)(cap >> 20));
     }
     g_bud.tokens += c.rate * (double)(now - g_bud.t_ns) / 1e9;
     if (g_bud.tokens > c.burst) g_bud.tokens = c.burst;
     g_bud.t_ns = now;
     if (now - g_bud.win_ns >= 1000000000ull) {
-        if (g_bud.n_fb || g_bud.n_cap)
-            VKB_INFO("BC budget: in the last %.1f s %u image(s) (%.1f Mtexels) decoded over VKBRIDGE_BC_TX_BUDGET, %u (%.1f) transcoded; "
-                     "%u transcoded past the decoded images' memory cap, %u of shapes the app asked memory requirements for; "
-                     "decoded images cost %lld MB of %lld more",
-                     (double)(now - g_bud.win_ns) / 1e9, g_bud.n_fb, g_bud.mtex_fb, g_bud.n_tx, g_bud.mtex_tx, g_bud.n_cap, g_bud.n_pin,
-                     (long long)(__atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) >> 20), (long long)(cap >> 20));
-        g_bud.win_ns = now, g_bud.n_tx = g_bud.n_fb = g_bud.n_cap = g_bud.n_pin = 0, g_bud.mtex_tx = g_bud.mtex_fb = 0;
+        if (g_bud.n_fb || g_bud.n_cap || g_bud.n_fast)
+            VKB_INFO("BC budget: in the last %.1f s %u image(s) (%.1f Mtexels) decoded over VKBRIDGE_BC_TX_BUDGET, %u (%.1f) transcoded "
+                     "(%u of them with the fast search everywhere); %u transcoded past the decoded images' memory cap, %u of shapes the app "
+                     "asked memory requirements for; decoded images cost %lld MB of %lld more",
+                     (double)(now - g_bud.win_ns) / 1e9, g_bud.n_fb, g_bud.mtex_fb, g_bud.n_tx, g_bud.mtex_tx, g_bud.n_fast, g_bud.n_cap,
+                     g_bud.n_pin, (long long)(__atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) >> 20), (long long)(cap >> 20));
+        g_bud.win_ns = now, g_bud.n_tx = g_bud.n_fb = g_bud.n_cap = g_bud.n_pin = g_bud.n_fast = 0, g_bud.mtex_tx = g_bud.mtex_fb = 0;
     }
     if (pin) g_bud.n_pin += txfam != TX_BC1_ASTC;
     else if (g_bud.tokens >= cost || g_bud.tokens >= c.burst * 0.999) {
-    } else if (extra <= 0 || __atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) + extra > cap) g_bud.n_cap++, g_bud.cap_total++;
+    } else if (cost_fast < cost && g_bud.tokens >= cost_fast) fast = 1, cost = cost_fast;
+    else if (extra <= 0 || __atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) + extra > cap) g_bud.n_cap++, g_bud.cap_total++;
     else tx = 0;
     if (tx) {
         g_bud.tokens -= cost;
         if (g_bud.tokens < -c.burst) g_bud.tokens = -c.burst;
         g_bud.n_tx++, g_bud.mtex_tx += cost, g_bud.tx_total++, g_bud.mtex_tx_total += cost;
+        if (fast) g_bud.n_fast++, g_bud.fast_total++, tls_fast = 1;
     } else {
         g_bud.n_fb++, g_bud.mtex_fb += cost, g_bud.fb_total++, g_bud.mtex_fb_total += cost;
         __atomic_add_fetch(&g_fb_live, extra, __ATOMIC_RELAXED);
@@ -643,19 +728,20 @@ static void budget_totals(void)
 {
     pthread_mutex_lock(&g_bud.lock);
     if (g_bud.started)
-        VKB_INFO("BC budget: so far %llu image(s) (%.1f Mtexels) transcoded, %llu (%.1f) decoded over VKBRIDGE_BC_TX_BUDGET, %llu transcoded "
-                 "past the decoded images' memory cap; decoded images alive cost %lld MB more",
-                 (unsigned long long)g_bud.tx_total, g_bud.mtex_tx_total, (unsigned long long)g_bud.fb_total, g_bud.mtex_fb_total,
-                 (unsigned long long)g_bud.cap_total, (long long)(__atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) >> 20));
+        VKB_INFO("BC budget: so far %llu image(s) (%.1f Mtexels) transcoded (%llu with the fast search everywhere), %llu (%.1f) decoded over "
+                 "VKBRIDGE_BC_TX_BUDGET, %llu transcoded past the decoded images' memory cap; decoded images alive cost %lld MB more",
+                 (unsigned long long)g_bud.tx_total, g_bud.mtex_tx_total, (unsigned long long)g_bud.fast_total,
+                 (unsigned long long)g_bud.fb_total, g_bud.mtex_fb_total, (unsigned long long)g_bud.cap_total,
+                 (long long)(__atomic_load_n(&g_fb_live, __ATOMIC_RELAXED) >> 20));
     pthread_mutex_unlock(&g_bud.lock);
 }
 
 /* A transcode done outside budget_take (a copy re-encoding a decoded image's texels): its texels
  * come off the bucket all the same. */
-static void budget_charge(int txfam, uint64_t texels)
+static void budget_charge(const bcn_state *s, int txfam, uint64_t texels)
 {
     budget_cfg c;
-    if (!budget_get(&c)) return;
+    if (!budget_get(s, &c)) return;
     double cost = (double)texels * tx_weight(txfam) / 1e6;
     pthread_mutex_lock(&g_bud.lock);
     if (g_bud.started) {
@@ -705,7 +791,9 @@ void vkb_emu_bcn_image_made(vkb_emu_device *e, vkb_emu_image *r)
 {
     (void)e;
     int64_t b = tls_fb;
-    tls_fb = 0;
+    int fast = tls_fast;
+    tls_fb = 0, tls_fast = 0;
+    if (r && fast) r->bc_fast = 1;
     if (!b) return;
     if (r) r->bc_fallback += b;
     else __atomic_sub_fetch(&g_fb_live, b, __ATOMIC_RELAXED);
@@ -816,21 +904,82 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci, int que
                  (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) ? " (STORAGE, the app's)" : "", ci->flags, n, n == 1 ? "" : "s");
 }
 
-/* A transcoded BC image has no COLOR_ATTACHMENT (ETC2 / EAC / ASTC cannot be rendered to) and no uncompressed
- * view of it can be given to the driver as a render target. Zink makes such views (R32G32B32A32_UINT of a BC2 /
- * BC3 / BC7 image: the one-time "uncompressed view ... shows decoded texels" warning in a player log, Soma) and
- * renders block data into them. A decoded image gave such a view a format it could render to; the transcoded
- * one gets this instead: an image of the blocks (one texel a block, the requested format, about the bytes of
- * the compressed image), made when the first such view is, that the view is made of. What is rendered there
- * is not seen through the BC views, as it was not meaningful through them when decoded (the texels were
- * the blocks' bits in a colour format), and nothing invalid reaches the driver. */
+/* Blocks drawn into uncompressed views. Zink renders BC blocks into uncompressed views of its BC images: Mesa's
+ * st_CompressedTexSubImage with a pixel buffer bound draws them, one texel a block, into an R32G32B32A32_UINT
+ * (16-byte blocks) or R16G16B16A16_UINT (8-byte blocks) view of the level. Neither a transcoded image (ETC2 / EAC /
+ * ASTC: no COLOR_ATTACHMENT, no such view) nor a decoded one (its texels are colours, not blocks) can take that draw,
+ * so such a view is a view of a sink: an image of the level's blocks (one texel a block, the view's format, the
+ * blocks of that level exactly), made when the first such view of the level is. When the render pass (or rendering)
+ * that drew into it ends, what was drawn - the renderArea, bounded by the viewports set and the rects cleared in it
+ * - is transcoded (decoded) from the sink into the texture, as an upload of those blocks would be (sink_writeback).
+ * SOMA's terrain was black on v0.5.5.2, where the draw stayed in the sink, and garbled on v0.5.5.1
+ *, where it went into the decoded image as colours. A view the app only samples stays a view of the image. */
 typedef struct bc_sink {
     VkFormat format;
+    uint32_t level;          /* the BC image's level whose blocks it holds */
+    uint32_t bw, bh, layers; /* blocks of that level; the image's layers */
     VkImage image;
     VkDeviceMemory mem;
-    uint32_t mips;
     struct bc_sink *next;
 } bc_sink;
+
+/* A view the app made of a BC image that is a view of a sink, until the app destroys it (or the image goes). */
+typedef struct sink_view {
+    VkImageView view;
+    VkImage bc;
+    bc_sink *sink;
+    uint32_t layer0, layers;
+    struct sink_view *next;
+} sink_view;
+
+typedef struct rp_att {
+    VkAttachmentLoadOp load;
+    VkAttachmentStoreOp store;
+    VkImageLayout initial, final;
+} rp_att;
+
+typedef struct rp_info { /* the attachments of a render pass the app made */
+    VkRenderPass rp;
+    uint32_t n;
+    rp_att *att;
+    struct rp_info *next;
+} rp_info;
+
+typedef struct fb_info { /* a framebuffer with a sink view among its attachments */
+    VkFramebuffer fb;
+    uint32_t n;
+    VkImageView *views;
+    struct fb_info *next;
+} fb_info;
+
+#define SK_BUCKETS 64
+#define SK_HASH(h) ((uint32_t)(((uint64_t)(h) >> 4) ^ ((uint64_t)(h) >> 12)) & (SK_BUCKETS - 1))
+
+/* Per device, alive until the device is (vkb_emu_bcsink_free): the hooks below chain to `next` even after the BC
+ * state is gone (the dynamic rendering emulation destroys its framebuffers through them at the end). */
+typedef struct bcsink {
+    pthread_mutex_t lock;
+    uint32_t nviews; /* atomic: sink views alive; 0: every hook passes straight through */
+    uint32_t nfbs;   /* atomic: fb_info entries */
+    sink_view *views[SK_BUCKETS];
+    rp_info *rps[SK_BUCKETS];
+    fb_info *fbs[SK_BUCKETS];
+    PFN_vkCreateRenderPass create_rp;
+    PFN_vkCreateRenderPass2 create_rp2;
+    PFN_vkDestroyRenderPass destroy_rp;
+    PFN_vkCreateFramebuffer create_fb;
+    PFN_vkDestroyFramebuffer destroy_fb;
+    PFN_vkDestroyImageView destroy_view;
+    PFN_vkCmdBeginRenderPass begin_rp;
+    PFN_vkCmdBeginRenderPass2 begin_rp2;
+    PFN_vkCmdEndRenderPass end_rp;
+    PFN_vkCmdEndRenderPass2 end_rp2;
+    PFN_vkCmdBeginRendering begin_r;
+    PFN_vkCmdEndRendering end_r;
+    PFN_vkCmdSetViewport set_vp;
+    PFN_vkCmdSetViewportWithCount set_vp_count;
+    PFN_vkCmdClearAttachments clear_att;
+} bcsink;
 
 #define SINK_USAGE (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
 
@@ -841,21 +990,23 @@ static void sink_free(vkb_emu_device *e, bc_sink *k)
     free(k);
 }
 
-static bc_sink *sink_make(vkb_emu_device *e, const vkb_emu_image *r, VkFormat format)
+static bc_sink *sink_make(vkb_emu_device *e, const vkb_emu_image *r, VkFormat format, uint32_t level)
 {
     bcn_state *s = e->bcn;
     const vkb_dispatch *d = &e->dev->real;
-    uint32_t w = (r->extent.width + 3) / 4, h = (r->extent.height + 3) / 4, mips = 1;
-    if (!w) w = 1;
-    if (!h) h = 1;
-    for (uint32_t m = w > h ? w : h; m > 1 && mips < r->mips; m >>= 1) mips++;
-    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, format, {w, h, 1}, mips, r->layers,
+    uint32_t w = r->extent.width >> level, h = r->extent.height >> level;
+    w = ((w ? w : 1) + 3) / 4;
+    h = ((h ? h : 1) + 3) / 4;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, format, {w, h, 1}, 1, r->layers,
                             VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, SINK_USAGE, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
                             VK_IMAGE_LAYOUT_UNDEFINED};
     bc_sink *k = calloc(1, sizeof(*k));
     if (!k) return NULL;
     k->format = format;
-    k->mips = mips;
+    k->level = level;
+    k->bw = w;
+    k->bh = h;
+    k->layers = r->layers;
     if (d->vkCreateImage(e->dev->device, &ci, NULL, &k->image) != VK_SUCCESS) {
         free(k);
         return NULL;
@@ -880,18 +1031,18 @@ static bc_sink *sink_make(vkb_emu_device *e, const vkb_emu_image *r, VkFormat fo
     return k;
 }
 
-/* The sink for `format` of image r (made now if there is none), NULL: none can be made. */
-static bc_sink *sink_get(vkb_emu_device *e, vkb_emu_image *r, VkFormat format)
+/* The sink for `format` and `level` of image r (made now if there is none), NULL: none can be made. */
+static bc_sink *sink_get(vkb_emu_device *e, vkb_emu_image *r, VkFormat format, uint32_t level)
 {
     pthread_mutex_lock(&e->lock);
     bc_sink *k = r->sinks;
-    while (k && k->format != format) k = k->next;
+    while (k && (k->format != format || k->level != level)) k = k->next;
     pthread_mutex_unlock(&e->lock);
     if (k) return k;
-    bc_sink *n = sink_make(e, r, format);
+    bc_sink *n = sink_make(e, r, format, level);
     if (!n) return NULL;
     pthread_mutex_lock(&e->lock);
-    for (k = r->sinks; k && k->format != format; k = k->next) {}
+    for (k = r->sinks; k && (k->format != format || k->level != level); k = k->next) {}
     if (!k) {
         n->next = r->sinks;
         r->sinks = k = n;
@@ -901,14 +1052,58 @@ static bc_sink *sink_get(vkb_emu_device *e, vkb_emu_image *r, VkFormat format)
     if (n) sink_free(e, n);
     static int told;
     if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
-        VKB_INFO("BC emulation: an uncompressed view (format %d) of a transcoded BC image the app may render to: it gets an image of the "
-                 "blocks of its own (%ux%u, %u mips), not the texture (logged for the first few)", format, (r->extent.width + 3) / 4,
-                 (r->extent.height + 3) / 4, k->mips);
+        VKB_INFO("BC emulation: an uncompressed view (format %d) of a %s BC image the app may render to: it is a view of an image of the "
+                 "blocks of level %u (%ux%u); what is drawn there goes into the texture when the render pass ends (logged for the first few)",
+                 format, vkb_tx_block_bytes(r->format) ? "transcoded" : "decoded", level, k->bw, k->bh);
     return k;
+}
+
+static void sink_view_add(vkb_emu_device *e, VkImageView v, VkImage bc, bc_sink *k, uint32_t layer0, uint32_t layers)
+{
+    bcsink *g = e->bcsink;
+    sink_view *n = g ? calloc(1, sizeof(*n)) : NULL;
+    if (!n) return;
+    *n = (sink_view){v, bc, k, layer0, layers, NULL};
+    pthread_mutex_lock(&g->lock);
+    n->next = g->views[SK_HASH(v)];
+    g->views[SK_HASH(v)] = n;
+    __atomic_add_fetch(&g->nviews, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g->lock);
+}
+
+/* Takes the sink views of view v (VK_NULL_HANDLE: every one of image bc) out of the register. */
+static void sink_views_drop(bcsink *g, VkImageView v, VkImage bc)
+{
+    if (!g || !__atomic_load_n(&g->nviews, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&g->lock);
+    for (uint32_t b = v ? SK_HASH(v) : 0; b < (v ? SK_HASH(v) + 1 : SK_BUCKETS); b++)
+        for (sink_view **pp = &g->views[b]; *pp;) {
+            sink_view *x = *pp;
+            if (v ? x->view == v : x->bc == bc) {
+                *pp = x->next;
+                free(x);
+                __atomic_sub_fetch(&g->nviews, 1, __ATOMIC_RELAXED);
+            } else {
+                pp = &x->next;
+            }
+        }
+    pthread_mutex_unlock(&g->lock);
+}
+
+/* A copy of the sink view v's record (lock held); 0: v is none. */
+static int sink_view_find(bcsink *g, VkImageView v, sink_view *out)
+{
+    for (sink_view *x = g->views[SK_HASH(v)]; x; x = x->next)
+        if (x->view == v) {
+            *out = *x;
+            return 1;
+        }
+    return 0;
 }
 
 void vkb_emu_image_release(vkb_emu_device *e, vkb_emu_image *img)
 {
+    if (img->sinks) sink_views_drop(e->bcsink, VK_NULL_HANDLE, img->image);
     while (img->sinks) {
         bc_sink *k = img->sinks;
         img->sinks = k->next;
@@ -937,38 +1132,52 @@ VkFormat vkb_emu_bcn_view_format(vkb_emu_device *e, VkImage image, VkFormat requ
     return requested;
 }
 
+static uint32_t block_texel_bytes(VkFormat f);
+
 static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImageView(VkDevice device, const VkImageViewCreateInfo *ci,
                                                          const VkAllocationCallbacks *pAllocator, VkImageView *pView)
 {
     VkImageViewCreateInfo *v = (VkImageViewCreateInfo *)ci;
     vkb_emu_device *e = vkb_emu_cur();
     vkb_emu_image *r = (e->flags & VKB_EMU_BCN) && !vkb_is_bc(ci->format) ? vkb_emu_find_image(e, ci->image) : NULL;
-    if (r && vkb_is_bc(r->client_format) && vkb_tx_block_bytes(r->format)) {
-        /* An uncompressed view of a transcoded image: what the view may be used as is the app's image usage, or
-         * its VkImageViewUsageCreateInfo's; the image the driver holds has no COLOR_ATTACHMENT and is no
-         * render target (see bc_sink). A view that is only sampled stays a view of the image. */
+    if (r && vkb_is_bc(r->client_format)) {
+        /* An uncompressed view of a BC image: what the view may be used as is the app's image usage, or its
+         * VkImageViewUsageCreateInfo's. One the app may render to, of one level of a 2D image, in a format a block
+         * is a texel of, is a view of the level's sink (see bc_sink); a transcoded image takes no other view it
+         * could render to or store into either (the sink, as before, without the way back into the texture for
+         * storage). A view that is only sampled stays a view of the image. */
+        int txd = vkb_tx_block_bytes(r->format) != 0;
         VkImageViewUsageCreateInfo *vu = NULL;
         for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
             if (b->sType == VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO) vu = (VkImageViewUsageCreateInfo *)b;
         VkImageUsageFlags want = vu ? vu->usage : r->client_usage;
-        if (r->type == VK_IMAGE_TYPE_2D && (want & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT))) {
-            bc_sink *k = sink_get(e, r, ci->format);
+        uint32_t level = ci->subresourceRange.baseMipLevel, levels = ci->subresourceRange.levelCount;
+        if (levels == VK_REMAINING_MIP_LEVELS) levels = r->mips > level ? r->mips - level : 0;
+        int writes = (want & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || (txd && (want & VK_IMAGE_USAGE_STORAGE_BIT));
+        if (writes && r->type == VK_IMAGE_TYPE_2D && levels == 1 && level < r->mips &&
+            (ci->viewType == VK_IMAGE_VIEW_TYPE_2D || ci->viewType == VK_IMAGE_VIEW_TYPE_2D_ARRAY) &&
+            block_texel_bytes(ci->format) == vkb_bc_block_bytes(r->client_format)) {
+            bc_sink *k = sink_get(e, r, ci->format, level);
             if (k) {
                 VkImageViewUsageCreateInfo use = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL,
                                                   (want & SINK_USAGE) ? (want & SINK_USAGE) : VK_IMAGE_USAGE_SAMPLED_BIT};
                 VkImageViewCreateInfo sv = *ci;
                 sv.pNext = &use;
                 sv.image = k->image;
-                if (sv.subresourceRange.baseMipLevel >= k->mips) sv.subresourceRange.baseMipLevel = k->mips - 1;
-                if (sv.subresourceRange.levelCount != VK_REMAINING_MIP_LEVELS &&
-                    sv.subresourceRange.baseMipLevel + sv.subresourceRange.levelCount > k->mips)
-                    sv.subresourceRange.levelCount = k->mips - sv.subresourceRange.baseMipLevel;
-                return vkb_emu_real()->vkCreateImageView(device, &sv, pAllocator, pView);
+                sv.subresourceRange.baseMipLevel = 0;
+                sv.subresourceRange.levelCount = 1;
+                uint32_t layer0 = sv.subresourceRange.baseArrayLayer, layers = sv.subresourceRange.layerCount;
+                if (layers == VK_REMAINING_ARRAY_LAYERS) layers = k->layers > layer0 ? k->layers - layer0 : 1;
+                VkResult res = vkb_emu_real()->vkCreateImageView(device, &sv, pAllocator, pView);
+                if (res == VK_SUCCESS) sink_view_add(e, *pView, r->image, k, layer0, layers);
+                return res;
             }
         }
-        /* a view only sampled (or no stand-in could be made): the usage the image has */
-        if (vu) vu->usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (vu && !vu->usage) vu->usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (txd) {
+            /* a view only sampled (or no stand-in could be made): the usage the image has */
+            if (vu) vu->usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            if (vu && !vu->usage) vu->usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+        }
     }
     v->format = vkb_emu_bcn_view_format(e, ci->image, ci->format);
     return vkb_emu_real()->vkCreateImageView(device, v, pAllocator, pView);
@@ -1386,10 +1595,74 @@ typedef struct upload {
     uint32_t n_dim;          /* texels a side of an output block: 4, or 6 / 8 for ASTC 6x6 / 8x8 */
     uint32_t xflags;         /* more flags for the shader (a re-encoder's, bc_decode.comp SRC_RAW) */
     VkDeviceSize left;       /* scratch the rest of the upload needs (sizes new chunks) */
-    VkBuffer *bufs;          /* decoded, waiting to be copied into the image */
-    VkBufferImageCopy *copies;
-    uint32_t n, cap;
+    struct bc_batch *pl;     /* decoded, waiting to be copied into their images */
 } upload;
+
+/* ------------------------------------------------------------------ uploads, counted and batched */
+
+/* What the conversions of the app's buffer-to-image copies into BC images record, all devices: a
+ * line every 60 s while it changes and at each device's end. GTA V (DXVK 3.1.1) streams
+ * ~1700 textures of ~25 KB in a second: one copy per mip level each, back to back with no barrier
+ * between them (DXVK records its layout transitions into a command buffer of their own), which
+ * the conversion turned into two barriers, a dispatch, a copy and a restore of the app's compute
+ * state per copy. */
+enum { BU_COPIES, BU_JOINED, BU_BARRIERS, BU_DISPATCHES, BU_COPYCMDS, BU_RESTORES, BU_COUNT };
+static uint64_t g_bu[BU_COUNT], g_bu_told[BU_COUNT], g_bu_ns;
+
+static void uploads_line(int end)
+{
+    uint64_t v[BU_COUNT];
+    int changed = 0;
+    for (int i = 0; i < BU_COUNT; i++) {
+        v[i] = __atomic_load_n(&g_bu[i], __ATOMIC_RELAXED);
+        changed |= v[i] != __atomic_load_n(&g_bu_told[i], __ATOMIC_RELAXED);
+    }
+    if (!changed && !(end && v[BU_COPIES])) return;
+    for (int i = 0; i < BU_COUNT; i++) __atomic_store_n(&g_bu_told[i], v[i], __ATOMIC_RELAXED);
+    VKB_INFO("BC uploads%s: %llu copies into BC images by the app (%llu right after another one, sharing its barriers); "
+             "the conversions recorded %llu barriers, %llu dispatches, %llu copy commands, %llu restores of the app's compute state",
+             end ? " so far" : " (running totals)", (unsigned long long)v[BU_COPIES], (unsigned long long)v[BU_JOINED],
+             (unsigned long long)v[BU_BARRIERS], (unsigned long long)v[BU_DISPATCHES], (unsigned long long)v[BU_COPYCMDS],
+             (unsigned long long)v[BU_RESTORES]);
+}
+
+static inline void bu_count(int what, uint64_t n) { __atomic_add_fetch(&g_bu[what], n, __ATOMIC_RELAXED); }
+
+static void bu_tick(void)
+{
+    uint64_t now = vkb_hitch_now(), last = __atomic_load_n(&g_bu_ns, __ATOMIC_RELAXED);
+    if ((!last || now - last >= 60000000000ull) && __atomic_compare_exchange_n(&g_bu_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        uploads_line(0);
+}
+
+/* Converted blocks waiting to be copied into their images: an upload's own (flushed at its end), or
+ * the thread's batch (tls_batch). A batch: in a replayed command stream (vkEndCommandBuffer, one
+ * thread, one command buffer), a BC buffer-to-image copy right after another one (nothing but
+ * other buffer-to-image copies between them) adds its dispatches after the earlier ones' and its
+ * copies to theirs, under the one to_compute barrier, and the batch's copies, one flush barrier and
+ * one restore of the app's compute state come before the stream's next other command
+ * (vkb_emu_bcn_batch_flush, server_conn.c) or the driver's End. Nothing else ran between those
+ * copies, the dispatches only read the app's buffers and write scratch, and copies with no command
+ * between them are not ordered against each other in Vulkan, so each command after the batch sees
+ * what it saw with a barrier pair per copy. VKBRIDGE_BC_BATCH=0: a pair per copy. */
+typedef struct pend {
+    VkBuffer buf;
+    VkImage image;
+    VkImageLayout layout;
+} pend;
+
+typedef struct bc_batch {
+    vkb_emu_device *e;
+    VkCommandBuffer cb;      /* the batch's (VK_NULL_HANDLE: none open) */
+    VkPipeline bound;        /* the converter its last dispatch used */
+    pend *p;                 /* per copy: from where into what */
+    VkBufferImageCopy *c;    /* ... and its region */
+    uint32_t n, cap;
+} bc_batch;
+
+static __thread bc_batch tls_batch;
+__thread int vkb_emu_bc_batch_open;
+static __thread int tls_b2i; /* the conversion in hand is of an app's buffer-to-image copy */
 
 /* Earlier transfers (the app's writes to the source, earlier copies out of this scratch) before the
  * decoder reads the source and writes the scratch. */
@@ -1399,22 +1672,56 @@ static void to_compute(upload *u)
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     u->e->dev->real.vkCmdPipelineBarrier(u->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL,
                                          0, NULL);
+    bu_count(BU_BARRIERS, 1);
 }
 
-/* Copies what is decoded into the image, in the layout the app recorded its copy with. */
-static void flush(upload *u)
+/* Copies what is decoded into the images, in the layouts the app recorded its copies with: one copy
+ * command per run of the same scratch buffer, image and layout. */
+static void pend_flush(vkb_emu_device *e, VkCommandBuffer cb, bc_batch *b)
 {
-    if (!u->n) return;
-    const vkb_dispatch *r = &u->e->dev->real;
+    if (!b->n) return;
+    const vkb_dispatch *r = &e->dev->real;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
-    r->vkCmdPipelineBarrier(u->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    for (uint32_t i = 0; i < u->n;) {
+    r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    uint64_t cmds = 0;
+    for (uint32_t i = 0; i < b->n;) {
         uint32_t k = i + 1;
-        while (k < u->n && u->bufs[k] == u->bufs[i]) k++;
-        r->vkCmdCopyBufferToImage(u->cb, u->bufs[i], u->img->image, u->layout, k - i, &u->copies[i]);
+        while (k < b->n && b->p[k].buf == b->p[i].buf && b->p[k].image == b->p[i].image && b->p[k].layout == b->p[i].layout) k++;
+        r->vkCmdCopyBufferToImage(cb, b->p[i].buf, b->p[i].image, b->p[i].layout, k - i, &b->c[i]);
+        cmds++;
         i = k;
     }
-    u->n = 0;
+    b->n = 0;
+    bu_count(BU_BARRIERS, 1);
+    bu_count(BU_COPYCMDS, cmds);
+}
+
+static void flush(upload *u) { pend_flush(u->e, u->cb, u->pl); }
+
+void vkb_emu_bcn_batch_flush(void)
+{
+    bc_batch *b = &tls_batch;
+    vkb_emu_bc_batch_open = 0;
+    if (!b->cb) return;
+    /* a crash line names these copies, not the command they come before */
+    extern __thread const char *vkb_srv_current_cmd;
+    const char *saved_cmd = vkb_srv_current_cmd;
+    vkb_srv_current_cmd = "vkCmdCopyBufferToImage (BC uploads recorded back to back, their copies)";
+    pend_flush(b->e, b->cb, b);
+    vkb_emu_restore_compute(b->e, b->cb);
+    vkb_srv_current_cmd = saved_cmd;
+    bu_count(BU_RESTORES, 1);
+    b->e = NULL, b->cb = VK_NULL_HANDLE, b->bound = VK_NULL_HANDLE;
+    bu_tick();
+}
+
+/* A stream cut short: its command buffer is not ended (nor submitted), so nothing more goes into it. */
+void vkb_emu_bcn_batch_drop(void)
+{
+    bc_batch *b = &tls_batch;
+    vkb_emu_bc_batch_open = 0;
+    b->n = 0;
+    b->e = NULL, b->cb = VK_NULL_HANDLE, b->bound = VK_NULL_HANDLE;
 }
 
 /* Room for `bytes` of decoded texels in the command buffer's scratch. */
@@ -1501,6 +1808,8 @@ static void dispatch(upload *u, uint32_t x, uint32_t y, uint32_t z)
         }
         r->vkCmdDispatch(u->cb, x, y, z);
     }
+    bu_count(BU_DISPATCHES, rep);
+    if (rep > 1) bu_count(BU_BARRIERS, rep - 1);
 }
 
 /* Decodes slices [slice0, slice0 + nslices) x block rows [row0, row0 + nrows) of a region into
@@ -1567,17 +1876,18 @@ static void queue_copy(upload *u, VkBuffer buf, const VkBufferImageCopy *cin)
     if ((uint32_t)c.imageOffset.x >= mw || (uint32_t)c.imageOffset.y >= mh) return;
     if (c.imageOffset.x + c.imageExtent.width > mw) c.imageExtent.width = mw - (uint32_t)c.imageOffset.x;
     if (c.imageOffset.y + c.imageExtent.height > mh) c.imageExtent.height = mh - (uint32_t)c.imageOffset.y;
-    if (u->n == u->cap) {
-        uint32_t cap = u->cap ? u->cap * 2 : 16;
-        VkBuffer *nb = realloc(u->bufs, cap * sizeof(*nb));
-        if (nb) u->bufs = nb;
-        VkBufferImageCopy *nc = realloc(u->copies, cap * sizeof(*nc));
-        if (nc) u->copies = nc;
-        if (!nb || !nc) return;
-        u->cap = cap;
+    bc_batch *b = u->pl;
+    if (b->n == b->cap) {
+        uint32_t cap = b->cap ? b->cap * 2 : 16;
+        pend *np = realloc(b->p, cap * sizeof(*np));
+        if (np) b->p = np;
+        VkBufferImageCopy *nc = realloc(b->c, cap * sizeof(*nc));
+        if (nc) b->c = nc;
+        if (!np || !nc) return;
+        b->cap = cap;
     }
-    u->bufs[u->n] = buf;
-    u->copies[u->n++] = c;
+    b->p[b->n] = (pend){buf, u->img->image, u->layout};
+    b->c[b->n++] = c;
 }
 
 /* ASTC 6x6 / 8x8 output: a region is encoded in whole ASTC blocks from the block-aligned corner at
@@ -1680,6 +1990,35 @@ int vkb_test_hitch_delay_ms(void)
 static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_image *img, VkImageLayout layout, uint32_t n,
                        const region *regs, const vkb_emu_image *raw);
 
+/* The most GPU time a conversion of these regions can take on this device, in ns, for the hitch
+ * line: server_hitch.c puts a wait down to BC conversions only when this reaches a fifth of it.
+ * Calibration: the G720 MC12's warm BC7 -> ASTC 4x4 2048x2048 level at the fast search, 4.2 Mtex in
+ * 29 ms (bcn_check, FEAT-bc-budget.md), so GPU_EST_NS_TEXEL a texel; scaled by budget_auto's rate for
+ * this GPU (its cores x a core's speed, 32 = the G720 MC12; not a Mali: as a G720 MC12), times the
+ * family's weight (tx_weight; decoders 1), the search's cost at the top of what was measured
+ * (default GPU_EST_DEFAULT x the fast one, high GPU_EST_HIGH) and the host tests' dispatch repeats
+ * (VKBRIDGE_TEST_BC_SLOW). An upper estimate on purpose: a wait is called bc only when the
+ * conversions could have filled a fifth of it. The fixed cost of each conversion (its barriers and
+ * small dispatches) is not in it; bc_n in the hitch line counts them. */
+#define GPU_EST_NS_TEXEL (29e6 / 4.2e6)
+#define GPU_EST_DEFAULT 4.0
+#define GPU_EST_HIGH 6.0
+static uint64_t gpu_est_ns(const bcn_state *s, const vkb_emu_image *img, uint32_t n, const region *regs, const vkb_emu_image *raw)
+{
+    int fam = family(img->client_format);
+    int transcode = vkb_tx_block_bytes(img->format) != 0;
+    fam = raw ? raw_family(img->format) : transcode ? tx_family(fam, img->format) : fam;
+    double scale = s && s->auto_rate > 0 ? s->auto_rate / 32.0 : 1.0;
+    double w = fam >= TX_BC1 ? tx_weight(fam) : 1.0, ns = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        double t = (double)regs[i].iext.width * regs[i].iext.height *
+                   (img->type == VK_IMAGE_TYPE_3D ? regs[i].iext.depth : regs[i].sub.layerCount);
+        uint32_t q = fam >= TX_BC1 ? level_quality(s, img, regs[i].sub.mipLevel) : 0;
+        ns += t * (q == 0 ? 1.0 : q == 2 ? GPU_EST_HIGH : GPU_EST_DEFAULT);
+    }
+    return (uint64_t)(ns * w * GPU_EST_NS_TEXEL / scale * test_slow(transcode));
+}
+
 /* A conversion recorded: timed and counted for the hitch line when the process has it on
  * (VKBRIDGE_HITCH_MS, server_hitch.c); its GPU time shows as the waits that follow it. */
 /* raw: the source holds texels of that decoded image (copy_mixed), not BC blocks. */
@@ -1701,13 +2040,21 @@ static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_
     for (uint32_t i = 0; i < n; i++)
         texels += (uint64_t)regs[i].iext.width * regs[i].iext.height *
                   (img->type == VK_IMAGE_TYPE_3D ? regs[i].iext.depth : regs[i].sub.layerCount);
-    vkb_hitch_note(p, VKB_HITCH_BC, t0, vkb_hitch_now(), 1, texels);
+    vkb_hitch_note_bc(p, t0, vkb_hitch_now(), texels, gpu_est_ns(e->bcn, img, n, regs, raw));
 }
 
 static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_image *img, VkImageLayout layout, uint32_t n,
                        const region *regs, const vkb_emu_image *raw)
 {
     bcn_state *s = e->bcn;
+    /* an app's buffer-to-image copy in a replayed stream joins the batch open on it (bc_batch);
+     * anything else flushes a batch first */
+    bc_batch own = {0}, *b = &own;
+    int batched = tls_b2i && !raw && s->batch && vkb_srv_replay_cb == cb;
+    if (vkb_emu_bc_batch_open && (!batched || tls_batch.cb != cb || tls_batch.e != e)) vkb_emu_bcn_batch_flush();
+    if (batched) b = &tls_batch;
+    int joined = b->cb == cb;
+    if (tls_b2i) bu_count(BU_COPIES, 1);
     int fam = family(img->client_format);
     fam = vkb_tx_block_bytes(img->format) ? tx_family(fam, img->format) : vkb_bc_is_packed(img->format) ? FAM_BC1_16 : fam;
     uint32_t xflags = 0, in_bytes = vkb_bc_block_bytes(img->client_format);
@@ -1720,10 +2067,10 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
     /* in auto per region (level_quality): the first region's, before anything is recorded (or the
      * other quality while this one is still being built) */
     uint32_t q0 = fam >= TX_BC1 ? level_quality(s, img, n ? regs[0].sub.mipLevel : 0) : 1;
-    VkPipeline pipe = pipeline(e, fam, q0), bound = VK_NULL_HANDLE;
+    VkPipeline pipe = pipeline(e, fam, q0), bound = joined ? b->bound : VK_NULL_HANDLE;
     if (!pipe) return;
     upload u = {e, cb, vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)), src, img, layout, out_block_bytes(img), in_bytes,
-                vkb_tx_block_dim(img->format), .xflags = xflags};
+                vkb_tx_block_dim(img->format), .xflags = xflags, .pl = b};
     if (!u.sc) return;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     for (uint32_t i = 0; i < n; i++) u.left += region_bytes(&u, &regs[i], is3d ? regs[i].iext.depth : regs[i].sub.layerCount);
@@ -1735,7 +2082,15 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
         for (uint32_t i = 0; i < u.sc->n; i++)
             if (u.sc->held[i].size > lim && u.sc->held[i].size <= CHUNK_MAX) lim = u.sc->held[i].size;
     }
-    to_compute(&u);
+    if (joined) {
+        bu_count(BU_JOINED, 1);
+    } else {
+        to_compute(&u);
+        if (batched) {
+            b->e = e, b->cb = cb;
+            vkb_emu_bc_batch_open = 1;
+        }
+    }
     /* VKBRIDGE_BC_LOG=<texels> (a diagnostic): uploads of that many texels or more logged with
      * their BC format, target and size, to tell which transcoders a stall in the frame comes from. */
     const char *lv = vkb_srv_env("VKBRIDGE_BC_LOG");
@@ -1788,10 +2143,16 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
                 for (uint32_t y = 0; y < bh; y += per) piece(&u, g, z, 1, y, bh - y < per ? bh - y : per);
         }
     }
+    if (batched) {
+        b->bound = bound; /* its copies, barrier and restore: at the batch's flush */
+        return;
+    }
     flush(&u);
-    free(u.bufs);
-    free(u.copies);
+    free(own.p);
+    free(own.c);
     vkb_emu_restore_compute(e, cb);
+    bu_count(BU_RESTORES, 1);
+    bu_tick();
 }
 
 static vkb_emu_image *bc_image(vkb_emu_device *e, VkImage img)
@@ -1810,7 +2171,9 @@ int vkb_emu_copy_buffer_to_image(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer
     for (uint32_t i = 0; i < n; i++)
         g[i] = (region){regions[i].bufferOffset, regions[i].bufferRowLength, regions[i].bufferImageHeight, regions[i].imageSubresource,
                         regions[i].imageOffset, regions[i].imageExtent};
+    tls_b2i = 1;
     decode(e, cb, src, img, dl, n, g, NULL);
+    tls_b2i = 0;
     free(g);
     return 1;
 }
@@ -1824,7 +2187,9 @@ int vkb_emu_copy_buffer_to_image2(vkb_emu_device *e, VkCommandBuffer cb, const V
         const VkBufferImageCopy2 *r = &info->pRegions[i];
         g[i] = (region){r->bufferOffset, r->bufferRowLength, r->bufferImageHeight, r->imageSubresource, r->imageOffset, r->imageExtent};
     }
+    tls_b2i = 1;
     decode(e, cb, info->srcBuffer, img, info->dstImageLayout, info->regionCount, g, NULL);
+    tls_b2i = 0;
     free(g);
     return 1;
 }
@@ -2090,7 +2455,7 @@ static void copy_mixed(vkb_emu_device *e, VkCommandBuffer cb, vkb_emu_image *s, 
     if (k) {
         r->vkCmdCopyImageToBuffer(cb, s->image, sl, buf, k, out);
         decode(e, cb, buf, d, dl, k, g, s);
-        budget_charge(tx_family(family(d->client_format), d->format), texels);
+        budget_charge(st, tx_family(family(d->client_format), d->format), texels);
     }
     free(out);
     free(g);
@@ -2188,6 +2553,543 @@ int vkb_emu_bcn_blocks_readback(vkb_emu_device *e, VkImage img)
     return 1;
 }
 
+/* ------------------------------------------------------------------ blocks drawn into uncompressed views */
+
+static bcsink *sk(void)
+{
+    vkb_emu_device *e = vkb_emu_cur();
+    return e ? e->bcsink : NULL;
+}
+
+static int sk_live(const bcsink *g) { return g && __atomic_load_n(&g->nviews, __ATOMIC_RELAXED) != 0; }
+
+static VkRect2D rect_union(VkRect2D a, VkRect2D b)
+{
+    if (!a.extent.width || !a.extent.height) return b;
+    if (!b.extent.width || !b.extent.height) return a;
+    int32_t x0 = a.offset.x < b.offset.x ? a.offset.x : b.offset.x, y0 = a.offset.y < b.offset.y ? a.offset.y : b.offset.y;
+    int64_t ax1 = (int64_t)a.offset.x + a.extent.width, bx1 = (int64_t)b.offset.x + b.extent.width;
+    int64_t ay1 = (int64_t)a.offset.y + a.extent.height, by1 = (int64_t)b.offset.y + b.extent.height;
+    int64_t x1 = ax1 > bx1 ? ax1 : bx1, y1 = ay1 > by1 ? ay1 : by1;
+    return (VkRect2D){{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+}
+
+static VkRect2D rect_meet(VkRect2D a, VkRect2D b)
+{
+    int64_t x0 = a.offset.x > b.offset.x ? a.offset.x : b.offset.x, y0 = a.offset.y > b.offset.y ? a.offset.y : b.offset.y;
+    int64_t ax1 = (int64_t)a.offset.x + a.extent.width, bx1 = (int64_t)b.offset.x + b.extent.width;
+    int64_t ay1 = (int64_t)a.offset.y + a.extent.height, by1 = (int64_t)b.offset.y + b.extent.height;
+    int64_t x1 = ax1 < bx1 ? ax1 : bx1, y1 = ay1 < by1 ? ay1 : by1;
+    if (x1 <= x0 || y1 <= y0) return (VkRect2D){{0, 0}, {0, 0}};
+    return (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+}
+
+/* The framebuffer texels viewports can reach (a negative height flips; a fraction reaches the texel it is in). */
+static VkRect2D viewports_rect(uint32_t n, const VkViewport *v)
+{
+    VkRect2D r = {{0, 0}, {0, 0}};
+    for (uint32_t i = 0; v && i < n; i++) {
+        float x0 = v[i].x, x1 = v[i].x + v[i].width, y0 = v[i].y, y1 = v[i].y + v[i].height;
+        if (x1 < x0) { float t = x0; x0 = x1; x1 = t; }
+        if (y1 < y0) { float t = y0; y0 = y1; y1 = t; }
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 <= x0 || y1 <= y0 || x0 > 65536.0f || y0 > 65536.0f) continue;
+        int32_t ix0 = (int32_t)x0, iy0 = (int32_t)y0;
+        float cx = x1 > 65536.0f ? 65536.0f : x1, cy = y1 > 65536.0f ? 65536.0f : y1;
+        int32_t ix1 = (int32_t)cx, iy1 = (int32_t)cy;
+        if ((float)ix1 < cx) ix1++;
+        if ((float)iy1 < cy) iy1++;
+        r = rect_union(r, (VkRect2D){{ix0, iy0}, {(uint32_t)(ix1 - ix0), (uint32_t)(iy1 - iy0)}});
+    }
+    return r;
+}
+
+static int rect_inside(VkRect2D a, VkRect2D b) /* a within b */
+{
+    return a.offset.x >= b.offset.x && a.offset.y >= b.offset.y &&
+           (int64_t)a.offset.x + a.extent.width <= (int64_t)b.offset.x + b.extent.width &&
+           (int64_t)a.offset.y + a.extent.height <= (int64_t)b.offset.y + b.extent.height;
+}
+
+/* A rect the pass may draw in: kept apart from the others (a bounding box would take in what lies between them,
+ * which the sink does not hold), up to 8; past that, one bounding box. */
+static void note_drawn(bcn_cb *c, VkRect2D r)
+{
+    r = rect_meet(r, c->area);
+    if (!r.extent.width) return;
+    for (uint32_t i = 0; i < c->ndrawn; i++)
+        if (rect_inside(r, c->drawn[i])) return;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < c->ndrawn; i++)
+        if (!rect_inside(c->drawn[i], r)) c->drawn[k++] = c->drawn[i];
+    c->ndrawn = k;
+    if (c->ndrawn < 8) {
+        c->drawn[c->ndrawn++] = r;
+        return;
+    }
+    VkRect2D u = r;
+    for (uint32_t i = 0; i < c->ndrawn; i++) u = rect_union(u, c->drawn[i]);
+    c->drawn[0] = u;
+    c->ndrawn = 1;
+}
+
+static void note_viewports(VkCommandBuffer cb, uint32_t n, const VkViewport *v)
+{
+    vkb_emu_device *e = vkb_emu_cur();
+    bcn_cb *c = vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb));
+    if (!c) return;
+    c->vp = viewports_rect(n, v);
+    c->vp_known = 1;
+    if (c->npass) {
+        note_drawn(c, c->vp);
+        c->vp_in = 1;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport *v)
+{
+    bcsink *g = sk();
+    if (sk_live(g)) note_viewports(cb, n, v);
+    g->set_vp(cb, first, n, v);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport *v)
+{
+    bcsink *g = sk();
+    if (sk_live(g)) note_viewports(cb, n, v);
+    g->set_vp_count(cb, n, v);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment *a, uint32_t nr,
+                                                        const VkClearRect *rects)
+{
+    bcsink *g = sk();
+    if (sk_live(g)) {
+        bcn_cb *c = vkb_emu_cb_bcn(vkb_emu_cur(), cb, sizeof(bcn_cb));
+        for (uint32_t i = 0; c && c->npass && i < nr; i++) {
+            note_drawn(c, rects[i].rect);
+            c->clear_in = 1;
+        }
+    }
+    g->clear_att(cb, n, a, nr, rects);
+}
+
+/* One attachment of the render pass instance about to begin: a sink view (copied out, lock held by the caller's
+ * caller) with what the pass does with it. */
+typedef struct pass_att {
+    sink_view v;
+    rp_att a;
+} pass_att;
+
+/* Before the render pass instance begins: what it draws into sinks is noted, and each such sink is put in the
+ * layout the pass starts it in (its content before the pass is not put back anywhere, so it is discarded). */
+static void pass_begin(VkCommandBuffer cb, const pass_att *at, uint32_t n, VkRect2D area, int whole)
+{
+    vkb_emu_device *e = vkb_emu_cur();
+    bcn_cb *c = n ? vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)) : NULL;
+    if (!c) return;
+    c->npass = 0;
+    c->area = area;
+    c->whole = whole;
+    c->ndrawn = 0;
+    c->vp_in = c->clear_in = 0;
+    c->pre = c->vp;
+    c->pre_known = c->vp_known;
+    VkImageMemoryBarrier b[4];
+    uint32_t nb = 0;
+    for (uint32_t i = 0; i < n && c->npass < 4; i++) {
+        c->pass[c->npass++] = (struct pass_sink){at[i].v.bc, at[i].v.sink, at[i].v.layer0, at[i].v.layers, at[i].a.final};
+        if (at[i].a.load == VK_ATTACHMENT_LOAD_OP_CLEAR) c->whole = 1;
+        if (at[i].a.initial != VK_IMAGE_LAYOUT_UNDEFINED)
+            b[nb++] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0,
+                                             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                             at[i].a.initial, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, at[i].v.sink->image,
+                                             {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, at[i].v.layer0, at[i].v.layers}};
+    }
+    if (n > 4) VKB_ONCE(VKB_LOG_WARN, "BC emulation: a render pass draws into more than 4 uncompressed views of BC images; the first 4 go "
+                                      "into their textures (logged once)");
+    if (nb)
+        e->dev->real.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0,
+                                          NULL, nb, b);
+}
+
+/* What was drawn into the sink of p (region: blocks of its level) transcoded (decoded) into the texture, as an upload
+ * of those blocks would be. Recorded after the render pass instance, the texture and the sink left in the layout
+ * the pass left the attachment in. */
+static void sink_writeback(vkb_emu_device *e, VkCommandBuffer cb, const struct pass_sink *p, VkRect2D rg)
+{
+    bc_sink *k = p->sink;
+    vkb_emu_image *img = e->bcn ? vkb_emu_find_image(e, p->bc) : NULL;
+    if (!img || !k) return;
+    rg = rect_meet(rg, (VkRect2D){{0, 0}, {k->bw, k->bh}});
+    if (!rg.extent.width || !p->layers) return;
+    uint32_t bb = vkb_bc_block_bytes(img->client_format);
+    if (block_texel_bytes(k->format) != bb) return;
+    bcn_cb *c = vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb));
+    if (!c) return;
+    VkDeviceSize total = (VkDeviceSize)rg.extent.width * rg.extent.height * p->layers * bb;
+    total = (total + SLOT_ALIGN - 1) & ~(VkDeviceSize)(SLOT_ALIGN - 1);
+    VkBuffer buf = stage_buffer(e, cb, c, total);
+    if (!buf) {
+        VKB_ONCE(VKB_LOG_ERROR, "BC emulation: no memory to stage %llu bytes of blocks drawn into an uncompressed view (logged once)",
+                 (unsigned long long)total);
+        return;
+    }
+    const vkb_dispatch *r = &e->dev->real;
+    VkImageMemoryBarrier b[2] = {
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, p->fin,
+         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, k->image,
+         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, p->layer0, p->layers}},
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, p->fin,
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img->image,
+         {VK_IMAGE_ASPECT_COLOR_BIT, k->level, 1, p->layer0, p->layers}}};
+    r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, b);
+    VkBufferImageCopy out = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, p->layer0, p->layers}, {rg.offset.x, rg.offset.y, 0},
+                             {rg.extent.width, rg.extent.height, 1}};
+    r->vkCmdCopyImageToBuffer(cb, k->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &out);
+    region g = {0, rg.extent.width * 4, rg.extent.height * 4, {VK_IMAGE_ASPECT_COLOR_BIT, k->level, p->layer0, p->layers},
+                {rg.offset.x * 4, rg.offset.y * 4, 0}, {rg.extent.width * 4, rg.extent.height * 4, 1}};
+    decode(e, cb, buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &g, NULL);
+    b[0] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, p->fin, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, k->image,
+                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, p->layer0, p->layers}};
+    b[1] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, p->fin,
+                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img->image,
+                                  {VK_IMAGE_ASPECT_COLOR_BIT, k->level, 1, p->layer0, p->layers}};
+    r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 2, b);
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+        VKB_INFO("BC emulation: blocks drawn into an uncompressed view (format %d) of a BC image (format %d, held as %d) put into the "
+                 "texture: %ux%u blocks at %d,%d of level %u, %u layer(s) (logged for the first few)", k->format, img->client_format,
+                 img->format, rg.extent.width, rg.extent.height, rg.offset.x, rg.offset.y, k->level, p->layers);
+}
+
+/* After the render pass instance: its draws into sinks put into the textures. */
+static void pass_end(VkCommandBuffer cb)
+{
+    vkb_emu_device *e = vkb_emu_cur();
+    bcn_cb *c = vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb));
+    if (!c || !c->npass) return;
+    /* What it drew: the renderArea where a clear at load or secondary command buffers write it all; else the viewports
+     * set in it and the rects cleared in it; with neither, the viewport its draws had from before it began (Zink sets
+     * one in the pass when it changed, so the one before is the one its draws use), or the renderArea if none is
+     * known. A pass that clears rects and draws with a viewport from before it gets only the rects (no draw is followed
+     * one by one: what is put back is never more than what was drawn there). */
+    if (!c->whole && !c->vp_in && !c->clear_in) {
+        if (c->pre_known) note_drawn(c, c->pre);
+        else c->whole = 1;
+    }
+    int all = c->whole; /* else the rects (none: the viewport from before lies outside the renderArea, nothing drawn) */
+    for (uint32_t i = 0; i < c->npass; i++)
+        for (uint32_t j = 0; j < (all ? 1 : c->ndrawn); j++) sink_writeback(e, cb, &c->pass[i], all ? c->area : c->drawn[j]);
+    c->npass = 0;
+}
+
+static const rp_info *rp_find(bcsink *g, VkRenderPass rp)
+{
+    for (rp_info *x = g->rps[SK_HASH(rp)]; x; x = x->next)
+        if (x->rp == rp) return x;
+    return NULL;
+}
+
+/* The sink views among a render pass instance's attachments, with what the pass does with them; how many. */
+static uint32_t rp_sink_atts(bcsink *g, const VkRenderPassBeginInfo *bi, pass_att *out, uint32_t max)
+{
+    const VkRenderPassAttachmentBeginInfo *ab = NULL;
+    for (const VkBaseInStructure *b = bi->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) ab = (const VkRenderPassAttachmentBeginInfo *)b;
+    uint32_t n = 0;
+    pthread_mutex_lock(&g->lock);
+    const VkImageView *views = NULL;
+    uint32_t nv = 0;
+    if (ab) {
+        views = ab->pAttachments;
+        nv = ab->attachmentCount;
+    } else if (__atomic_load_n(&g->nfbs, __ATOMIC_RELAXED)) {
+        for (fb_info *x = g->fbs[SK_HASH(bi->framebuffer)]; x; x = x->next)
+            if (x->fb == bi->framebuffer) {
+                views = x->views;
+                nv = x->n;
+                break;
+            }
+    }
+    const rp_info *rp = views ? rp_find(g, bi->renderPass) : NULL;
+    for (uint32_t i = 0; rp && i < nv && i < rp->n && n < max; i++)
+        if (sink_view_find(g, views[i], &out[n].v)) {
+            out[n].a = rp->att[i];
+            if (out[n].a.store == VK_ATTACHMENT_STORE_OP_STORE) n++;
+        }
+    pthread_mutex_unlock(&g->lock);
+    return n;
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, VkSubpassContents contents)
+{
+    bcsink *g = sk();
+    if (sk_live(g)) {
+        pass_att at[8];
+        uint32_t n = rp_sink_atts(g, bi, at, 8);
+        if (n) pass_begin(cb, at, n, bi->renderArea, contents == VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+    }
+    g->begin_rp(cb, bi, contents);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdBeginRenderPass2(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, const VkSubpassBeginInfo *si)
+{
+    bcsink *g = sk();
+    if (sk_live(g)) {
+        pass_att at[8];
+        uint32_t n = rp_sink_atts(g, bi, at, 8);
+        if (n) pass_begin(cb, at, n, bi->renderArea, si && si->contents == VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+    }
+    g->begin_rp2(cb, bi, si);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdEndRenderPass(VkCommandBuffer cb)
+{
+    bcsink *g = sk();
+    g->end_rp(cb);
+    if (sk_live(g)) pass_end(cb);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo *ei)
+{
+    bcsink *g = sk();
+    g->end_rp2(cb, ei);
+    if (sk_live(g)) pass_end(cb);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri)
+{
+    bcsink *g = sk();
+    if (sk_live(g)) {
+        pass_att at[8];
+        uint32_t n = 0;
+        pthread_mutex_lock(&g->lock);
+        for (uint32_t i = 0; i < ri->colorAttachmentCount && n < 8; i++) {
+            const VkRenderingAttachmentInfo *a = &ri->pColorAttachments[i];
+            if (a->imageView && a->storeOp == VK_ATTACHMENT_STORE_OP_STORE && sink_view_find(g, a->imageView, &at[n].v)) {
+                at[n].a = (rp_att){a->loadOp, a->storeOp, a->imageLayout, a->imageLayout};
+                n++;
+            }
+        }
+        pthread_mutex_unlock(&g->lock);
+        if (n && (ri->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT))) {
+            VKB_ONCE(VKB_LOG_WARN, "BC emulation: a suspended or resumed rendering draws into an uncompressed view of a BC image; not put "
+                                   "into the texture (logged once)");
+            n = 0;
+        }
+        if (n) pass_begin(cb, at, n, ri->renderArea, (ri->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) != 0);
+    }
+    g->begin_r(cb, ri);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_CmdEndRendering(VkCommandBuffer cb)
+{
+    bcsink *g = sk();
+    g->end_r(cb);
+    if (sk_live(g)) pass_end(cb);
+}
+
+static void rp_add(bcsink *g, VkRenderPass rp, uint32_t n, const rp_att *att)
+{
+    rp_info *x = calloc(1, sizeof(*x));
+    rp_att *a = calloc(n ? n : 1, sizeof(*a));
+    if (!x || !a) {
+        free(x);
+        free(a);
+        return;
+    }
+    memcpy(a, att, n * sizeof(*a));
+    *x = (rp_info){rp, n, a, NULL};
+    pthread_mutex_lock(&g->lock);
+    x->next = g->rps[SK_HASH(rp)];
+    g->rps[SK_HASH(rp)] = x;
+    pthread_mutex_unlock(&g->lock);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL sk_CreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                          VkRenderPass *rp)
+{
+    bcsink *g = sk();
+    VkResult r = g->create_rp(device, ci, a, rp);
+    if (r == VK_SUCCESS && ci->attachmentCount <= 64) {
+        rp_att at[64];
+        for (uint32_t i = 0; i < ci->attachmentCount; i++)
+            at[i] = (rp_att){ci->pAttachments[i].loadOp, ci->pAttachments[i].storeOp, ci->pAttachments[i].initialLayout,
+                             ci->pAttachments[i].finalLayout};
+        rp_add(g, *rp, ci->attachmentCount, at);
+    }
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL sk_CreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a,
+                                                           VkRenderPass *rp)
+{
+    bcsink *g = sk();
+    VkResult r = g->create_rp2(device, ci, a, rp);
+    if (r == VK_SUCCESS && ci->attachmentCount <= 64) {
+        rp_att at[64];
+        for (uint32_t i = 0; i < ci->attachmentCount; i++)
+            at[i] = (rp_att){ci->pAttachments[i].loadOp, ci->pAttachments[i].storeOp, ci->pAttachments[i].initialLayout,
+                             ci->pAttachments[i].finalLayout};
+        rp_add(g, *rp, ci->attachmentCount, at);
+    }
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_DestroyRenderPass(VkDevice device, VkRenderPass rp, const VkAllocationCallbacks *a)
+{
+    bcsink *g = sk();
+    if (rp) {
+        pthread_mutex_lock(&g->lock);
+        for (rp_info **pp = &g->rps[SK_HASH(rp)]; *pp; pp = &(*pp)->next)
+            if ((*pp)->rp == rp) {
+                rp_info *x = *pp;
+                *pp = x->next;
+                free(x->att);
+                free(x);
+                break;
+            }
+        pthread_mutex_unlock(&g->lock);
+    }
+    g->destroy_rp(device, rp, a);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL sk_CreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                           VkFramebuffer *fb)
+{
+    bcsink *g = sk();
+    VkResult r = g->create_fb(device, ci, a, fb);
+    if (r != VK_SUCCESS || !sk_live(g) || (ci->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) || !ci->attachmentCount) return r;
+    int any = 0;
+    sink_view tmp;
+    pthread_mutex_lock(&g->lock);
+    for (uint32_t i = 0; i < ci->attachmentCount && !any; i++) any = sink_view_find(g, ci->pAttachments[i], &tmp);
+    pthread_mutex_unlock(&g->lock);
+    if (!any) return r;
+    fb_info *x = calloc(1, sizeof(*x));
+    VkImageView *v = calloc(ci->attachmentCount, sizeof(*v));
+    if (!x || !v) {
+        free(x);
+        free(v);
+        return r;
+    }
+    memcpy(v, ci->pAttachments, ci->attachmentCount * sizeof(*v));
+    *x = (fb_info){*fb, ci->attachmentCount, v, NULL};
+    pthread_mutex_lock(&g->lock);
+    x->next = g->fbs[SK_HASH(*fb)];
+    g->fbs[SK_HASH(*fb)] = x;
+    __atomic_add_fetch(&g->nfbs, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g->lock);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_DestroyFramebuffer(VkDevice device, VkFramebuffer fb, const VkAllocationCallbacks *a)
+{
+    bcsink *g = sk();
+    if (fb && __atomic_load_n(&g->nfbs, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&g->lock);
+        for (fb_info **pp = &g->fbs[SK_HASH(fb)]; *pp; pp = &(*pp)->next)
+            if ((*pp)->fb == fb) {
+                fb_info *x = *pp;
+                *pp = x->next;
+                free(x->views);
+                free(x);
+                __atomic_sub_fetch(&g->nfbs, 1, __ATOMIC_RELAXED);
+                break;
+            }
+        pthread_mutex_unlock(&g->lock);
+    }
+    g->destroy_fb(device, fb, a);
+}
+
+static VKAPI_ATTR void VKAPI_CALL sk_DestroyImageView(VkDevice device, VkImageView v, const VkAllocationCallbacks *a)
+{
+    bcsink *g = sk();
+    if (v) sink_views_drop(g, v, VK_NULL_HANDLE);
+    g->destroy_view(device, v, a);
+}
+
+/* The hooks, over what the device's table has (the errata fixes beneath, the emulations installed later over them:
+ * the dynamic rendering emulation makes its render passes and framebuffers through these). */
+static void sink_install(vkb_srv_table *dev)
+{
+    vkb_emu_device *e = dev->emu;
+    vkb_dispatch *dt = &dev->dt;
+    if (e->bcsink || !dt->vkCreateRenderPass || !dt->vkDestroyRenderPass || !dt->vkCreateFramebuffer || !dt->vkDestroyFramebuffer ||
+        !dt->vkDestroyImageView || !dt->vkCmdBeginRenderPass || !dt->vkCmdEndRenderPass || !dt->vkCmdSetViewport || !dt->vkCmdClearAttachments)
+        return;
+    bcsink *g = calloc(1, sizeof(*g));
+    if (!g) return;
+    pthread_mutex_init(&g->lock, NULL);
+    g->create_rp = dt->vkCreateRenderPass;
+    g->destroy_rp = dt->vkDestroyRenderPass;
+    g->create_fb = dt->vkCreateFramebuffer;
+    g->destroy_fb = dt->vkDestroyFramebuffer;
+    g->destroy_view = dt->vkDestroyImageView;
+    g->begin_rp = dt->vkCmdBeginRenderPass;
+    g->end_rp = dt->vkCmdEndRenderPass;
+    g->set_vp = dt->vkCmdSetViewport;
+    g->clear_att = dt->vkCmdClearAttachments;
+    g->create_rp2 = dt->vkCreateRenderPass2;
+    g->begin_rp2 = dt->vkCmdBeginRenderPass2;
+    g->end_rp2 = dt->vkCmdEndRenderPass2;
+    g->begin_r = dt->vkCmdBeginRendering;
+    g->end_r = dt->vkCmdEndRendering;
+    g->set_vp_count = dt->vkCmdSetViewportWithCount;
+    e->bcsink = g;
+    dt->vkCreateRenderPass = sk_CreateRenderPass;
+    dt->vkDestroyRenderPass = sk_DestroyRenderPass;
+    dt->vkCreateFramebuffer = sk_CreateFramebuffer;
+    dt->vkDestroyFramebuffer = sk_DestroyFramebuffer;
+    dt->vkDestroyImageView = sk_DestroyImageView;
+    dt->vkCmdBeginRenderPass = sk_CmdBeginRenderPass;
+    dt->vkCmdEndRenderPass = sk_CmdEndRenderPass;
+    dt->vkCmdSetViewport = sk_CmdSetViewport;
+    dt->vkCmdClearAttachments = sk_CmdClearAttachments;
+    if (g->create_rp2) dt->vkCreateRenderPass2 = sk_CreateRenderPass2;
+    if (g->begin_rp2 && g->end_rp2) {
+        dt->vkCmdBeginRenderPass2 = sk_CmdBeginRenderPass2;
+        dt->vkCmdEndRenderPass2 = sk_CmdEndRenderPass2;
+    }
+    if (g->begin_r && g->end_r) {
+        dt->vkCmdBeginRendering = sk_CmdBeginRendering;
+        dt->vkCmdEndRendering = sk_CmdEndRendering;
+    }
+    if (g->set_vp_count) dt->vkCmdSetViewportWithCount = sk_CmdSetViewportWithCount;
+}
+
+void vkb_emu_bcsink_free(vkb_emu_device *e)
+{
+    bcsink *g = e ? e->bcsink : NULL;
+    if (!g) return;
+    e->bcsink = NULL;
+    for (uint32_t b = 0; b < SK_BUCKETS; b++) {
+        while (g->views[b]) {
+            sink_view *x = g->views[b];
+            g->views[b] = x->next;
+            free(x);
+        }
+        while (g->rps[b]) {
+            rp_info *x = g->rps[b];
+            g->rps[b] = x->next;
+            free(x->att);
+            free(x);
+        }
+        while (g->fbs[b]) {
+            fb_info *x = g->fbs[b];
+            g->fbs[b] = x->next;
+            free(x->views);
+            free(x);
+        }
+    }
+    pthread_mutex_destroy(&g->lock);
+    free(g);
+}
+
 /* ------------------------------------------------------------------ install */
 
 void vkb_emu_bcn_install(vkb_srv_table *dev)
@@ -2250,6 +3152,12 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
         VKB_ONCE(VKB_LOG_WARN, "BC emulation: formats%s decoded, not transcoded: the startup probe could not build their transcoder "
                  "(its line in the device profile says why; VKBRIDGE_PROBE=force runs it again)", off);
     s->quality = transcode_quality();
+    {
+        VkPhysicalDeviceProperties pp;
+        dev->real.vkGetPhysicalDeviceProperties(dev->physical, &pp);
+        s->auto_rate = budget_auto(auto_name(pp.deviceName), &s->auto_fast, s->auto_why, sizeof(s->auto_why));
+        s->auto_burst = s->auto_rate / 8;
+    }
     static const char *const qname[4] = {", fast", "", ", high quality", ", auto quality (fast for levels of 1024x1024 texels or more)"};
     if (len) VKB_INFO("BC emulation: transcoding (BC format -> format):%s%s%s", msg, qname[s->quality],
                       s->astc_n == 6 ? ", ASTC 6x6 (VKBRIDGE_BC_ASTC_BLOCK)" : s->astc_n == 8 ? ", ASTC 8x8 (VKBRIDGE_BC_ASTC_BLOCK)" : "");
@@ -2272,8 +3180,15 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     }
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &s->dsl, 1, &pr};
     dev->real.vkCreatePipelineLayout(dev->device, &plci, NULL, &s->layout);
+    {
+        const char *bv = vkb_srv_env("VKBRIDGE_BC_BATCH");
+        s->batch = !(bv && bv[0] == '0' && !bv[1]);
+        VKB_INFO("BC emulation: %s", s->batch ? "uploads recorded back to back share one barrier pair (VKBRIDGE_BC_BATCH=0: a pair each)"
+                                               : "a barrier pair per upload (VKBRIDGE_BC_BATCH=0)");
+    }
     e->bcn = s;
     dev->dt.vkCreateImageView = emu_CreateImageView;
+    sink_install(dev);
 }
 
 void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
@@ -2282,6 +3197,7 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
     if (!s) return;
     budget_totals();
     copies_line(1);
+    uploads_line(1);
     vkb_emu_bcn_quiesce(dev);
     for (int q = 0; q < 3; q++)
         for (int i = 0; i < FAM_COUNT; i++)

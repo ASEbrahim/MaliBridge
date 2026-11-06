@@ -185,12 +185,14 @@ set(CHECK_TESTS
     cached_check
     polygon_check
     gpuview_check
+    membudget_check
     dedhint_check
     planar_check
     fdprops_check
     memclass_check
     procaddr_check
     exitclean_check
+    exitheap_check
     texcap_check
     asyncpipe_check
     robust2_check
@@ -200,14 +202,18 @@ set(CHECK_TESTS
     shmbarrier_check
     stencillayout_check
     dynrend_check
+    imageless_check
     wave32_check
     xfb_check
     gshide_check
     featclamp_check
     gsexport_check
+    dmabufsize_check
     present_late_check
     eventstatus_check
     querystuck_check
+    lost_check
+    endcb_check
 )
 foreach(t IN LISTS CHECK_TESTS)
     add_executable(${t}
@@ -220,7 +226,7 @@ foreach(t IN LISTS CHECK_TESTS)
     vkb_host_output(${t})
 endforeach()
 
-target_sources(bcn_check PRIVATE "${SRV}/bc_spv.h")
+target_sources(bcn_check PRIVATE "${SRV}/bc_spv.h" "${VKB}/tests/bcsink_vert.inc" "${VKB}/tests/bcsink_frag.inc")
 target_sources(divisor_check PRIVATE
     "${VKB}/tests/divisor_vert.inc"
     "${VKB}/tests/divisor_frag.inc"
@@ -255,6 +261,10 @@ target_sources(asyncpipe_check PRIVATE
     "${VKB}/tests/dynstate_frag.inc"
 )
 target_sources(dynrend_check PRIVATE
+    "${VKB}/tests/polygon_vert.inc"
+    "${VKB}/tests/polygon_frag.inc"
+)
+target_sources(imageless_check PRIVATE
     "${VKB}/tests/polygon_vert.inc"
     "${VKB}/tests/polygon_frag.inc"
 )
@@ -304,6 +314,29 @@ add_executable(flip_corpus
 )
 target_link_libraries(flip_corpus PRIVATE vkb_host_warn)
 vkb_host_output(flip_corpus)
+
+# The wire primitives (common/vkb_wire.h) against a byte-wise model, and their cost
+add_executable(wire_check
+    "${VKB}/tests/wire_check.c"
+    ${COMMON_SRC}
+)
+target_link_libraries(wire_check PRIVATE vkb_host_flags)
+target_compile_options(wire_check PRIVATE -O2)
+vkb_host_output(wire_check)
+
+# The capability check's SPIR-V scan (server/spirv_caps.c) on its own (run_ci_tests.sh, capgate_test.sh)
+add_executable(capgate_unit
+    "${VKB}/tests/capgate_unit.c"
+    "${SRV}/spirv_caps.c"
+)
+target_link_libraries(capgate_unit PRIVATE vkb_host_flags)
+target_include_directories(capgate_unit PRIVATE "${SRV}")
+vkb_host_output(capgate_unit)
+
+# A vertex shader's clip distance drawn (clip_check.sh, capgate_test.sh)
+add_executable(clip_pipeline "${VKB}/tests/clip_pipeline.c")
+target_link_libraries(clip_pipeline PRIVATE vkb_host_flags ${CMAKE_DL_LIBS})
+vkb_host_output(clip_pipeline)
 
 # The MK-03 SPIR-V pass alone, over a corpus (host/bitwise_test.sh)
 add_executable(bitwise_corpus
@@ -375,10 +408,17 @@ target_include_directories(effects_corpus PRIVATE "${SRV}" "${VKB}/tests")
 target_link_libraries(effects_corpus PRIVATE vkb_host_warn)
 vkb_host_output(effects_corpus)
 
+# The suite's Mali profile (mali_profile.sh): the profile's switches added to every server's and client's own (LD_PRELOAD)
+add_library(vkb_mali_profile SHARED "${CMAKE_CURRENT_SOURCE_DIR}/profiles/mali_profile_shim.c")
+set_target_properties(vkb_mali_profile PROPERTIES PREFIX "lib" OUTPUT_NAME "vkb_mali_profile")
+target_link_libraries(vkb_mali_profile PRIVATE pthread)
+vkb_host_output(vkb_mali_profile)
+
 # `make -C host test` runs the whole regression suite; so does `cmake --build <dir> --target test`.
 add_custom_target(test
     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/run_tests.sh" "${OUT}"
     DEPENDS
+        vkb_mali_profile
         vkbridge-server
         vulkan_droidbridge
         vkbridge-smoke
@@ -386,6 +426,7 @@ add_custom_target(test
         layer-app
         ${CHECK_TESTS}
         flip_corpus
+        wire_check
         bitwise_corpus
         clampzero_corpus
         shlbarrier_corpus
@@ -454,6 +495,7 @@ add_custom_target(quick-check
 add_custom_target(ci-test
     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/run_ci_tests.sh"
     DEPENDS
+        vkb_mali_profile
         vkbridge-server
         vulkan_droidbridge
         vkbridge-smoke
@@ -485,6 +527,8 @@ add_custom_target(ci-test
         fp16_check
         asyncpipe_check
         xfb_check
+        capgate_unit
+        clip_pipeline
         downgrade_corpus
         shmbarrier_corpus
         wave32_corpus

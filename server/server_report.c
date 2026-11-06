@@ -1023,12 +1023,13 @@ static int waits_for_gpu(const char *call)
 
 /* The process's request that has run at least VKBRIDGE_REPORT_STUCK_S and not returned: its seconds
  * (0: none) and name. Read when the report is written, so it says what runs now. */
-static double running_stuck(const rp_proc *p, const char **call)
+static double running_stuck(const rp_proc *p, const char **call, char *where, size_t cap)
 {
     *call = NULL;
+    if (where && cap) where[0] = 0;
     double lim = stuck_s();
     if (!p->alive || lim <= 0) return 0;
-    double s = vkb_srv_running_longest(p->pid, call);
+    double s = vkb_srv_running_longest(p->pid, call, where, cap);
     return s >= lim ? s : 0;
 }
 
@@ -1054,8 +1055,13 @@ static int list_issues(FILE *f, int json, int notes)
         if (p->lost) issue(&is, "%s: device lost %u time(s), first in %s", nm, p->lost, p->lost_first);
         if (p->long_waits) issue(&is, "%s: %u GPU wait(s) longer than 2 s (longest %.1f s)", nm, p->long_waits, p->long_wait_max_ms / 1000.0);
         const char *call;
-        double stuck = running_stuck(p, &call);
-        if (stuck > 0)
+        char where[800];
+        double stuck = running_stuck(p, &call, where, sizeof(where));
+        if (stuck > 0 && where[0])
+            issue(&is, waits_for_gpu(call) ? "%s: %s has waited %.0f s for the GPU and not returned (still waiting; %s)"
+                                           : "%s: %s has run %.0f s in the GPU driver and not returned (still running; %s)",
+                  nm, call, stuck, where);
+        else if (stuck > 0)
             issue(&is, waits_for_gpu(call) ? "%s: %s has waited %.0f s for the GPU and not returned (still waiting)"
                                            : "%s: %s has run %.0f s in the GPU driver and not returned (still running)",
                   nm, call, stuck);
@@ -1464,12 +1470,15 @@ static void write_json(FILE *f, int final)
         fprintf(f, ", \"presents_elsewhere\": %s", presents_elsewhere(p) ? "true" : "false");
         {
             const char *call;
-            double stuck = running_stuck(p, &call);
+            char where[800];
+            double stuck = running_stuck(p, &call, where, sizeof(where));
             fprintf(f, ", \"stuck_call\": ");
             if (stuck > 0) {
                 fprintf(f, "{\"call\": ");
                 js(f, call);
-                fprintf(f, ", \"s\": %.1f, \"gpu_wait\": %s}", stuck, waits_for_gpu(call) ? "true" : "false");
+                fprintf(f, ", \"s\": %.1f, \"gpu_wait\": %s, \"where\": ", stuck, waits_for_gpu(call) ? "true" : "false");
+                js(f, where);
+                fprintf(f, "}");
             } else {
                 fprintf(f, "null");
             }
@@ -1580,7 +1589,7 @@ static void *report_main(void *arg)
                 pthread_mutex_lock(&rlock);
                 for (int i = 0; i < nprocs && !dirty; i++) {
                     const char *call;
-                    if (running_stuck(&procs[i], &call) > 0) dirty = 1;
+                    if (running_stuck(&procs[i], &call, NULL, 0) > 0) dirty = 1;
                 }
                 pthread_mutex_unlock(&rlock);
             }

@@ -439,6 +439,15 @@ uint64_t vkb_memtotal_mb(void) { return meminfo_kb("MemTotal", "VKBRIDGE_FAKE_ME
 /* Memory free for use now in KB (MemAvailable; VKBRIDGE_FAKE_MEMAVAIL_MB for tests), 0 when unknown */
 uint64_t vkb_memavail_kb(void) { return meminfo_kb("MemAvailable", "VKBRIDGE_FAKE_MEMAVAIL_MB"); }
 
+/* Swap (zram on Android) in MB (VKBRIDGE_FAKE_SWAPTOTAL_MB / VKBRIDGE_FAKE_SWAPFREE_MB for tests); total 0: none or unknown */
+uint64_t vkb_swaptotal_mb(void) { return meminfo_kb("SwapTotal", "VKBRIDGE_FAKE_SWAPTOTAL_MB") >> 10; }
+uint64_t vkb_swapfree_mb(void)
+{
+    const char *f = getenv("VKBRIDGE_FAKE_SWAPFREE_MB");
+    if (f && *f) return strtoull(f, NULL, 10); /* 0 is a value here (swap used up) */
+    return meminfo_kb("SwapFree", "VKBRIDGE_FAKE_SWAPFREE_MB") >> 10;
+}
+
 /* The default heap cap: in safe mode on a device with 12.5 GB of RAM or less (an "8 GB" phone or
  * tablet shows 7-8 GB, a "12 GB" one 11-11.7), when VKBRIDGE_HEAP_MAX_MB says nothing, half the
  * RAM rounded down to 512 MB, at least 2048 and at most 4096 (4096 on 12 GB devices). DXVK
@@ -455,7 +464,60 @@ uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb)
     return cap < 2048 ? 2048 : cap > 4096 ? 4096 : (uint32_t)cap;
 }
 
-void vkb_preset_client_values(vkb_server_pd_info *info)
+/* The default cap, lowered to the memory free when the process first asks (MemAvailable plus the GPU memory
+ * it already holds), rounded down to 512 MB, at least 2048: never more video memory than the phone has
+ * free for the game. A Mali driver has no VK_EXT_memory_budget (none in any player's log), so the heap
+ * size is all DXVK and vkd3d-proton go by: DXGI's DedicatedVideoMemory is the largest device-local heap
+ * (4064 MB under the 4096 cap) and games size their texture pools from it; on Mali (an integrated GPU)
+ * DXVK enforces no budget, so a smaller heap refuses nothing, it only changes what the game is told.
+ * vivo X300, 11350 MB, 2.9-3.5 GB free at the game's start: Gas Station Simulator
+ * (UE5) took 3.0-3.3 GB of GPU memory under the 4096 cap and the system killed the bridge (exit 137)
+ * both times. With as much free as the cap or more nothing changes. Fixed per process at its first query,
+ * so its later instances and devices see the same heaps. Only the default cap: an explicit
+ * VKBRIDGE_HEAP_MAX_MB (preset, <cache dir>/env, the guest) wins, and no cap (more than 12800 MB of
+ * RAM, performance mode) stays none. VKBRIDGE_HEAP_FOLLOW_FREE=0: the cap as before. */
+#define VKB_HEAP_FREE_FLOOR_MB 2048u
+static uint32_t heap_free_cap_mb(uint32_t cap_mb, uint64_t free_mb)
+{
+    if (!cap_mb || !free_mb) return cap_mb;
+    uint64_t mb = free_mb & ~(uint64_t)511;
+    if (mb < VKB_HEAP_FREE_FLOOR_MB) mb = VKB_HEAP_FREE_FLOOR_MB;
+    return mb < cap_mb ? (uint32_t)mb : cap_mb;
+}
+
+static uint32_t heap_follow_free(uint32_t cap, vkb_srv_proc *proc)
+{
+    const char *e = vkb_srv_env("VKBRIDGE_HEAP_FOLLOW_FREE");
+    int follow = !(e && !strcmp(e, "0"));
+    uint32_t had = proc ? __atomic_load_n(&proc->heap_free_mb, __ATOMIC_RELAXED) : 0;
+    if (had) return follow && had - 1 < cap ? had - 1 : cap;
+    uint64_t avail = vkb_memavail_kb() >> 10;
+    if (!avail) return cap;
+    int64_t own = 0, total, images, bc_images, bc_src;
+    if (proc) vkb_memstat_query(proc->pid, &own, &total, &images, &bc_images, &bc_src);
+    uint64_t free_mb = avail + (own > 0 ? (uint64_t)own >> 20 : 0);
+    /* Started short of memory: less free than the cap it would be shown. Such a process alone gets the
+     * bridge's VK_EXT_memory_budget (vkb_emu_membudget_for, server_memory.c memb_fill); one that started
+     * with the cap free or more, and every process on a device without the default cap, does not. */
+    if (proc && free_mb < cap) __atomic_store_n(&proc->start_short, 1, __ATOMIC_RELAXED);
+    if (!follow) {
+        if (proc) __atomic_store_n(&proc->heap_free_mb, cap + 1, __ATOMIC_RELAXED);
+        return cap;
+    }
+    uint32_t mb = heap_free_cap_mb(cap, free_mb);
+    if (proc) {
+        uint32_t want = 0;
+        if (!__atomic_compare_exchange_n(&proc->heap_free_mb, &want, mb + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return want - 1 < cap ? want - 1 : cap; /* another of its threads was first */
+    }
+    if (mb < cap)
+        VKB_INFO("heap cap: process %d (%s) shown device-local heaps of at most %u MB, not %u: %llu MB free when it started "
+                 "(VKBRIDGE_HEAP_FOLLOW_FREE=0 turns this off)", proc ? proc->pid : 0, proc ? proc->comm : "?", mb, cap,
+                 (unsigned long long)free_mb);
+    return mb;
+}
+
+void vkb_preset_client_values(vkb_server_pd_info *info, vkb_srv_proc *proc)
 {
     const char *h = vkb_srv_env("VKBRIDGE_HEAP_MAX_MB");
     uint64_t heap = UINT64_MAX; /* nothing said: an explicit value, 0 too, wins over the default */
@@ -474,6 +536,7 @@ void vkb_preset_client_values(vkb_server_pd_info *info)
                      "as at most %llu MB (VKBRIDGE_HEAP_MAX_MB=0 turns this off)", (unsigned long long)ram, VKB_HEAP_DEFAULT_RAM_MAX_MB,
                      (unsigned long long)heap);
             if (first_time(msg)) VKB_INFO("%s", msg);
+            heap = heap_follow_free((uint32_t)heap, proc);
         }
     }
     info->heap_max_mb = (uint32_t)heap;

@@ -14,19 +14,19 @@ cd "$(dirname "$0")"
 # With no names the whole suite runs. `--list` prints the names.
 # The Makefile/CMake `test` targets pass the output directory as the first argument; ignore it.
 VKB_TEST_NAMES="smoke smoke_memtypes smoke_xring memclass_xring fdprops_xring smoke_o1 memclass_o1
-bgr10 uf11 memclass_g720 smoke_push bcn_transcode bcn_zink bcn_decode bcn_astc texcap bcn nulldesc opaque
+bgr10 uf11 memclass_g720 smoke_push bcn_transcode bcn_zink bcn_zink_dynrend bcn_decode bcn_astc texcap bcn nulldesc opaque
 planar dmabuf_image fdprops memclass procaddr exitclean recycle desc_traffic flicker d3d11
 d3d11_flicker pcache wait_imitate compile_watchdog gsfold probe_report probe_end probe_tx errata
 bitwise shlbarrier promote shmbarrier wave32 clampzero views cmdstate vbbake cullmode_test dedimport
 stencillayout dynrend probe_mk viewport_test mode presets calts robust2 fp16 begin_encoding cached
-heapcap asyncpipe fossilize viewport_check view3d viewchurn dynstate vbstride dedhint cullmode_check
+heapcap membudget asyncpipe fossilize viewport_check view3d viewchurn dynstate vbstride dedhint cullmode_check
 divisor polygon polygon_off vkcube_wayland_dmabuf vkcube_wayland_shm vkcube_x11 gamescope
-divisor_g925 divisor_khr report_stall report_stuck report_cpu report_gpumem present_timeout zerocopy_nested server_hup gshide
-featclamp envfile unflagged eventstatus query querystuck gsexport vtxlayout beginfail endfail secfail
-submitfail waitlost apicap ycbcr_swap driverid vidyn eds compilegate sparse a1zink envswitch poolfull lowmem xclipse_zink syncfd dmabufsync timeline dabreg dmabufahb
-xfb xfb_nofold hotpath
-poll reqcache syncmirror stale_frames bcn_budget bcn_mixcopy hitch bcbudget latency lagprobe framequeue
-presentwait present_block compileburst querystuck_burst"
+divisor_g925 divisor_khr report_stall report_stuck report_cpu report_gpumem present_timeout zerocopy_nested server_hup crashline unbound_draw lost memfault endcb xfb_bind reqguard capgate capgate_unit divisor_dynanyway gshide
+featclamp envfile unflagged eventstatus query querystuck gsexport dmabufsize dshape vtxlayout beginfail endfail secfail
+submitfail waitlost apicap ycbcr_swap driverid vidyn eds compilegate sparse a1zink envswitch poolfull heapleak lowmem exitheap xclipse_zink syncfd dmabufsync timeline imageless dabreg dmabufahb
+xfb xfb_nofold hotpath wire
+poll reqcache syncmirror stale_frames bcn_budget bcn_mixcopy hitch bcauto bcbudget bcupload latency lagprobe framequeue
+presentwait present_block compileburst querystuck_burst describe dmaheap"
 if [ "${1:-}" = --list ]; then
   printf '%s\n' $VKB_TEST_NAMES
   exit 0
@@ -34,10 +34,60 @@ fi
 if [ -n "${1:-}" ] && [ -d "$1" ]; then shift; fi
 VKB_ONLY=${VKB_ONLY:-$*}
 want() {
-  [ -z "$VKB_ONLY" ] && return 0
-  local w
-  for w in ${VKB_ONLY//,/ }; do [ "$w" = "$1" ] && return 0; done
-  return 1
+  if [ -n "$VKB_ONLY" ]; then
+    local w hit=
+    for w in ${VKB_ONLY//,/ }; do [ "$w" = "$1" ] && hit=1; done
+    [ -n "$hit" ] || return 1
+  fi
+  mp_for "$1"
+  return 0
+}
+# The Mali profile (mali_profile.sh): every test runs on the desktop driver with what the strictest real
+# Mali lacks taken away (VKB_MALI_PROFILE, default common), except the tests below, each with the profile
+# it runs under and why. A family name = the oldest Mali driver family the test's subject exists on; off =
+# needs something no Mali has (then the test cannot show that its fix acts on a Mali: say so in the reason).
+# VKB_PROFILE_FOR_ADD="name=profile ..." adds entries for one run. Verdicts: MALI-PROFILE-PROGRESS.md (artifacts plans).
+VKB_PROFILE_FOR=
+# pf <test> <profile> <why>: the test runs under <profile> (the reason is for the reader only)
+pf() { VKB_PROFILE_FOR="$VKB_PROFILE_FOR $1=$2"; }
+# Vulkan 1.2/1.3 in the test program itself (timeline semaphores, host query reset, extended dynamic
+# state, DXVK 2): Mali r18-r40 drivers are Vulkan 1.1 and games keep 1.1 there (version promotion is
+# off on every driver: none is on its tested list), so these fixes act from r44 on
+for t in poll reqcache d3d11 wait_imitate waitlost present_timeout hitch lagprobe presentwait apicap cullmode_test \
+         dynrend a1zink sparse timeline eventstatus syncmirror query querystuck querystuck_burst; do
+  pf $t r44 "needs Vulkan 1.2/1.3 in the client; Mali r18-r40 show games 1.1"
+done
+pf opaque r32-r34 "opaque fds over dma-bufs need the driver's VK_KHR_external_memory_fd: no r18-r26 Mali in the logs has it (nothing D3D runs there either: Vulkan 1.1)"
+pf probe_end r18-r19 "passes on every family; the common profile (the intersection) is stricter than any real driver"
+pf ycbcr_swap r32-r34 "the subject is Xclipse and Valhall's YCbCr refusal; r18-r26 lack the YCbCr pieces the test draws with"
+pf calts r32-r34 "needs a driver with VK_EXT_calibrated_timestamps (r18-r26 and part of r38-r40 lack it)"
+pf featclamp r32-r34 "needs transform feedback (r18-r26 have none); the subject is r44's missing geometry streams"
+pf cmdstate r49 "reads the driver's VK_EXT_vertex_input_dynamic_state (r49p1 has it; below r48 the errata hide it)"
+pf divisor_g925 r49 "Mali-G925's KHR-only divisor is r49p1's (older families have neither name: everything emulated)"
+pf divisor_khr r49 "a KHR-only divisor driver: needs the KHR extension (r49 on)"
+pf probe_report r54 "expects the emulation masks of a driver with divisor and push descriptors (r54 on)"
+pf mode r54 "expects the emulation masks of a driver with divisor and push descriptors (r54 on)"
+pf robust2 r54 "the subject is r54p3's robustness2 without robust access; older families have no VK_EXT_robustness2"
+pf promote r56 "promotes a desktop driver taken as 1.1/1.2 with every 1.3 piece; no 1.1 Mali in the logs has them (they reach 1.2 at most), and its 'driver as it is' step needs the real 1.4"
+pf viewport_test r56 "draws two viewports with ViewportIndex; Mali r18-r54 have no multiViewport (the bridge's compat draws the first only)"
+pf vbbake r44 "vbstride_check binds with vkCmdBindVertexBuffers2 (Vulkan 1.3)"
+pf heapcap off "FIX NOT ON MALI: step 9 (FIXES-LEDGER rows 111/197) leans on VK_EXT_memory_budget, which no Mali in the logs has"
+pf vidyn off "FIX NOT ON MALI in part: every Mali family has clip/cull emulated; a vertex shader declaring ClipDistance/CullDistance gets a rewritten module, the vertex-input layer cannot keep that pipeline, and the BGRA 10-10-10-2 / B10G11R11 vertex fetch emulation is not fitted (r49p1+ with the driver's vidyn)"
+pf xclipse_zink off "the subject is Samsung's Xclipse driver (Vulkan 1.3, imitated with VKBRIDGE_FAKE_DRIVER=samsung:<driverVersion>), not a Mali: a Mali profile takes the imitated device down to 1.1 and Zink then never starts"
+pf fp16 r56 "a profile below the desktop driver's 1.4 installs the promotion's feature query, which drops fp16_hide's (latent bug, MALI-PROFILE-PROGRESS.md); real r54 drivers report what they are"
+mp_for() {
+  local want_p=${VKB_MALI_PROFILE:-common} e
+  [ "$want_p" = off ] || for e in $VKB_PROFILE_FOR ${VKB_PROFILE_FOR_ADD:-}; do
+    [ "${e%%=*}" = "$1" ] && want_p=${e#*=}
+  done
+  [ "$want_p" = "${VKB_MALI_PROFILE_CUR:-}" ] && return 0
+  mp_apply "$want_p" || exit 1
+  echo "  (Mali profile $want_p for $1)"
+  # the mode's shared server takes the profile when it starts: start it again
+  case ${vkb_cur_mode:-} in
+    mali) . ./mali_env.sh >/dev/null ;;
+    plain) . ./bridge_env.sh >/dev/null ;;
+  esac
 }
 want_any() {
   [ -z "$VKB_ONLY" ] && return 0
@@ -61,18 +111,20 @@ export VKB_RUN_DIR VKBRIDGE_SOCKET=$VKB_RUN_DIR/server.sock VKB_SERVER_LOG=$VKB_
 unset VKBRIDGE_CACHE_DIR VKB_SERVER_PID
 . ./server_start.sh
 trap 'vkb_server_stop; cp -f "$VKB_SERVER_LOG" out/server.log 2>/dev/null; rm -rf "$VKB_RUN_DIR"' EXIT
+. ./mali_profile.sh
 pass=0; fail=0
 result() { if [ "$1" = 0 ]; then pass=$((pass+1)); echo "  ok   $2"; else fail=$((fail+1)); echo "  FAIL $2"; fi; }
 # A server-side protocol error fails the run even when the desktop driver shrugs it off (a missing
 # count in vkBeginCommandBuffer's encoding passed every check on RADV and crashed Mali).
 server_errors() {
-  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG" 2>/dev/null)
-  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no|named ahead failed|bad batch entry" "$VKB_SERVER_LOG")"; return 1; }
+  local n; n=$(grep -cE "command stream:|malformed request|unknown command id|the driver has no |named ahead failed|bad batch entry" "$VKB_SERVER_LOG" 2>/dev/null)
+  [ "${n:-0}" = 0 ] || { echo "  server log: $n protocol errors, first: $(grep -m1 -E "command stream:|malformed request|unknown command id|the driver has no |named ahead failed|bad batch entry" "$VKB_SERVER_LOG")"; return 1; }
 }
 run_mode() {
   local mode=$1
   echo "== $mode"
   : > "$VKB_SERVER_LOG"
+  vkb_cur_mode=$mode
   if [ "$mode" = mali ]; then . ./mali_env.sh >/dev/null; else unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API; . ./bridge_env.sh >/dev/null; fi
   if want smoke; then
     timeout 120 ./out/vkbridge-smoke >out/t-smoke.log 2>&1; result $? "smoke ($(tail -1 out/t-smoke.log))"
@@ -245,21 +297,41 @@ run_mode() {
       timeout 180 ./out/bcn_check transcode >out/t-bcn.log 2>&1; result $? "bcn_check, BC transcoded ($(tail -1 out/t-bcn.log))"
     fi
     # Zink's BC images (usage 0x17 with COLOR_ATTACHMENT, flags 0x108) are transcoded too, within the same floors
-    # (they were all decoded, 620 MB of BC held as 3.1 GB); none is logged as decoded; Zink's uncompressed views
-    # of them (rendered to) get an image of the blocks of their own, and the texture is unchanged
+    # (they were all decoded, 620 MB of BC held as 3.1 GB); none is logged as decoded; blocks drawn into
+    # uncompressed views of them, as Mesa uploads BC data from a pixel buffer, show in the texture (black)
     if want bcn_zink; then
       VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
       from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
       timeout 180 ./out/bcn_check transcode zink >out/t-bcn-zink.log 2>&1 &&
         tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: image .* transcoded as format [0-9]*, usage 0x7," &&
         tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: an uncompressed view (format [0-9]*) of a transcoded BC image the app may render to" &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: blocks drawn into an uncompressed view (format [0-9]*) of a BC image .* put into the texture" &&
         ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: image .* decoded as format"
       result $? "bcn_check transcode zink, BC images made as Zink makes them are transcoded ($(tail -1 out/t-bcn-zink.log); $(tail -n +$from "$VKB_SERVER_LOG" | grep -c 'BC emulation: image .* transcoded as') logged transcoded)"
+    fi
+    # The same uploads through a pixel buffer recorded with vkCmdBeginRendering on a driver without dynamic rendering
+    # (Mali-G77 r32p1): the bridge's render passes for it reach the blocks' way into the texture too
+    if want bcn_zink_dynrend; then
+      VKB_BC_TX_BUDGET=0 VKB_MISSING_ADD=dynrend . ./mali_env.sh >/dev/null
+      from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+      timeout 180 ./out/bcn_check transcode zink >out/t-bcn-zink-dynrend.log 2>&1 &&
+        grep -q "dynamic rendering: .* show in the texture" out/t-bcn-zink-dynrend.log &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "dynamic rendering emulated on device" &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "BC emulation: blocks drawn into an uncompressed view (format [0-9]*) of a BC image .* put into the texture"
+      result $? "bcn_check transcode zink, dynamic rendering emulated: blocks drawn into uncompressed views show in the texture ($(tail -1 out/t-bcn-zink-dynrend.log))"
+      . ./mali_env.sh >/dev/null
     fi
     if want bcn_budget; then
       VKB_BC_TX_BUDGET=32:4 . ./mali_env.sh >/dev/null
       timeout 180 ./out/bcn_check transcode >out/t-bcn-budget.log 2>&1 && grep -q "BC budget: transcoding" "$VKB_SERVER_LOG"
       result $? "bcn_check, BC transcoded under a 32:4 conversion budget ($(tail -1 out/t-bcn-budget.log); $(grep -o 'so far [0-9]* image(s) ([0-9.]* Mtexels) transcoded, [0-9]* ([0-9.]*) decoded' "$VKB_SERVER_LOG" | tail -1))"
+      # auto as a Mali-G615 MC6 would have it (11.2:1.4): short images encoded fast or
+      # decoded, every texture still at its floor
+      VKB_BC_TX_BUDGET=auto VKB_SERVER_ENV=VKBRIDGE_TEST_BC_GPU_NAME=Mali-G615_MC6 . ./mali_env.sh >/dev/null
+      timeout 180 ./out/bcn_check transcode >out/t-bcn-budget-auto.log 2>&1 && grep -q "BC budget: auto for Mali-G615 MC6" "$VKB_SERVER_LOG"
+      result $? "bcn_check, BC transcoded under the auto budget of a Mali-G615 MC6 ($(tail -1 out/t-bcn-budget-auto.log); $(grep -o 'so far [0-9]* image(s) ([0-9.]* Mtexels) transcoded ([0-9]* with the fast search everywhere), [0-9]* ([0-9.]*) decoded' "$VKB_SERVER_LOG" | tail -1))"
+      unset VKB_SERVER_ENV
+      . ./mali_env.sh >/dev/null
     fi
     # Copies between a decoded and a transcoded image of one BC format (the budget leaves both, and
     # UE4 copies a streamed texture's levels between its old and new image): every copy done (from
@@ -288,7 +360,7 @@ run_mode() {
     fi
     if want bcn_decode; then
       VKB_BC_TRANSCODE=0 . ./mali_env.sh >/dev/null
-      timeout 180 ./out/bcn_check >out/t-bcn-decode.log 2>&1; result $? "bcn_check, BC decoded ($(tail -1 out/t-bcn-decode.log))"
+      timeout 180 ./out/bcn_check upload >out/t-bcn-decode.log 2>&1; result $? "bcn_check, BC decoded, Zink uploads through a pixel buffer too ($(tail -1 out/t-bcn-decode.log))"
       . ./mali_env.sh >/dev/null
     fi
     # BC2 / BC3 / BC7 into ASTC 6x6 and 8x8 blocks (VKBRIDGE_BC_ASTC_BLOCK): the same checks by PSNR
@@ -387,14 +459,46 @@ run_mode() {
         grep -q "dma-buf image query refused by the driver: format 44 type 1 tiling 1000158000 usage 0xd flags 0x8 (2 view formats) modifier 0x0: result -11, external features 0x0; answered from plain LINEAR" out/t-gsexport-r32-client.log
       result $? "gsexport_check, r32p1's refused modifier queries with the export emulated ($(tail -1 out/t-gsexport-r32.log))"
       if docker image inspect vkb-arch-gamescope >/dev/null 2>&1; then
-        VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
-          "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames'" \
+        # headless as the main gamescope check: a nested window draws only while the desktop's compositor
+        # gives it frames (a fullscreen game or a locked screen on the PC: "Compositor released us but we
+        # were not acquired", no glxgears frame), which says nothing about the bridge. Headless, gamescope
+        # still imports its clients' LINEAR dma-bufs (the 300x300 line) but exports no output of its own:
+        # that export (the 960x540 line) is gsexport_check's r32p1 run just above, and the nested window's
+        # below with VKB_GS_VISIBLE=1
+        VKB_GS_HEADLESS=1 VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
+          "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames.in'" \
           >out/t-gamescope-r32.log 2>&1
         grep -q "frames in" out/t-gamescope-r32.log && ! grep -q "Assertion" out/t-gamescope-r32.log &&
-          tail -n +$from "$VKB_SERVER_LOG" | grep -q "format 44 960x540 usage 0x[0-9a-f]* flags 0x8); made as a plain LINEAR" &&
           tail -n +$from "$VKB_SERVER_LOG" | grep -q "dma-buf import image at the LINEAR modifier refused by the driver's format query (format 44 300x300 usage 0x4"
-        result $? "gamescope + Zink glxgears, r32p1's refused modifier queries with the export emulated ($(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-r32.log)$(grep -m1 -o 'Assertion.*' out/t-gamescope-r32.log))"
+        result $? "gamescope + Zink glxgears, r32p1's refused modifier queries with the export emulated, headless ($(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-r32.log)$(grep -m1 -o 'Assertion.*' out/t-gamescope-r32.log))"
+        if [ "${VKB_GS_VISIBLE:-0}" = 1 ]; then
+          from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+          VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
+            "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames.in'" \
+            >out/t-gamescope-r32-window.log 2>&1
+          grep -q "frames in" out/t-gamescope-r32-window.log && ! grep -q "Assertion" out/t-gamescope-r32-window.log &&
+            tail -n +$from "$VKB_SERVER_LOG" | grep -q "format 44 960x540 usage 0x[0-9a-f]* flags 0x8); made as a plain LINEAR" &&
+            tail -n +$from "$VKB_SERVER_LOG" | grep -q "dma-buf import image at the LINEAR modifier refused by the driver's format query (format 44 300x300 usage 0x4"
+          result $? "gamescope + Zink glxgears, r32p1, nested window: its output exported plain LINEAR ($(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-r32-window.log)$(grep -m1 -o 'Assertion.*' out/t-gamescope-r32-window.log))"
+        fi
       fi
+      unset VKB_MISSING_ADD VKB_SERVER_ENV
+      . ./mali_env.sh >/dev/null
+    fi
+  fi
+  # Xiaomi 17T, Mali-G720 r49p1, no VK_EXT_image_drm_format_modifier: gamescope's import of Steam's LINEAR dma-buf
+  # as an OPTIMAL image with an implicit layout, which Mali sizes larger than the dma-buf (optpad imitates that: +14%).
+  # The importer is made LINEAR at the export's layout (server_emu_layer.c, dmabuf_shape_made); with an OPTIMAL export of
+  # the shape live as well it stays OPTIMAL.
+  if want dmabufsize && [ -x out/dmabufsize_check ]; then
+    if [ "$mode" = mali ]; then
+      from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+      VKB_MISSING_ADD=dmabufexport,optpad VKB_SERVER_ENV=VKBRIDGE_TEST_EXPORT_PAGES=driver . ./mali_env.sh >/dev/null
+      timeout 60 ./out/dmabufsize_check >out/t-dmabufsize.log 2>&1 &&
+        [ "$(tail -n +$from "$VKB_SERVER_LOG" | grep -c "dma-buf import image at OPTIMAL tiling (format 44 1564x720 usage 0x[0-9a-f]*) needs [0-9]* bytes, a LINEAR export of that format and size has [0-9]*: made as a plain LINEAR image at the export's layout")" = 1 ] &&
+        ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "800x600 usage 0x[0-9a-f]*) needs" &&
+        ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "dma-buf import: .* bytes asked for"
+      result $? "dmabufsize_check, r49p1's larger OPTIMAL images with the export emulated ($(tail -1 out/t-dmabufsize.log))"
       unset VKB_MISSING_ADD VKB_SERVER_ENV
       . ./mali_env.sh >/dev/null
     fi
@@ -538,9 +642,18 @@ run_mode() {
       timeout 300 ./hitch_test.sh >out/t-hitch.log 2>&1; result $? "hitch_test ($(tail -1 out/t-hitch.log))"
     fi
     # The conversion budget (VKBRIDGE_BC_TX_BUDGET): a burst of BC uploads on a GPU slowed to a
-    # Mali's, without it, with 32:4 (DS3's preset), decoded and unset (off); the contents, the memory cap, query pins
+    # Mali's, without it, with 32:4 (DS3's preset), decoded and unset (off); the contents, the memory cap, query pins;
+    # first auto's rate from GPU names alone (no core count never gets more than the smallest of the family)
+    if want bcauto; then
+      timeout 60 ./out/bcauto_unit >out/t-bcauto.log 2>&1; result $? "bcauto_unit ($(tail -1 out/t-bcauto.log))"
+    fi
     if want bcbudget; then
       timeout 900 ./bcbudget_test.sh >out/t-bcbudget.log 2>&1; result $? "bcbudget_test ($(tail -1 out/t-bcbudget.log))"
+    fi
+    # Small BC textures streamed as GTA V does through DXVK 3.1.1 (one copy per level, back to back):
+    # batched (default) vs VKBRIDGE_BC_BATCH=0, the same texels read back, fewer barriers
+    if want bcupload; then
+      timeout 900 ./bcupload_test.sh >out/t-bcupload.log 2>&1; result $? "bcupload_test ($(tail -1 out/t-bcupload.log))"
     fi
     # The latency log (VKBRIDGE_LATLOG): one line a frame with every stage, from <cache dir>/env, the
     # server, the guest, a path of its own; off by default; tools/latency_report.py reads it; and
@@ -568,13 +681,53 @@ run_mode() {
       timeout 200 ./present_block_test.sh >out/t-pblock.log 2>&1; result $? "present_block_test ($(tail -1 out/t-pblock.log))"
     fi
     # Under a nested gamescope the gralloc images are offered to the app's compositor, which pairs them
-    # with the same dma-bufs gamescope passes on; every off case keeps ordinary dma-bufs
+    # with the same dma-bufs gamescope passes on (GitHub #44); every off case keeps ordinary dma-bufs
     if want zerocopy_nested; then
       timeout 300 ./zerocopy_nested_test.sh >out/t-zcnested.log 2>&1; result $? "zerocopy_nested_test ($(tail -1 out/t-zcnested.log))"
     fi
     # A hangup does not end the separate server: the app stops it last, after the session's programs
     if want server_hup; then
       timeout 60 ./server_hup_test.sh >out/t-hup.log 2>&1; result $? "server_hup_test ($(tail -1 out/t-hup.log))"
+    fi
+    # A driver crash's line names the client, the bind's image and memory, a draw's bound pipeline
+    if want crashline; then
+      timeout 200 ./crashline_test.sh >out/t-crashline.log 2>&1; result $? "crashline_test ($(tail -1 out/t-crashline.log))"
+    fi
+    # A draw or dispatch with no pipeline bound (Mali reads through the missing pipeline) is left out
+    if want unbound_draw; then
+      timeout 400 ./unbound_draw_test.sh >out/t-unbound.log 2>&1; result $? "unbound_draw_test ($(tail -1 out/t-unbound.log))"
+    fi
+    # A lost device stays its program's: submissions and waits after the loss answer -4 without the
+    # driver, and a driver thread faulting after a loss is stopped (a player log, Pixel 9 r54p3)
+    if want lost; then
+      timeout 300 ./lost_test.sh >out/t-lost.log 2>&1; result $? "lost_test ($(tail -1 out/t-lost.log))"
+    fi
+    # A driver fault in vkAllocateMemory or a bind is contained: the allocation fails, a bind takes its
+    # device as lost, the other programs go on (Mali-G615 r44p1)
+    if want memfault; then
+      timeout 300 ./memfault_test.sh >out/t-memfault.log 2>&1; result $? "memfault_test ($(tail -1 out/t-memfault.log))"
+    fi
+    # A driver fault in vkEndCommandBuffer of a client's command buffer is contained: its device is stopped,
+    # its program ends, the other programs go on (Mali-G2-Ultra r56p0 beta, vkd3d-proton's query resets)
+    if want endcb; then
+      timeout 300 ./endcb_test.sh >out/t-endcb.log 2>&1; result $? "endcb_test ($(tail -1 out/t-endcb.log))"
+    fi
+    # One guard around a connection's driver calls: a fault in a replayed draw (No Man's Sky's last crash) or a
+    # submit takes its program's device down, not the server with every program on it
+    if want reqguard; then
+      timeout 300 ./reqguard_test.sh >out/t-reqguard.log 2>&1; result $? "reqguard_test ($(tail -1 out/t-reqguard.log))"
+    fi
+    # The capability check before the driver: a clip/cull distance built-in never reaches a driver without
+    # the feature (ULTRAKILL, No Man's Sky: Mali's compiler died on it); the SPIR-V scan on its own
+    if want capgate_unit; then
+      timeout 60 ./out/capgate_unit ../tests/corpus >out/t-capgate-unit.log 2>&1; result $? "capgate_unit ($(tail -1 out/t-capgate-unit.log))"
+    fi
+    if want capgate; then
+      timeout 300 ./capgate_test.sh >out/t-capgate.log 2>&1; result $? "capgate_test ($(tail -1 out/t-capgate.log))"
+    fi
+    # Transform feedback begun under a held pipeline bind (Zink, Mali read through no pipeline)
+    if want xfb_bind; then
+      timeout 300 ./xfb_bind_test.sh >out/t-xfb-bind.log 2>&1; result $? "xfb_bind_test ($(tail -1 out/t-xfb-bind.log))"
     fi
     # A start that ends inside a probe: a stop or a kill runs it again, an abort or a hang past the
     # watchdog is died and decided; the default budget defers the heavy probes, both parts timed
@@ -758,10 +911,19 @@ run_mode() {
     if want poolfull; then
       timeout 120 ./poolfull_test.sh >out/t-poolfull.log 2>&1; result $? "poolfull_test ($(tail -1 out/t-poolfull.log))"
     fi
+    # The server heap with Detroit: Become Human's pattern: no overflow pools for sets bigger
+    # than the pool, no copies of the app's pipeline caches past the limit, flat over 10000 frames
+    if want heapleak; then
+      timeout 600 ./heapleak_test.sh >out/t-heapleak.log 2>&1; result $? "heapleak_test ($(tail -1 out/t-heapleak.log))"
+    fi
     # Low memory: said once with what the server holds, its memory line marked, idle
     # descriptor overflow pools freed at resets and made again when needed (a server of its own; once)
     if want lowmem; then
       timeout 120 ./lowmem_test.sh >out/t-lowmem.log 2>&1; result $? "lowmem_test ($(tail -1 out/t-lowmem.log))"
+    fi
+    # What a process gone without destroying its device leaves in the server: destroyed, the heap flat
+    if want exitheap; then
+      timeout 300 ./exitheap_test.sh >out/t-exitheap.log 2>&1; result $? "exitheap_test ($(tail -1 out/t-exitheap.log))"
     fi
     # the compile gate on its own (server_compile_gate.c): its limit, one at a time while memory is low
     if want compilegate; then
@@ -784,6 +946,11 @@ run_mode() {
     if want heapcap; then
       timeout 300 ./heapcap_test.sh >out/t-heapcap.log 2>&1; result $? "heapcap_test ($(tail -1 out/t-heapcap.log))"
     fi
+    # The bridge's VK_EXT_memory_budget where the driver has none (every Mali; the desktop driver's hidden):
+    # DXVK/vkd3d only, the heaps' sizes until memory is low, then process + free - reserve (servers of its own)
+    if want membudget; then
+      timeout 300 ./membudget_test.sh >out/t-membudget.log 2>&1; result $? "membudget_test ($(tail -1 out/t-membudget.log))"
+    fi
     # <cache dir>/env written, changed or removed while the server runs: the first process after
     # it gets the new client switches (vkbQueryServer reads the file again when it changed; a
     # server of its own; once)
@@ -795,6 +962,15 @@ run_mode() {
     # buffers made without the handle type; nothing faked, the choice unchanged (a server of its own; once)
     if want unflagged; then
       timeout 400 ./unflagged_test.sh >out/t-unflagged.log 2>&1; result $? "unflagged_test ($(tail -1 out/t-unflagged.log))"
+    fi
+    # describe_test.sh: the build name is the nearest release tag, lightweight tags included (git only; once)
+    if want describe; then
+      timeout 60 ./describe_test.sh >out/t-describe.log 2>&1; result $? "describe_test ($(tail -1 out/t-describe.log))"
+    fi
+    # dmaheap_test.sh: a phone without /dev/dma_heap (VKBRIDGE_FAKE_MISSING=dmaheap) still gets dma-buf export for
+    # gamescope's images from other pages, and says so (a server of its own per step; once)
+    if want dmaheap; then
+      timeout 300 ./dmaheap_test.sh >out/t-dmaheap.log 2>&1; result $? "dmaheap_test ($(tail -1 out/t-dmaheap.log))"
     fi
     # xclipse_zink_test.sh: Zink on Samsung's Xclipse driver without EDS2 (push descriptors kept)
     if want xclipse_zink; then
@@ -812,8 +988,16 @@ run_mode() {
     if want timeline; then
       timeout 300 ./timeline_test.sh >out/t-timeline.log 2>&1; result $? "timeline_test ($(tail -1 out/t-timeline.log))"
     fi
+    # imageless_test.sh: VK_KHR_imageless_framebuffer made by the bridge (Mali r18-r26; Zink requires it), under the
+    # profiles it names itself
+    if want imageless; then
+      timeout 600 ./imageless_test.sh >out/t-imageless.log 2>&1; result $? "imageless_test ($(tail -1 out/t-imageless.log))"
+    fi
     # dma-buf memory over AHardwareBuffers where the driver has none (Kirin, Maleoon, Venus): the register alone,
     # then gamescope's and Zink's exports and imports with the desktop driver's dma-bufs standing in for the buffers
+    if want dshape; then
+      timeout 60 ./out/dshape_unit >out/t-dshape.log 2>&1; result $? "dshape_unit ($(tail -1 out/t-dshape.log))"
+    fi
     if want dabreg; then
       timeout 60 ./out/dabreg_unit >out/t-dabreg.log 2>&1; result $? "dabreg_unit ($(tail -1 out/t-dabreg.log))"
     fi
@@ -1028,7 +1212,7 @@ run_mode() {
     # frames, and its FPS is the monitor's
     if [ "${VKB_GS_VISIBLE:-0}" = 1 ]; then
       VKB_DOCKER_EXTRA="--device /dev/dri/renderD128" VKBRIDGE_DRM_RENDER=226:128 timeout 120 ./gamescope_test.sh \
-        "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames'" \
+        "bash -c 'export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true; timeout 20 glxgears 2>&1 | grep -m1 frames.in'" \
         >out/t-gamescope-window-$mode.log 2>&1
       grep -q "frames in" out/t-gamescope-window-$mode.log
       result $? "gamescope + Zink glxgears, nested window (smoke; $(grep -m1 -o '[0-9.]* FPS' out/t-gamescope-window-$mode.log) is the monitor's refresh)"
@@ -1054,9 +1238,35 @@ divisor_variants() {
     VKB_MISSING=VK_EXT_vertex_attribute_divisor . ./bridge_env.sh >/dev/null
     VKBRIDGE_HIDE_EXTS=VK_EXT_vertex_attribute_divisor timeout 60 ./out/divisor_check >out/t-divisor-khr.log 2>&1 &&
       tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "VK_EXT_vertex_attribute_divisor is enabled as VK_KHR_vertex_attribute_divisor" &&
-      ! tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "emulation 0x[0-9a-f]* installed"
+      ! div_emulated $((l+1))
     result $? "divisor_check, complete KHR-only divisor: EXT name aliased, native ($(tail -1 out/t-divisor-khr.log))"
   fi
+  # The server must survive a client drawing dynamic strides on a device without extended dynamic state
+  # (invalid usage) over the divisor emulation, which would rebind them with the driver's missing
+  # vkCmdBindVertexBuffers2 (the server died at pc 0 in vkCmdDraw, MALI-PROFILE-PROGRESS.md): such a pipeline
+  # is refused at its creation (no emulation can draw it) and said so; the common profile's Vulkan 1.1 device
+  # is the case (under a 1.3 profile the strides are the driver's and the pipeline is built)
+  if want divisor_dynanyway; then
+    VKB_MISSING= . ./bridge_env.sh >/dev/null
+    l=$(wc -l < "$VKB_SERVER_LOG")
+    DIVISOR_DYN_ANYWAY=1 timeout 60 ./out/divisor_check >out/t-divisor-dynanyway.log 2>&1
+    timeout 30 ./out/vkbridge-smoke >out/t-divisor-dynanyway-after.log 2>&1 && kill -0 "$VKB_SERVER_PID" 2>/dev/null &&
+      ! tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "crashed with signal\|CONTAINED driver crash" &&
+      { grep -q "^PASS pipeline with divisors 0/2/1, dynamic strides" out/t-divisor-dynanyway.log ||
+        { tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "divisor emulation: .*refused" &&
+          # divisor_check then ends with vkDestroyInstance alone: its device is destroyed first (the loader aborted the server)
+          tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -q "vkDestroyInstance [0-9]* with device [0-9]* still alive"; }; }
+    result $? "divisor_check drawing dynamic strides on a Vulkan 1.1 device anyway: refused, the server lives ($(tail -n +$((l+1)) "$VKB_SERVER_LOG" | grep -m1 -o 'divisor emulation: .*refused[^;]*' | cut -c1-160); $(tail -1 out/t-divisor-dynanyway-after.log))"
+  fi
+}
+# Whether a device from server log line $1 on had the divisor emulation (VKB_EMU_DIVISOR, bit 1) installed:
+# other emulations (a Mali profile's) may be installed too
+div_emulated() {
+  local m
+  for m in $(tail -n +"$1" "$VKB_SERVER_LOG" | grep -o "emulation 0x[0-9a-f]* installed" | cut -d' ' -f2); do
+    (( m & 2 )) && return 0
+  done
+  return 1
 }
 # The request arena and the null-descriptor set map on their own (no driver): checks, and the
 # times against the code before 2026-10-21 (hotpath_bench_old), shown, not judged
@@ -1068,8 +1278,17 @@ if want hotpath; then
     result $r "hotpath_bench ($(grep -m1 -o '[0-9.]* us per request' out/t-hotpath.log | cut -d' ' -f1-2) per ~600 KiB request, was $(grep -m1 -o '[0-9.]* us per request' out/t-hotpath-old.log 2>/dev/null | cut -d' ' -f1-2); 1M sets: $(grep '1000000 sets' out/t-hotpath.log | grep -o '[0-9.]* ns per lookup'), was $(grep '1000000 sets' out/t-hotpath-old.log 2>/dev/null | grep -o '[0-9.]* ns per lookup'))"
   fi
 fi
+# The wire primitives on their own (no driver): checks against a byte-wise model, and ns per field before/after
+if want wire && [ -x out/wire_check ]; then
+  timeout 300 ./out/wire_check >out/t-wire.log 2>&1
+  result $? "wire_check ($(tail -1 out/t-wire.log); $(grep '^encode' out/t-wire.log | cut -d: -f2 | cut -d'(' -f1))"
+fi
 run_mode plain
-if want_any divisor_g925 divisor_khr; then divisor_variants; fi
+# keep the plain-mode server log: the mali pass truncates it, and a plain-mode server death (seen once on
+# lavapipe, t11 gate 11-05: the shared server segfaulted and ~37 later checks failed at vkCreateInstance)
+# must be readable afterwards
+cp -f "$VKB_SERVER_LOG" out/server-plain.log 2>/dev/null
+if want_any divisor_g925 divisor_khr divisor_dynanyway; then divisor_variants; fi
 server_errors; result $? "no protocol errors in the server log (plain)"
 run_mode mali
 server_errors; result $? "no protocol errors in the server log (mali)"
@@ -1079,5 +1298,5 @@ server_errors; result $? "no protocol errors in the server log (mali)"
 vkb_server_start VKBRIDGE_WG_INIT=1
 timeout 60 ./out/wginit_check >out/t-wginit.log 2>&1 && { grep -q "^SKIP" out/t-wginit.log || grep -q "wg_init: workgroup memory zeroed" "$VKB_SERVER_LOG"; }
 result $? "wginit_check, wg_init forced on ($(tail -1 out/t-wginit.log))"
-echo "== $pass passed, $fail failed"
+echo "== $pass passed, $fail failed (Mali profile ${VKB_MALI_PROFILE:-common})"
 [ "$fail" = 0 ]

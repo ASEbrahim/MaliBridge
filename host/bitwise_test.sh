@@ -21,7 +21,8 @@ cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
 work=$(mktemp -d)
 cache=$work/c
-mkdir -p "$cache"
+mkdir -p "$cache" "$cache/dump-spirv" # the server reads dump-spirv's presence once, at its first module (vkb_emu_dumping):
+# made before it starts, or an emulation's module (a Mali profile's) would fix it at "absent" before the hang-detector step
 sock=${XDG_RUNTIME_DIR:-/tmp}/vkbridge-bitwise-$$.sock
 log=$work/server.log
 srv=

@@ -1,7 +1,33 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
- * syncfd_check direct|bounded|stall|order|orderoff|any: a sync-fd export of a semaphore whose batch is held, with and without the server's deadlines.
+ * syncfd_check: a sync-fd export (vkGetSemaphoreFdKHR, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT)
+ * of a binary semaphore whose signalling batch the driver has not handed to the kernel yet: the
+ * batch waits on a timeline value another thread signals HOLD_MS later. A driver with a submit
+ * thread (Mesa's RADV here; Samsung's Xclipse driver is suspected of the same: Xwayland
+ * stuck in this call, the X server with it) answers the export only once the batch is out.
+ *
+ *   syncfd_check direct|bounded|stall|order|orderoff|any
+ *     direct:  the export takes about HOLD_MS and gives a valid fd (the driver's own answer; the
+ *              bridge's bound off, or no bridge);
+ *     bounded: the export ends well before HOLD_MS (VKBRIDGE_SYNCFD_EXPORT_MS on the server, set
+ *              below HOLD_MS), fd -1 ("already signalled"); the semaphore is destroyed at once,
+ *              while the driver's call may still be blocked on it (the server holds that destroy
+ *              back until the call returns);
+ *     stall:   an empty submit and a vkDeviceWaitIdle on another thread after it, nothing else (the server holds the
+ *              submit: VKBRIDGE_TEST_DELAY_CMD; its log then says what the wait waited for);
+ *     order:   a submit the server holds (VKBRIDGE_TEST_DELAY_CMD) and, on the same thread right after it, a sync-fd
+ *              export of what it signals (Xwayland's pattern): with VKBRIDGE_SYNCFD_ORDER_MS below the hold
+ *              the export is answered at that deadline with fd -1; the queue goes idle once the submit is out;
+ *     orderoff: the same with the order deadline off: the export waits for the whole hold;
+ *     endstall: a command buffer of a few recorded commands is ended (asynchronous through the bridge, its stream replayed
+ *              by the server) and a vkDeviceWaitIdle on another thread waits behind it. The server holds the replay of
+ *              one command (VKBRIDGE_TEST_DELAY_CMD=vkCmdSetViewport) or the driver's own End (=driver-end): its log then
+ *              names the command it is in (Xwayland's End never returned on Xclipse);
+ *     any:     printed, not judged.
+ *   Both then check an ordinary export (the batch out at once): quick, a valid fd, and that the fd
+ *   signals once the queue is idle. A driver that does not block (the first export quick in
+ *   "direct") prints "SKIP" and exits 0.
+ * One line per step, "OK: ..." / "FAILED: ..." / "SKIP: ..." last.
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -28,6 +54,8 @@ I(vkCreateInstance); I(vkEnumeratePhysicalDevices); I(vkGetPhysicalDevicePropert
 I(vkGetPhysicalDeviceExternalSemaphoreProperties); I(vkCreateDevice); I(vkGetDeviceProcAddr); I(vkGetDeviceQueue);
 I(vkQueueSubmit); I(vkCreateSemaphore); I(vkDestroySemaphore); I(vkQueueWaitIdle); I(vkDeviceWaitIdle); I(vkDestroyDevice);
 I(vkSignalSemaphore); I(vkGetSemaphoreFdKHR);
+I(vkCreateCommandPool); I(vkAllocateCommandBuffers); I(vkBeginCommandBuffer); I(vkEndCommandBuffer); I(vkCmdPipelineBarrier);
+I(vkCmdSetViewport); I(vkDestroyCommandPool);
 #undef I
 
 static double now_ms(void)
@@ -57,6 +85,17 @@ static void *idle_thread(void *arg)
 {
     *(VkResult *)arg = vkDeviceWaitIdle(dev);
     return NULL;
+}
+
+/* The client's flusher sends an asynchronous request on its own connection 100 us after it is queued; a
+ * synchronous call made before that sends the queue first on ITS connection (client/conn.c), where the held
+ * request is no earlier request of another connection and the server has no order wait to name it. On a busy
+ * host the flusher can be that late (1 in 5 runs on 11-05 while the PC was gaming), so the held request is let
+ * go out first: the waiting thread then starts about 0.2 s into the hold. */
+static void let_the_flusher_send(void)
+{
+    struct timespec ts = {0, 200000000L};
+    nanosleep(&ts, NULL);
 }
 
 static VkSemaphore exportable(void)
@@ -142,11 +181,14 @@ int main(int argc, char **argv)
 #define G(n) n = (PFN_##n)vkGetDeviceProcAddr(dev, #n)
     G(vkGetDeviceQueue); G(vkQueueSubmit); G(vkCreateSemaphore); G(vkDestroySemaphore); G(vkQueueWaitIdle); G(vkDeviceWaitIdle);
     G(vkDestroyDevice); G(vkSignalSemaphore); G(vkGetSemaphoreFdKHR);
+    G(vkCreateCommandPool); G(vkAllocateCommandBuffers); G(vkBeginCommandBuffer); G(vkEndCommandBuffer); G(vkCmdPipelineBarrier);
+    G(vkCmdSetViewport); G(vkDestroyCommandPool);
 #undef G
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     printf("device: %s (expecting %s)\n", props.deviceName, expect);
 
-    /* stall: an empty submit the server holds, then a synchronous call that has to wait for it. */
+    /* stall: an empty submit (asynchronous through the bridge; the server holds it with
+     * VKBRIDGE_TEST_DELAY_CMD), then a synchronous call that has to wait for it there. */
     if (!strcmp(expect, "stall")) {
         VkSemaphore b0 = exportable();
         double t0 = now_ms();
@@ -154,11 +196,47 @@ int main(int argc, char **argv)
         /* from another thread: its own connection, ordered behind the submit by the server */
         pthread_t w;
         if (r == VK_SUCCESS) {
+            let_the_flusher_send();
             pthread_create(&w, NULL, idle_thread, &r);
             pthread_join(w, NULL);
         }
         printf("  a held submit, then vkDeviceWaitIdle on another thread: %d after %.0f ms\n", r, now_ms() - t0);
         vkDestroySemaphore(dev, b0, NULL);
+        vkDestroyDevice(dev, NULL);
+        printf(r == VK_SUCCESS ? "OK: done\n" : "FAILED: %d\n", r);
+        return r == VK_SUCCESS ? 0 : 1;
+    }
+
+    /* endstall: a recorded command buffer ended (the server replays its stream, holding one command), then a synchronous
+     * call on another thread that has to wait behind that asynchronous End. */
+    if (!strcmp(expect, "endstall")) {
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, qfam};
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        VkResult r = vkCreateCommandPool(dev, &pci, NULL, &pool);
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        if (r == VK_SUCCESS) r = vkAllocateCommandBuffers(dev, &ai, &cb);
+        double t0 = now_ms();
+        if (r == VK_SUCCESS) {
+            VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT};
+            VkViewport vp = {0, 0, 64, 64, 0, 1};
+            r = vkBeginCommandBuffer(cb, &bi);
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            vkCmdSetViewport(cb, 0, 1, &vp);
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            VkResult re = vkEndCommandBuffer(cb);
+            if (r == VK_SUCCESS) r = re;
+        }
+        pthread_t w;
+        if (r == VK_SUCCESS) {
+            let_the_flusher_send();
+            pthread_create(&w, NULL, idle_thread, &r);
+            pthread_join(w, NULL);
+        }
+        printf("  a command buffer ended, then vkDeviceWaitIdle on another thread: %d after %.0f ms\n", r, now_ms() - t0);
+        if (pool) vkDestroyCommandPool(dev, pool, NULL);
         vkDestroyDevice(dev, NULL);
         printf(r == VK_SUCCESS ? "OK: done\n" : "FAILED: %d\n", r);
         return r == VK_SUCCESS ? 0 : 1;

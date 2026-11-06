@@ -13,6 +13,15 @@
  * that big in the driver (DXVK's pools on the XRing O3 grew to 8 times their size,
  * in the same game whose server the system closed for lack of memory, #18). While memory is low
  * (vkb_mem_low), a reset frees the overflow pools nothing was allocated from since the last one.
+ *
+ * A set bigger than the pool (more of a type than a pool like the app's has) fits in no overflow
+ * pool either: when an overflow pool that is empty refuses it, no more are made for it, and a
+ * set of that layout asked for again with as many variable descriptors or more is refused after
+ * the app's pool alone (until a layout is destroyed: handles come back). The size is part of
+ * it: a layout with a variable descriptor count (bindless heaps: vkd3d-proton, native engines)
+ * refused at 8000 descriptors still gets overflow pools at 16, as without the memo. Before, each such request made overflow pools up to the cap of
+ * 64: Detroit: Become Human (a player log, G925) got 384 for six pools of 45056 sets, 8 MB each in
+ * Mali's heap, 3 GB at the game's start.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -30,6 +39,13 @@ typedef struct ep_pool {
     uint32_t nextra, cur;            /* allocations try extra[cur..] after the app's pool */
     uint32_t used;                   /* extra[0..used) allocated from since the last reset */
     int can_free;
+    /* Layouts an empty overflow pool refused (a set of one bigger than the pool), while no layout
+     * was destroyed since (a destroyed layout's handle can come back as another layout): asked
+     * again, they are refused after the app's pool alone, as the driver would refuse them. */
+    VkDescriptorSetLayout refused[4];
+    uint32_t refused_count[4];       /* ... with this many variable descriptors (0: none asked); as many or more refused */
+    uint32_t nrefused, refused_next;
+    uint64_t refused_gen;
     struct ep_pool *next;
 } ep_pool;
 
@@ -48,7 +64,10 @@ typedef struct vkb_pools {
     PFN_vkResetDescriptorPool reset;
     PFN_vkAllocateDescriptorSets allocate;
     PFN_vkFreeDescriptorSets free_sets;
+    PFN_vkDestroyDescriptorSetLayout destroy_layout;
+    uint64_t layout_gen;             /* layouts destroyed (atomic) */
     unsigned long grown;
+    unsigned long oversize;          /* sets refused by an empty overflow pool */
 } vkb_pools;
 
 static vkb_pools *states[4096];
@@ -176,6 +195,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL ep_ResetDescriptorPool(VkDevice device, Vk
     return s->reset(device, pool, flags);
 }
 
+/* The variable descriptor count asked for set i (0 without VkDescriptorSetVariableDescriptorCountAllocateInfo) */
+static uint32_t var_count(const VkDescriptorSetAllocateInfo *ai, uint32_t i)
+{
+    for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO) {
+            const VkDescriptorSetVariableDescriptorCountAllocateInfo *v = (const void *)b;
+            return v->pDescriptorCounts && i < v->descriptorSetCount ? v->pDescriptorCounts[i] : 0;
+        }
+    return 0;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL ep_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out)
 {
     vkb_pools *s = st();
@@ -187,6 +217,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL ep_AllocateDescriptorSets(VkDevice device,
         pthread_mutex_unlock(&s->lock);
         return r;
     }
+    uint64_t gen = __atomic_load_n(&s->layout_gen, __ATOMIC_RELAXED);
+    if (p->nrefused && p->refused_gen == gen)
+        for (uint32_t i = 0; i < ai->descriptorSetCount; i++)
+            for (uint32_t k = 0; k < p->nrefused; k++)
+                if (ai->pSetLayouts[i] == p->refused[k] && var_count(ai, i) >= p->refused_count[k]) {
+                    s->oversize++;
+                    pthread_mutex_unlock(&s->lock);
+                    return r;
+                }
     VkDescriptorSetAllocateInfo a2 = *ai;
     for (;;) {
         if (p->cur >= p->nextra) {
@@ -220,6 +259,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL ep_AllocateDescriptorSets(VkDevice device,
             break;
         }
         if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) break;
+        /* An overflow pool nothing was allocated from since the last reset is empty, and it is
+         * made like the app's: a set it refuses no pool like it can hold (more of a type than the
+         * pool has), so another one cannot help. Detroit: Become Human (a player log, G925) asked a
+         * FREE_DESCRIPTOR_SET pool of 45056 sets, still empty, for a set of 8426 image samplers
+         * and 12800 storage buffers; each refusal made overflow pools until the 64 cap, 384 of
+         * them for 6 pools, 8 MB each in Mali's heap: 3 GB at the game's start for nothing. */
+        if (p->cur >= p->used) {
+            if (ai->descriptorSetCount == 1) {
+                if (p->refused_gen != gen) p->nrefused = p->refused_next = 0;
+                p->refused_gen = gen;
+                uint32_t vc = var_count(ai, 0), k = 0;
+                while (k < p->nrefused && p->refused[k] != ai->pSetLayouts[0]) k++;
+                if (k < p->nrefused) {
+                    if (vc < p->refused_count[k]) p->refused_count[k] = vc; /* the smallest size refused */
+                } else {
+                    k = p->refused_next++ & 3;
+                    p->refused[k] = ai->pSetLayouts[0];
+                    p->refused_count[k] = vc;
+                    if (p->nrefused < 4) p->nrefused++;
+                }
+            }
+            if (!s->oversize++)
+                VKB_INFO("descriptor pools: a set that an empty pool like the app's refuses (bigger than the pool) is refused "
+                         "without more overflow pools (logged once)");
+            break;
+        }
         p->cur++;
     }
     pthread_mutex_unlock(&s->lock);
@@ -253,6 +318,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL ep_FreeDescriptorSets(VkDevice device, VkD
     return r;
 }
 
+static VKAPI_ATTR void VKAPI_CALL ep_DestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout l, const VkAllocationCallbacks *a)
+{
+    vkb_pools *s = st();
+    if (l) __atomic_add_fetch(&s->layout_gen, 1, __ATOMIC_RELAXED);
+    s->destroy_layout(device, l, a);
+}
+
 void vkb_pools_device_init(vkb_srv_table *t)
 {
     vkb_dispatch *dt = &t->dt;
@@ -265,11 +337,13 @@ void vkb_pools_device_init(vkb_srv_table *t)
     s->reset = dt->vkResetDescriptorPool;
     s->allocate = dt->vkAllocateDescriptorSets;
     s->free_sets = dt->vkFreeDescriptorSets;
+    s->destroy_layout = dt->vkDestroyDescriptorSetLayout;
     dt->vkCreateDescriptorPool = ep_CreateDescriptorPool;
     dt->vkDestroyDescriptorPool = ep_DestroyDescriptorPool;
     dt->vkResetDescriptorPool = ep_ResetDescriptorPool;
     dt->vkAllocateDescriptorSets = ep_AllocateDescriptorSets;
     dt->vkFreeDescriptorSets = ep_FreeDescriptorSets;
+    if (s->destroy_layout) dt->vkDestroyDescriptorSetLayout = ep_DestroyDescriptorSetLayout;
     states[t->id] = s;
 }
 
@@ -283,6 +357,7 @@ void vkb_pools_device_destroy(vkb_srv_table *t)
     dt->vkResetDescriptorPool = s->reset;
     dt->vkAllocateDescriptorSets = s->allocate;
     dt->vkFreeDescriptorSets = s->free_sets;
+    if (s->destroy_layout) dt->vkDestroyDescriptorSetLayout = s->destroy_layout;
     for (int b = 0; b < SET_BUCKETS; b++)
         while (s->pools[b]) {
             ep_pool *p = s->pools[b];
@@ -299,7 +374,9 @@ void vkb_pools_device_destroy(vkb_srv_table *t)
             s->sets[i] = e->next;
             free(e);
         }
-    if (s->grown) VKB_INFO("device %u: %lu overflow descriptor pools made", t->id, s->grown);
+    if (s->grown || s->oversize)
+        VKB_INFO("device %u: %lu overflow descriptor pools made, %lu allocation(s) no pool like the app's could hold", t->id, s->grown,
+                 s->oversize);
     pthread_mutex_destroy(&s->lock);
     free(s);
     states[t->id] = NULL;

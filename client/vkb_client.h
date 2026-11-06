@@ -295,6 +295,9 @@ void vkb_frames_present(void); /* frames.c: frame statistics for the server's se
 void vkb_frames_swapchain(void); /* frames.c: a swapchain made */
 void vkb_frames_external(void);  /* frames.c: memory the app exported or imported as an fd */
 uint64_t vkb_frames_presented(void); /* frames.c: presents so far in this process */
+/* conn.c: an informational line written at any log level (default-on statistics) */
+void vkb_log_info_always(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 /* hitch.c: the per-hitch line's client half (VKBRIDGE_HITCH_MS). vkb_hitch_active: 0 while off. */
 extern int vkb_hitch_active;
 extern __thread int vkb_hitch_in_present;   /* inside the swapchain's own wait (wsi.c) */

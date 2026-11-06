@@ -18,7 +18,11 @@
  * asked; process B imports it as gamescope does (the explicit LINEAR modifier at that plane) and
  * reads its colour back. Argument "ahb" (the bridge's path): the format's modifiers are LINEAR alone
  * and an explicit import at another row pitch is refused.
- * Usage: dmabufahb_check [foreign-refused] [ahb]  - exit 77 when the device offers no dma-buf memory,
+ * Argument "linear-only" (the bridge's path where the start's check failed OPTIMAL images and passed LINEAR
+ * ones): gamescope's OPTIMAL export is refused, as is an import into an OPTIMAL image made without
+ * the handle type and a dma-buf image that cannot be LINEAR (a depth format, 4 samples: query and creation);
+ * gamescope's OPTIMAL import with the handle type is still made (LINEAR) and reads Zink's colour back.
+ * Usage: dmabufahb_check [foreign-refused] [ahb] [linear-only]  - exit 77 when the device offers no dma-buf memory,
  * prints PASS/FAIL lines and "OK: 0 failures" / "FAILED: n failures".
  */
 #define _GNU_SOURCE
@@ -295,7 +299,7 @@ static int recv_fds(int sock, int *fds, int n)
 /* B8G8R8A8 of (r, g, b, 1) as a little-endian word */
 #define BGRA(r, g, b) ((uint32_t)(b) | ((uint32_t)(g) << 8) | ((uint32_t)(r) << 16) | 0xff000000u)
 
-static int importer(int sock, int foreign_refused, int ahb)
+static int importer(int sock, int foreign_refused, int ahb, int linear_only)
 {
     who = "B";
     ctx cc, *c = &cc;
@@ -348,16 +352,18 @@ static int importer(int sock, int foreign_refused, int ahb)
         snprintf(d, sizeof(d), "texel 0x%08x, want 0x%08x", t, BGRA(0x40, 0xbf, 0x80));
         check(near(t, BGRA(0x40, 0xbf, 0x80)), "its colour read back", d);
     }
-    /* gamescope's OPTIMAL export into a LINEAR image: laid out otherwise, refused */
-    VkImage li = image(c, VK_IMAGE_TILING_LINEAR, 0, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    /* gamescope's OPTIMAL export into a LINEAR image: laid out otherwise, refused. LINEAR only: Zink's LINEAR
+     * export into an OPTIMAL image made without the handle type, refused (no picture through the OPTIMAL layout) */
+    VkImage li = image(c, linear_only ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR, 0, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     VkDeviceMemory lm = VK_NULL_HANDLE;
-    r = li ? import_image(c, li, fds[0], &lm) : VK_ERROR_INITIALIZATION_FAILED;
+    r = li ? import_image(c, li, fds[linear_only ? 1 : 0], &lm) : VK_ERROR_INITIALIZATION_FAILED;
     snprintf(d, sizeof(d), "%d", r);
-    check(r == VK_ERROR_INVALID_EXTERNAL_HANDLE, "an import laid out unlike its exporter is refused", d);
+    check(r == VK_ERROR_INVALID_EXTERNAL_HANDLE,
+          linear_only ? "an import into an OPTIMAL image without the handle type is refused" : "an import laid out unlike its exporter is refused", d);
     /* fd properties */
     PFN_vkGetMemoryFdPropertiesKHR props = (PFN_vkGetMemoryFdPropertiesKHR)c->gdpa(c->dev, "vkGetMemoryFdPropertiesKHR");
     VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
-    r = props(c->dev, DMABUF, fds[0], &fp);
+    r = props(c->dev, DMABUF, fds[linear_only ? 1 : 0], &fp);
     snprintf(d, sizeof(d), "%d, types 0x%x", r, fp.memoryTypeBits);
     check(r == VK_SUCCESS && fp.memoryTypeBits, "vkGetMemoryFdPropertiesKHR of the bridge's dma-buf", d);
     int foreign = memfd_create("not-a-dmabuf", MFD_CLOEXEC);
@@ -387,10 +393,11 @@ static int importer(int sock, int foreign_refused, int ahb)
 
 int main(int argc, char **argv)
 {
-    int foreign_refused = 0, ahb = 0;
+    int foreign_refused = 0, ahb = 0, linear_only = 0;
     for (int a = 1; a < argc; a++) {
         foreign_refused |= !strcmp(argv[a], "foreign-refused");
         ahb |= !strcmp(argv[a], "ahb");
+        linear_only |= !strcmp(argv[a], "linear-only");
     }
     ctx cc, *c = &cc;
     int s = setup(c);
@@ -433,10 +440,47 @@ int main(int argc, char **argv)
     int fds[3] = {-1, -1, -1};
     r = gs ? export_image(c, gs, &gm, &fds[0]) : VK_ERROR_INITIALIZATION_FAILED;
     snprintf(d, sizeof(d), "%d, fd %d", r, fds[0]);
-    check(r == VK_SUCCESS && fds[0] >= 0, "gamescope's flippable image (no handle type) exported", d);
+    if (linear_only) {
+        /* its memory would be shared in the OPTIMAL layout, which failed the start's check */
+        check(r != VK_SUCCESS && fds[0] < 0, "gamescope's OPTIMAL image (no handle type): its memory not exported", d);
+        if (gm) D(vkFreeMemory)(c->dev, gm, NULL);
+        gm = VK_NULL_HANDLE;
+    } else {
+        check(r == VK_SUCCESS && fds[0] >= 0, "gamescope's flippable image (no handle type) exported", d);
+    }
     r = zk ? export_image(c, zk, &zm, &fds[1]) : VK_ERROR_INITIALIZATION_FAILED;
     snprintf(d, sizeof(d), "%d, fd %d", r, fds[1]);
     check(r == VK_SUCCESS && fds[1] >= 0, "Zink's LINEAR dma-buf image exported", d);
+    if (linear_only && fds[1] >= 0) {
+        fds[0] = dup(fds[1]); /* the importer does not use it */
+        /* dma-buf images that cannot be LINEAR: refused, never made OPTIMAL */
+        VkPhysicalDeviceExternalImageFormatInfo dei = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, NULL, DMABUF};
+        VkPhysicalDeviceImageFormatInfo2 dii = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &dei, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D,
+                                                VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0};
+        VkExternalImageFormatProperties dep = {VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+        VkImageFormatProperties2 dip = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &dep};
+        r = I(vkGetPhysicalDeviceImageFormatProperties2)(c->pd, &dii, &dip);
+        snprintf(d, sizeof(d), "%d, features 0x%x", r, dep.externalMemoryProperties.externalMemoryFeatures);
+        check(r == VK_ERROR_FORMAT_NOT_SUPPORTED && !dep.externalMemoryProperties.externalMemoryFeatures,
+              "a dma-buf depth image query (no LINEAR depth): not supported", d);
+        VkExternalMemoryImageCreateInfo dx = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL, DMABUF};
+        VkImageCreateInfo dci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &dx, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_D32_SFLOAT, {W, H, 1}, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImage di = VK_NULL_HANDLE;
+        r = D(vkCreateImage)(c->dev, &dci, NULL, &di);
+        snprintf(d, sizeof(d), "%d", r);
+        check(r == VK_ERROR_FORMAT_NOT_SUPPORTED && !di, "a dma-buf depth image: refused", d);
+        if (di) D(vkDestroyImage)(c->dev, di, NULL);
+        dci.format = FMT;
+        dci.samples = VK_SAMPLE_COUNT_4_BIT;
+        dci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        di = VK_NULL_HANDLE;
+        r = D(vkCreateImage)(c->dev, &dci, NULL, &di);
+        snprintf(d, sizeof(d), "%d", r);
+        check(r == VK_ERROR_FORMAT_NOT_SUPPORTED && !di, "a 4-sample dma-buf image: refused", d);
+        if (di) D(vkDestroyImage)(c->dev, di, NULL);
+    }
     if (fds[0] < 0 || fds[1] < 0) {
         printf("FAILED: %d failures\n", failures);
         return 1;
@@ -511,7 +555,7 @@ int main(int argc, char **argv)
     ((PFN_vkGetMemoryFdKHR)c->gdpa(c->dev, "vkGetMemoryFdKHR"))(c->dev, &gfi, &again);
     check(again >= 0 && lseek(again, 0, SEEK_END) >= (off_t)(W * H * 4), "a second export of the same memory: a dma-buf of its size", NULL);
     if (again >= 0) close(again);
-    clear(c, gs, 0.75f, 0.25f, 0.5f);
+    if (!linear_only) clear(c, gs, 0.75f, 0.25f, 0.5f);
     clear(c, zk, 0.25f, 0.75f, 0.5f);
     int sv[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
@@ -519,7 +563,7 @@ int main(int argc, char **argv)
     pid_t pid = fork();
     if (pid == 0) {
         close(sv[0]);
-        _exit(importer(sv[1], foreign_refused, ahb));
+        _exit(importer(sv[1], foreign_refused, ahb, linear_only));
     }
     close(sv[1]);
     send_fds(sv[0], fds, c->mods ? 3 : 2);
@@ -530,7 +574,7 @@ int main(int argc, char **argv)
     waitpid(pid, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st)) failures++;
     /* the exporter frees after the importer: nothing left behind */
-    D(vkFreeMemory)(c->dev, gm, NULL);
+    if (gm) D(vkFreeMemory)(c->dev, gm, NULL);
     D(vkFreeMemory)(c->dev, zm, NULL);
     D(vkDestroyImage)(c->dev, gs, NULL);
     D(vkDestroyImage)(c->dev, zk, NULL);

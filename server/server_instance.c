@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * Instances, devices and the startup self-test.
  */
@@ -265,9 +264,11 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         t->api_version = ci->pApplicationInfo ? ci->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
         t->zink = ci->pApplicationInfo && ci->pApplicationInfo->pEngineName && !strncmp(ci->pApplicationInfo->pEngineName, "mesa zink", 9);
         t->vkd3d = ci->pApplicationInfo && ci->pApplicationInfo->pEngineName && !strcmp(ci->pApplicationInfo->pEngineName, "vkd3d");
+        t->dxvk = ci->pApplicationInfo && ci->pApplicationInfo->pEngineName && !strcmp(ci->pApplicationInfo->pEngineName, "DXVK");
         t->promote_ui = ci->pApplicationInfo && ci->pApplicationInfo->pApplicationName &&
                         !strcmp(ci->pApplicationInfo->pApplicationName, "gamescope");
         vkb_dispatch_load_instance(&t->real, vkb_gipa, inst);
+        vkb_emu_linearstorage_instance_init(t); /* host: a driver refusing LINEAR storage images, beneath every layer */
         t->dt = t->real;
         vkb_opaque_instance_install(t);
         vkb_dab_instance_install(t); /* dma-bufs over AHardwareBuffers: their queries */
@@ -306,6 +307,16 @@ void vkb_sv_vkDestroyInstance(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
+    /* an instance whose device a stopped driver thread may still use is left as it is (server_lost.c) */
+    if (vkb_lost_stopped(t)) {
+        VKB_WARN("instance %u is left as it is: a device of it was stopped after a driver thread's fault", t->id);
+        return;
+    }
+    /* a device the program did not destroy goes first (server_conn.c); one to be left keeps the instance too */
+    if (!vkb_srv_instance_orphans(t)) {
+        VKB_WARN("instance %u is left as it is: a device of it is left alive (stopped, or a sync-fd export in the driver)", t->id);
+        return;
+    }
     vkb_table_unregister(t);
     t->real.vkDestroyInstance(inst, NULL);
     pthread_mutex_destroy(&t->lock);
@@ -337,22 +348,25 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
         info.client_knobs = (info.client_knobs & ~(3u << VKB_KNOB_SYNC_MIRROR_SHIFT)) | (VKB_KNOB_OFF << VKB_KNOB_SYNC_MIRROR_SHIFT);
         VKB_ONCE(VKB_LOG_INFO, "sync mirror off: the timeline semaphores are the bridge's (fence and event status on the wire)");
     }
-    vkb_preset_client_values(&info);               /* the heap cap and GPU identity the app is shown, the same way */
+    vkb_preset_client_values(&info, c->conn->proc); /* the heap cap and GPU identity the app is shown, the same way */
     info.hitch_ms = vkb_hitch_ms_setting();        /* the per-hitch line (server_hitch.c), the same way */
     if (info.hitch_ms) vkb_hitch_enable(c->conn->proc, info.hitch_ms);
     info.latlog = vkb_lat_setting();               /* the latency log (server_latency.c), the same way */
     info.frame_queue = vkb_frame_queue_setting();  /* the frame queue cap (client/wsi.c), the same way */
     info.present_wait = vkb_present_wait_setting(); /* present ids and waits offered (client/wsi.c), the same way */
     vkb_mem_cached_gate(&info, mode); /* server_memory.c: cached readback per VKBRIDGE_CACHED_READBACK and the mode */
-    info.api_cap = vkb_steam_api_cap(c->table, pd); /* server_apicap.c: the Vulkan version cap for Steam mode's processes */
+    info.api_cap = vkb_steam_api_cap(c->table, pd); /* server_apicap.c: Steam mode's own processes at Vulkan 1.1 (the black screen) */
     if ((info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)) && !vkb_emu_bgr10_for(c->table, pd))
         info.emu &= ~(VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX);
     {
-        /* outside the Steam-mode fix (a game's DXVK, vkd3d, native Vulkan): the driver's dynamic rendering */
+        /* outside the A1 fix (a game's DXVK, vkd3d, native Vulkan): the driver's dynamic rendering */
         uint32_t not_a1 = vkb_emu_a1_not_for(c->table);
         info.emu &= ~not_a1;
         info.missing &= ~not_a1;
     }
+    /* the bridge's VK_EXT_memory_budget: DXVK and vkd3d-proton only; the instance remembers the device it answers for */
+    if ((info.emu & VKB_EMU_MEM_BUDGET) && !vkb_emu_membudget_for(c->table)) info.emu &= ~VKB_EMU_MEM_BUDGET;
+    if (info.emu & VKB_EMU_MEM_BUDGET) __atomic_store_n(&c->table->membudget_pd, pd, __ATOMIC_RELEASE);
     vkb_enc_raw(&c->r, &info, sizeof(info));
 }
 
@@ -386,7 +400,8 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     uint32_t strategy = k ? k->info.strategy : VKB_MEM_NONE;
     uint32_t emu = k ? k->info.emu : 0;
     if ((emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)) && !vkb_emu_bgr10_for(inst, pd)) emu &= ~(VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX);
-    emu &= ~vkb_emu_a1_not_for(inst); /* the driver's dynamic rendering outside the Steam-mode fix */
+    emu &= ~vkb_emu_a1_not_for(inst); /* the driver's dynamic rendering outside the A1 fix */
+    if (!vkb_emu_membudget_for(inst)) emu &= ~VKB_EMU_MEM_BUDGET;
     {
         /* VKBRIDGE_EMU_OFF=<hex mask of VKB_EMU_* bits>: this device runs without those emulations
          * (the client still reports their features: for bisecting, not for games). */
@@ -607,15 +622,19 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         t->real = inst->real;
         PFN_vkGetDeviceProcAddr gdpa = vkb_promote_gdpa((PFN_vkGetDeviceProcAddr)vkb_gipa(inst->instance, "vkGetDeviceProcAddr"));
         vkb_dispatch_load_device(&t->real, gdpa, dev);
+        vkb_children_device_init(t); /* the very bottom: the driver's objects as it makes them (server_children.c) */
         vkb_promote_device_init(t); /* beneath every layer: what reaches the driver is SPIR-V it takes */
         t->dt = t->real;
         id = vkb_table_register(t);
         if (!id) {
+            vkb_children_device_destroy(t, 0);
             t->real.vkDestroyDevice(dev, NULL);
             free(t);
             dev = VK_NULL_HANDLE;
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
         } else {
+            vkb_crashctx_test_init(t); /* host tests: a client's call faults at the driver, beneath everything */
+            vkb_lost_device_init(t); /* beneath every layer: a lost device runs nothing more (server_lost.c) */
             vkb_qlock_device_init(t); /* beneath everything: every submit, the layers' own too, takes its queue's lock */
             vkb_mem_device_install(t); /* host: another driver's image requirements, beneath every layer */
             vkb_spvfix_fake_init(t); /* host: a driver refusing compute pipelines with YCbCr samplers */
@@ -670,7 +689,8 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
-    /* A sync-fd export still in the driver on this device: the device and its table are left as they are. */
+    /* A sync-fd export still blocked in the driver on this device: the device and its table are
+     * left as they are (the table stays registered, so its id is not reused under that call). */
     if (vkb_syncfd_device_destroy(t)) return;
     vkb_table_unregister(t);
     vkb_async_device_destroy(t);
@@ -696,6 +716,8 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_report_device_destroy(t);
     vkb_mem_free_all(t);
     vkb_dab_device_destroy(t);
+    vkb_lost_device_destroy(t);
+    vkb_children_device_destroy(t, 0); /* the app's own destroy: nothing more destroyed than before */
     t->real.vkDestroyDevice(dev, NULL);
     vkb_qlock_device_destroy(t); /* server_qlock.c: the device's queue locks */
     VKB_INFO("device %u destroyed", t->id);

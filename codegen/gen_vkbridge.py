@@ -131,6 +131,21 @@ CLIENT_CUSTOM = {
     'vkCmdEndRenderPass', 'vkCmdEndRenderPass2', 'vkCmdBeginRendering', 'vkCmdEndRendering', 'vkCmdEndRendering2KHR',
     'vkGetSemaphoreFdKHR', 'vkGetMemoryFdKHR',
     }
+# Server handlers that note their arguments for the crash line (server_crashctx.c) right before
+# the driver's call - a few stores each; a note that returns non-zero leaves the call out (a
+# vkCmdBindPipeline of VK_NULL_HANDLE). After: what the call made, for the crash line's lookups.
+SERVER_NOTE = {
+    'vkBindImageMemory': 'vkb_srv_note_bind_image(image, memory, memoryOffset);',
+    'vkBindImageMemory2': 'vkb_srv_note_bind_image2(bindInfoCount, pBindInfos);',
+    'vkCmdBindPipeline': 'if (vkb_srv_note_bind_pipeline(pipelineBindPoint, pipeline)) return;',
+    'vkCmdSetLineWidth': 'vkb_srv_note_line_width(lineWidth);',
+    'vkCreateGraphicsPipelines': 'vkb_srv_pipe_snap snap_[VKB_PIPE_SNAP]; vkb_srv_note_pipelines_pre(snap_, createInfoCount, pCreateInfos);',
+    'vkCreateImage': 'VkFormat asked_format_ = pCreateInfo ? pCreateInfo->format : VK_FORMAT_UNDEFINED; VkImageTiling asked_tiling_ = pCreateInfo ? pCreateInfo->tiling : VK_IMAGE_TILING_OPTIMAL;',
+}
+SERVER_NOTE_AFTER = {
+    'vkCreateGraphicsPipelines': 'if (r_ >= 0) vkb_srv_note_pipelines(snap_, createInfoCount, pPipelines);',
+    'vkCreateImage': 'if (r_ == VK_SUCCESS && pCreateInfo && pImage) vkb_srv_note_image(c, device, pCreateInfo, *pImage, asked_format_, asked_tiling_);',
+}
 # Commands whose server handler is hand-written (server/*.c defines vkb_sv_<name>).
 SERVER_CUSTOM = {
     'vkCreateInstance', 'vkDestroyInstance', 'vkCreateDevice', 'vkDestroyDevice',
@@ -1344,8 +1359,12 @@ for c in wire_cmds:
         # where the device lacks the extension (Lee Gao, DroidDeck#165): asked only of one that has it.
         vw(f'if (!vkb_srv_pd_has_ext(c, {params[0].name}, "{g}")) {{ vkb_srv_unsupported(c, "{c}", "{g}"); return; }}')
     vw(f'if (!{fn}) {{ vkb_srv_missing(c, "{c}"); return; }}')
+    if c in SERVER_NOTE:
+        vw(SERVER_NOTE[c])
     if ret != 'void':
         vw(f'{ret} r_ = {fn}({", ".join(call_args)});')
+        if c in SERVER_NOTE_AFTER:
+            vw(SERVER_NOTE_AFTER[c])
         if c in FD_IMPORTS:
             fp = FD_IMPORTS[c]
             vw(f'if (r_ != VK_SUCCESS && {fp} && {fp}->fd >= 0) vkb_close_fd({fp}->fd);')

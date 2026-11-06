@@ -33,10 +33,18 @@
  * with the AHB handle type). The start's check (vkb_dab_selfcheck) runs exactly that - one buffer
  * imported twice, a LINEAR and an OPTIMAL image on each, a clear through one read back through the
  * other - and the path is offered only where it passed (LINEAR images only where LINEAR passed).
+ * Where OPTIMAL failed and LINEAR passed (the Maleoon 910 in a player log read OPTIMAL back as 0) the path
+ * is on in LINEAR-only mode: every dma-buf image is made LINEAR, and what cannot be LINEAR is refused
+ * (VK_ERROR_FORMAT_NOT_SUPPORTED), as is sharing the memory of a non-LINEAR image: nothing falls back
+ * to the layout that failed. Where OPTIMAL passed nothing changes.
  * VKBRIDGE_DMABUF_VIA_AHB=1 takes this path on a GPU with dma-bufs of its own (to check it on a
  * capable tablet), =0 never takes it; also from <cache dir>/env, read once per server start.
  * Host tests: VKBRIDGE_TEST_EXPORT_PAGES=driver - the pages are the desktop driver's own dma-bufs
  * (made, exported, freed: the fd keeps them), imported as dma-bufs; the rest is as on Android.
+ * VKBRIDGE_TEST_EXPORT_PAGES=memfd - the pages are memfds, for a driver that imports dma-bufs but
+ * exports none (lavapipe without /dev/udmabuf); an import the driver describes with no memory type
+ * takes any. VKBRIDGE_TEST_DAB_WRONG=optimal[,linear] - the start's check reads that tiling's texel
+ * back as 0 (a player log's OPTIMAL failure: "texel 0x00000000 WRONG").
  * VKBRIDGE_FAKE_MISSING=dmabufext imitates a driver without dma-buf memory for clients.
  */
 #define _GNU_SOURCE
@@ -52,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __ANDROID__
@@ -65,6 +74,7 @@ static int dab_on;          /* decided at the self-test (vkb_dab_wanted) */
 static int dab_forced;      /* VKBRIDGE_DMABUF_VIA_AHB=1 on a driver with dma-bufs of its own */
 static int check_ok = -1;   /* the start's check: -1 not run, 0 failed, 1 passed */
 static int check_linear;    /* LINEAR images passed it too */
+static int linear_only;     /* OPTIMAL failed it, LINEAR and the identity test passed: every dma-buf image LINEAR */
 static char check_text[400];
 
 /* ------------------------------------------------------------------ the pages */
@@ -114,15 +124,22 @@ static int ahb_ok(void)
 #endif
 
 #ifndef __ANDROID__
-/* Host tests: the desktop driver's own dma-bufs stand in for the AHardwareBuffers. */
+/* Host tests: the desktop driver's own dma-bufs (1) or memfds (2) stand in for the AHardwareBuffers. */
 static int host_pages(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *v = vkb_srv_env_global("VKBRIDGE_TEST_EXPORT_PAGES");
-        on = v && !strcmp(v, "driver");
+        on = v && !strcmp(v, "driver") ? 1 : v && !strcmp(v, "memfd") ? 2 : 0;
     }
     return on;
+}
+
+/* Host tests: the start's check reads this tiling's texel back as 0 (VKBRIDGE_TEST_DAB_WRONG). */
+static int test_wrong(VkImageTiling tiling)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_TEST_DAB_WRONG");
+    return v && strstr(v, tiling == VK_IMAGE_TILING_LINEAR ? "linear" : "optimal") != NULL;
 }
 #endif
 
@@ -175,6 +192,14 @@ static int pages_new(const dab_dev_fns *f, uint64_t bytes, uint32_t type, dab_pa
     p->ahb = ahb;
     return 1;
 #else
+    if (host_pages() == 2) {
+        p->fd = memfd_create("vkb-dab-pages", MFD_CLOEXEC);
+        if (p->fd >= 0 && ftruncate(p->fd, (off_t)bytes) != 0) {
+            close(p->fd);
+            p->fd = -1;
+        }
+        return p->fd >= 0;
+    }
     if (!host_pages() || !f->dt->vkGetMemoryFdKHR) return 0;
     VkExportMemoryAllocateInfo ex = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, NULL, DMABUF};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ex, bytes, type};
@@ -215,6 +240,7 @@ static VkResult pages_props(const dab_dev_fns *f, void *ahb, int fd, uint64_t by
     VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
     VkResult r = f->dt->vkGetMemoryFdPropertiesKHR(f->dev, DMABUF, fd, &fp);
     *bits = fp.memoryTypeBits;
+    if (r == VK_SUCCESS && !*bits && host_pages() == 2) *bits = ~0u; /* lavapipe describes a memfd with no type, imports it into any */
     *size = bytes;
     return r;
 #endif
@@ -407,6 +433,9 @@ static int chk_tiling(const dab_dev_fns *f, VkQueue q, VkCommandPool pool, VkIma
     f->dt->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
     r = chk_submit(f, q, pool, cb);
     uint32_t got = r == VK_SUCCESS && map ? *(volatile uint32_t *)map : 0;
+#ifndef __ANDROID__
+    if (test_wrong(tiling)) got = 0;
+#endif
     const uint32_t want = 0xff4080bfu; /* B8G8R8A8 (0.25, 0.5, 0.75, 1): bytes bf 80 40 ff */
     ok = 1;
     for (int k = 0; k < 4; k++) {
@@ -492,7 +521,7 @@ static int candidate(const vkb_dispatch *idt, VkPhysicalDevice pd, int *needed, 
     if (!driver_has(idt, pd, "VK_EXT_queue_family_foreign")) return *why = "no VK_EXT_queue_family_foreign in the driver", 0;
     if (!ahb_ok()) return *why = "no AHardwareBuffer functions", 0;
 #else
-    if (!host_pages()) return *why = "no AHardwareBuffers on this system (host tests: VKBRIDGE_TEST_EXPORT_PAGES=driver)", 0;
+    if (!host_pages()) return *why = "no AHardwareBuffers on this system (host tests: VKBRIDGE_TEST_EXPORT_PAGES=driver or memfd)", 0;
     if (!driver_has(idt, pd, "VK_KHR_external_memory_fd") || !driver_has(idt, pd, "VK_EXT_external_memory_dma_buf"))
         return *why = "host pages need the driver's dma-bufs", 0;
 #endif
@@ -531,20 +560,33 @@ void vkb_dab_selfcheck(const vkb_dispatch *idt, VkPhysicalDevice pd, VkDevice de
 #ifdef __ANDROID__
     if (o <= 0 && ahb_cpu == AHB_CPU_RARELY) {
         /* some grallocs refuse BLOB buffers with CPU usage "rarely" (server_memory.c's export check) */
+        int l0 = l;
+        char lin0[sizeof(lin)];
+        memcpy(lin0, lin, sizeof(lin));
         ahb_cpu = AHB_CPU_OFTEN;
         l = chk_tiling(&f, q, pool, VK_IMAGE_TILING_LINEAR, lin, sizeof(lin));
         o = chk_tiling(&f, q, pool, VK_IMAGE_TILING_OPTIMAL, opt, sizeof(opt));
         snprintf(cpu, sizeof(cpu), "; CPU usage often");
-        if (o <= 0) ahb_cpu = AHB_CPU_RARELY;
+        /* OPTIMAL failed both ways: the setting LINEAR passed with (LINEAR-only mode), "rarely" first */
+        if (o <= 0 && (l0 == 1 || l != 1)) {
+            ahb_cpu = AHB_CPU_RARELY;
+            l = l0;
+            memcpy(lin, lin0, sizeof(lin));
+            cpu[0] = 0;
+        }
     }
 #endif
     int id = chk_identity(&f, ident, sizeof(ident));
     dt->vkDestroyCommandPool(dev, pool, NULL);
     check_linear = l == 1;
     check_ok = o == 1 && id;
+    linear_only = !check_ok && check_linear && id;
     snprintf(check_text, sizeof(check_text), "OPTIMAL %s: %s; LINEAR %s: %s; %s%s", o == 1 ? "passed" : "FAILED", opt,
              l == 1 ? "passed" : l < 0 ? "not offered" : "FAILED", lin, ident, cpu);
     if (check_ok) VKB_INFO("dma-buf over AHardwareBuffer: the start's check passed (%s)", check_text);
+    else if (linear_only)
+        VKB_WARN("dma-buf over AHardwareBuffer: the start's check FAILED for OPTIMAL images, passed for LINEAR ones (%s); offered with "
+                 "LINEAR images only", check_text);
     else VKB_WARN("dma-buf over AHardwareBuffer: the start's check FAILED (%s); not offered", check_text);
 }
 
@@ -566,13 +608,21 @@ int vkb_dab_wanted(const vkb_dispatch *idt, VkPhysicalDevice pd)
         return 0;
     }
     if (!needed && sw != 1) return 0;
-    if (check_ok != 1) {
+    if (check_ok != 1 && !linear_only) {
         VKB_ONCE(VKB_LOG_WARN, "dma-buf over AHardwareBuffer: wanted (%s) but the start's check %s; gamescope will find no dma-buf memory",
                  needed ? "the driver has no dma-buf memory" : "VKBRIDGE_DMABUF_VIA_AHB=1", check_ok < 0 ? "did not run" : "failed");
         return 0;
     }
     __atomic_store_n(&dab_forced, !needed, __ATOMIC_RELAXED);
     __atomic_store_n(&dab_on, 1, __ATOMIC_RELEASE);
+    if (linear_only) {
+        VKB_ONCE(VKB_LOG_WARN, "dma-buf over AHardwareBuffer: on, LINEAR only (%s; the start's check failed OPTIMAL images and passed LINEAR "
+                               "ones): clients get VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf and the modifier extension "
+                               "(LINEAR only); every dma-buf image is made LINEAR, one that cannot be is refused, and the memory of a "
+                               "non-LINEAR image is not shared",
+                 needed ? "the driver has no dma-buf memory" : "VKBRIDGE_DMABUF_VIA_AHB=1 on a driver with its own");
+        return 1;
+    }
     VKB_ONCE(VKB_LOG_INFO, "dma-buf over AHardwareBuffer: on (%s): clients get VK_KHR_external_memory_fd, "
                            "VK_EXT_external_memory_dma_buf and the modifier extension (LINEAR %s); dma-buf images made %s",
              needed ? "the driver has no dma-buf memory" : "VKBRIDGE_DMABUF_VIA_AHB=1 on a driver with its own",
@@ -628,6 +678,21 @@ static VkImageTiling made_tiling(const vkb_dispatch *real, VkPhysicalDevice pd, 
     return VK_IMAGE_TILING_LINEAR;
 }
 
+/* LINEAR-only mode: a dma-buf image of this tiling would be laid out as the start's check failed. */
+static int lo_refused(VkImageTiling made)
+{
+    return linear_only && made != VK_IMAGE_TILING_LINEAR;
+}
+
+static void lo_told(const char *what, VkFormat format, const VkExtent3D *extent, uint32_t mips, uint32_t layers, VkSampleCountFlagBits samples,
+                    VkImageUsageFlags usage)
+{
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 6)
+        VKB_WARN("dma-buf over AHardwareBuffer: LINEAR only: a dma-buf image of format %d (%ux%u, %u mips, %u layers, %d samples, usage 0x%x) "
+                 "cannot be LINEAR; refused%s", format, extent ? extent->width : 0, extent ? extent->height : 0, mips, layers, samples, usage, what);
+}
+
 typedef struct dab_img {
     VkImage image;
     vkb_dmabuf_ahb_info d;
@@ -660,21 +725,27 @@ static int img_find(vkb_dab_dev *d, VkImage image, dab_img *out)
     return found;
 }
 
-void vkb_dab_image_create(vkb_emu_device *e, VkImageCreateInfo *ci, vkb_dab_note *n)
+VkResult vkb_dab_image_create(vkb_emu_device *e, VkImageCreateInfo *ci, vkb_dab_note *n)
 {
     memset(n, 0, sizeof(*n));
-    if (!(e->flags & VKB_EMU_DMABUF_AHB) || !e->dev->dab) return;
+    if (!(e->flags & VKB_EMU_DMABUF_AHB) || !e->dev->dab) return VK_SUCCESS;
     VkExternalMemoryImageCreateInfo *x = NULL;
     for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b && !x; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) x = (VkExternalMemoryImageCreateInfo *)b;
-    if (!x || !(x->handleTypes & DMABUF)) return;
+    if (!x || !(x->handleTypes & DMABUF)) return VK_SUCCESS;
+    vkb_srv_table *t = e->dev;
+    VkImageTiling made = made_tiling(&t->real, t->physical, ci->format, ci->imageType, ci->tiling, ci->usage, ci->flags, &ci->extent,
+                                     ci->mipLevels, ci->arrayLayers, ci->samples);
+    if (lo_refused(made)) {
+        lo_told("", ci->format, &ci->extent, ci->mipLevels, ci->arrayLayers, ci->samples, ci->usage);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED; /* nothing changed in ci yet */
+    }
     n->dmabuf = 1;
     n->asked_tiling = ci->tiling;
     x->handleTypes &= ~(VkExternalMemoryHandleTypeFlags)DMABUF;
     if (!x->handleTypes) vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-    vkb_srv_table *t = e->dev;
-    ci->tiling = made_tiling(&t->real, t->physical, ci->format, ci->imageType, ci->tiling, ci->usage, ci->flags, &ci->extent, ci->mipLevels,
-                             ci->arrayLayers, ci->samples);
+    ci->tiling = made;
+    return VK_SUCCESS;
 }
 
 void vkb_dab_image_created(vkb_emu_device *e, VkImage image, const VkImageCreateInfo *ci, const vkb_dab_note *n)
@@ -751,6 +822,55 @@ int vkb_dab_linear_modifier(void)
     return check_linear;
 }
 
+/* The usages a plain LINEAR image may be made with when the driver refuses the asked one: gamescope asks for
+ * its images with SAMPLED | STORAGE | TRANSFER_SRC (0xd) and Mali r18p0 (Kirin 810) refused that
+ * as a LINEAR image (-11) while it made LINEAR images of Zink's usages; gamescope then found no modifier
+ * and stopped on "modifiers.size > 0". A LINEAR-modifier image is the bridge's own plain LINEAR one, so
+ * what the driver cannot do at LINEAR is dropped from it: first the storage bit, then the transfer-source
+ * bit as well (a client's dma-buf image is sampled; the storage bit is gamescope's blanket request).
+ * The asked usage comes first, so a driver that takes it is unchanged. Returns the number of usages
+ * to try (1..3) in out[]. */
+static unsigned linear_usages(VkImageUsageFlags usage, VkImageUsageFlags out[3])
+{
+    unsigned n = 0;
+    out[n++] = usage;
+    VkImageUsageFlags u = usage & ~(VkImageUsageFlags)VK_IMAGE_USAGE_STORAGE_BIT;
+    if (u != usage) out[n++] = u;
+    VkImageUsageFlags v = u & ~(VkImageUsageFlags)VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (v != u && v) out[n++] = v;
+    return n;
+}
+
+static void told_reduced(const char *what, VkFormat format, VkImageUsageFlags asked, VkImageUsageFlags made)
+{
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+        VKB_WARN("dma-buf over AHardwareBuffer: the driver refuses a LINEAR image of format %d with usage 0x%x; %s with usage 0x%x "
+                 "(the LINEAR modifier stays offered, so gamescope finds one)", format, asked, what, made);
+}
+
+/* The usage a LINEAR-modifier image (a list holding LINEAR, or the explicit LINEAR modifier) is made with
+ * (server_emu_layer.c dab_linear_mod): the asked one where the driver makes such an image, else the
+ * first reduction it does (linear_usages). Unchanged when none does (vkCreateImage then says so). */
+void vkb_dab_linear_usage(vkb_srv_table *t, VkImageCreateInfo *ci)
+{
+    if (!t->real.vkGetPhysicalDeviceImageFormatProperties || ci->tiling != VK_IMAGE_TILING_LINEAR) return;
+    VkImageUsageFlags u[3];
+    unsigned n = linear_usages(ci->usage, u);
+    if (n < 2) return; /* nothing to drop */
+    for (unsigned i = 0; i < n; i++) {
+        VkImageFormatProperties p;
+        if (t->real.vkGetPhysicalDeviceImageFormatProperties(t->physical, ci->format, ci->imageType, VK_IMAGE_TILING_LINEAR, u[i], ci->flags, &p) ==
+            VK_SUCCESS) {
+            if (i) {
+                told_reduced("image made", ci->format, ci->usage, u[i]);
+                ci->usage = u[i];
+            }
+            return;
+        }
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL dab_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat format, VkFormatProperties2 *props)
 {
     const vkb_dispatch *real = &vkb_srv_current_table()->real;
@@ -804,11 +924,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL dab_GetPhysicalDeviceImageFormatProperties
     VkImageTiling asked = ii->tiling;
     if (!mod) {
         ii->tiling = made_tiling(real, pd, ii->format, ii->type, ii->tiling, ii->usage, ii->flags, NULL, 1, 1, VK_SAMPLE_COUNT_1_BIT);
-        r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, ii, props);
+        if (lo_refused(ii->tiling)) lo_told(" (a format query)", ii->format, NULL, 1, 1, VK_SAMPLE_COUNT_1_BIT, ii->usage);
+        else r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, ii, props);
     } else if (mi && mi->drmFormatModifier == 0 /* DRM_FORMAT_MOD_LINEAR */ && check_linear && lin_mod_ok(ii->format) &&
                ii->type == VK_IMAGE_TYPE_2D) {
         ii->tiling = VK_IMAGE_TILING_LINEAR; /* the LINEAR modifier: a plain LINEAR image */
-        r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, ii, props);
+        VkImageUsageFlags u[3], asked_usage = ii->usage;
+        unsigned nu = linear_usages(asked_usage, u);
+        for (unsigned i = 0; i < nu; i++) {
+            ii->usage = u[i];
+            r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, ii, props);
+            if (r == VK_SUCCESS) {
+                if (i) told_reduced("answered for an image made", ii->format, asked_usage, u[i]);
+                break;
+            }
+        }
+        ii->usage = asked_usage;
     }
     ii->tiling = asked;
     if (took_mi) {
@@ -886,6 +1017,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL dab_GetMemoryFdPropertiesKHR(VkDevice devi
         dab_reg_put(e);
         return r == VK_SUCCESS ? VK_SUCCESS : VK_ERROR_INVALID_EXTERNAL_HANDLE;
     }
+    /* not one of ours: the driver's only where it imports dma-bufs itself (forced on a capable GPU), as vkb_dab_allocate
+     * does; an imitated driver without dma-buf memory (host tests) refuses it as Kirin's does */
+    if (type == DMABUF && t && t->dab && !t->dab->native) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
     if (t && t->real.vkGetMemoryFdPropertiesKHR) return t->real.vkGetMemoryFdPropertiesKHR(device, type, fd, props);
     return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
@@ -1005,6 +1139,15 @@ int vkb_dab_allocate(vkb_srv_table *t, VkMemoryAllocateInfo *ai, vkb_srv_mem *m,
              (unsigned long long)ai->allocationSize);
         *res = VK_ERROR_INVALID_EXTERNAL_HANDLE;
         return 2;
+    }
+    if (linear_only && have_img && mine.d.tiling != VK_IMAGE_TILING_LINEAR) {
+        /* its memory would be shared in the layout the start's check failed */
+        told(&d->refused, 1, "LINEAR only: pid %d's %s of memory for image %llx (tiling %u%s) not %s", pid, im ? "import" : "export",
+             (unsigned long long)(uintptr_t)image, mine.d.tiling, mine.asked_dmabuf ? "" : ", made without the dma-buf handle type",
+             im ? "imported" : "exported");
+        if (e) dab_reg_put(e);
+        *res = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        return im ? 2 : 1;
     }
     if (im) {
         const vkb_dmabuf_ahb_info *theirs = dab_reg_image(e);
