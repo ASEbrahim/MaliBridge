@@ -276,6 +276,8 @@ run_mode() {
     # capability check before the driver (ULTRAKILL / No Man's Sky: a clip distance built-in Mali's compiler died on)
     timeout 300 ./reqguard_test.sh >out/ci-reqguard.log 2>&1; result $? "reqguard_test ($(tail -1 out/ci-reqguard.log))" "out/ci-reqguard.log"
     timeout 60 ./out/capgate_unit ../tests/corpus >out/ci-capgate-unit.log 2>&1; result $? "capgate_unit ($(tail -1 out/ci-capgate-unit.log))" "out/ci-capgate-unit.log"
+    # The register that answers an importer passing back a compressed export's layout, no driver needed
+    timeout 60 ./out/dbmeta_unit >out/ci-dbmeta-unit.log 2>&1; result $? "dbmeta_unit ($(tail -1 out/ci-dbmeta-unit.log))" "out/ci-dbmeta-unit.log"
     timeout 300 ./capgate_test.sh >out/ci-capgate.log 2>&1; result $? "capgate_test ($(tail -1 out/ci-capgate.log))" "out/ci-capgate.log"
     # What a process gone without destroying its device leaves in the server: destroyed, the heap flat
     timeout 300 ./exitheap_test.sh >out/ci-exitheap.log 2>&1; result $? "exitheap_test ($(tail -1 out/ci-exitheap.log))" "out/ci-exitheap.log"
