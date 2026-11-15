@@ -287,6 +287,13 @@ typedef struct wl_state {
     struct wl_proxy *lat_fb[16];   /* feedback objects not answered yet (destroyed before the queue) */
     uint32_t lat_fb_n[16];         /* ... their frames' latency log numbers */
     uint64_t lat_fb_id[16];        /* ... and present ids (0: none) */
+    /* VKBRIDGE_PRESENT_REAP: an early frame's wait for its rendering (accounting, fence reuse) is done by this thread, so the
+     * presenting thread goes on to the next queued frame at once instead of sitting in the wait (own connection to the server). */
+    pthread_t reaper;
+    int reaper_on, reap_quit;
+    pthread_cond_t reap_cond;      /* with sc->lock */
+    uint32_t reap_ring[64], reap_lat[64], reap_head, reap_len;
+    uint8_t *reap_busy;            /* per image: queued or being waited for (its fence may not be submitted again yet) */
 } wl_state;
 
 /* The compositor's zero-copy switch. A live swapchain built for the other mode is retired (out of
@@ -568,6 +575,46 @@ static int early_attach(vkb_swapchain *sc, wl_state *s, uint32_t index)
     return 0;
 }
 
+static int reap_wanted(void)
+{
+    static int v = -1;
+    int c = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (c >= 0) return c;
+    const char *e = getenv("VKBRIDGE_PRESENT_REAP");
+    c = !(e && *e && strcmp(e, "0") == 0); /* default on */
+    __atomic_store_n(&v, c, __ATOMIC_RELAXED);
+    return c;
+}
+
+static void *reaper_thread(void *arg)
+{
+    vkb_swapchain *sc = arg;
+    wl_state *s = sc->bdata;
+    pthread_setname_np(pthread_self(), "vkb-present-rp");
+    pthread_mutex_lock(&sc->lock);
+    for (;;) {
+        while (!s->reap_len && !s->reap_quit) pthread_cond_wait(&s->reap_cond, &sc->lock);
+        if (!s->reap_len) break;
+        uint32_t index = s->reap_ring[s->reap_head], lat = s->reap_lat[s->reap_head];
+        pthread_mutex_unlock(&sc->lock);
+        VkResult rw = vkb_wsi_wait_frame(sc, s->fences[index]);
+        if (rw >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
+        pthread_mutex_lock(&sc->lock);
+        s->reap_head = (s->reap_head + 1) % 64;
+        s->reap_len--;
+        s->reap_busy[index] = 0;
+        s->rendering--;
+        if (rw < 0) {
+            sc->images[index].busy = 0;
+            if (sc->status >= 0) sc->status = rw == VK_ERROR_DEVICE_LOST ? rw : VK_ERROR_SURFACE_LOST_KHR;
+            s->dead = 1;
+        }
+        pthread_cond_broadcast(&s->changed);
+    }
+    pthread_mutex_unlock(&sc->lock);
+    return NULL;
+}
+
 /* Waits for each queued frame's rendering, then shows it; between frames, takes the
  * compositor's events (buffer releases, frame callbacks) so images come back to the game. */
 static void *present_thread(void *arg)
@@ -622,6 +669,15 @@ static void *present_thread(void *arg)
             if (early) {
                 /* committed with the fence attached; now the thread waits for the rendering, for its accounting and the fence's reuse */
                 if (shown) s->e_frames++;
+                if (s->reaper_on) {
+                    pthread_mutex_lock(&sc->lock);
+                    s->reap_ring[(s->reap_head + s->reap_len) % 64] = index;
+                    s->reap_lat[(s->reap_head + s->reap_len) % 64] = lat;
+                    s->reap_len++;
+                    s->reap_busy[index] = 1;
+                    pthread_cond_signal(&s->reap_cond);
+                    pthread_mutex_unlock(&sc->lock);
+                } else {
                 VkResult rw = vkb_wsi_wait_frame(sc, s->fences[index]);
                 if (rw >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
                 else if (r >= 0) r = rw;
@@ -629,6 +685,7 @@ static void *present_thread(void *arg)
                 s->rendering--;
                 pthread_cond_broadcast(&s->changed);
                 pthread_mutex_unlock(&sc->lock);
+                }
             }
             if (stats_seconds() && ewant) {
                 uint64_t now = early_now();
@@ -698,6 +755,12 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
             }
         }
         pthread_cond_init(&s->changed, NULL);
+        pthread_cond_init(&s->reap_cond, NULL);
+        s->reap_busy = calloc(sc->count, 1);
+        if (s->esem && s->reap_busy && reap_wanted() && pthread_create(&s->reaper, NULL, reaper_thread, sc) == 0) {
+            s->reaper_on = 1;
+            VKB_INFO("present early: the wait for a committed frame's rendering is on its own thread (VKBRIDGE_PRESENT_REAP=0 to turn off)");
+        }
         if (pthread_create(&s->thread, NULL, present_thread, sc) != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
         s->thread_on = 1;
     }
@@ -705,6 +768,11 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
     for (uint32_t i = 0; i < nwait; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     int early = s->esem && !__atomic_load_n(&s->early_off, __ATOMIC_RELAXED) && !__atomic_load_n(&early_dead, __ATOMIC_RELAXED);
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, nwait, wait, stages, 0, NULL, early, early ? &s->esem[index] : NULL};
+    if (s->reaper_on) { /* the fence of this image's last frame is reset by the reaper thread: not before */
+        pthread_mutex_lock(&sc->lock);
+        while (s->reap_busy[index] && sc->status >= 0 && !s->dead) pthread_cond_wait(&s->changed, &sc->lock);
+        pthread_mutex_unlock(&sc->lock);
+    }
     VkResult r = vkb_sm_queue_submit(queue, 1, &si, s->fences[index]);
     pthread_mutex_lock(&sc->lock);
     if (r != VK_SUCCESS || s->len == 64) {
@@ -1284,6 +1352,16 @@ static void wl_destroy(vkb_swapchain *sc)
         uint64_t one = 1;
         if (write(s->efd, &one, sizeof(one)) < 0) { /* the counter is already set */ }
         pthread_join(s->thread, NULL);
+        if (s->reaper_on) {
+            pthread_mutex_lock(&sc->lock);
+            s->reap_quit = 1;
+            pthread_cond_signal(&s->reap_cond);
+            pthread_mutex_unlock(&sc->lock);
+            pthread_join(s->reaper, NULL);
+            s->reaper_on = 0;
+        }
+        free(s->reap_busy);
+        pthread_cond_destroy(&s->reap_cond);
         pthread_cond_destroy(&s->changed);
         s->thread_on = 0;
     }
