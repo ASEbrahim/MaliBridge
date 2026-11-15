@@ -324,6 +324,14 @@ target_link_libraries(wire_check PRIVATE vkb_host_flags)
 target_compile_options(wire_check PRIVATE -O2)
 vkb_host_output(wire_check)
 
+# present_early_check: VKBRIDGE_PRESENT_EARLY's fence-into-dma-buf step on a udmabuf (host/present_early_test.sh)
+add_executable(present_early_check
+    "${VKB}/tests/present_early_check.c"
+    "${VKB}/client/dmabuf_attach.c"
+)
+target_link_libraries(present_early_check PRIVATE vkb_host_flags ${CMAKE_DL_LIBS})
+vkb_host_output(present_early_check)
+
 # The capability check's SPIR-V scan (server/spirv_caps.c) on its own (run_ci_tests.sh, capgate_test.sh)
 add_executable(capgate_unit
     "${VKB}/tests/capgate_unit.c"
