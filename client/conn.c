@@ -159,6 +159,22 @@ static uint64_t process_token;
  * included - what each side pays a syscall, a header and an ordering step for. */
 static int stat_period = -1;
 static uint64_t stat_msgs, stat_wire, stat_msgs_total, stat_wire_total;
+/* VKBRIDGE_STATS, time blocked in round trips (vkb_call_exec): summed over the calling threads, the
+ * longest single round trip, and per command. Only counted while STATS is on. */
+static uint64_t stat_blocked_ns, stat_blocked_max_ns, stat_blocked_cmd_ns[VKB_CMD_COUNT];
+static uint64_t stat_blocked_total_ns, stat_blocked_total_max_ns;
+static void stat_blocked_add(uint32_t cmd, uint64_t ns)
+{
+    __atomic_add_fetch(&stat_blocked_ns, ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_blocked_total_ns, ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_blocked_cmd_ns[cmd], ns, __ATOMIC_RELAXED);
+    uint64_t m = __atomic_load_n(&stat_blocked_max_ns, __ATOMIC_RELAXED);
+    while (ns > m && !__atomic_compare_exchange_n(&stat_blocked_max_ns, &m, ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+    m = __atomic_load_n(&stat_blocked_total_max_ns, __ATOMIC_RELAXED);
+    while (ns > m && !__atomic_compare_exchange_n(&stat_blocked_total_max_ns, &m, ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
 static void stat_wire_add(uint64_t msgs, uint64_t bytes)
 {
     if (stat_period <= 0) return;
@@ -676,12 +692,14 @@ int vkb_call_exec(vkb_call *c)
         wait_period = wait_explicit ? atoi(v) : WAIT_STATS_DEFAULT;
     }
     int hitch = __atomic_load_n(&vkb_hitch_active, __ATOMIC_RELAXED);
-    if ((!slow_ms && wait_period <= 0 && !hitch) || (c->flags & VKB_F_NOREPLY)) return exec(c);
+    int stats = __atomic_load_n(&stat_period, __ATOMIC_RELAXED) > 0;
+    if ((!slow_ms && wait_period <= 0 && !hitch && !stats) || (c->flags & VKB_F_NOREPLY)) return exec(c);
     uint64_t t0 = now_ns();
     int r = exec(c);
     uint64_t t1 = now_ns(), ns = t1 - t0, us = ns / 1000;
     if (hitch && r) vkb_hitch_rt(c->cmd, ns); /* the per-hitch sums (hitch.c) */
     if (wait_period > 0) wait_note(c->cmd, ns, t1);
+    if (stats) stat_blocked_add(c->cmd, ns);
     if (slow_ms && us >= (uint64_t)slow_ms * 1000) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -1012,9 +1030,10 @@ static void stats_exit(void)
         s += stat_total_sync[i];
         a += stat_total_async[i];
     }
-    vkb_log(VKB_LOG_ERROR, "stats at exit: %llu round trips, %llu async, %llu KB encoded; %llu messages, %llu KB on the wire",
+    vkb_log(VKB_LOG_ERROR, "stats at exit: %llu round trips, %llu async, %llu KB encoded; %llu messages, %llu KB on the wire; blocked %llu ms, max %.1f ms",
             (unsigned long long)s, (unsigned long long)a, (unsigned long long)(stat_total_bytes >> 10),
-            (unsigned long long)stat_msgs_total, (unsigned long long)(stat_wire_total >> 10));
+            (unsigned long long)stat_msgs_total, (unsigned long long)(stat_wire_total >> 10),
+            (unsigned long long)(stat_blocked_total_ns / 1000000), stat_blocked_total_max_ns / 1e6);
     uint64_t refused = stat_total_refused + __atomic_exchange_n(&vkb_stat_refused, 0, __ATOMIC_RELAXED);
     uint64_t full = stat_total_full + __atomic_exchange_n(&vkb_stat_pool_full, 0, __ATOMIC_RELAXED);
     if (refused || full)
@@ -1056,10 +1075,13 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
         tot_s += stat_sync[i];
         tot_a += stat_async[i];
     }
-    vkb_log(VKB_LOG_ERROR, "stats over %us: %u round trips, %u async, %llu KB encoded; %llu messages, %llu KB on the wire", period,
-            tot_s, tot_a, (unsigned long long)(stat_bytes >> 10),
+    uint64_t blocked = __atomic_exchange_n(&stat_blocked_ns, 0, __ATOMIC_RELAXED);
+    uint64_t blocked_max = __atomic_exchange_n(&stat_blocked_max_ns, 0, __ATOMIC_RELAXED);
+    vkb_log(VKB_LOG_ERROR, "stats over %us: %u round trips, %u async, %llu KB encoded; %llu messages, %llu KB on the wire; blocked %llu ms, max %.1f ms",
+            period, tot_s, tot_a, (unsigned long long)(stat_bytes >> 10),
             (unsigned long long)__atomic_exchange_n(&stat_msgs, 0, __ATOMIC_RELAXED),
-            (unsigned long long)(__atomic_exchange_n(&stat_wire, 0, __ATOMIC_RELAXED) >> 10));
+            (unsigned long long)(__atomic_exchange_n(&stat_wire, 0, __ATOMIC_RELAXED) >> 10),
+            (unsigned long long)(blocked / 1000000), blocked_max / 1e6);
     for (int k = 0; k < 8; k++) {
         uint32_t best = 0, bi = 0;
         for (uint32_t i = 0; i < VKB_CMD_COUNT; i++)
@@ -1068,14 +1090,16 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
                 bi = i;
             }
         if (!best) break;
-        vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async %7llu KB", vkb_cmd_names[bi], stat_sync[bi], stat_async[bi],
-                (unsigned long long)(stat_cmd_bytes[bi] >> 10));
+        vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async %7llu KB, blocked %llu ms", vkb_cmd_names[bi], stat_sync[bi], stat_async[bi],
+                (unsigned long long)(stat_cmd_bytes[bi] >> 10),
+                (unsigned long long)(__atomic_exchange_n(&stat_blocked_cmd_ns[bi], 0, __ATOMIC_RELAXED) / 1000000));
         stat_sync[bi] = stat_async[bi] = 0;
     }
     /* Round trips are what cost: the rest of them too, from one a second. */
     for (uint32_t i = 0; i < VKB_CMD_COUNT; i++)
         if (stat_sync[i] >= (uint32_t)period)
-            vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async", vkb_cmd_names[i], stat_sync[i], stat_async[i]);
+            vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async, blocked %llu ms", vkb_cmd_names[i], stat_sync[i], stat_async[i],
+                    (unsigned long long)(__atomic_exchange_n(&stat_blocked_cmd_ns[i], 0, __ATOMIC_RELAXED) / 1000000));
     uint32_t refused = __atomic_exchange_n(&vkb_stat_refused, 0, __ATOMIC_RELAXED);
     if (refused) vkb_log(VKB_LOG_ERROR, "  descriptor set allocations refused: %u", refused);
     uint32_t full = __atomic_exchange_n(&vkb_stat_pool_full, 0, __ATOMIC_RELAXED);
@@ -1084,6 +1108,7 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
     memset(stat_sync, 0, sizeof(stat_sync));
     memset(stat_async, 0, sizeof(stat_async));
     memset(stat_cmd_bytes, 0, sizeof(stat_cmd_bytes));
+    memset(stat_blocked_cmd_ns, 0, sizeof(stat_blocked_cmd_ns));
     stat_bytes = 0;
 }
 
