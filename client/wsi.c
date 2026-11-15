@@ -958,6 +958,17 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateSwapchainKHR(VkDevice device, cons
     }
     sc->count = pCreateInfo->minImageCount < 2 ? 2 : pCreateInfo->minImageCount;
     if (s->kind == VKB_SURF_WAYLAND && sc->count < 3) sc->count = 3;
+    /* VKBRIDGE_SWAPCHAIN_IMAGES=<n> (Wayland, default off): at least n images (max 8), so a frame can be drawn while the
+     * compositor still holds three (on Android the release of a buffer comes about three refreshes after its commit). */
+    if (s->kind == VKB_SURF_WAYLAND) {
+        const char *ev = getenv("VKBRIDGE_SWAPCHAIN_IMAGES");
+        int n = ev ? atoi(ev) : 0;
+        if (n > 8) n = 8;
+        if (n > 0 && sc->count < (uint32_t)n) {
+            VKB_INFO("swapchain: %u images instead of %u (VKBRIDGE_SWAPCHAIN_IMAGES=%d)", (unsigned)n, sc->count, n);
+            sc->count = (uint32_t)n;
+        }
+    }
     sc->images = calloc(sc->count, sizeof(vkb_swap_image));
     sc->copy_cbs = calloc(sc->count, sizeof(VkCommandBuffer));
     for (uint32_t i = 0; i < sc->count; i++) sc->images[i].dmabuf_fd = sc->images[i].ahb_sock = -1;
