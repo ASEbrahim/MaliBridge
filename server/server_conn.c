@@ -1686,7 +1686,7 @@ static void conn_loop(void *arg)
         if (srv_recv(conn, &st->h, &payload, st->fds, &nfds) < 0) break;
         vkb_msg_hdr h = st->h;
         tls_proc = conn->proc; /* set by its hello */
-        uint64_t wait_ns = 0;
+        uint64_t wait_ns = 0, tm_recv = (h.flags & VKB_F_TIMES) ? mono_ns() : 0, tm_start = 0;
         if (conn->proc && h.cmd < VKB_CMD_COUNT && h.cmd != VKB_CMD_vkbHello) {
             uint64_t t0 = st_period ? mono_ns() : 0;
             int oms = vkb_syncfd_order_ms(h.table, h.cmd); /* server_syncfd.c: a sync-fd export's deadline */
@@ -1697,6 +1697,7 @@ static void conn_loop(void *arg)
             }
             if (st_period) wait_ns = mono_ns() - t0;
         }
+        if (tm_recv) tm_start = mono_ns();
         if (h.cmd == VKB_CMD_vkbBatch && (h.flags & VKB_F_NOREPLY) && !nfds && conn->proc) {
             st->busy = 2;
             run_batch(conn, &st->c, payload, h.size, wait_ns);
@@ -1712,6 +1713,13 @@ static void conn_loop(void *arg)
         if (!(h.flags & VKB_F_NOREPLY)) {
             vkb_msg_hdr rh = {VKB_MAGIC, st->c.status == VKB_ST_OK ? (uint32_t)st->c.r.len : 0, st->c.status, 0,
                               st->c.status == VKB_ST_OK ? (uint32_t)st->c.r.nfds : 0, 0, 0, 0};
+            if (tm_recv) {
+                uint64_t us = (tm_start - tm_recv) / 1000;
+                rh.flags = VKB_F_TIMES;
+                rh.seq = tm_start;
+                rh.barrier = mono_ns();
+                rh.table = us > 0xffffffffu ? 0xffffffffu : (uint32_t)us;
+            }
             if (st->c.r.oom) {
                 rh.cmd = VKB_ST_BAD_MESSAGE;
                 rh.size = 0;
