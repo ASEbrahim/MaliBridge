@@ -300,6 +300,7 @@ void vkb_log_info_always(const char *fmt, ...) __attribute__((format(printf, 1, 
 
 /* hitch.c: the per-hitch line's client half (VKBRIDGE_HITCH_MS). vkb_hitch_active: 0 while off. */
 extern int vkb_hitch_active;
+int vkb_dmabuf_attach_write_fence(int dmabuf_fd, int sync_fd); /* dmabuf_attach.c: 0 or an errno */
 extern __thread int vkb_hitch_in_present;   /* inside the swapchain's own wait (wsi.c) */
 uint64_t vkb_hitch_now(void);
 void vkb_hitch_server_ms(uint32_t ms);      /* vkbQueryServer's hitch_ms (physdev.c) */
