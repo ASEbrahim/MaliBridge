@@ -28,48 +28,61 @@
 
 <table align="center">
 <tr>
-<td align="center" valign="top" width="25%"><a href="https://www.youtube.com/watch?v=xTerCRrXkIU"><img src="docs/img/tekken7-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩《铁拳7》" width="400"></a><br>
-<i>《铁拳7》，Galaxy Tab S11 Ultra，v0.5.5。</i><br>
-<a href="https://www.youtube.com/watch?v=xTerCRrXkIU">YouTube</a> · <a href="https://www.youtube.com/shorts/iEbOgO-w8XU">短视频</a></td>
-<td align="center" valign="top" width="25%"><a href="https://youtu.be/nikeajHpf5s"><img src="docs/img/ds3-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩《黑暗之魂3》，古达 Boss 战" width="400"></a><br>
-<i>《黑暗之魂3》。用 v0.5.1 录制，以 2 倍速播放。</i><br>
-<a href="https://youtu.be/nikeajHpf5s">YouTube</a> · <a href="https://www.bilibili.com/video/BV124HN61EPM">哔哩哔哩</a> · <a href="https://www.reddit.com/r/GalaxyTab/comments/1xea3as/">Reddit 帖子</a></td>
-<td align="center" valign="top" width="25%"><a href="https://youtube.com/shorts/jAMXM8XYq8Y"><img src="docs/img/ultrakill-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩 ULTRAKILL，Gabriel 战" width="400"></a><br>
-<i>ULTRAKILL，Gabriel 战。以 1.5 倍速播放。</i><br>
-<a href="https://youtube.com/shorts/jAMXM8XYq8Y">YouTube</a> · <a href="https://www.reddit.com/r/SBCGaming/comments/1xjkz64/">Reddit 帖子</a></td>
-<td align="center" valign="top" width="25%"><a href="https://youtu.be/rdEQbt02dK4"><img src="docs/img/sekiro-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩《只狼》，苇名弦一郎战" width="400"></a><br>
-<i>《只狼》，苇名弦一郎战。用 v0.5.4 录制，正常速度。</i><br>
-<a href="https://youtu.be/rdEQbt02dK4">YouTube</a> · <a href="https://www.bilibili.com/video/BV1YQn96fECh">哔哩哔哩</a> · <a href="https://www.reddit.com/r/GalaxyTab/comments/1xfn2v6/">Reddit 帖子</a></td>
+<td align="center" valign="top" colspan="4"><a href="https://youtu.be/j32-ADueh7g"><img src="docs/img/whatis-video.jpg" alt="视频：MaliBridge 是什么？" width="800"></a><br>
+<i>MaliBridge 是什么？v0.5.6。</i><br>
+<a href="https://youtu.be/j32-ADueh7g">YouTube</a></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/5uNwzfRtVfM"><img src="docs/img/re2-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩《生化危机2》" width="400"></a><br>
+<i>《生化危机2》，Galaxy Tab S11 Ultra，v0.5.6。</i><br>
+<a href="https://youtu.be/5uNwzfRtVfM">YouTube</a></td>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/RAQajpT91L8"><img src="docs/img/re3-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩《生化危机3》" width="400"></a><br>
+<i>《生化危机3》，Galaxy Tab S11 Ultra，v0.5.6。</i><br>
+<a href="https://youtu.be/RAQajpT91L8">YouTube</a></td>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/G6H-xtBnkLE"><img src="docs/img/dmc5-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩《鬼泣5》" width="400"></a><br>
+<i>《鬼泣5》，Galaxy Tab S11 Ultra，v0.5.6。</i><br>
+<a href="https://youtu.be/G6H-xtBnkLE">YouTube</a></td>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/ByL7c7jNg3M"><img src="docs/img/stray-video.jpg" alt="视频：在 Galaxy Tab S11 Ultra 上玩Stray" width="400"></a><br>
+<i>Stray，Galaxy Tab S11 Ultra，v0.5.6。</i><br>
+<a href="https://youtu.be/ByL7c7jNg3M">YouTube</a></td>
 </tr>
 </table>
 
-<p align="center"><a href="https://www.youtube.com/@malibridge">更多视频</a> · <a href="https://space.bilibili.com/3747573858831484">哔哩哔哩</a></p>
+<p align="center">更早的视频：<a href="https://www.youtube.com/watch?v=xTerCRrXkIU">《铁拳7》</a> · <a href="https://youtu.be/nikeajHpf5s">《黑暗之魂3》</a> · <a href="https://youtube.com/shorts/jAMXM8XYq8Y">ULTRAKILL</a> · <a href="https://youtu.be/rdEQbt02dK4">《只狼》</a><br>
+<a href="https://www.youtube.com/@malibridge">更多视频</a> · <a href="https://space.bilibili.com/3747573858831484">哔哩哔哩</a></p>
 
-<p align="center"><img src="docs/img/ingame-v055.jpg" alt="《生化危机2》《雨中冒险：回归》和 Celeste 通过 MaliBridge 运行" width="900"><br>
-<i>在 Galaxy Tab S11 Ultra 上用 v0.5.4 实际游玩的画面。</i></p>
+<p align="center"><img src="docs/img/ingame-v056.jpg" alt="《生化危机5》《鬼泣5》和 Stray 通过 MaliBridge 运行" width="900"><br>
+<i>在 Galaxy Tab S11 Ultra 上实际游玩的画面（左上角是帧数）。</i></p>
+
+<p align="center"><img src="docs/img/app-v056.jpg" alt="应用里的 MaliBridge 页面和一键最佳设置" width="900"><br>
+<i>应用里的 MaliBridge 页面和一键最佳设置，Galaxy Tab S10+。</i></p>
 
 > [!IMPORTANT]
 > 请从本页的 [Releases](https://github.com/ASEbrahim/MaliBridge/releases) 下载 DroidDeck Mali。其他网站上的副本可能是旧版本或被改动过。
-> 官方 [DroidDeck](https://github.com/Droid-Deck/DroidDeck) 目前还没有包含 MaliBridge；包含之后，从官方下载也可以。
+> 官方 [DroidDeck](https://github.com/Droid-Deck/DroidDeck) 没有包含 MaliBridge。
 
 > 这是英文 README 的中文翻译。如有出入，以[英文版](README.md)为准，那里更新得最快。
 
-**[加入 Discord](https://discord.gg/9xC67qTjDq)**：测试版、帮助和更多额外内容（中国大陆可能无法直接访问）。
+**[加入 Discord](https://discord.gg/9xC67qTjDq)**：帮助、新消息和更多额外内容（中国大陆可能无法直接访问）。
 
-**当前版本：v0.5.5.3**，基于 DroidDeck 0.6.9。更早的版本见 [Releases 页面](https://github.com/ASEbrahim/MaliBridge/releases)。
+**当前版本：v0.5.6**，基于 DroidDeck 0.7.1。更早的版本见 [Releases 页面](https://github.com/ASEbrahim/MaliBridge/releases)。
 
-MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配合 DroidDeck 使用的版本（DroidDeck 是在安卓上运行 Steam 客户端和 PC 游戏的应用）。在三星 Galaxy Tab S10+（Mali-G720）和 Galaxy Tab S11 Ultra（Mali-G925）上，我测试过的 36 款游戏达到了可玩或更好的水平，例如《半条命2》约 94 fps、《空洞骑士：丝之歌》、《星露谷物语》、Risk of Rain Returns、《黑暗之魂 重制版》、《盖瑞模组》。玩家还从另外 38 台 Mali 手机、平板和掌机发来了反馈。下面的表格共涉及 98 款不同的游戏。MaliBridge 是免费的。
+MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配合 DroidDeck 使用的版本（DroidDeck 是在安卓上运行 Steam 客户端和 PC 游戏的应用）。在我的 Galaxy Tab S10+（Mali-G720）上，《生化危机5》接近 60 fps。在我的 Galaxy Tab S11 Ultra（Mali-G925）上，《生化危机2》约 49 fps，《鬼泣5》45-52 fps，《生化危机3》30-60 fps，Stray 根据区域在 25 到 55 fps 之间，《半条命2》和 Balatro 这样较轻的游戏能到 90 fps 以上。玩家已经在大约 70 台手机、平板和掌机上运行过它，《生化危机3》在 Pixel 10 Pro XL 上也能玩。MaliBridge 是免费的。
+
+在 [MaliBridge.com](https://malibridge.com/) 或应用的 **MaliBridge** 页面里，可以查看你的手机表现如何，以及和你类似的手机上跑得最好的设置。
+
+**v0.5.6 新内容：** Galaxy Tab S11 Ultra 上《生化危机3》和《鬼泣5》的闪烁修好了，你自己添加的游戏不需要 Steam 客户端也能启动，应用里加入了 **MaliBridge** 页面、**一键最佳设置**和**性能开关**（见[最佳设置](#最佳设置与性能建议)）。完整列表见[发布说明](https://github.com/ASEbrahim/MaliBridge/releases/tag/v0.5.6)。
 
 ## 我的设备能用吗？
 
-设备需要使用 Arm Mali GPU（Immortalis 也属于 Mali）；Steam 在部分三星 Xclipse GPU 上也能启动，见表格。不确定自己的芯片？可以在“设置 → 关于手机”（或“关于平板”）里查看处理器，也可以用 CPU-Z 之类的应用查看 GPU。
+设备需要使用 Arm Mali GPU（Immortalis 也属于 Mali）；Steam 在部分三星 Xclipse GPU 和 Pixel 10 Pro XL 上也能启动，见表格。不确定自己的芯片？可以在“设置 → 关于手机”（或“关于平板”）里查看处理器，也可以用 CPU-Z 之类的应用查看 GPU。
 
 标签的含义：
 
 - **可用**：Steam 能启动，游戏能运行。有玩家反馈，或者我自己测试过。
 - **可用，有说明**：能运行，但有备注里写明的限制。
 
-除两台平板外，其余都来自玩家反馈，我没有亲自测试过这些设备。与下表中某设备 GPU 相同的设备，表现通常也相近；不过各厂商的驱动版本不同，所以依然欢迎反馈。
+除两台平板和标有“我的测试”的行外，其余都来自玩家反馈，我没有亲自测试过这些设备。与下表中某设备 GPU 相同的设备，表现通常也相近；不过各厂商的驱动版本不同，所以依然欢迎反馈。
 
 | GPU | 设备（芯片） | 驱动 | 状态 | 说明 |
 |---|---|---|---|---|
@@ -78,8 +91,11 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 | Mali-G57 | 三星 Galaxy F15 | r38p1 | **可用** | Steam 可以打开，玩家已确认 |
 | Mali-G68 | 三星 Galaxy A16 5G | r38p1 | **可用** | Steam 可以打开，玩家已确认 |
 | Mali-G57 | 三星 Galaxy A07（Helio G99） |  | **可用** | 《Tap Ninja》约 59 fps |
+| Mali-G57 | 三星 Galaxy A17 | r54p1 | **可用** | 我的测试：Steam 菜单约 20 fps；桌面模式可以运行 |
+| Mali-G57 | 联想 Idea Tab |  | **可用** | 《Brotato》50-60 fps |
 | Mali-G68 | 三星 Galaxy A54 | r38p1 | **可用，有说明** | Steam 可以打开；菜单较慢 |
 | Mali-G68 | 三星 Galaxy A34 5G（天玑 1080） |  | **可用** | 《星球大战：共和国突击队》可玩，约 30 fps |
+| Mali-G68 | 三星 Galaxy A35 | r38p1 | **可用** | 我的测试：Steam 能进入登录画面；桌面模式可以运行 |
 | Mali-G76 | 三星 Galaxy S10+ 手机（Exynos 9820） | r38p1 beta | **可用，有说明** | Steam 可以打开，游戏能运行但比较慢 |
 | Mali-G77 | Retroid Pocket 4 Pro（天玑 1100） | r32p1 | **可用，有说明** | Steam 和 Big Picture 可以运行；部分画面会闪烁 |
 | Mali-G77 | 华为 Nova 7（麒麟 985） |  | **可用，有说明** | 《杀戮尖塔》1 和 2 可以运行；有一款游戏提示 “Direct3D isn't supported” |
@@ -98,7 +114,7 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 | Immortalis-G720 | vivo X100 Pro（天玑 9300） |  | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19193192)：《茶杯头》约 100 fps；Steam 菜单约 15 fps，打开时会白屏闪一下；《极限竞速：地平线4》进入游戏时关闭 |
 | Immortalis-G720 | realme Neo7（天玑 9300+） | r44p1 | **可用** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/5)：《星露谷物语》约 59 fps，《Balatro》55-72 fps |
 | Immortalis-G720 | 小米 14T Pro（天玑 9300+） | r44p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19146763)：Steam、手柄和下载都正常；《心灵杀手》低画质 20-50 fps；偶尔有需要重启游戏的画面异常 |
-| Mali-G720 | POCO X8 Pro（天玑 8500） | r49p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497)：《印第安纳·琼斯与帝王之墓》约 30 fps；《Hob》会卡顿 |
+| Mali-G720 | POCO X8 Pro（天玑 8500） | r49p1 | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497)：《印第安纳·琼斯与帝王之墓》约 30 fps；《Hob》会卡顿；从 v0.5.6 起《星球大战：旧共和国武士》（KOTOR）的文字和角色显示正常 |
 | Mali-G720 | POCO X7 Pro（天玑 8400-Ultra） | | **可用** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/23)：较轻的游戏可以运行（Stardew Valley、Rain World、Tukoni: Forest Keepers 等）；[《暗黑血统：创世纪》低画质 23-27 fps](https://github.com/ASEbrahim/MaliBridge/issues/62) |
 | Immortalis-G925 | 三星 Galaxy Tab S11 Ultra（天玑 9400） | r49p1 | **可用** | 深入测试 |
 | Immortalis-G925 | vivo X200（天玑 9400） |  | **可用** | [玩家反馈](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6314012693)：《欧洲卡车模拟2》约 20 fps，《模拟山羊》约 35 fps |
@@ -112,21 +128,13 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 | Mali-G2-Ultra-NX | 小米 18 Fold（玄戒 O3） | r56p0 | **可用** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/7)：自检 13/13，Steam 可用，《Brotato》约 77 fps |
 | Mali-G2-Ultra-NX | 小米平板 9 Pro Max（玄戒 O3） |  | **可用** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19136786)：《人类一败涂地》可玩，《传送门2》1080p 40-50 fps；《泰坦陨落2》暂时无法启动 |
 | Xclipse 530 | 三星 Galaxy A55 |  | **可用，有说明** | [玩家反馈](https://github.com/ASEbrahim/MaliBridge/issues/27)：Steam 可以启动；游戏还没有确认 |
+| PowerVR DXT-48-1536 | Google Pixel 10 Pro XL（Tensor G5） |  | **可用，有说明** | 我的测试：Steam 可以运行；从 v0.5.6 起《生化危机3》画面正常，但还有点卡顿 |
 
 设备不在表里，或者有什么不能用？在应用里点 **Send logs to MaliBridge**（发送日志给 MaliBridge），把代码贴到 [Discord](https://discord.gg/9xC67qTjDq)。
 
-更多玩家反馈和测试见 Discord，那里还有测试版、帮助和更多额外内容。
+完整列表（大约 70 台设备和玩家的结果）见 [MaliBridge.com](https://malibridge.com/)。那里还没有的设备，反馈最有帮助。
 
-**需要更多反馈：尚未测试的设备。** 这些设备的反馈最有帮助：
-
-| 芯片 | GPU | 设备举例 |
-|---|---|---|
-| 天玑 9300 / 9300+（其他设备） | Immortalis-G720 MC12 | OPPO Find X7 |
-| 天玑 9400 / 9400+（其他设备） | Immortalis-G925 MC12 | OPPO Find X8 |
-| 天玑 7300 等 | Mali-G615 / G610 | 许多中端手机（GPU 较小：只适合较轻的游戏） |
-| Exynos 1280 | Mali-G68 | Galaxy A53 |
-
-**非 Mali 芯片：** 骁龙使用 Adreno GPU，请直接使用官方 DroidDeck。三星较新的 Exynos 芯片使用 Xclipse GPU，其中一些手机可以用（表里有 Galaxy A55）。升级到 Android 17（One UI 9）的三星手机上，Steam 会一直停在加载画面；v0.5.5.3 应该能修复。我自己用 v0.5.5.3 测试时，Steam 在 Galaxy S26 FE（Android 17）和 Galaxy A56 上都能进入登录界面。Galaxy S24+（Xclipse 940，[#43](https://github.com/ASEbrahim/MaliBridge/issues/43)）和 A56（Xclipse 540，[#29](https://github.com/ASEbrahim/MaliBridge/issues/29)）的玩家还没有确认。
+**非 Mali 芯片：** 骁龙使用 Adreno GPU，请直接使用官方 DroidDeck。三星较新的 Exynos 芯片使用 Xclipse GPU，其中一些手机可以用（表里有 Galaxy A55）。升级到 Android 17（One UI 9）的三星手机上，Steam 以前会一直停在加载画面；从 v0.5.5.3 起，我测试时 Steam 在 Galaxy S26 FE（Android 17）和 Galaxy A56 上都能进入登录界面。
 
 不在表里的设备依然只算测试：结果取决于 GPU 及其驱动。欢迎发送日志（见[获取帮助](#获取帮助)）。
 
@@ -136,6 +144,7 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 2. 从[最新版本](https://github.com/ASEbrahim/MaliBridge/releases/latest)下载 `DroidDeck-MaliBridge-....apk` 并安装。安装后的应用名是 **DroidDeck Mali**，可以和官方 DroidDeck 同时存在。
 3. 打开 DroidDeck Mali（**Mali bridge** 默认开启，不确定的话到 **配置**（Setup）页面的“概览”里看一下），启动 **Steam** 会话并登录。
 4. 直接启动游戏。应用会自己选一个能用的 DroidDeck-Proton，不需要手动切换。
+5. 想用和你相近的设备上跑得最好的设置？在 **MaliBridge** 页面打开这个游戏，点 **Apply settings**（套用设置），随时都能撤销。
 
 **需要：** 64 位 Android 8.0 或更新；8 GB 内存以上（较大的游戏建议 12 GB 以上）；游戏之外约 8-10 GB 空闲空间。
 
@@ -157,17 +166,18 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 | GRIS | **极佳**，继续游戏后约 105 fps | **极佳**，约 119 fps |
 | Phoenix Wright: Ace Attorney Trilogy | **尚未评级**（仅菜单）：标题和菜单约 118 fps | **极佳**，约 118 fps（120 Hz 屏幕刷新率） |
 | Doki Doki Literature Club | **极佳**，标题画面 91-92 fps | **极佳**，剧情中 112-114 fps |
-| Balatro | **极佳**，一手牌中约 97 fps（v0.5.4.2：约 85-89） | **极佳**，一局游戏中约 112 fps |
+| Balatro | **极佳**，游戏中中位数 91 fps | **极佳**，一局游戏中约 112 fps |
 | ULTRAKILL | **很流畅**，55-57 fps | **极佳**，0-1 开头 111-116 fps |
 | Hades | **极佳** | **极佳**，House of Hades 里 110-128 fps |
-| Hollow Knight | **极佳**，87-124 fps。在同一个高负载位置，v0.5.5 与 v0.5.4.2 持平（63.6-65.9 fps 对 61.6-63.9） | **极佳**，110+ fps（玩家反馈） |
+| Hollow Knight | **极佳**，87-124 fps | **极佳**，110+ fps（玩家反馈） |
 | Dead Cells | **极佳** | **极佳**，Prisoners' Quarters 里 110-120 fps |
 | A Dance of Fire and Ice | **尚未评级**（仅菜单）：标题场景 45-52 fps | **极佳**，约 106-113 fps；用蓝牙 PS5 手柄没有感觉到输入延迟 |
 | Garry's Mod | **很流畅**，gm_construct 地图 49-54 fps（菜单 59） | **极佳**，简单地图中位数 104 fps；Golden City Sandbox 地图中位数 82 fps，最低 34 |
 | Half-Life 2 | **极佳**，开场章节 59-74 fps | **极佳**，开场章节 94-103 fps；Water Hazard 约 110 fps |
-| Portal | **极佳**，约 63 fps | **极佳**，第一个测试室 85-90 fps（透过传送门看时约 65）；第一个传送门打开时短暂停顿一次 |
+| Portal | **极佳**，游戏中中位数 65 fps | **极佳**，游戏中中位数 106 fps（透过传送门看时约 65）；第一个传送门打开时短暂停顿一次 |
 | Hollow Knight: Silksong | **极佳**，游戏中稳定 62-66 fps | **极佳**，72-96 fps |
 | Celeste | **极佳**，57-59 fps | **极佳**，游戏中 60 fps（上限） |
+| Resident Evil 5 | **很流畅**，720p 高画质下第 1-1 章 55-61 fps（中位数 58.4），村子人群里接近 60 | **很流畅**，第 1-1 章 51-72 fps |
 | The Elder Scrolls V: Skyrim Special Edition | **极佳**，Medium 下约 60 fps（上限）；第三人称流畅，首次加载时有些卡顿 | 未测试 |
 | Don't Starve Together | **极佳**，新世界里 60 fps（上限） | **极佳**，60 fps |
 | ENDER LILIES | **可玩**，42-44 fps | **极佳**，第一个区域 59-61 fps（上限）；颜色较平淡，和 Stray 一样 |
@@ -177,32 +187,38 @@ MaliBridge 运行在 **DroidDeck Mali** 里。DroidDeck Mali 是一个可以配�
 | Stardew Valley | **极佳**，在农场里游玩时 60 fps（上限） | **极佳**，57-62 fps |
 | Inscryption | **极佳**，68-83 fps | **很流畅**，第一张牌桌 55-57 fps，偶尔掉到 20 左右 |
 | Dark Souls Remastered | **尚未评级**（仅菜单）：标题和主菜单 60 fps（上限） | **很流畅**，玩了 10 分钟，中位数 53.7 fps，最低 43.9，平板不热时 60 fps（上限）；过场动画正常 |
+| Devil May Cry 5 | 未测试 | **很流畅**，玩了 7 分钟，中位数 45 fps；v0.5.6 修好了闪烁的建筑 |
+| SOMA | 未测试 | **很流畅**，游戏中中位数 49 fps |
+| Resident Evil 7 | 未测试 | **极佳**，玩了 9 分钟，中位数 57 fps（最慢的 10% 约 47） |
+| Resident Evil 3 | 未测试 | **很流畅**，原生 720p 下 30-60 fps，没有锁帧；v0.5.6 修好了方块闪烁 |
+| NieR:Automata | 未测试 | **很流畅**，玩了 11 分钟，中位数 58 fps，会掉到二十多 fps |
 | Portal 2 | **可玩**，游戏中约 45-50 fps，偶尔掉到 30 左右 | **尚未评级**（仅菜单）：菜单 115 fps |
 | Muck | **尚未评级**（仅菜单）：3D 岛屿背景的主菜单 43 fps | **可玩**，岛上 45-48 fps |
-| Resident Evil 2 | **可玩**，第一个大厅约 33 fps（DX12），会掉到十几 fps | **可玩**，警察局里约 41 fps（DX11 测试版）。在 v0.5.5 上我自己玩的感觉比之前好很多：约 30 fps，随区域在 15 到 60 fps 之间 |
+| Resident Evil 2 | **可玩**，第一个大厅约 33 fps（DX12），会掉到十几 fps | **很流畅**，游戏中中位数 49 fps（最慢的 10% 约 43） |
 | R.E.P.O. | **尚未评级**（仅菜单）：预热 50 秒后主菜单约 42 fps | **可玩**，单人模式约 40 fps |
-| Tekken 7 | 未测试 | **可玩**，中位数 38 fps，低点约 36，很少低于 30 |
-| Sekiro: Shadows Die Twice | 未测试 | **可玩**，游戏中站立约 38 fps |
+| Tekken 7 | 未测试 | **很流畅**，游戏中中位数 34 fps，最慢的 10% 约 29（我自己的评级） |
+| Sekiro: Shadows Die Twice | **勉强可玩**，游戏中中位数 22 fps | **可玩**，玩了 15 分钟，中位数 32 fps |
 | Outer Wilds | **勉强运行**，游戏中约 10 fps（标题 73）：平板内存不足（12 GB，大量交换） | **可玩**，起始星球 35-45 fps，太空中约 75-80，Brittle Hollow 二十多 fps，看向黑洞时约 17（GPU 一半空闲）；受 CPU 限制 |
-| Dark Souls III | **勉强运行**，站立不动 20-21 fps（v0.5.4.2：约 19），移动时更低，并有短暂卡顿（正在处理） | **勉强可玩**，游戏中站立约 35 fps；移动时短暂卡顿（已知问题） |
+| Dark Souls III | **勉强运行**，站立不动 20-21 fps，移动时更低，并有短暂卡顿（正在处理） | **勉强可玩**，游戏中中位数 28 fps（站立约 35）；移动时短暂卡顿（已知问题） |
 | Risk of Rain 2 | **勉强可玩**，半分辨率下，人多、特效多的 Boss 战 18-30 fps（1280x720 下 15-23 fps） | **可玩**，1280x720 下 30-43 fps；拥挤的 Boss 战 20-28 fps（录屏时测量） |
 | The Forest | **尚未评级**（仅菜单）：菜单 60 fps；第一次启动在 20 秒后卡住过一次，第二次正常 | **可玩**，四分之一、一半和全分辨率下都是 30-45 fps；受 CPU 限制，所以分辨率没有影响。第一次启动时崩溃过一次，之后没有再出现 |
 | Subnautica | **可玩**，细节设为 High 时 20-24 fps | **很流畅**，游戏中 28-40 fps（温控降频时），菜单 81 fps |
 | Poppy Playtime (Chapter 1) | **尚未评级**（仅菜单）：第一章主菜单 62-64 fps | **勉强可玩**，工厂大厅 28-32 fps；颜色较平淡，和 Stray 一样 |
 | Lethal Company | **可玩**，43-45 fps | **勉强可玩**，飞船上约 25 fps，有掉帧（比 S10+ 低，正在复查） |
-| The Witcher 3 (DX12) | **勉强运行**，加载时 GPU 长时间卡住 | **勉强可玩**，中位数约 29 fps（23-37）；有一次在过场动画里卡死（正在处理） |
+| The Witcher 3 (DX12) | **勉强运行**，加载时 GPU 长时间卡住 | **勉强可玩**，约 28-30 fps；从 v0.5.6 起不会再在进入菜单前的过场动画里卡死 |
+| Lies of P | 未测试 | **勉强可玩**，游戏中中位数 22 fps；可能黑屏（见已知问题） |
 | Bright Memory: Infinite | **勉强运行**，DirectX 11 下站立不动约 22 fps，移动时更低；DirectX 12 模式无法运行 | 未测试 |
-| Stray | **勉强运行**，开场 17 fps（受 CPU 限制） | **可玩**，游戏中约 20 fps；颜色较平淡（见已知问题） |
+| Stray | **勉强运行**，游戏中中位数 18.5 fps（受 CPU 限制） | **可玩**，根据区域在 25 到 55 fps 之间；颜色较平淡（见已知问题） |
 | ASTRONEER | **尚未评级**（仅菜单）：3D 菜单 27-29 fps | **勉强可玩**，画面正常（没有白屏）；全低画质约 20 fps，Ultra 约 17；受 CPU 限制；颜色较平淡 |
 | Elden Ring（DX12，离线） | 未测试 | **勉强运行**，进入世界后一直是 12 fps（正在处理） |
 | Deep Rock Galactic | **勉强可玩**，较慢 | **已知问题**：标题画面正常，但进入 Space Rig 后游戏可能会卡住。正在处理 |
 
-仅供参考：GameNative（另一款应用，用于许多 Mali 设备）的公开玩家汇总把 Outer Wilds、The Forest 和 ASTRONEER 在 Mali 上评得较低；这不是同条件对比。游戏的成绩、设置和测试版会在 [Discord](https://discord.gg/9xC67qTjDq) 上分享。
+游戏的成绩和设置会在 [Discord](https://discord.gg/9xC67qTjDq) 和 [MaliBridge.com](https://malibridge.com/) 上分享。
 
 <details>
 <summary>这些数字是怎么测的</summary>
 
-G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，以及 Half-Life 2 的 Water Hazard 数据，是 2026 年 10 月用 v0.5.4 测量的：进入游戏后站立不动，每款 60 秒，用游戏自己的帧数统计。G925 上的 Dark Souls Remastered 和 Garry's Mod 是在安全模式下亲手玩的。G925 的其他数据来自 v0.4，只有 Subnautica 的菜单、Half-Life 2 和 Stray 是用 v0.5 测量的。从 Poppy Playtime 到 Outer Wilds 这几款，是 2026 年 10 月用 v0.5 的版本在 G925 上亲手玩的（fps 读自启动器的帧数计数器）。G925 上的 Hades、ULTRAKILL、Portal、Cuphead、Dead Cells、ENDER LILIES、Inscryption 和 Doki Doki Literature Club，以及 G720 上的 Helltaker、Stardew Valley 和 Don't Starve Together，是 2026 年 10 月用 v0.5.4.1 进入实际游戏场景后测量的：每款 75-90 秒，按屏幕的帧时间统计。G925 上的 Lethal Company、G720 上的 Resident Evil 2（DX12），以及 G925 上的 Elden Ring（DX12，离线），是之后补测的（Elden Ring 用的是 10 月 27 日的版本）。G925 上的 Tekken 7 和 The Witcher 3（DX12），以及 G720 上的 Balatro、Portal、Hollow Knight、Dark Souls III 和 Bright Memory: Infinite，是用 v0.5.5 测量的。Resident Evil 2 在 v0.5.5 上的说明来自我自己的游玩，不是测量数据。Risk of Rain Returns 以前会在开场视频卡住，现在在两台平板上都修好了。
+写着“游戏中中位数”的行，来自我自己在 2026 年 11 月用 v0.5.5 和 v0.5.6 的版本的游玩记录：整段游玩的中位数，不算菜单和加载，和 [MaliBridge Library](https://malibridge.com/) 上的算法一样。G925 上的 Resident Evil 5、Resident Evil 3、G925 上的 Stray 和 The Witcher 3 来自我自己用 v0.5.6 的版本的游玩。其他行是 2026 年 10 月用 v0.4 到 v0.5.5 测的较早数据（游戏自己的帧数统计或屏幕的帧时间），我还没有重新测。
 
 </details>
 
@@ -256,7 +272,7 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 | Brotato | 小米 18 Fold（玄戒 O3） | [约 77 fps](https://github.com/ASEbrahim/MaliBridge/issues/7) |
 | Portal 2 | 小米平板 9 Pro Max（玄戒 O3） | [1080p 40-50 fps](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19137389) |
 | Human Fall Flat | 小米平板 9 Pro Max（玄戒 O3） | [可以运行](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19136786) |
-| Titanfall 2 | 小米 M367FC（玄戒 O3，12 GB） | [**勉强能运行**：v0.5.2 上 57-83 fps，但 3-5 分钟后安卓因内存不足将其关闭；v0.5.4.1 占用内存更少，但在 v0.5.4.x 上无法启动。v0.5.5 会运行 EA 应用的安装步骤，应该可以启动；尚未确认](https://github.com/ASEbrahim/MaliBridge/issues/18) |
+| Titanfall 2 | 小米 M367FC（玄戒 O3，12 GB） | [**勉强能运行**：57-83 fps，但在较旧的版本上 3-5 分钟后安卓因内存不足将其关闭。还没有在 v0.5.6 上确认](https://github.com/ASEbrahim/MaliBridge/issues/18) |
 
 </details>
 
@@ -405,24 +421,15 @@ G925 上的 Celeste、Balatro、Dark Souls III、Sekiro 和 Resident Evil 2，�
 
 ## 最佳设置与性能建议
 
+- **一键最佳设置：** 在 **MaliBridge** 页面打开游戏，点 **Apply settings**（套用设置），就会用上和你相近的设备上跑得最好的设置（Proton、MaliBridge 模式、图形层和启动选项），随时都能撤销。其他玩家分享的设置只能改图形选项。
 - **Proton：** 不需要手动切换。应用会自己选一个能用的 DroidDeck-Proton（默认是 DroidDeck-Proton 11-11.10），也不会自己把你的游戏换到更新的版本。列表中 Valve 官方的 “Proton (ARM64)” 和 “Steam Linux Runtime” 在 DroidDeck 里无法启动。同时有 Linux 版本的游戏（《传送门2》《半条命2》等）需要手动选一个 DroidDeck-Proton。
-- **先用安全模式（默认）。** 它的兼容性最好。**性能模式**（Safe mode 关闭）在 Mali bridge 按钮下面；在我的平板上它只快 0-2%，在较弱的 GPU（Mali-G57、G68、G610）上，我看过的日志里没有提升。等游戏已经能正常运行后再试，如果出问题，先切回安全模式再反馈。
+- **先用安全模式（默认）。** 它的兼容性最好。**性能模式**（Safe mode 关闭）在 Mali bridge 按钮下面；在我的平板上差别不大。等游戏已经能正常运行后再试，如果出问题，先切回安全模式再反馈。
+- **性能开关**（默认开启）在**性能**页面，单个游戏在该游戏的 **Components** 页面。它应该能降低部分受 GPU 限制的游戏的输入延迟，并让 Steam 性能叠加层占用更少。如果某个游戏开启后变差，就为那个游戏关掉，并发送日志。
 - **DXVK: automatic**（默认）会在 GPU 太旧、跑不了 Proton 自带 DXVK 的手机上换用较旧的 DXVK。
 - **Steam menus: automatic**（默认）可以避免较旧的 Mali GPU 上 Steam 菜单黑屏。如果 Steam 还是黑屏，改成 **Steam menus: software**，游戏仍然使用 GPU。
-- **MaliBridge 会自动设置的游戏：** 《饥荒联机版》（Don't Starve Together）、较旧手机上的《半条命2》和《环世界》、Indiana Jones and the Emperor's Tomb，以及 Stray、SOMA 和两款 Amnesia。这些游戏不需要设置启动选项。
+- **MaliBridge 会自动设置的游戏：** 《生化危机5》、《饥荒联机版》（Don't Starve Together）、较旧手机上的《半条命2》和《环世界》、Indiana Jones and the Emperor's Tomb，以及 Stray、SOMA 和两款 Amnesia。这些游戏不需要设置启动选项。
 
 Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali bridge** 按钮下面。[安装指南（英文）](INSTALL.md#how-demanding-each-game-is)按负载高低给游戏分了组。
-
-两种模式在我的平板上的帧率对比（fps 中位数，每个游戏每种模式跑一次，接 USB 供电，温控状态 0-1）。游戏是按顺序跑的，没有交替，所以几个百分点的差别属于正常误差。
-
-| 游戏（场景） | G720 安全 | G720 性能 | G925 安全 | G925 性能 |
-|---|---|---|---|---|
-| Half-Life 2（火车场景） | 74.1 | 75.9 | 93.7 | 93.7 |
-| Subnautica（菜单） | 62.0 | 62.3 | 81.3 | 81.5 |
-| Stray（标题） | 17.1 | 15.8 | 58.4 | 58.0 |
-| Stardew Valley（标题，60 fps 上限） | 60.0 | 60.0 | 60.0 | 60.0 |
-| Risk of Rain 2（标题） | 35.6 | 35.8 | 56.8 | 没有完整的一次（见已知问题） |
-| Skyrim Special Edition（主菜单，60 fps 上限） | 60.7 | 60.7 | 未测试 | 未测试 |
 
 **建议**
 
@@ -468,34 +475,37 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 
 ## 已知问题
 
-- **Galaxy Tab S9 FE（Mali-G68）上的 OpenGL 游戏**可能出现贴图错误，例如 OpenGL 模式下的《欧洲卡车模拟2》。正在处理。Galaxy A16、A54、F15、Tab S10 Lite 和 Anbernic RG556 上的 OpenGL 游戏还没有测试。
-- 一些边走边加载贴图的游戏（《黑暗之魂3》、Hob）在**移动时会短暂卡顿**。v0.5.5.3 会记录每次卡顿在等什么，所以卡顿的游戏的日志会有帮助。
-- 部分小米、POCO 和 vivo 手机上 **Steam 菜单反复关闭**，以及 POCO X8 Pro 上游戏回到 Steam（[#55](https://github.com/ASEbrahim/MaliBridge/issues/55)）。v0.5.5.3 会记录关闭的原因，出现后马上发送日志就行。
-- **手机内存不足时游戏被关闭。** v0.5.5.3 在部分游戏里可能有帮助。先关掉其他应用，每次会话只启动一个游戏。
-- **部分 Android 10 的华为手机**（P30、P40 Pro）可能卡在 Steam 安装步骤。v0.5.5.3 可能有帮助；如果还是卡住，日志会有帮助。
-- 在**部分 vivo 和 iQOO 手机**上，Steam 的菜单可能只有约 15 fps，打开菜单时会白屏闪一下。v0.5.5 为此做了改动，但还没有在手机上确认。如果你有这些手机，日志会有帮助。
-- **Mali-G925 上的《巫师3》（DX12）**约 29 fps，但有一次在过场动画里卡死。正在处理。
-- **Mali-G720 上的《Bright Memory: Infinite》**在 DirectX 11 下勉强运行，DirectX 12 模式无法运行。
-- **Mali-G925 上的 Deep Rock Galactic** 进入 Space Rig 后可能会卡住。正在处理。
-- **Mali-G925 上的 Stray 和 ENDER LILIES** 颜色较平淡，没有游戏自己的调色效果（Poppy Playtime 和 ASTRONEER 也是）。正在处理。
-- **Stray 加 `-dx12` 启动**时，在 G925 上大约 60 秒后关闭。默认的 DX11 没有问题。
-- **Risk of Rain 2**：在 G925 上有一次性能模式启动时，标题加载约 2 分钟没有画面，之后恢复正常。之后没有再出现。
-- **Mali-G925 上的 Steam 窗口**可能有些慢。游戏不受影响。
+- **Mali-G925 上的《生化危机 村庄》**会出现黑斑、闪烁和画面卡住。正在处理。
+- **Galaxy Tab S11 Ultra 上的《生化危机4》**玩一段时间后可能会闪退。
+- **Galaxy Tab S11 Ultra 上的《匹诺曹的谎言》（Lies of P）**可能黑屏。
+- **《生化危机5》**需要 DroidDeck-Proton 11-11.10，应用会自动帮它选好；如果你在 Steam 里给它选了别的 Proton，会保留你的选择，结束画面会提示你换过来。如果开场动画卡住，按 Back 或 Select 可以跳过。
+- 部分手机上**《极限竞速：地平线6》**启动时仍然会关闭。
+- 部分手机上**从 Epic 添加的《无主之地2》**可能在启动时关闭。
+- **《半条命》**打开手电筒后可能会明显变慢。
+- **Galaxy Tab S10+ 上的《小缇娜的奇幻之地》**第一次准备着色器时可能会崩溃。
+- 一些边走边加载贴图的游戏（《黑暗之魂3》、Hob）在**移动时会短暂卡顿**。卡顿的游戏的日志会有帮助。
 - 天玑 9500 手机（Mali-G1-Ultra）的部分游戏有**绿色方块贴图问题**。正在处理。
-- **Just Cause 2、Mafia II 和 Space Marine** 可能一直停在 Steam 的 “Updating executable” 步骤：Steam 的防拷贝检查在 DroidDeck 里耗时太长。
-- **《生化危机2》**菜单上可能出现 “Failed to send play data to RE NET”。按 OK 即可，游戏正常运行，只影响 Capcom 的在线游玩统计。
-- **《黑暗之魂3》在较慢的设备上**可能提示 “Frame rate unsuitable for online play” 并回到标题画面。这是游戏自己的规则（低于约 20 fps）：在这些设备上请离线游玩。
+- **Galaxy Tab S9 FE（Mali-G68）上的 OpenGL 游戏**可能出现贴图错误，例如 OpenGL 模式下的《欧洲卡车模拟2》。
+- **Just Cause 2、Mafia II 和 Space Marine** 可能一直停在 Steam 的 “Updating executable” 步骤（[#27](https://github.com/ASEbrahim/MaliBridge/issues/27)）。
+- 部分小米、POCO 和 vivo 手机上 **Steam 菜单反复关闭**，以及 POCO X8 Pro 上游戏回到 Steam（[#55](https://github.com/ASEbrahim/MaliBridge/issues/55)）。出现后马上发送日志就行。
+- 在**部分 vivo 和 iQOO 手机**上，Steam 的菜单可能比较慢，打开菜单时会白屏闪一下。日志会有帮助。
+- **手机内存不足时游戏被关闭。** 先关掉其他应用，每次会话只启动一个游戏。
+- **部分 Android 10 的华为手机**（P30、P40 Pro）可能卡在 Steam 安装步骤。日志会有帮助。
+- **Mali-G720 上的《Bright Memory: Infinite》**在 DirectX 11 下勉强运行，DirectX 12 模式无法运行。
+- **Mali-G925 上的 Deep Rock Galactic** 进入 Space Rig 后可能会卡住。
+- **Mali-G925 上的 Stray、ENDER LILIES、Poppy Playtime 和 ASTRONEER** 颜色较平淡，没有游戏自己的调色效果。**Stray 加 `-dx12` 启动**时，在那上面大约 60 秒后关闭；默认的 DX11 没有问题。
+- **《生化危机2》**菜单上可能出现 “Failed to send play data to RE NET”。按 OK 即可，游戏正常运行。
+- **《黑暗之魂3》在较慢的设备上**可能提示 “Frame rate unsuitable for online play” 并回到标题画面。这是游戏自己的规则（低于约 20 fps），在这些设备上请离线游玩。
 - **Outer Wilds、ASTRONEER 和 The Forest** 在 G925 上受 CPU 限制，降低分辨率或画质帮助不大。
 
 ## 接下来
 
-- 修复移动时的短暂卡顿（《黑暗之魂3》、Hob）。
-- 更多性能优化。
-- 第一次进入新区域时更流畅。
-- 受 CPU 限制的游戏（The Forest、ASTRONEER、Outer Wilds）以及 Just Cause 2。
-- DirectX 12：《巫师3》过场动画卡死、DX12 下的 Stray、《艾尔登法环》、Bright Memory。
+- 减少内存占用，让内存较小的手机也能跑较大的游戏。
+- 提高受 GPU 限制的游戏的帧率。
+- 移动时的短暂卡顿（《黑暗之魂3》、Hob），以及第一次进入新区域时更流畅。
+- DirectX 12：《生化危机 村庄》的画面问题、DX12 下的 Stray、《艾尔登法环》、Bright Memory。
 - Steam 菜单反复关闭或一直黑屏的手机。
-- 更多设备：来自我没测试过的 Mali GPU 的反馈，是最快的途径。
+- 更多设备：来自 MaliBridge.com 上还没有的 Mali GPU 的反馈，是最快的途径。
 
 ## 常见问题
 
@@ -507,9 +517,6 @@ Safe mode、DXVK 和 Steam menus 都在 **配置**（Setup）页面的 **Mali br
 
 **带反作弊的网络游戏能玩吗？**
 我没有测试过。很多反作弊系统在 Proton 下根本无法运行，所以基本无法游玩。
-
-**和 PanVK 一样吗？**
-不一样。PanVK 会替换手机的驱动，MaliBridge 保留手机自带的驱动。它们是不同的项目。
 
 **能在 GameNative、Winlator 等应用里用吗？**
 不能。MaliBridge 内置在 Releases 页面的 DroidDeck Mali 里。
