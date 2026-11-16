@@ -17,6 +17,7 @@
  */
 #define _GNU_SOURCE
 #include "server_emu.h"
+#include "server_dmabuf_meta.h"
 #include "server_dshape.h"
 #include "vkb_emu_formats.h"
 
@@ -815,6 +816,43 @@ void vkb_emu_driver_imitate_init(vkb_srv_table *t)
         }
 }
 
+/* The shape and one-plane layout of a dma-buf import that names an explicit DRM modifier. */
+static int import_meta_shape(const VkImageCreateInfo *ci, vkb_meta_shape *q)
+{
+    if (ci->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT || ci->imageType != VK_IMAGE_TYPE_2D || ci->mipLevels != 1 ||
+        ci->arrayLayers != 1 || ci->samples != VK_SAMPLE_COUNT_1_BIT)
+        return 0;
+    int dmabuf = 0, found = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+            dmabuf |= (((const VkExternalMemoryImageCreateInfo *)b)->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) != 0;
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) {
+            const VkImageDrmFormatModifierExplicitCreateInfoEXT *x = (const void *)b;
+            if (x->drmFormatModifierPlaneCount != 1 || !x->pPlaneLayouts) return 0;
+            *q = (vkb_meta_shape){ci->format, ci->extent.width, ci->extent.height, ci->mipLevels, ci->arrayLayers,
+                                  x->drmFormatModifier, x->pPlaneLayouts[0]};
+            found = 1;
+        }
+    }
+    return dmabuf && found;
+}
+
+/* Remembers a dma-buf export's shape, chosen modifier and plane layout (server_dmabuf_meta.c). */
+static void export_meta_note(VkDevice device, VkImage image, const VkImageCreateInfo *ci)
+{
+    if (ci->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) return;
+    const vkb_dispatch *real = vkb_emu_real();
+    VkImageDrmFormatModifierPropertiesEXT mp = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT};
+    if (!real->vkGetImageDrmFormatModifierPropertiesEXT ||
+        real->vkGetImageDrmFormatModifierPropertiesEXT(device, image, &mp) != VK_SUCCESS || !mp.drmFormatModifier)
+        return;
+    VkImageSubresource sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+    VkSubresourceLayout l = {0};
+    real->vkGetImageSubresourceLayout(device, image, &sub, &l);
+    vkb_meta_shape s = {ci->format, ci->extent.width, ci->extent.height, ci->mipLevels, ci->arrayLayers, mp.drmFormatModifier, l};
+    vkb_meta_note(&s);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
                                                      const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
@@ -837,8 +875,43 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
     if (lm_candidate && linear_mod_refused(e->dev, ci)) linear_mod = linear_mod_plain(ci, VK_SUCCESS);
     VkSubresourceLayout lm_plane = {0};
     int lm_import = !lm_candidate && (e->flags & VKB_EMU_DMABUF_EXPORT) && has_linear_mod_explicit(ci, &lm_plane);
+    /* A dma-buf import that passes back a layout an export of this server reported, while naming
+     * the LINEAR modifier (or an explicit layout the driver's path inflates): the export is
+     * compressed (AFBC), and Mali reads its superblock row pitch as a pixel row's. 1668x2173 BGRA8
+     * asked 27,648 x 2172 + 6,672 = 60,058,128 bytes of a 3,760,128-byte dma-buf and failed with
+     * VK_ERROR_INVALID_EXTERNAL_HANDLE (Zink then lost the surface; Gecko fell back to wl_shm).
+     * Made at the export's modifier alone, the driver lays the image out as the exporter's and
+     * the layout it answers is the one the app passed (server_dmabuf_meta.c). */
+    VkImageDrmFormatModifierListCreateInfoEXT meta_list = {
+        VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT, NULL, 1, NULL};
+    uint64_t meta_mod = 0;
+    VkBaseOutStructure *meta_expl = NULL;
+    vkb_meta_shape meta_q;
+    if ((e->flags & VKB_EMU_DMABUF_EXPORT) && !linear_mod && import_meta_shape(ci, &meta_q) &&
+        (meta_mod = vkb_meta_match(&meta_q)) != 0 &&
+        (meta_expl = vkb_emu_chain_take(ci, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT))) {
+        meta_list.pNext = ci->pNext;
+        meta_list.pDrmFormatModifiers = &meta_mod;
+        ci->pNext = (const void *)&meta_list;
+        lm_import = 0; /* not a linear image: the LINEAR-the-driver-lays-out fallback does not apply */
+        static int told;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+            VKB_INFO("dma-buf import image (format %d %ux%u): its layout (offset %llu, row pitch %llu, size %llu) is the "
+                     "dma-buf export's; made at modifier 0x%llx without the explicit plane layout",
+                     ci->format, ci->extent.width, ci->extent.height, (unsigned long long)meta_q.layout.offset,
+                     (unsigned long long)meta_q.layout.rowPitch, (unsigned long long)meta_q.layout.size,
+                     (unsigned long long)meta_mod);
+    } else {
+        meta_mod = 0;
+    }
     if (lm_import && linear_mod_refused(e->dev, ci)) linear_mod = linear_import_plain(ci, VK_SUCCESS);
     VkResult r = driver_create_image(device, ci, pAllocator, pImage);
+    if (r != VK_SUCCESS && meta_mod) {
+        /* What the app asked again, and the retries it has always had. */
+        ci->pNext = (const void *)meta_expl;
+        meta_mod = 0;
+        r = driver_create_image(device, ci, pAllocator, pImage);
+    }
     if (r != VK_SUCCESS && (lm_candidate || lm_import) && !linear_mod) {
         linear_mod = lm_candidate ? linear_mod_plain(ci, r) : linear_import_plain(ci, r);
         r = driver_create_image(device, ci, pAllocator, pImage);
@@ -882,6 +955,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL emu_CreateImage(VkDevice device, const VkI
                 vkb_srv_table *t = vkb_srv_current_table();
                 VKB_INFO("dma-buf image %llx (pid %d): format %d %ux%u tiling %d usage 0x%x flags 0x%x", (unsigned long long)(uintptr_t)*pImage,
                          t && t->proc ? t->proc->pid : 0, ci->format, ci->extent.width, ci->extent.height, ci->tiling, ci->usage, ci->flags);
+                export_meta_note(device, *pImage, ci);
                 break;
             }
     } else {

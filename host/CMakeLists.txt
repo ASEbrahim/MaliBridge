@@ -333,6 +333,15 @@ target_link_libraries(capgate_unit PRIVATE vkb_host_flags)
 target_include_directories(capgate_unit PRIVATE "${SRV}")
 vkb_host_output(capgate_unit)
 
+# The register of dma-buf export layouts (server/server_dmabuf_meta.c) on its own (run_ci_tests.sh)
+add_executable(dbmeta_unit
+    "${VKB}/tests/dbmeta_unit.c"
+    "${SRV}/server_dmabuf_meta.c"
+)
+target_link_libraries(dbmeta_unit PRIVATE vkb_host_flags)
+target_include_directories(dbmeta_unit PRIVATE "${SRV}")
+vkb_host_output(dbmeta_unit)
+
 # A vertex shader's clip distance drawn (clip_check.sh, capgate_test.sh)
 add_executable(clip_pipeline "${VKB}/tests/clip_pipeline.c")
 target_link_libraries(clip_pipeline PRIVATE vkb_host_flags ${CMAKE_DL_LIBS})
@@ -528,6 +537,7 @@ add_custom_target(ci-test
         asyncpipe_check
         xfb_check
         capgate_unit
+        dbmeta_unit
         clip_pipeline
         downgrade_corpus
         shmbarrier_corpus

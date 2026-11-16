@@ -27,6 +27,7 @@ TESTS += compileburst_check
 TESTS += presentwait_check
 TESTS += dabreg_unit dmabufahb_check
 TESTS += dshape_unit dmabufsize_check
+TESTS += dbmeta_unit
 TESTS += bcauto_unit
 TESTS += querystuck_check
 TESTS += sparse_check
@@ -100,6 +101,11 @@ $(OUT)/dshape_unit: $(VKB)/tests/dshape_unit.c $(SRV)/server_dmabuf_shape.c $(SR
 $(OUT)/bcauto_unit: $(VKB)/tests/bcauto_unit.c $(SRV)/server_bc_auto.h
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(SAN) $(WARN) -I$(SRV) -o $@ $(VKB)/tests/bcauto_unit.c -lm
+
+# dbmeta_unit: the register of dma-buf export layouts (server_dmabuf_meta.c) on its own.
+$(OUT)/dbmeta_unit: $(VKB)/tests/dbmeta_unit.c $(SRV)/server_dmabuf_meta.c $(SRV)/server_dmabuf_meta.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) $(WARN) $(INC) -I$(SRV) -o $@ $(VKB)/tests/dbmeta_unit.c $(SRV)/server_dmabuf_meta.c -lpthread
 
 # compilegate_unit: server_compile_gate.c on its own, the server's functions stubbed in the test.
 $(OUT)/compilegate_unit: $(VKB)/tests/compilegate_unit.c $(SRV)/server_compile_gate.c $(SRV)/vkb_server.h
