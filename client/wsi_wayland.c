@@ -274,6 +274,10 @@ typedef struct wl_state {
     uint32_t rendering;            /* frames given to the thread whose rendering it has not seen done yet (VKBRIDGE_FRAME_QUEUE) */
     uint64_t fq_calls, fq_waits, fq_ns, fq_max_ns; /* the frame queue's waits, for the line at the end */
     uint32_t ring_lat[64];         /* ... each with its latency log number (latency.c), 0 */
+    uint8_t ring_early[64];        /* ... and whether its submit signals esem[image] (VKBRIDGE_PRESENT_EARLY) */
+    VkSemaphore *esem;             /* one per image, exportable as a sync fd: signalled by the present submit; NULL: not early */
+    int early_off;                 /* the early path is given up for this swapchain (atomic) */
+    uint64_t e_frames, e_fallback, e_errors, e_last_ns, e_said;
     uint64_t ring_id[64];          /* ... and its present id (VK_KHR_present_id, wsi.c), 0 */
     uint32_t lat_cur;              /* the presenting thread's frame being shown: its latency log number */
     uint64_t id_cur;               /* ... its present id */
@@ -283,6 +287,13 @@ typedef struct wl_state {
     struct wl_proxy *lat_fb[16];   /* feedback objects not answered yet (destroyed before the queue) */
     uint32_t lat_fb_n[16];         /* ... their frames' latency log numbers */
     uint64_t lat_fb_id[16];        /* ... and present ids (0: none) */
+    /* VKBRIDGE_PRESENT_REAP: an early frame's wait for its rendering (accounting, fence reuse) is done by this thread, so the
+     * presenting thread goes on to the next queued frame at once instead of sitting in the wait (own connection to the server). */
+    pthread_t reaper;
+    int reaper_on, reap_quit;
+    pthread_cond_t reap_cond;      /* with sc->lock */
+    uint32_t reap_ring[64], reap_lat[64], reap_head, reap_len;
+    uint8_t *reap_busy;            /* per image: queued or being waited for (its fence may not be submitted again yet) */
 } wl_state;
 
 /* The compositor's zero-copy switch. A live swapchain built for the other mode is retired (out of
@@ -489,6 +500,121 @@ static int dispatch_or_wake(wl_state *s, int efd)
 
 static VkResult wl_present(vkb_swapchain *sc, uint32_t index, const VkPresentRegionKHR *region);
 
+/*
+ * VKBRIDGE_PRESENT_EARLY=1: the presenting thread commits a frame to the compositor without waiting for its rendering. The frame's
+ * present submit also signals a sync-fd exportable semaphore of its own (not the fence the thread waits on afterwards, whose
+ * payload an export would take); the thread exports that as a sync file (a round trip that does not wait for the GPU: it is ordered
+ * after the submit by the request's barrier), puts it into the image's dma-buf as a write fence (dmabuf_attach.c), and only then
+ * commits. Whoever reads the buffer waits for the fence: gamescope polls the dma-buf, DroidDeck's compositor exports it as the
+ * layer's acquire fence. A frame whose fence could not be attached is waited for and committed as without the knob, and the
+ * first failure ends the early path for the swapchain (the semaphore's state is not known any more); a failure that is the
+ * system's (no ioctl, not allowed) ends it for the process. The wait for the fence follows the commit, for the accounting.
+ */
+static int early_wanted(void)
+{
+    static int v = -1;
+    int c = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (c >= 0) return c;
+    const char *e = getenv("VKBRIDGE_PRESENT_EARLY");
+    c = e && *e && strcmp(e, "0") != 0;
+    __atomic_store_n(&v, c, __ATOMIC_RELAXED);
+    return c;
+}
+static int early_dead; /* the process: the system does not let the fence be attached (atomic) */
+
+static uint64_t early_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int stats_seconds(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_STATS");
+        v = e && atoi(e) > 0 ? atoi(e) : 0;
+    }
+    return v;
+}
+
+static void early_line(wl_state *s, const char *why, int final)
+{
+    if (!s->e_frames && !s->e_fallback && !s->e_errors && !why) return;
+    VKB_INFO("present early: %llu frames, fallback %llu, import errors %llu%s%s%s", (unsigned long long)s->e_frames,
+             (unsigned long long)s->e_fallback, (unsigned long long)s->e_errors, why ? " (" : "", why ? why : "", why ? ")" : "");
+    (void)final;
+    s->e_frames = s->e_fallback = s->e_errors = 0;
+}
+
+/* Tries to hand the frame's fence to its dma-buf: 1 when it is there (the frame may be committed now). */
+static int early_attach(vkb_swapchain *sc, wl_state *s, uint32_t index)
+{
+    int fd = -1;
+    VkSemaphoreGetFdInfoKHR gi = {VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, NULL, s->esem[index],
+                                  VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+    VkResult er = vkb_wire_vkGetSemaphoreFdKHR((VkDevice)sc->dev, &gi, &fd);
+    if (er != VK_SUCCESS || fd < 0) {
+        if (fd >= 0) close(fd);
+        __atomic_store_n(&s->early_off, 1, __ATOMIC_RELAXED);
+        s->e_errors++;
+        VKB_WARN("present early: no sync fd for the frame's fence (%s); presenting as without VKBRIDGE_PRESENT_EARLY from now on",
+                 er != VK_SUCCESS ? "export failed" : "already signalled or abandoned");
+        return 0;
+    }
+    int err = vkb_dmabuf_attach_write_fence(sc->images[index].dmabuf_fd, fd);
+    close(fd);
+    if (!err) return 1;
+    s->e_errors++;
+    __atomic_store_n(&s->early_off, 1, __ATOMIC_RELAXED);
+    if (err == ENOTTY || err == EACCES || err == EPERM || err == EINVAL || err == ENOSYS || err == EBADF || err == EOPNOTSUPP)
+        __atomic_store_n(&early_dead, 1, __ATOMIC_RELAXED);
+    VKB_WARN("present early: DMA_BUF_IOCTL_IMPORT_SYNC_FILE failed (%s); presenting as without VKBRIDGE_PRESENT_EARLY from now on",
+             strerror(err));
+    return 0;
+}
+
+static int reap_wanted(void)
+{
+    static int v = -1;
+    int c = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (c >= 0) return c;
+    const char *e = getenv("VKBRIDGE_PRESENT_REAP");
+    c = !(e && *e && strcmp(e, "0") == 0); /* default on */
+    __atomic_store_n(&v, c, __ATOMIC_RELAXED);
+    return c;
+}
+
+static void *reaper_thread(void *arg)
+{
+    vkb_swapchain *sc = arg;
+    wl_state *s = sc->bdata;
+    pthread_setname_np(pthread_self(), "vkb-present-rp");
+    pthread_mutex_lock(&sc->lock);
+    for (;;) {
+        while (!s->reap_len && !s->reap_quit) pthread_cond_wait(&s->reap_cond, &sc->lock);
+        if (!s->reap_len) break;
+        uint32_t index = s->reap_ring[s->reap_head], lat = s->reap_lat[s->reap_head];
+        pthread_mutex_unlock(&sc->lock);
+        VkResult rw = vkb_wsi_wait_frame(sc, s->fences[index]);
+        if (rw >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
+        pthread_mutex_lock(&sc->lock);
+        s->reap_head = (s->reap_head + 1) % 64;
+        s->reap_len--;
+        s->reap_busy[index] = 0;
+        s->rendering--;
+        if (rw < 0) {
+            sc->images[index].busy = 0;
+            if (sc->status >= 0) sc->status = rw == VK_ERROR_DEVICE_LOST ? rw : VK_ERROR_SURFACE_LOST_KHR;
+            s->dead = 1;
+        }
+        pthread_cond_broadcast(&s->changed);
+    }
+    pthread_mutex_unlock(&sc->lock);
+    return NULL;
+}
+
 /* Waits for each queued frame's rendering, then shows it; between frames, takes the
  * compositor's events (buffer releases, frame callbacks) so images come back to the game. */
 static void *present_thread(void *arg)
@@ -504,6 +630,7 @@ static void *present_thread(void *arg)
         uint32_t index = have ? s->ring[s->head] : 0;
         uint32_t lat = have ? s->ring_lat[s->head] : 0;
         uint64_t pid = have ? s->ring_id[s->head] : 0;
+        int ewant = have ? s->ring_early[s->head] : 0;
         if (have) {
             s->head = (s->head + 1) % 64;
             s->len--;
@@ -512,12 +639,20 @@ static void *present_thread(void *arg)
         if (have) {
             /* A slow frame (a game loading) is waited for; only a real loss or a frame past the limit
              * (VKBRIDGE_PRESENT_TIMEOUT_S) ends the swapchain (wsi.c) */
-            VkResult r = vkb_wsi_wait_frame(sc, s->fences[index]);
-            if (r >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
-            pthread_mutex_lock(&sc->lock);
-            s->rendering--; /* a present waiting for the frame queue (wl_wait_queue) may go on */
-            pthread_cond_broadcast(&s->changed);
-            pthread_mutex_unlock(&sc->lock);
+            VkResult r = VK_SUCCESS;
+            int early = 0;
+            if (ewant) {
+                if (!__atomic_load_n(&s->early_off, __ATOMIC_RELAXED)) early = early_attach(sc, s, index);
+                if (!early) s->e_fallback++;
+            }
+            if (!early) {
+                r = vkb_wsi_wait_frame(sc, s->fences[index]);
+                if (r >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
+                pthread_mutex_lock(&sc->lock);
+                s->rendering--; /* a present waiting for the frame queue (wl_wait_queue) may go on */
+                pthread_cond_broadcast(&s->changed);
+                pthread_mutex_unlock(&sc->lock);
+            }
             s->lat_cur = lat;
             s->id_cur = pid;
             s->fb_for_id = 0;
@@ -531,6 +666,35 @@ static void *present_thread(void *arg)
             if (shown) vkb_wsi_pw_committed(sc, pid, s->fb_for_id);
             s->lat_cur = 0;
             s->id_cur = 0;
+            if (early) {
+                /* committed with the fence attached; now the thread waits for the rendering, for its accounting and the fence's reuse */
+                if (shown) s->e_frames++;
+                if (s->reaper_on) {
+                    pthread_mutex_lock(&sc->lock);
+                    s->reap_ring[(s->reap_head + s->reap_len) % 64] = index;
+                    s->reap_lat[(s->reap_head + s->reap_len) % 64] = lat;
+                    s->reap_len++;
+                    s->reap_busy[index] = 1;
+                    pthread_cond_signal(&s->reap_cond);
+                    pthread_mutex_unlock(&sc->lock);
+                } else {
+                VkResult rw = vkb_wsi_wait_frame(sc, s->fences[index]);
+                if (rw >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
+                else if (r >= 0) r = rw;
+                pthread_mutex_lock(&sc->lock);
+                s->rendering--;
+                pthread_cond_broadcast(&s->changed);
+                pthread_mutex_unlock(&sc->lock);
+                }
+            }
+            if (stats_seconds() && ewant) {
+                uint64_t now = early_now();
+                if (!s->e_last_ns) s->e_last_ns = now;
+                if (now - s->e_last_ns >= (uint64_t)stats_seconds() * 1000000000ull) {
+                    early_line(s, NULL, 0);
+                    s->e_last_ns = now;
+                }
+            }
             pthread_mutex_lock(&sc->lock);
             if (r < 0 || s->dead) {
                 sc->images[index].busy = 0;
@@ -573,13 +737,42 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         for (uint32_t i = 0; i < sc->count; i++)
             if (vkb_ep_vkCreateFence(device, &fci, NULL, &s->fences[i]) != VK_SUCCESS) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (early_wanted() && !__atomic_load_n(&early_dead, __ATOMIC_RELAXED)) {
+            s->esem = calloc(sc->count, sizeof(VkSemaphore));
+            VkExportSemaphoreCreateInfo xi = {VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, NULL,
+                                              VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+            VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &xi, 0};
+            int ok = s->esem != NULL;
+            for (uint32_t i = 0; ok && i < sc->count; i++) ok = vkb_ep_vkCreateSemaphore(device, &sci, NULL, &s->esem[i]) == VK_SUCCESS;
+            if (!ok) {
+                VKB_WARN("present early: no exportable semaphores; presenting as without VKBRIDGE_PRESENT_EARLY");
+                for (uint32_t i = 0; s->esem && i < sc->count; i++)
+                    if (s->esem[i]) vkb_ep_vkDestroySemaphore(device, s->esem[i], NULL);
+                free(s->esem);
+                s->esem = NULL;
+            } else {
+                VKB_INFO("present early: on (VKBRIDGE_PRESENT_EARLY): frames are committed once their fence is in the dma-buf");
+            }
+        }
         pthread_cond_init(&s->changed, NULL);
+        pthread_cond_init(&s->reap_cond, NULL);
+        s->reap_busy = calloc(sc->count, 1);
+        if (s->esem && s->reap_busy && reap_wanted() && pthread_create(&s->reaper, NULL, reaper_thread, sc) == 0) {
+            s->reaper_on = 1;
+            VKB_INFO("present early: the wait for a committed frame's rendering is on its own thread (VKBRIDGE_PRESENT_REAP=0 to turn off)");
+        }
         if (pthread_create(&s->thread, NULL, present_thread, sc) != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
         s->thread_on = 1;
     }
     VkPipelineStageFlags *stages = alloca((nwait ? nwait : 1) * sizeof(VkPipelineStageFlags));
     for (uint32_t i = 0; i < nwait; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, nwait, wait, stages, 0, NULL, 0, NULL};
+    int early = s->esem && !__atomic_load_n(&s->early_off, __ATOMIC_RELAXED) && !__atomic_load_n(&early_dead, __ATOMIC_RELAXED);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, nwait, wait, stages, 0, NULL, early, early ? &s->esem[index] : NULL};
+    if (s->reaper_on) { /* the fence of this image's last frame is reset by the reaper thread: not before */
+        pthread_mutex_lock(&sc->lock);
+        while (s->reap_busy[index] && sc->status >= 0 && !s->dead) pthread_cond_wait(&s->changed, &sc->lock);
+        pthread_mutex_unlock(&sc->lock);
+    }
     VkResult r = vkb_sm_queue_submit(queue, 1, &si, s->fences[index]);
     pthread_mutex_lock(&sc->lock);
     if (r != VK_SUCCESS || s->len == 64) {
@@ -589,6 +782,7 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
     }
     s->ring[(s->head + s->len) % 64] = index;
     s->ring_lat[(s->head + s->len) % 64] = sc->lat_n;
+    s->ring_early[(s->head + s->len) % 64] = (uint8_t)early;
     s->ring_id[(s->head + s->len) % 64] = sc->pw_cur;
     s->len++;
     s->rendering++;
@@ -1158,6 +1352,16 @@ static void wl_destroy(vkb_swapchain *sc)
         uint64_t one = 1;
         if (write(s->efd, &one, sizeof(one)) < 0) { /* the counter is already set */ }
         pthread_join(s->thread, NULL);
+        if (s->reaper_on) {
+            pthread_mutex_lock(&sc->lock);
+            s->reap_quit = 1;
+            pthread_cond_signal(&s->reap_cond);
+            pthread_mutex_unlock(&sc->lock);
+            pthread_join(s->reaper, NULL);
+            s->reaper_on = 0;
+        }
+        free(s->reap_busy);
+        pthread_cond_destroy(&s->reap_cond);
         pthread_cond_destroy(&s->changed);
         s->thread_on = 0;
     }
@@ -1166,6 +1370,13 @@ static void wl_destroy(vkb_swapchain *sc)
             if (s->fences[i]) vkb_ep_vkDestroyFence((VkDevice)sc->dev, s->fences[i], NULL);
         free(s->fences);
         s->fences = NULL;
+    }
+    if (s && s->esem) {
+        for (uint32_t i = 0; i < sc->count; i++)
+            if (s->esem[i]) vkb_ep_vkDestroySemaphore((VkDevice)sc->dev, s->esem[i], NULL);
+        free(s->esem);
+        s->esem = NULL;
+        early_line(s, __atomic_load_n(&s->early_off, __ATOMIC_RELAXED) ? "given up" : "swapchain ended", 1);
     }
     if (s && s->efd > 0) close(s->efd);
     wl_teardown(sc->bdata);
