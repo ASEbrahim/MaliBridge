@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -159,6 +160,22 @@ static uint64_t process_token;
  * included - what each side pays a syscall, a header and an ordering step for. */
 static int stat_period = -1;
 static uint64_t stat_msgs, stat_wire, stat_msgs_total, stat_wire_total;
+/* VKBRIDGE_STATS, time blocked in round trips (vkb_call_exec): summed over the calling threads, the
+ * longest single round trip, and per command. Only counted while STATS is on. */
+static uint64_t stat_blocked_ns, stat_blocked_max_ns, stat_blocked_cmd_ns[VKB_CMD_COUNT];
+static uint64_t stat_blocked_total_ns, stat_blocked_total_max_ns;
+static void stat_blocked_add(uint32_t cmd, uint64_t ns)
+{
+    __atomic_add_fetch(&stat_blocked_ns, ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_blocked_total_ns, ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stat_blocked_cmd_ns[cmd], ns, __ATOMIC_RELAXED);
+    uint64_t m = __atomic_load_n(&stat_blocked_max_ns, __ATOMIC_RELAXED);
+    while (ns > m && !__atomic_compare_exchange_n(&stat_blocked_max_ns, &m, ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+    m = __atomic_load_n(&stat_blocked_total_max_ns, __ATOMIC_RELAXED);
+    while (ns > m && !__atomic_compare_exchange_n(&stat_blocked_total_max_ns, &m, ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
 static void stat_wire_add(uint64_t msgs, uint64_t bytes)
 {
     if (stat_period <= 0) return;
@@ -167,6 +184,52 @@ static void stat_wire_add(uint64_t msgs, uint64_t bytes)
     __atomic_add_fetch(&stat_msgs_total, msgs, __ATOMIC_RELAXED);
     __atomic_add_fetch(&stat_wire_total, bytes, __ATOMIC_RELAXED);
 }
+/* VKBRIDGE_STATS_SPLIT (default on, only with VKBRIDGE_STATS; 0 = off): each round trip asks the
+ * server for its timestamps (VKB_F_TIMES) and the interval line is followed by "split" lines that
+ * divide a command's time into the server's run (for vkWaitForFences: from the wait being issued to
+ * the fence signalled, the driver's own wake-up included), the wait for earlier async work, the
+ * transport (request and reply on the socket, thread wake-ups) and the client's own work. */
+enum { SPL_RUN, SPL_BACKLOG, SPL_TRANSPORT, SPL_CLIENT, SPL_N };
+typedef struct {
+    uint64_t n, sum[SPL_N], max[SPL_N];
+} stat_split;
+static stat_split stat_spl[VKB_CMD_COUNT];
+static pthread_mutex_t stat_spl_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    uint64_t t_send, t_recv, s_start, s_end;
+    uint32_t order_us;
+    int valid;
+} vkb_times;
+static __thread vkb_times tls_tm;
+static int stat_split_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_STATS_SPLIT");
+        v = !(e && !strcmp(e, "0"));
+    }
+    return v;
+}
+static void stat_split_add(uint32_t cmd, uint64_t t0, uint64_t t1)
+{
+    const vkb_times *m = &tls_tm;
+    if (!m->valid || m->s_end < m->s_start || m->t_recv < m->s_end || m->s_start < m->t_send) return;
+    uint64_t backlog = (uint64_t)m->order_us * 1000;
+    uint64_t run = m->s_end - m->s_start;
+    uint64_t srv_recv = m->s_start > backlog ? m->s_start - backlog : m->s_start;
+    uint64_t tr = (srv_recv > m->t_send ? srv_recv - m->t_send : 0) + (m->t_recv - m->s_end);
+    uint64_t cl = (m->t_send - t0) + (t1 - m->t_recv);
+    uint64_t v[SPL_N] = {run, backlog, tr, cl};
+    pthread_mutex_lock(&stat_spl_lock);
+    stat_split *a = &stat_spl[cmd];
+    a->n++;
+    for (int i = 0; i < SPL_N; i++) {
+        a->sum[i] += v[i];
+        if (v[i] > a->max[i]) a->max[i] = v[i];
+    }
+    pthread_mutex_unlock(&stat_spl_lock);
+}
+
 /* The last asynchronous request's sequence number in this process (see vkb_msg_hdr). */
 static uint64_t async_seq;
 static uint32_t fork_epoch;
@@ -676,12 +739,16 @@ int vkb_call_exec(vkb_call *c)
         wait_period = wait_explicit ? atoi(v) : WAIT_STATS_DEFAULT;
     }
     int hitch = __atomic_load_n(&vkb_hitch_active, __ATOMIC_RELAXED);
-    if ((!slow_ms && wait_period <= 0 && !hitch) || (c->flags & VKB_F_NOREPLY)) return exec(c);
+    int stats = __atomic_load_n(&stat_period, __ATOMIC_RELAXED) > 0;
+    if ((!slow_ms && wait_period <= 0 && !hitch && !stats) || (c->flags & VKB_F_NOREPLY)) return exec(c);
     uint64_t t0 = now_ns();
+    tls_tm.valid = 0;
     int r = exec(c);
     uint64_t t1 = now_ns(), ns = t1 - t0, us = ns / 1000;
+    if (stats && r && tls_tm.valid) stat_split_add(c->cmd, t0, t1);
     if (hitch && r) vkb_hitch_rt(c->cmd, ns); /* the per-hitch sums (hitch.c) */
     if (wait_period > 0) wait_note(c->cmd, ns, t1);
+    if (stats) stat_blocked_add(c->cmd, ns);
     if (slow_ms && us >= (uint64_t)slow_ms * 1000) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -711,6 +778,7 @@ static int exec(vkb_call *c)
     }
     vkb_msg_hdr h = {VKB_MAGIC, (uint32_t)c->e.len, c->cmd, c->table, (uint32_t)c->e.nfds, c->flags & VKB_F_NOREPLY, 0, 0};
     vkb_stats_count(c->cmd, (c->flags & VKB_F_NOREPLY) != 0, c->e.len);
+    if (!(c->flags & VKB_F_NOREPLY) && __atomic_load_n(&stat_period, __ATOMIC_RELAXED) > 0 && stat_split_on()) h.flags |= VKB_F_TIMES;
     pthread_mutex_lock(&aq_lock);
     if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds && vkb_async_framed()) {
         /* Appended to the open vkbBatch (or opening it) under the lock that orders the seqs. Requests
@@ -814,6 +882,7 @@ static int exec(vkb_call *c)
         h.barrier = c->flags & VKB_CALL_POLL ? 0 : async_seq;
     }
     pthread_mutex_unlock(&aq_lock);
+    if (h.flags & VKB_F_TIMES) tls_tm.t_send = now_ns();
     if (qr < 0 || vkb_send_msg(conn->sock, &h, c->e.buf, c->e.fds, c->e.nfds) < 0) {
         VKB_ERR("%s: lost the bridge server (%s)", vkb_cmd_names[c->cmd], strerror(errno));
         conn->dead = 1;
@@ -833,6 +902,11 @@ static int exec(vkb_call *c)
         conn->dead = 1;
         c->conn = NULL;
         return 0;
+    }
+    if (h.flags & VKB_F_TIMES) {
+        tls_tm.t_recv = now_ns();
+        tls_tm.valid = (rh.flags & VKB_F_TIMES) != 0;
+        tls_tm.s_start = rh.seq, tls_tm.s_end = rh.barrier, tls_tm.order_us = rh.table;
     }
     for (uint64_t o = __atomic_load_n(&synced_seq, __ATOMIC_RELAXED);
          o < h.barrier && !__atomic_compare_exchange_n(&synced_seq, &o, h.barrier, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);) {}
@@ -1012,9 +1086,10 @@ static void stats_exit(void)
         s += stat_total_sync[i];
         a += stat_total_async[i];
     }
-    vkb_log(VKB_LOG_ERROR, "stats at exit: %llu round trips, %llu async, %llu KB encoded; %llu messages, %llu KB on the wire",
+    vkb_log(VKB_LOG_ERROR, "stats at exit: %llu round trips, %llu async, %llu KB encoded; %llu messages, %llu KB on the wire; blocked %llu ms, max %.1f ms",
             (unsigned long long)s, (unsigned long long)a, (unsigned long long)(stat_total_bytes >> 10),
-            (unsigned long long)stat_msgs_total, (unsigned long long)(stat_wire_total >> 10));
+            (unsigned long long)stat_msgs_total, (unsigned long long)(stat_wire_total >> 10),
+            (unsigned long long)(stat_blocked_total_ns / 1000000), stat_blocked_total_max_ns / 1e6);
     uint64_t refused = stat_total_refused + __atomic_exchange_n(&vkb_stat_refused, 0, __ATOMIC_RELAXED);
     uint64_t full = stat_total_full + __atomic_exchange_n(&vkb_stat_pool_full, 0, __ATOMIC_RELAXED);
     if (refused || full)
@@ -1024,6 +1099,35 @@ static void stats_exit(void)
         if (stat_total_sync[i] + stat_total_async[i] >= 100)
             vkb_log(VKB_LOG_ERROR, "  %-40s %8llu sync %8llu async", vkb_cmd_names[i], (unsigned long long)stat_total_sync[i],
                     (unsigned long long)stat_total_async[i]);
+}
+
+/* One line per command whose round trips took 20 ms (VKBRIDGE_STATS_SPLIT_MS) or more in the interval (at most 6, longest
+ * first): count, then avg/max of each part in ms (see VKBRIDGE_STATS_SPLIT above). */
+static void stat_split_print(void)
+{
+    stat_split snap[VKB_CMD_COUNT];
+    pthread_mutex_lock(&stat_spl_lock);
+    memcpy(snap, stat_spl, sizeof(snap));
+    memset(stat_spl, 0, sizeof(stat_spl));
+    pthread_mutex_unlock(&stat_spl_lock);
+    const char *me = getenv("VKBRIDGE_STATS_SPLIT_MS");
+    uint64_t min_ns = (me && *me ? strtoull(me, NULL, 10) : 20ull) * 1000000ull;
+    for (int k = 0; k < 6; k++) {
+        uint64_t best = 0;
+        uint32_t bi = 0;
+        for (uint32_t i = 0; i < VKB_CMD_COUNT; i++) {
+            uint64_t tot = snap[i].sum[0] + snap[i].sum[1] + snap[i].sum[2] + snap[i].sum[3];
+            if (snap[i].n && tot > best) best = tot, bi = i;
+        }
+        if (best < min_ns) break;
+        const stat_split *a = &snap[bi];
+        double n = (double)a->n;
+        vkb_log(VKB_LOG_ERROR,
+                "  split %-28s %5llu calls; ms avg/max: server-run %.2f/%.2f, async-backlog %.2f/%.2f, transport+wake %.2f/%.2f, client %.2f/%.2f",
+                vkb_cmd_names[bi], (unsigned long long)a->n, a->sum[0] / n / 1e6, a->max[0] / 1e6, a->sum[1] / n / 1e6, a->max[1] / 1e6,
+                a->sum[2] / n / 1e6, a->max[2] / 1e6, a->sum[3] / n / 1e6, a->max[3] / 1e6);
+        snap[bi].n = 0;
+    }
 }
 
 void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
@@ -1056,10 +1160,13 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
         tot_s += stat_sync[i];
         tot_a += stat_async[i];
     }
-    vkb_log(VKB_LOG_ERROR, "stats over %us: %u round trips, %u async, %llu KB encoded; %llu messages, %llu KB on the wire", period,
-            tot_s, tot_a, (unsigned long long)(stat_bytes >> 10),
+    uint64_t blocked = __atomic_exchange_n(&stat_blocked_ns, 0, __ATOMIC_RELAXED);
+    uint64_t blocked_max = __atomic_exchange_n(&stat_blocked_max_ns, 0, __ATOMIC_RELAXED);
+    vkb_log(VKB_LOG_ERROR, "stats over %us: %u round trips, %u async, %llu KB encoded; %llu messages, %llu KB on the wire; blocked %llu ms, max %.1f ms",
+            period, tot_s, tot_a, (unsigned long long)(stat_bytes >> 10),
             (unsigned long long)__atomic_exchange_n(&stat_msgs, 0, __ATOMIC_RELAXED),
-            (unsigned long long)(__atomic_exchange_n(&stat_wire, 0, __ATOMIC_RELAXED) >> 10));
+            (unsigned long long)(__atomic_exchange_n(&stat_wire, 0, __ATOMIC_RELAXED) >> 10),
+            (unsigned long long)(blocked / 1000000), blocked_max / 1e6);
     for (int k = 0; k < 8; k++) {
         uint32_t best = 0, bi = 0;
         for (uint32_t i = 0; i < VKB_CMD_COUNT; i++)
@@ -1068,14 +1175,17 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
                 bi = i;
             }
         if (!best) break;
-        vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async %7llu KB", vkb_cmd_names[bi], stat_sync[bi], stat_async[bi],
-                (unsigned long long)(stat_cmd_bytes[bi] >> 10));
+        vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async %7llu KB, blocked %llu ms", vkb_cmd_names[bi], stat_sync[bi], stat_async[bi],
+                (unsigned long long)(stat_cmd_bytes[bi] >> 10),
+                (unsigned long long)(__atomic_exchange_n(&stat_blocked_cmd_ns[bi], 0, __ATOMIC_RELAXED) / 1000000));
         stat_sync[bi] = stat_async[bi] = 0;
     }
     /* Round trips are what cost: the rest of them too, from one a second. */
     for (uint32_t i = 0; i < VKB_CMD_COUNT; i++)
         if (stat_sync[i] >= (uint32_t)period)
-            vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async", vkb_cmd_names[i], stat_sync[i], stat_async[i]);
+            vkb_log(VKB_LOG_ERROR, "  %-40s %6u sync %6u async, blocked %llu ms", vkb_cmd_names[i], stat_sync[i], stat_async[i],
+                    (unsigned long long)(__atomic_exchange_n(&stat_blocked_cmd_ns[i], 0, __ATOMIC_RELAXED) / 1000000));
+    stat_split_print();
     uint32_t refused = __atomic_exchange_n(&vkb_stat_refused, 0, __ATOMIC_RELAXED);
     if (refused) vkb_log(VKB_LOG_ERROR, "  descriptor set allocations refused: %u", refused);
     uint32_t full = __atomic_exchange_n(&vkb_stat_pool_full, 0, __ATOMIC_RELAXED);
@@ -1084,6 +1194,7 @@ void vkb_stats_count(uint32_t cmd, int async, size_t bytes)
     memset(stat_sync, 0, sizeof(stat_sync));
     memset(stat_async, 0, sizeof(stat_async));
     memset(stat_cmd_bytes, 0, sizeof(stat_cmd_bytes));
+    memset(stat_blocked_cmd_ns, 0, sizeof(stat_blocked_cmd_ns));
     stat_bytes = 0;
 }
 

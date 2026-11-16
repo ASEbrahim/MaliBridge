@@ -331,7 +331,8 @@ static void fb_sync_output(void *data, struct wl_proxy *fb, struct wl_proxy *out
 static void fb_presented(void *data, struct wl_proxy *fb, uint32_t sec_hi, uint32_t sec_lo, uint32_t nsec, uint32_t refresh, uint32_t seq_hi,
                          uint32_t seq_lo, uint32_t flags)
 {
-    (void)refresh, (void)seq_hi, (void)seq_lo, (void)flags;
+    (void)refresh, (void)seq_hi, (void)flags;
+    VKB_FT('S', seq_lo, (((uint64_t)sec_hi << 32) | sec_lo) * 1000000000ull + nsec);
     wl_state *s = data;
     uint64_t pres = (((uint64_t)sec_hi << 32) | sec_lo) * 1000000000ull + nsec, id;
     uint32_t n = fb_forget(s, fb, &id);
@@ -345,6 +346,7 @@ static void fb_discarded(void *data, struct wl_proxy *fb)
 {
     wl_state *s = data;
     uint64_t id;
+    VKB_FT('X', 0, 0);
     vkb_lat_flag(fb_forget(s, fb, &id), VKB_LAT_F_DISCARDED);
     vkb_wsi_pw_shown(s->sc, id);
 }
@@ -415,6 +417,7 @@ static void buffer_release(void *data, struct wl_proxy *buffer)
 {
     (void)buffer;
     vkb_swap_image *img = data;
+    VKB_FT('L', img - img->chain->images, 0);
     pthread_mutex_lock(&img->chain->lock);
     img->busy = 0;
     pthread_mutex_unlock(&img->chain->lock);
@@ -432,8 +435,8 @@ static const void *shm_buffer_listener[] = {(void *)shm_buffer_release};
 
 static void frame_done(void *data, struct wl_proxy *cb, uint32_t t)
 {
-    (void)t;
     wl_state *s = data;
+    VKB_FT('F', t, 0);
     if (s->frame == cb) s->frame = NULL;
     wl.proxy_destroy(cb);
 }
@@ -510,9 +513,11 @@ static void *present_thread(void *arg)
         }
         pthread_mutex_unlock(&sc->lock);
         if (have) {
+            VKB_FT('P', index, s->len);
             /* A slow frame (a game loading) is waited for; only a real loss or a frame past the limit
              * (VKBRIDGE_PRESENT_TIMEOUT_S) ends the swapchain (wsi.c) */
             VkResult r = vkb_wsi_wait_frame(sc, s->fences[index]);
+            VKB_FT('g', index, r);
             if (r >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
             pthread_mutex_lock(&sc->lock);
             s->rendering--; /* a present waiting for the frame queue (wl_wait_queue) may go on */
@@ -573,6 +578,11 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         for (uint32_t i = 0; i < sc->count; i++)
             if (vkb_ep_vkCreateFence(device, &fci, NULL, &s->fences[i]) != VK_SUCCESS) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        vkb_ft_init();
+        if (vkb_ft_on)
+            VKB_INFO_ALWAYS("swapchain %ux%u: present mode %d, %u images, format %d, VKBRIDGE_FRAME_QUEUE %u", sc->info.imageExtent.width,
+                            sc->info.imageExtent.height, (int)sc->info.presentMode, sc->count, (int)sc->info.imageFormat, frame_queue_value());
+        VKB_FT('m', sc->info.presentMode, sc->count);
         pthread_cond_init(&s->changed, NULL);
         if (pthread_create(&s->thread, NULL, present_thread, sc) != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
         s->thread_on = 1;
@@ -965,6 +975,7 @@ static VkResult wl_present(vkb_swapchain *sc, uint32_t index, const VkPresentReg
     if (sc->info.presentMode == VK_PRESENT_MODE_FIFO_KHR || sc->info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
         struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+        VKB_FT('b', s->frame != NULL, 0); /* the previous frame's callback: is it still outstanding? */
         while (s->frame) {
             if (dispatch_timeout(s, 20000000ull) < 0) return VK_ERROR_SURFACE_LOST_KHR;
             struct timespec t1;
@@ -973,6 +984,7 @@ static VkResult wl_present(vkb_swapchain *sc, uint32_t index, const VkPresentReg
         }
     }
     struct wl_proxy *buffer;
+    VKB_FT('c', index, 0);
     if (!sc->copy_present) {
         buffer = s->buffers[index];
     } else {
@@ -1027,6 +1039,7 @@ static VkResult wl_present(vkb_swapchain *sc, uint32_t index, const VkPresentReg
     }
     wl.proxy_marshal(s->surface_wrapper, WL_SURFACE_COMMIT);
     wl.display_flush(s->display);
+    VKB_FT('M', index, 0);
     if (wl.display_dispatch_queue_pending(s->display, s->queue) < 0) return VK_ERROR_SURFACE_LOST_KHR;
     return VK_SUCCESS;
 }

@@ -1105,16 +1105,20 @@ static VkResult acquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t time
     if (sc->retired) return VK_ERROR_OUT_OF_DATE_KHR;
     if (sc->status != VK_SUCCESS) return sc->status;
     uint64_t deadline = timeout == UINT64_MAX ? UINT64_MAX : now_ns() + timeout;
+    VKB_FT('a', 0, timeout == UINT64_MAX ? -1 : (int64_t)timeout);
     for (;;) {
         pthread_mutex_lock(&sc->lock);
         for (uint32_t i = 0; i < sc->count; i++) {
             if (!sc->images[i].busy && !sc->images[i].acquired) {
                 sc->images[i].acquired = 1;
                 pthread_mutex_unlock(&sc->lock);
+                VKB_FT('d', i, 0);
                 if (sc->ahb) wait_display_release(&sc->images[i]);
+                VKB_FT('D', i, 0);
                 VkResult r = signal_acquire(vkb_dev(device), semaphore, fence);
                 if (r != VK_SUCCESS) return r;
                 *pImageIndex = i;
+                VKB_FT('A', i, 0);
                 return sc->status;
             }
         }
@@ -1125,6 +1129,7 @@ static VkResult acquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t time
         /* a late copy present holds an image until shown: wait for it, not for the window system */
         if (late_wait(sc, deadline)) continue;
         uint64_t ht0 = vkb_hitch_active ? now_ns() : 0;
+        VKB_FT('f', 0, 0); /* no free image: waiting for a release */
         VkResult r = sc->backend->wait_free(sc, deadline == UINT64_MAX ? UINT64_MAX : deadline - now);
         if (ht0) vkb_hitch_waited(VKB_HITCH_W_PRESENT, VKB_CMD_COUNT, now_ns() - ht0);
         if (r < 0) {
@@ -1235,6 +1240,8 @@ static uint32_t frame_queue(void)
     return n;
 }
 
+uint32_t frame_queue_value(void) { return frame_queue(); }
+
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
     const VkPresentRegionsKHR *regions = NULL;
@@ -1256,6 +1263,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
         vkb_swapchain *sc = chain(pPresentInfo->pSwapchains[i]);
         uint32_t index = pPresentInfo->pImageIndices[i];
+        VKB_FT('Q', index, pPresentInfo->waitSemaphoreCount);
         VkResult r = sc->status;
         if (index >= sc->count) r = VK_ERROR_OUT_OF_DATE_KHR;
         uint32_t nwait = i == 0 ? pPresentInfo->waitSemaphoreCount : 0;
@@ -1285,7 +1293,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
             uint32_t fq = r >= 0 && sc->backend->wait_queue ? frame_queue() : 0;
             if (fq) {
                 uint64_t ht0 = vkb_hitch_active ? now_ns() : 0;
+                VKB_FT('w', 0, fq);
                 sc->backend->wait_queue(sc, fq - 1);
+                VKB_FT('W', 0, 0);
                 if (ht0) vkb_hitch_waited(VKB_HITCH_W_PRESENT, VKB_CMD_COUNT, now_ns() - ht0);
             }
             goto done;
@@ -1318,6 +1328,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
         vkb_lat_presented(sc->lat_n, r >= 0);
         sc->lat_n = 0;
     done:
+        VKB_FT('q', index, r);
         if (r < 0) {
             pthread_mutex_lock(&sc->lock);
             if (index < sc->count) sc->images[index].busy = 0;

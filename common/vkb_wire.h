@@ -136,6 +136,11 @@ typedef struct vkb_msg_hdr {
 } vkb_msg_hdr;
 #define VKB_MAGIC 0x32424b56u   /* "VKB2" */
 #define VKB_F_NOREPLY 1u
+/* Request flag (VKBRIDGE_STATS on the client): the reply says when the server received the request
+ * and ran it. Reply header, flags = VKB_F_TIMES when present: seq = CLOCK_MONOTONIC ns the request
+ * began to run (after the wait for earlier async work), barrier = ns it was done, table = us it
+ * waited for earlier async work. One kernel, one clock. An older server answers with zeros. */
+#define VKB_F_TIMES 2u
 
 /* Reply status codes (vkb_msg_hdr.cmd in replies). */
 #define VKB_ST_OK 0u
