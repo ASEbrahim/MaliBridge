@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * wait_retry (MK-01): waits the driver ends with an error it may not return. Arm's blob waits
- * with ppoll() and does not restart it when a signal interrupts it (EINTR); the wait then fails
+ * with ppoll and does not restart it when a signal interrupts it (EINTR); the wait then fails
  * with VK_ERROR_INITIALIZATION_FAILED (-3) - Citra/Azahar retry their present waits for it. In the
  * in-app server the runtime signals threads routinely (garbage collection, profiling): the
  * Mali-G925 (Android 16, The Witcher 3 and Stray through vkd3d-proton) answered vkWaitSemaphores
@@ -28,7 +27,7 @@
  * vkGetFenceStatus failed the same way is asked again three times (1 ms apart), then answered
  * VK_NOT_READY: the app polls again.
  *
- * An early VK_TIMEOUT: a fence or semaphore wait the driver ends with VK_TIMEOUT before the
+ * An early VK_TIMEOUT (a player log): a fence or semaphore wait the driver ends with VK_TIMEOUT before the
  * app's timeout has passed - on a wait with no timeout (UINT64_MAX), which may not time out at all -
  * is not done yet: the wait goes on, by the same loop (polled first, so what is signalled ends it at
  * once), until the work finishes or the app's real deadline; with no deadline, until the 30 s cap
@@ -42,7 +41,7 @@
  * The first case of each kind is logged in full, then a tally at 10, 100, 1000, ... cases; a wait
  * whose driver error reaches the app is always logged.
  *
- * A semaphore wait past its deadline with the work already submitted: DXVK since
+ * A semaphore wait past its deadline with the work already submitted (a player log): DXVK since
  * 852d454f6 (2026-10-08; Proton Experimental 11.0-20261014 has it) waits on its timelines for
  * 5 s, not for ever, and takes a VK_TIMEOUT there as a lost device ("DxvkSubmissionQueue: Timeout
  * occured, GPU likely hung."): Stray on the Dimensity 9500 (Mali-G1-Ultra, r54p1) then ended with
@@ -57,7 +56,23 @@
  * submit); the first case is logged with how long the work took, then a tally; a wait the grace did
  * not save is always logged.
  *
- * A timed-out semaphore wait answered VK_ERROR_DEVICE_LOST, where the startup probe saw it, gets the poll's answer.
+ * A timed-out semaphore wait answered VK_ERROR_DEVICE_LOST (the A1 black screen/#15): Arm's
+ * job-manager drivers that give apps Vulkan 1.3 (r38p1 on the Galaxy A16 / Tab S9 FE / F15 / A54, r40p0 on the
+ * Anbernic RG556) end a vkWaitSemaphores whose timeout runs out with VK_ERROR_DEVICE_LOST instead of
+ * VK_TIMEOUT; the poll right after says VK_TIMEOUT and the device goes on working (the startup probe's
+ * "waits": "2 ms -> -4", then a submission signals it and the wait returns 0). Zink and DXVK take -4 as a
+ * lost device. Where that probe saw it (VKB_PROBE_FLAG_WAIT_LOST), a -4 from a wait with a timeout is
+ * checked: a poll (timeout 0) and the first semaphore's value; when the poll says VK_SUCCESS or
+ * VK_TIMEOUT and the value reads, the app gets the poll's answer (a VK_TIMEOUT before the deadline then
+ * goes on waiting as an early timeout, above); a device that is really lost answers the poll or the
+ * value read with an error and the -4 stands. The first case is logged, then a tally.
+ * VKBRIDGE_WAIT_LOST_FIX=1 turns the check on whatever the probe said, =0 off.
+ *
+ * A wait given up with the device not lost - one with no deadline the driver kept failing to the cap (or
+ * timing out early), or a semaphore wait still not done at the end of the grace - is a GPU job that never
+ * finished: Elden Ring on the S11 Ultra (Mali-G925 r49p1, a player log) ran the GPU 99-100% busy for 130 s after 83
+ * read faults, the driver failing vkd3d's timeline wait with -3 every 5 s and never losing the device. It arms
+ * the hang detector for that program's next launch (server_hang.c, vkb_hang_arm_hung), which names the job.
  *
  * Switches: VKBRIDGE_ERRATA=-wait_retry turns the fix off (VKBRIDGE_WAIT_FIX=0 still does).
  * The imitation (VKBRIDGE_ERRATA_IMITATE=wait_retry on host builds; VKBRIDGE_WAIT_FAKE_ERROR set
@@ -71,7 +86,10 @@
  *                           of each kind
  *     kind: fence, sem, idle (both idle waits), query, status (vkGetFenceStatus); default all but
  *           status (an app polling a fence status that never answers would never end)
- *   VKBRIDGE_WAIT_FAKE_LOST=1: timed-out semaphore waits answered VK_ERROR_DEVICE_LOST (alone, no -3)
+ *   VKBRIDGE_WAIT_FAKE_LOST=1: a semaphore wait with a timeout that the driver ends with VK_TIMEOUT
+ *           is answered VK_ERROR_DEVICE_LOST (the job-manager drivers' bug, above), the probe's "waits"
+ *           included; alone it imitates no -3 (with VKBRIDGE_WAIT_FAKE_ERROR or
+ *           VKBRIDGE_ERRATA_IMITATE=wait_retry, both)
  *   VKBRIDGE_WAIT_FAKE_RESULT=timeout: the fence and semaphore waits taken end with VK_TIMEOUT
  *           instead of -3, and only when the driver's own wait of up to 20 ms did not finish and the
  *           app's timeout is longer than that (the early timeout above; -3 stays on the other kinds)
@@ -260,6 +278,15 @@ static VkResult retry_loop(waitop *w, VkResult first)
             nap = MS / 2;
     }
     outcome = r == VK_SUCCESS ? O_SUCCESS : r == VK_TIMEOUT ? O_TIMEOUT : !legal(r) ? O_DRIVER_ERROR : O_OTHER;
+    /* given up with no deadline and the device not lost: a GPU job that never finished; its next launch names it */
+    if (w->timeout == UINT64_MAX && w->kind != K_STATUS && ((!early && outcome == O_DRIVER_ERROR) || (early && outcome == O_TIMEOUT))) {
+        char what[160];
+        if (early)
+            snprintf(what, sizeof(what), "%s returned VK_TIMEOUT early for %.1f s, no deadline", kind_name[w->kind], (now_ns() - w->t0) / 1e9);
+        else
+            snprintf(what, sizeof(what), "%s failed by the driver (%d) for %.1f s, no deadline", kind_name[w->kind], r, (now_ns() - w->t0) / 1e9);
+        vkb_hang_arm_hung(vkb_srv_current_table(), what);
+    }
     if (early)
         count_early(w->kind, outcome, r, failed_after, tries, now_ns() - start, w->timeout, w->detail);
     else
@@ -269,7 +296,7 @@ static VkResult retry_loop(waitop *w, VkResult first)
 
 /* ------------------------------------------------------------------ a timed-out wait answered -4 */
 
-static int lost_fix_env = -1; /* read at each install (-1: the probe decides) */
+static int lost_fix_env = -1; /* VKBRIDGE_WAIT_LOST_FIX, read at each install (-1: the probe decides) */
 static unsigned long lost_tally[O_COUNT + 1];
 
 static int lost_fix_on(void)
@@ -277,7 +304,8 @@ static int lost_fix_on(void)
     return lost_fix_env >= 0 ? lost_fix_env : vkb_probe_flag(VKB_PROBE_FLAG_WAIT_LOST);
 }
 
-/* The driver's vkWaitSemaphores, with a VK_ERROR_DEVICE_LOST from a wait with a timeout checked where the probe saw it. */
+/* The driver's vkWaitSemaphores, with a VK_ERROR_DEVICE_LOST from a wait with a timeout checked where the
+ * driver answers timed-out waits so: the poll's VK_SUCCESS or VK_TIMEOUT when the device answers */
 static VkResult sem_wait_drv(const vkb_dispatch *nx, VkDevice d, const VkSemaphoreWaitInfo *wi, uint64_t timeout)
 {
     uint64_t s = now_ns();
@@ -316,7 +344,7 @@ static uint64_t grace_ns = GRACE_DEFAULT;
  * semaphores land here too (their value is ignored); only vkWaitSemaphores, timelines only, reads. */
 #define SIG_SLOTS 8192
 static struct {
-    uint64_t h, v;
+    uint64_t h, v, t; /* t: when the highest value v was submitted */
 } sig[SIG_SLOTS];
 static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned sig_used;
@@ -362,7 +390,7 @@ static void sig_note(VkSemaphore s, uint64_t v)
         return;
     }
     sig[i].h = h;
-    if (v > sig[i].v) sig[i].v = v;
+    if (v > sig[i].v) sig[i].v = v, sig[i].t = now_ns();
 }
 
 /* The highest value submitted to signal s; 0 if none is known */
@@ -412,7 +440,7 @@ static VKAPI_ATTR void VKAPI_CALL w_DestroySemaphore(VkDevice d, VkSemaphore s, 
     if (s) {
         pthread_mutex_lock(&sig_lock);
         int i = sig_slot((uint64_t)(uintptr_t)s, 0);
-        if (i >= 0) sig[i].h = 1, sig[i].v = 0;
+        if (i >= 0) sig[i].h = 1, sig[i].v = 0, sig[i].t = 0;
         pthread_mutex_unlock(&sig_lock);
     }
     nx->vkDestroySemaphore(d, s, a);
@@ -471,6 +499,12 @@ static VkResult grace_wait(const vkb_dispatch *nx, VkDevice d, const VkSemaphore
     }
     retrying--;
     int outcome = r == VK_SUCCESS ? O_SUCCESS : r == VK_TIMEOUT ? O_TIMEOUT : O_OTHER;
+    if (outcome == O_TIMEOUT) { /* the work was submitted and is still not done: a GPU job that never finished */
+        char what[160];
+        snprintf(what, sizeof(what), "vkWaitSemaphores still not done %.1f s past the app's %.3f s deadline", (now_ns() - t0) / 1e9 - timeout / 1e9,
+                 timeout / 1e9);
+        vkb_hang_arm_hung(vkb_srv_current_table(), what);
+    }
     __atomic_add_fetch(&grace_tally[outcome], 1, __ATOMIC_RELAXED);
     unsigned long n = __atomic_add_fetch(&grace_tally[O_COUNT], 1, __ATOMIC_RELAXED);
     double total = (now_ns() - t0) / 1e9;
@@ -486,6 +520,53 @@ static VkResult grace_wait(const vkb_dispatch *nx, VkDevice d, const VkSemaphore
                  "VK_SUCCESS, %lu in VK_TIMEOUT, %lu otherwise", n, __atomic_load_n(&grace_tally[O_SUCCESS], __ATOMIC_RELAXED),
                  __atomic_load_n(&grace_tally[O_TIMEOUT], __ATOMIC_RELAXED), __atomic_load_n(&grace_tally[O_OTHER], __ATOMIC_RELAXED));
     return r;
+}
+
+/* ------------------------------------------------------------------ GPU jobs that took seconds */
+
+/* Resident Evil Village on the S11 Ultra (Mali-G925 r49p1, a player log): from one frame on, every frame's work ran
+ * until the driver's progress timer killed its queue group ('GROUP_ERROR_TIMEOUT', ~7 s), 113 waits over 2 s, the
+ * device never lost, until Android's own UI could not draw and the app was killed (ANR). A semaphore wait that ends
+ * in VK_SUCCESS VKBRIDGE_HUNG_JOB_MS (default 5000; 0: off) or more after the signal it waited for was submitted is
+ * a GPU job that took that long; VKBRIDGE_HUNG_JOBS (default 5) such jobs of a device within 60 s arm the hang
+ * detector for the program's next launch, as a wait given up does (Elden Ring, above). RE8 made one every ~7 s.
+ * Loading bursts seen in players' logs stay under it (Euro Truck Simulator 2: 15 waits over 2 s in a session, Saints
+ * Row, Watch_Dogs: 3-6); the submit time is that of the highest value submitted, so a job's time is never overstated. */
+static uint64_t hung_job_ns = 5000 * MS;
+static unsigned hung_jobs = 5;
+#define HUNG_WINDOW (60 * SEC)
+static unsigned hung_n[4096];
+static uint64_t hung_max[4096], hung_first[4096];
+static pthread_mutex_t hung_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void hung_job_check(const VkSemaphoreWaitInfo *wi)
+{
+    if (!hung_job_ns || !grace_ns || !wi || !wi->semaphoreCount) return;
+    uint64_t end = now_ns(), last = 0;
+    pthread_mutex_lock(&sig_lock);
+    for (uint32_t i = 0; i < wi->semaphoreCount; i++) {
+        int k = sig_slot((uint64_t)(uintptr_t)wi->pSemaphores[i], 0);
+        if (k < 0 || sig[k].v < wi->pValues[i] || !sig[k].t) {
+            last = 0; /* not known submitted: not judged */
+            break;
+        }
+        if (sig[k].t > last) last = sig[k].t;
+    }
+    pthread_mutex_unlock(&sig_lock);
+    if (!last || end - last < hung_job_ns) return;
+    vkb_srv_table *t = vkb_srv_current_table();
+    if (!t || t->id >= 4096) return;
+    uint64_t took = end - last;
+    pthread_mutex_lock(&hung_lock);
+    if (!hung_n[t->id] || end - hung_first[t->id] > HUNG_WINDOW) hung_n[t->id] = 0, hung_max[t->id] = 0, hung_first[t->id] = end;
+    if (took > hung_max[t->id]) hung_max[t->id] = took;
+    unsigned n = ++hung_n[t->id];
+    pthread_mutex_unlock(&hung_lock);
+    if (n != hung_jobs) return;
+    char what[160];
+    snprintf(what, sizeof(what), "%u GPU job(s) of %.1f s or more in 60 s, the longest %.1f s, the device not lost", n, hung_job_ns / 1e9,
+             hung_max[t->id] / 1e9);
+    vkb_hang_arm_hung(t, what);
 }
 
 /* ------------------------------------------------------------------ the fix */
@@ -563,7 +644,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_WaitSemaphores(VkDevice d, const VkSemap
             sem_state(nx, d, wi, w.detail, sizeof(w.detail));
         r = retry(&w, r);
     }
-    return r == VK_TIMEOUT ? grace_wait(nx, d, wi, timeout, t0) : r;
+    if (r == VK_TIMEOUT) r = grace_wait(nx, d, wi, timeout, t0);
+    if (r == VK_SUCCESS && hung_job_ns && now_ns() - t0 >= hung_job_ns) hung_job_check(wi);
+    return r;
 }
 
 typedef struct {
@@ -679,6 +762,9 @@ void vkb_wait_retry_install(vkb_srv_table *t, vkb_errata_dev *e)
         ERRATA_HOOK(t, vkQueueSubmit2, w_QueueSubmit2);
         ERRATA_HOOK(t, vkDestroySemaphore, w_DestroySemaphore);
     }
+    const char *hj = vkb_srv_env("VKBRIDGE_HUNG_JOB_MS"), *hn = vkb_srv_env("VKBRIDGE_HUNG_JOBS");
+    hung_job_ns = hj && *hj ? (uint64_t)(atof(hj) > 0 ? atof(hj) * 1e6 : 0) : 5000 * MS;
+    hung_jobs = hn && *hn && atoi(hn) > 0 ? (unsigned)atoi(hn) : 5;
     const char *lf = vkb_srv_env("VKBRIDGE_WAIT_LOST_FIX");
     lost_fix_env = lf && *lf ? strcmp(lf, "0") != 0 : -1;
     if (lost_fix_env >= 0)
@@ -710,7 +796,7 @@ static int eintr_asked(void)
     return (f && *f && strcmp(f, "0")) || (i && strstr(i, "wait_retry"));
 }
 
-/* The driver's answer under VKBRIDGE_WAIT_FAKE_LOST */
+/* The driver's answer, as the job-manager drivers give it under VKBRIDGE_WAIT_FAKE_LOST */
 static VkResult imi_lost_of(VkResult r, uint64_t timeout)
 {
     return imi_lost && timeout && r == VK_TIMEOUT ? VK_ERROR_DEVICE_LOST : r;

@@ -1,11 +1,19 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
- * bcupload_check: many small BC textures streamed in as GTA V does through DXVK 3.1.1 (* ~1700 textures of ~25 KB in a second, mostly BC1), for the cost the BC conversion adds per
+ * bcupload_check: many small BC textures streamed in as GTA V does through DXVK 3.1.1 (a player log:
+ * ~1700 textures of ~25 KB in a second, mostly BC1), for the cost the BC conversion adds per
  * upload (server/server_emu_bcn.c, bc_batch). host/bcupload_test.sh runs it against a server of
  * its own that converts BC (VKBRIDGE_FAKE_MISSING=bc).
  *
- *   bcupload_check [--size N] [--count T] [--frames F] [--pattern dxvk3|pertex|mixed]
+ *   bcupload_check [--size N] [--count T] [--frames F] [--pattern dxvk3|pertex|mixed] [--rgb] [--query] [--placed] [--pause MS]
+ *
+ * --query: every texture's memory requirements asked before it is made (vkGetDeviceImageMemoryRequirements, as vkd3d's
+ * placed resources); an image that then needs more than it was told fails the run (query_bigger)
+ * --placed: before the frames, vkd3d-proton's sizing of a placed resource without maintenance4: for each of 8 shapes a
+ * temporary image is made and its memory requirements read while 48 BC3 128x128 images are alive (of their own shape
+ * each round, 1-8 levels: a small-decode cap of 1 MB is then full), the temporary image and the 48 are destroyed, and the real image of that shape is made; one
+ * that needs more than its temporary image did fails the run (placed_bigger)
+ * --pause: MS ms of sleep before each frame after the first (a server's background work lands between frames)
  *
  * Each frame makes T textures (default 400) of NxN or Nx(N/2) (default 128), every mip level,
  * two BC1 to one BC3, and uploads them:
@@ -51,6 +59,7 @@ I(vkCmdPipelineBarrier); I(vkQueueSubmit); I(vkDeviceWaitIdle); I(vkCreateFence)
 I(vkGetPhysicalDeviceMemoryProperties); I(vkAllocateMemory); I(vkCreateImage); I(vkGetImageMemoryRequirements);
 I(vkBindImageMemory); I(vkCreateBuffer); I(vkGetBufferMemoryRequirements); I(vkBindBufferMemory); I(vkMapMemory);
 I(vkCmdCopyBufferToImage); I(vkResetCommandBuffer); I(vkCmdBlitImage); I(vkCmdCopyImageToBuffer); I(vkCmdFillBuffer);
+I(vkGetDeviceImageMemoryRequirements); I(vkGetDeviceProcAddr); I(vkDestroyImage); I(vkFreeMemory);
 #undef I
 
 static double now_ms(void)
@@ -131,8 +140,10 @@ typedef struct tex {
 
 static tex *texs;
 static int ntex, captex;
+static unsigned long long bc_copies, bc_texels; /* copies into BC images and their texels (the server's "BC conversions" line counts the same) */
 
-static uint32_t bb(VkFormat f) { return f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? 8 : f == VK_FORMAT_BC3_UNORM_BLOCK ? 16 : 0; }
+static int is_bc1(VkFormat f) { return f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || f == VK_FORMAT_BC1_RGB_UNORM_BLOCK; }
+static uint32_t bb(VkFormat f) { return is_bc1(f) ? 8 : f == VK_FORMAT_BC3_UNORM_BLOCK ? 16 : 0; }
 static uint32_t lw(uint32_t v, uint32_t m) { return v >> m ? v >> m : 1; }
 static VkDeviceSize level_bytes(const tex *t, uint32_t m)
 {
@@ -165,7 +176,7 @@ static void make_blocks(tex *t)
                     texel(t->seed + m * 101, x < w ? x : w - 1, y < h ? y : h - 1, w, blk[i]);
                 }
                 uint8_t *dst = o + ((size_t)by * bw + bx) * bb(t->fmt);
-                if (t->fmt == VK_FORMAT_BC1_RGBA_UNORM_BLOCK) enc_bc1((const uint8_t(*)[4])blk, dst);
+                if (is_bc1(t->fmt)) enc_bc1((const uint8_t(*)[4])blk, dst);
                 else enc_bc3((const uint8_t(*)[4])blk, dst);
             }
     }
@@ -187,15 +198,25 @@ static VkBuffer host_buffer(VkDeviceSize bytes, VkBufferUsageFlags usage, void *
     return buf;
 }
 
+static int query, query_bigger; /* --query: memory requirements asked before each image; images needing more than told */
 static VkImage device_image(VkFormat f, uint32_t w, uint32_t h, uint32_t mips, VkImageUsageFlags usage)
 {
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {w, h, 1}, mips, 1, VK_SAMPLE_COUNT_1_BIT,
                              VK_IMAGE_TILING_OPTIMAL, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     VkImage img;
+    VkDeviceSize told = 0;
+    if (query && vkGetDeviceImageMemoryRequirements) { /* asked first, as vkd3d's placed resources do */
+        VkDeviceImageMemoryRequirements dq = {VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, NULL, &ici, 0};
+        VkMemoryRequirements2 r2 = {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+        vkGetDeviceImageMemoryRequirements(dev, &dq, &r2);
+        told = r2.memoryRequirements.size;
+    }
     if (vkCreateImage(dev, &ici, NULL, &img)) return VK_NULL_HANDLE;
     VkMemoryRequirements r;
     vkGetImageMemoryRequirements(dev, img, &r);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r.size, mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+    if (query && r.size > told) query_bigger++;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, query && told > r.size ? told : r.size,
+                               mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     VkDeviceMemory m;
     if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(dev, &ai, NULL, &m) || vkBindImageMemory(dev, img, m, 0)) return VK_NULL_HANDLE;
     return img;
@@ -222,17 +243,75 @@ static void begin(VkCommandBuffer cb)
     vkBeginCommandBuffer(cb, &bi);
 }
 
+/* --placed: a placed resource sized from a temporary image while other small BC images hold the memory, made for real
+ * after they are gone (vkd3d-proton without VK_KHR_maintenance4): how many real images needed more than their
+ * temporary one. */
+static int placed_check(void)
+{
+    enum { FILL = 48, SHAPES = 8 };
+    VkImage fill[FILL];
+    VkDeviceMemory fmem[FILL];
+    int bigger = 0;
+    for (int s = 0; s < SHAPES; s++) {
+        uint32_t nf = 0;
+        for (int i = 0; i < FILL; i++) {
+            VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_BC3_UNORM_BLOCK, {128, 128, 1}, 1 + (uint32_t)s, 1,
+                                    VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+            VkMemoryRequirements r;
+            if (vkCreateImage(dev, &ci, NULL, &fill[nf])) break;
+            vkGetImageMemoryRequirements(dev, fill[nf], &r);
+            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r.size, mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            if (vkAllocateMemory(dev, &ai, NULL, &fmem[nf])) {
+                vkDestroyImage(dev, fill[nf], NULL);
+                break;
+            }
+            vkBindImageMemory(dev, fill[nf], fmem[nf], 0);
+            nf++;
+        }
+        /* a shape of its own each time (BC1 / BC3, 64 or 32 high, 1-4 levels): never made before */
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D,
+                                s & 1 ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK, {128, s & 2 ? 32u : 64u, 1}, 1 + (uint32_t)(s >> 2) * 3, 1,
+                                VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImage tmp, real;
+        VkMemoryRequirements rt = {0}, rr = {0};
+        if (!vkCreateImage(dev, &ci, NULL, &tmp)) {
+            vkGetImageMemoryRequirements(dev, tmp, &rt);
+            vkDestroyImage(dev, tmp, NULL);
+        }
+        for (uint32_t i = 0; i < nf; i++) {
+            vkDestroyImage(dev, fill[i], NULL);
+            vkFreeMemory(dev, fmem[i], NULL);
+        }
+        if (!vkCreateImage(dev, &ci, NULL, &real)) {
+            vkGetImageMemoryRequirements(dev, real, &rr);
+            vkDestroyImage(dev, real, NULL);
+        }
+        printf("placed shape %d: temporary image %llu bytes, real one %llu (%u images held the memory)\n", s, (unsigned long long)rt.size,
+               (unsigned long long)rr.size, nf);
+        if (!rt.size || rr.size > rt.size) bigger++;
+    }
+    return bigger;
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     uint32_t size = 128;
     int count = 400, frames = 5;
     const char *pattern = "dxvk3";
+    int placed = 0, placed_bigger = 0, pause_ms = 0;
+    int rgb = 0; /* --rgb: every sixth texture BC1 RGB (no alpha: other flags for the converter, server_emu_bcn.c family_flags) */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--size") && i + 1 < argc) size = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--count") && i + 1 < argc) count = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pattern") && i + 1 < argc) pattern = argv[++i];
+        else if (!strcmp(argv[i], "--rgb")) rgb = 1;
+        else if (!strcmp(argv[i], "--query")) query = 1;
+        else if (!strcmp(argv[i], "--placed")) placed = 1;
+        else if (!strcmp(argv[i], "--pause") && i + 1 < argc) pause_ms = atoi(argv[++i]);
     }
     int pertex = !strcmp(pattern, "pertex"), mixed = !strcmp(pattern, "mixed");
     if (!pertex && !mixed && strcmp(pattern, "dxvk3")) {
@@ -259,6 +338,7 @@ int main(int argc, char **argv)
     G(vkGetPhysicalDeviceMemoryProperties); G(vkAllocateMemory); G(vkCreateImage); G(vkGetImageMemoryRequirements);
     G(vkBindImageMemory); G(vkCreateBuffer); G(vkGetBufferMemoryRequirements); G(vkBindBufferMemory); G(vkMapMemory);
     G(vkCmdCopyBufferToImage); G(vkResetCommandBuffer); G(vkCmdBlitImage); G(vkCmdCopyImageToBuffer); G(vkCmdFillBuffer);
+G(vkGetDeviceProcAddr); G(vkDestroyImage); G(vkFreeMemory);
 #undef G
     uint32_t n = 1;
     vkEnumeratePhysicalDevices(inst, &n, &pd);
@@ -283,6 +363,11 @@ int main(int argc, char **argv)
         return 2;
     }
     vkGetDeviceQueue(dev, family, 0, &queue);
+    if (query) vkGetDeviceImageMemoryRequirements = (PFN_vkGetDeviceImageMemoryRequirements)vkGetDeviceProcAddr(dev, "vkGetDeviceImageMemoryRequirements");
+    if (query && !vkGetDeviceImageMemoryRequirements) {
+        printf("FAILED: setup: no vkGetDeviceImageMemoryRequirements\n");
+        return 2;
+    }
     VkCommandPool pool;
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, family};
     vkCreateCommandPool(dev, &pci, NULL, &pool);
@@ -293,6 +378,7 @@ int main(int argc, char **argv)
     VkFence fence;
     vkCreateFence(dev, &fci, NULL, &fence);
     VkBuffer junk = host_buffer(1 << 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, NULL);
+    if (placed) placed_bigger = placed_check();
 
     /* the textures and their blocks, made before the frames (a game reads them from its files) */
     uint32_t seed = 1;
@@ -305,7 +391,8 @@ int main(int argc, char **argv)
             for (int rgba = 0; rgba < 1 + (mixed && k % 5 == 4); rgba++) {
                 tex *t = &texs[ntex++];
                 uint32_t h = (k & 2) ? size / 2 : size;
-                *t = (tex){VK_NULL_HANDLE, rgba ? VK_FORMAT_R8G8B8A8_UNORM : k % 3 == 2 ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                *t = (tex){VK_NULL_HANDLE, rgba ? VK_FORMAT_R8G8B8A8_UNORM : k % 3 == 2 ? VK_FORMAT_BC3_UNORM_BLOCK
+                                           : rgb && k % 6 == 1 ? VK_FORMAT_BC1_RGB_UNORM_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
                            rgba ? 64 : size, rgba ? 64 : h, 0, seed++, NULL};
                 for (uint32_t s = t->w > t->h ? t->w : t->h; s; s >>= 1) t->mips++;
                 make_blocks(t);
@@ -327,6 +414,10 @@ int main(int argc, char **argv)
     int next = 0;
     VkImageMemoryBarrier *bars = malloc(sizeof(*bars) * (count * 2 + 8));
     for (int f = 0; f < frames; f++) {
+        if (f && pause_ms > 0) {
+            struct timespec ts = {pause_ms / 1000, (pause_ms % 1000) * 1000000L};
+            nanosleep(&ts, NULL);
+        }
         int first = next, last = next;
         while (last < ntex && last - first < count + (mixed ? count / 5 : 0)) last++;
         next = last;
@@ -356,6 +447,10 @@ int main(int argc, char **argv)
                                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 vkCmdPipelineBarrier(cbs[0], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
                 vkCmdCopyBufferToImage(cbs[0], stage, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, t->mips, regs);
+                if (bb(t->fmt)) {
+                    bc_copies++;
+                    for (uint32_t m = 0; m < t->mips; m++) bc_texels += (unsigned long long)lw(t->w, m) * lw(t->h, m);
+                }
                 b = img_barrier(t->img, t->mips, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                 vkCmdPipelineBarrier(cbs[0], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
@@ -380,6 +475,7 @@ int main(int argc, char **argv)
                     memcpy((uint8_t *)stage_map + used, t->blocks + level_off(t, m), level_bytes(t, m));
                     VkBufferImageCopy r = {used, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1}, {0, 0, 0}, {lw(t->w, m), lw(t->h, m), 1}};
                     vkCmdCopyBufferToImage(cbs[1], stage, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+                    if (bb(t->fmt)) bc_copies++, bc_texels += (unsigned long long)lw(t->w, m) * lw(t->h, m);
                     used += level_bytes(t, m);
                 }
                 if (mixed && bb(t->fmt) && ++bc_seen % 7 == 0) vkCmdFillBuffer(cbs[1], junk, 0, 256, (uint32_t)i);
@@ -447,13 +543,14 @@ int main(int argc, char **argv)
                         memcpy(want, lv + ((size_t)y * w + x) * 4, 4);
                     } else {
                         const uint8_t *blk = lv + ((size_t)(y / 4) * bw + x / 4) * bb(t->fmt);
-                        if (t->fmt == VK_FORMAT_BC1_RGBA_UNORM_BLOCK) bcdec_bc1(blk, dec, 16);
+                        if (is_bc1(t->fmt)) bcdec_bc1(blk, dec, 16);
                         else bcdec_bc3(blk, dec, 16);
                         memcpy(want, dec + ((y & 3) * 4 + (x & 3)) * 4, 4);
+                        if (t->fmt == VK_FORMAT_BC1_RGB_UNORM_BLOCK) want[3] = 255;
                     }
                     for (int c = 0; c < 4; c++) {
                         int d = abs((int)g[c] - (int)want[c]);
-                        int *md = !bb(t->fmt) ? &maxdr : t->fmt == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? &maxd1 : &maxd3;
+                        int *md = !bb(t->fmt) ? &maxdr : is_bc1(t->fmt) ? &maxd1 : &maxd3;
                         if (d > *md) *md = d;
                         hash = (hash ^ g[c]) * 0x100000001b3ull;
                     }
@@ -461,8 +558,17 @@ int main(int argc, char **argv)
         }
     }
     printf("RESULT pattern=%s textures=%d bc=%d frames=%d upload_ms=%.1f steady_ms=%.1f worst_frame_ms=%.1f maxdiff_bc1=%d maxdiff_bc3=%d maxdiff_rgba=%d "
-           "hash=%016llx\n",
-           pattern, ntex, nbc, frames, total, steady, worst, maxd1, maxd3, maxdr, (unsigned long long)hash);
+           "hash=%016llx bc_copies=%llu bc_texels=%llu query_bigger=%d placed_bigger=%d\n",
+           pattern, ntex, nbc, frames, total, steady, worst, maxd1, maxd3, maxdr, (unsigned long long)hash, bc_copies, bc_texels, query_bigger,
+           placed_bigger);
+    if (placed_bigger) {
+        printf("FAILED: %d placed image(s) needed more memory than their temporary image of the same shape\n", placed_bigger);
+        return 1;
+    }
+    if (query_bigger) {
+        printf("FAILED: %d image(s) needed more memory than vkGetDeviceImageMemoryRequirements said\n", query_bigger);
+        return 1;
+    }
     if (maxdr) {
         printf("FAILED: RGBA8 textures read back changed (max difference %d)\n", maxdr);
         return 1;

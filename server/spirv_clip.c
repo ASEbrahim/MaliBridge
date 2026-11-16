@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Clip/cull distance (and geometry/tessellation point size) built-ins turned into ordinary
  * Location variables, for a driver without shaderClipDistance/shaderCullDistance (Mali-G720,
  * r44p1); server_emu_shader.c decides where and builds the fragment discard on top.
@@ -128,7 +127,7 @@ static uint32_t id_words(const spv_inst *in)
     case SpvOpBranchConditional: return 3;
     /* OpLine: file (an OpString), then line and column literals; No Man's Sky's vertex shaders
      * carry source lines, and a line number equal to gl_PerVertex's id read as a use of the block
-     * left ClipDistance a built-in (Mali's compiler crashed on the pipeline) */
+     * left ClipDistance a built-in (a player log: Mali's compiler crashed on the pipeline) */
     case SpvOpLine: return 1;
     case SpvOpNoLine: return 0;
     default: return UINT16_MAX;

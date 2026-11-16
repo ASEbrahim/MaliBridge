@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * querystuck_check: the query mirror (client/query.c) must not answer "not ready" forever for a
  * query the GPU has finished. Deep Rock Galactic on the S11 Ultra (2026-10-27): UE4's render thread
- * spun for minutes on the mirror's not-ready answer with the GPU and the server idle; with the
- * mirror off every load passed. Each case polls the way DXVK's GetData does (64-bit,
+ * spun for minutes on the mirror's not-ready answer with the GPU and the server idle; with
+ * VKBRIDGE_QUERY_MIRROR=0 every load passed. Each case polls the way DXVK's GetData does (64-bit,
  * no WAIT, in a loop) after the GPU is known to be done (fence waited), and fails when the answer
  * is still "not ready" after 3 s.
  *
@@ -37,10 +36,17 @@
  *                                300 ms, its siblings at once); a query reset and never ended, and one
  *                                ended in a primary never submitted, stay not ready
  *
- *   querystuck_check late        Sifu (UE4 through DXVK): two pools whose mirror copies are lost
+ *   querystuck_check late        Sifu (UE4 through DXVK, a player log): two pools whose mirror copies are lost
  *                                (imitated: the 1st and the 2nd flush); the first query found stuck marks
  *                                its pool late, and that pool's other queries then come ready at once
  *                                instead of 200 ms each; the other pool is still on the 200 ms rule
+ *
+ *   querystuck_check behind      Bright Memory: Infinite on the S10+ (UE4 through DXVK, 2026-11-10): the occlusion
+ *                                pass is early in a command buffer whose rest takes tens of ms more GPU time, every frame
+ *                                under 200 ms. The driver has each result when the pass is done; the mirror's copy runs at
+ *                                the end of the command buffer. UE4's render thread spins on the result. A pool the mirror
+ *                                is behind on must be found late without a 200 ms stall (lavapipe's own reads answer
+ *                                only at the end of a submit, so the time saved shows only on a device)
  *
  *   querystuck_check stale       Batman: Arkham Asylum on the Galaxy Tab S12+ (, UE3 through
  *                                DXVK): a query slot whose last use counted 0 samples is reset and
@@ -92,7 +98,8 @@ I(vkCreateFramebuffer); I(vkCreateGraphicsPipelines); I(vkCmdBeginRenderPass); I
 I(vkCmdBindPipeline); I(vkCmdPushConstants); I(vkCmdSetViewport); I(vkCmdSetScissor); I(vkCreateFence); I(vkWaitForFences);
 I(vkResetFences); I(vkDestroyDevice); I(vkCreateQueryPool); I(vkDestroyQueryPool); I(vkResetQueryPool); I(vkCmdBeginQuery);
 I(vkCmdEndQuery); I(vkGetQueryPoolResults); I(vkCmdExecuteCommands); I(vkResetCommandPool); I(vkDeviceWaitIdle);
-I(vkDestroyCommandPool); I(vkCmdResetQueryPool);
+I(vkDestroyCommandPool); I(vkCmdResetQueryPool); I(vkCreateBuffer); I(vkGetBufferMemoryRequirements); I(vkBindBufferMemory);
+I(vkCmdFillBuffer); I(vkDestroyBuffer); I(vkFreeMemory);
 #undef I
 
 static void check(int ok, const char *what, const char *detail)
@@ -396,10 +403,16 @@ static void case_late(void)
     snprintf(d, sizeof(d), "pool A %.0f/%.0f/%.0f ms, pool B %.0f/%.0f/%.0f ms, lost copies imitated: %ld", took[0][0] * 1e3, took[0][1] * 1e3,
              took[0][2] * 1e3, took[1][0] * 1e3, took[1][1] * 1e3, took[1][2] * 1e3, told);
     check(ok, "late pool: every result exact", d);
-    if (mirror && told == 2) {
+    const char *pe = getenv("VKBRIDGE_QUERY_LATE_PROBE_MS");
+    int probe = !(pe && !strcmp(pe, "0"));
+    if (mirror && told == 2 && !probe) {
         /* The first query of a pool waits the 200 ms rule; once the pool is known late its others come at once. */
         check(took[0][0] > 0.15 && took[0][1] < 0.08 && took[0][2] < 0.08, "late pool: the first query waits 200 ms, the pool's others come ready at once", d);
         check(took[1][0] > 0.15, "a pool never found late stays on the 200 ms rule", d);
+    } else if (mirror && told == 2) {
+        /* The late probe (4 ms, once a pool per 50 ms) finds each pool late without the 200 ms wait. */
+        check(took[0][0] < 0.08 && took[0][1] < 0.08 && took[0][2] < 0.08, "late pool: the late probe finds it at once, the pool's others come ready at once", d);
+        check(took[1][0] < 0.08, "the other pool: found by its own late probe, not the 200 ms rule", d);
     }
     vkDestroyQueryPool(dev, pool[0], NULL);
     vkDestroyQueryPool(dev, pool[1], NULL);
@@ -599,7 +612,11 @@ static void case_drg(long frames)
     long wire = wire_polls() - w0;
     snprintf(d, sizeof(d), "%ld frames x %d queries in %.1f s, %ld polls, slowest %.1f ms, %ld round trips%s%s", frames, DRG_PER_FRAME, secs,
              drg_polls, drg_worst * 1e3, wire, *drg_why ? "; " : "", drg_why);
-    check(!bad && !drg_stuck && !drg_wrong && (!mirror || wire == 0),
+    /* With the mirror on, no poll's round trip: only the late probe's asks (client/query.c: one a pool per 50 ms at most, while
+     * a thread spins on a query not ready in the mirror for 4 ms; lavapipe's slowest frames reach that). */
+    const char *pe = getenv("VKBRIDGE_QUERY_LATE_PROBE_MS");
+    long allowed = pe && !strcmp(pe, "0") ? 0 : (long)(secs * 20) + 8;
+    check(!bad && !drg_stuck && !drg_wrong && (!mirror || wire <= allowed),
           drg_batman ? "UE3's pattern (slots alternating 0 and full counts, host and command-buffer resets, a spinning thread)"
                      : "Deep Rock Galactic's pattern (host resets, secondaries, a spinning thread)",
           d);
@@ -718,6 +735,125 @@ static void case_burst(int mode, uint32_t n)
     vkDestroyQueryPool(dev, pool, NULL);
 }
 
+/* Bright Memory: Infinite (UE4 through DXVK) on the S10+, 2026-11-10: test47 and test48 run the same mirror, but which path
+ * answered BMI's render thread depended on one load frame: a frame of >= 200 ms right after the level load let one query sit
+ * not ready in the mirror for VKBRIDGE_QUERY_STUCK_MS while the driver had it, the pool was marked late, and from then on the
+ * server answered (render thread 63% of a core, 21.4-22.5 fps). Without such a frame (fast create and the BC_FAST converters made
+ * the load frames shorter) the mirror answered all session long, each result only at the end of DXVK's command buffer, and the
+ * render thread spun at 94% of a core for it (20.6-21.2 fps). Here: the pass first, then GPU work (a big fill) in the same
+ * command buffer, no frame near 200 ms; the spin must end long before the fill does once the first frames are past. */
+static void case_behind(long frames)
+{
+    char d[400];
+    VkFence f;
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(dev, &fci, NULL, &f);
+    VkDeviceSize size = 256ull << 20;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    VkMemoryRequirements r;
+    if (vkCreateBuffer(dev, &bci, NULL, &buf)) {
+        check(0, "behind: big buffer", "vkCreateBuffer");
+        return;
+    }
+    vkGetBufferMemoryRequirements(dev, buf, &r);
+    uint32_t ty = find_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ty == UINT32_MAX) ty = find_type(r.memoryTypeBits, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r.size, ty};
+    if (vkAllocateMemory(dev, &ai, NULL, &mem) || vkBindBufferMemory(dev, buf, mem, 0)) {
+        check(0, "behind: big buffer", "memory");
+        return;
+    }
+    /* Calibrate: fills per command buffer so that the work after the pass takes 40-120 ms (never near 200). */
+    int fills = 1;
+    double tfill = 0;
+    for (int tries = 0, warm = 0; tries < 10; tries++) {
+        VkCommandBuffer cb = alloc_cb(cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+        begin_primary(cb);
+        for (int i = 0; i < fills; i++) vkCmdFillBuffer(cb, buf, 0, VK_WHOLE_SIZE, 0x01010101u * (uint32_t)(i + 1));
+        double t0 = now_s();
+        submit_wait(cb, f);
+        tfill = now_s() - t0;
+        if (!warm++) continue; /* the first fill pays the buffer's first touch */
+        if ((tfill >= 0.04 && tfill < 0.12) || fills >= 64) break;
+        fills = (int)(fills * (0.07 / (tfill > 0.001 ? tfill : 0.001)) + 0.5);
+        if (fills < 1) fills = 1;
+        if (fills > 64) fills = 64;
+    }
+    VkQueryPool pool = make_pool(8);
+    long polls0 = wire_polls();
+    double lat[256];
+    int ok = 1, nl = 0;
+    if (frames > 256) frames = 256;
+    for (long fr = 0; fr < frames; fr++) {
+        vkResetQueryPool(dev, pool, 0, 3); /* DXVK: from the host when handed out */
+        VkCommandBuffer cb = alloc_cb(cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+        begin_primary(cb);
+        begin_pass(cb, &plain, VK_SUBPASS_CONTENTS_INLINE);
+        for (uint32_t q = 0; q < 3; q++) counted_draw(cb, &plain, pool, q, 4 + q * 3, 5 + q);
+        vkCmdEndRenderPass(cb);
+        for (int i = 0; i < fills; i++) vkCmdFillBuffer(cb, buf, 0, VK_WHOLE_SIZE, 0x01010101u * (uint32_t)(i + 1));
+        vkEndCommandBuffer(cb);
+        vkResetFences(dev, 1, &f);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+        double t0 = now_s();
+        if (vkQueueSubmit(queue, 1, &si, f)) {
+            ok = 0;
+            break;
+        }
+        for (uint32_t q = 0; q < 3; q++) {
+            uint64_t v = 0;
+            double took;
+            VkResult rr = spin(pool, q, &v, 3.0, &took, NULL);
+            uint64_t want = (uint64_t)(4 + q * 3) * (5 + q);
+            if (rr != VK_SUCCESS || (precise ? v != want : v == 0)) ok = 0;
+        }
+        lat[nl++] = now_s() - t0;
+        vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ull);
+    }
+    long wire = wire_polls() - polls0;
+    /* median of the frames after the first quarter (finding the pool late may take the first frames) */
+    int from = nl / 4, m = nl - from;
+    for (int i = from; i < nl; i++)
+        for (int j = i + 1; j < nl; j++)
+            if (lat[j] < lat[i]) {
+                double t = lat[i];
+                lat[i] = lat[j];
+                lat[j] = t;
+            }
+    double med = m > 0 ? lat[from + m / 2] : 0;
+    snprintf(d, sizeof(d), "%d fills = %.0f ms of GPU work after the pass, %d frames: results seen a median %.1f ms after the submit "
+             "(frames %d-%d), %ld vkGetQueryPoolResults round trips", fills, tfill * 1e3, nl, med * 1e3, from, nl - 1, wire);
+    check(ok, "behind: every result exact", d);
+    check(tfill >= 0.03 && tfill < 0.17, "behind: the work after the pass is tens of ms, under the 200 ms rule", d);
+    /* lavapipe runs a submit as one piece and its own query read answers only when the command buffer is done, so the time a
+     * result is seen is the same here either way (mirror off: the same ~fill time); on the G720 the driver had each one 2-26 ms
+     * before the mirror ("the GPU had a result N ms before the mirror"). What is checked is the rule that decides it: with no
+     * frame near 200 ms, the pool must still be found late (asked of the server, which has it), within the first frames. */
+    /* the client's 'N so far' count of queries the server had while the mirror said not ready (logged at 1-5 and powers of 2) */
+    long found = 0;
+    if (trace) {
+        pthread_mutex_lock(&trace_lock);
+        fflush(stderr);
+        rewind(trace);
+        char line[512];
+        while (fgets(line, sizeof(line), trace)) {
+            const char *k = strstr(line, "but done on the GPU; answered by the server until it is reset (");
+            long v;
+            if (k && sscanf(k + strlen("but done on the GPU; answered by the server until it is reset ("), "%ld", &v) == 1 && v > found) found = v;
+        }
+        fseek(trace, 0, SEEK_END);
+        pthread_mutex_unlock(&trace_lock);
+    }
+    snprintf(d + strlen(d), sizeof(d) - strlen(d), "; queries the server had while the mirror said not ready: %ld (logged count)", found);
+    if (mirror) check(found >= nl / 2, "behind: the pool is found late without a 200 ms frame, its results from then on asked of the driver", d);
+    else check(1, "behind: mirror off, the server answers every query", d);
+    vkDestroyQueryPool(dev, pool, NULL);
+    vkDestroyBuffer(dev, buf, NULL);
+    vkFreeMemory(dev, mem, NULL);
+}
+
 int main(int argc, char **argv)
 {
     const char *what = argc > 1 ? argv[1] : "all";
@@ -814,7 +950,8 @@ int main(int argc, char **argv)
     G(vkCmdPushConstants); G(vkCmdSetViewport); G(vkCmdSetScissor); G(vkCreateFence); G(vkWaitForFences); G(vkResetFences);
     G(vkDestroyDevice); G(vkCreateQueryPool); G(vkDestroyQueryPool); G(vkResetQueryPool); G(vkCmdBeginQuery); G(vkCmdEndQuery);
     G(vkGetQueryPoolResults); G(vkCmdExecuteCommands); G(vkResetCommandPool); G(vkDeviceWaitIdle); G(vkDestroyCommandPool);
-    G(vkCmdResetQueryPool);
+    G(vkCmdResetQueryPool); G(vkCreateBuffer); G(vkGetBufferMemoryRequirements); G(vkBindBufferMemory); G(vkCmdFillBuffer);
+    G(vkDestroyBuffer); G(vkFreeMemory);
 #undef G
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, qfam};
@@ -828,6 +965,7 @@ int main(int argc, char **argv)
     if (all || !strcmp(what, "drg") || drg_batman) case_drg(frames);
     if (!strcmp(what, "stale")) case_stale();
     if (!strcmp(what, "late")) case_late();
+    if (!strcmp(what, "behind")) case_behind(argc > 2 ? frames : 40);
     if (burst >= 0) case_burst(burst, burst_n);
 
     vkDeviceWaitIdle(dev);

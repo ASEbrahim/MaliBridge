@@ -1,27 +1,28 @@
 #!/bin/bash
-#, Mali-G615 MC6 r44p1: the one server died in the driver's
+# a player log (Mali-G615 MC6 r44p1): the one server died in the driver's
 # vkBindImageMemory and, the next time, in its vkAllocateMemory (same driver pc, SEGV_ACCERR), and
 # took Steam, the compositor and the game with it. The cause inside the driver is not known; a
 # fault in those calls is now contained (server_guard.c): the allocation fails with
 # VK_ERROR_OUT_OF_DEVICE_MEMORY, a bind takes its device as lost, the other programs go on.
 # VKBRIDGE_TEST_CRASH_CMD=<call> VKBRIDGE_TEST_CRASH_ONCE=1 VKBRIDGE_TEST_CRASH_ACCERR=1: a client's
-# first such call faults at the driver boundary the way did (code 2, a 2-byte store at ..e5e
+# first such call faults at the driver boundary the way the player's did (code 2, a 2-byte store at ..e5e
 # into a mapping without access).
 #   1  allocation: the server lives and says it contained the fault in vkAllocateMemory;
 #   2  the program then goes on and a second program works;
 #   3  bind: the server lives, the program's device is taken as lost (its waits answer -4);
 #   4  a second program works on the same server;
-#   5  A/B: with VKBRIDGE_NO_CRASH_GUARD=1 the same fault kills the server (fingerprint);
+#   5  A/B: with VKBRIDGE_NO_CRASH_GUARD=1 the same fault kills the server (the player's fingerprint);
 #   6  a fault with a driver lock held (VKBRIDGE_TEST_CRASH_LOCK=1: the lock is left held, the program's
 #      next allocation waits on it for good): the stall watchdog (VKBRIDGE_MEM_STALL_S=3 here, 30 by
 #      default) ends that program's session, it ends in seconds, the server lives;
 #   7  a second program then waits on the same lock: the server ends (as the fault would have ended
 #      it), with the watchdog's line in its log and crash.log; the program ends instead of freezing;
 #   8  A/B: with VKBRIDGE_MEM_STALL_S=0 the first program freezes (still in its allocation after 12 s).
-#  10  (a player log/5PA6 on t12+, RE-CRASH 11-05) a contained fault says what the uncontained crash line said: code 2
+#  10  (a player log on t12+, 11-05) a contained fault says what the uncontained crash line said: code 2
 #      (SEGV_ACCERR), pc as library + offset, the faulting thread and what the address lies in, the call's
-#      arguments (allocation size/type/path; bind image + memory) and the other calls in flight; the CONTAINED
-#      line alone (t12-t15) could not tell next RE log's hypotheses apart.
+#      arguments (allocation size/type/path; bind image + memory) and the other calls in flight (at the fault, copied
+#      in the handler, and after recovery); the CONTAINED
+#      line alone (t12-t15) could not tell the next RE log's hypotheses apart.
 #   9  test11 audit P2 (ledger 167): after the watchdog of 6 stops a program, its driver event thread faults
 #      (VKBRIDGE_TEST_LOST=1:stop) and is parked; the driver needed that thread (the imitation: every fence
 #      wait then hangs in the driver; the held lock is the faulting device's own, VKBRIDGE_TEST_CRASH_LOCK=dev,
@@ -73,13 +74,14 @@ stop
 a_pc=$(grep -m1 -A1 'CONTAINED driver crash: .* in vkAllocateMemory' "$work/alloc-kept.log" | grep -m1 '  fault: ')
 a_where=$(grep -m1 -A3 'CONTAINED driver crash: .* in vkAllocateMemory' "$work/alloc-kept.log" | grep -m1 '  thread [0-9]* "')
 a_args=$(grep -m1 -A4 'CONTAINED driver crash: .* in vkAllocateMemory' "$work/alloc-kept.log" | grep -m1 '  allocation of ')
-a_oth=$(grep -m1 -A5 'CONTAINED driver crash: .* in vkAllocateMemory' "$work/alloc-kept.log" | grep -m1 '  other calls in flight: ')
+a_at=$(grep -m1 -A6 'CONTAINED driver crash: .* in vkAllocateMemory' "$work/alloc-kept.log" | grep -m1 '  calls in flight at the fault: ')
+a_oth=$(grep -m1 -A6 'CONTAINED driver crash: .* in vkAllocateMemory' "$work/alloc-kept.log" | grep -m1 '  calls in flight after recovery: ')
 b_args=$(grep -m1 -A4 'CONTAINED driver crash: .* in vkBindImageMemory' "$work/bind.log" | grep -m1 '  bind of image 0x')
 echo "$a_pc" | grep -Eq 'fault: code 2 \(SEGV_ACCERR\), pc 0x[0-9a-f]+ \(vkbridge-server\+0x[0-9a-f]+\)' &&
   echo "$a_where" | grep -Eq 'address 0x[0-9a-f]+e5e is in [0-9a-f]+-[0-9a-f]+ ---p \(anonymous\)' &&
-  echo "$a_args" | grep -Eq 'allocation of [1-9][0-9]* bytes in memory type [0-9]+, ' && [ -n "$a_oth" ] &&
+  echo "$a_args" | grep -Eq 'allocation of [1-9][0-9]* bytes in memory type [0-9]+, ' && [ -n "$a_at" ] && [ -n "$a_oth" ] &&
   echo "$b_args" | grep -q 'to memory 0x'
-step $? "10 the contained fault's detail: ${a_pc#*E   } | ${a_where#*E   } | ${a_args#*E   } | ${a_oth#*E   } | ${b_args#*E   }"
+step $? "10 the contained fault's detail: ${a_pc#*E   } | ${a_where#*E   } | ${a_args#*E   } | ${a_at#*E   } | ${a_oth#*E   } | ${b_args#*E   }"
 
 start noguard VKBRIDGE_TEST_CRASH_CMD=vkBindImageMemory VKBRIDGE_NO_CRASH_GUARD=1
 { smoke >"$work/noguard.out" 2>&1; } 2>/dev/null

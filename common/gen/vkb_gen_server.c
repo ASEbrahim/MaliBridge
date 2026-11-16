@@ -4374,6 +4374,7 @@ void vkb_sv_vkCreateBuffer(vkb_srv_call *c)
     VkBuffer *pBuffer = has_pBuffer ? &pBuffer_v : NULL;
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkCreateBuffer) { vkb_srv_missing(c, "vkCreateBuffer"); return; }
+    vkb_srv_fast_create_pre(c, NULL, pCreateInfo);
     VkResult r_ = c->dt->vkCreateBuffer(device, pCreateInfo, NULL, pBuffer);
     vkb_enc_bytes(e, &r_, sizeof(r_));
     vkb_enc_u8(e, pBuffer != NULL);
@@ -4703,12 +4704,13 @@ void vkb_sv_vkCreateImage(vkb_srv_call *c)
     VkImage *pImage = has_pImage ? &pImage_v : NULL;
     if (d->err) { vkb_srv_bad_message(c); return; }
     if (!c->dt->vkCreateImage) { vkb_srv_missing(c, "vkCreateImage"); return; }
-    VkFormat asked_format_ = pCreateInfo ? pCreateInfo->format : VK_FORMAT_UNDEFINED; VkImageTiling asked_tiling_ = pCreateInfo ? pCreateInfo->tiling : VK_IMAGE_TILING_OPTIMAL;
+    vkb_srv_fast_create_pre(c, pCreateInfo, NULL); VkFormat asked_format_ = pCreateInfo ? pCreateInfo->format : VK_FORMAT_UNDEFINED; VkImageTiling asked_tiling_ = pCreateInfo ? pCreateInfo->tiling : VK_IMAGE_TILING_OPTIMAL;
     VkResult r_ = c->dt->vkCreateImage(device, pCreateInfo, NULL, pImage);
     if (r_ == VK_SUCCESS && pCreateInfo && pImage) vkb_srv_note_image(c, device, pCreateInfo, *pImage, asked_format_, asked_tiling_);
     vkb_enc_bytes(e, &r_, sizeof(r_));
     vkb_enc_u8(e, pImage != NULL);
     if (pImage) vkb_enc_raw(e, pImage, sizeof(*pImage));
+    vkb_srv_fast_create_reply(c, device, r_, pImage, pCreateInfo);
 }
 
 void vkb_sv_vkCreateImageView(vkb_srv_call *c)
@@ -7823,4 +7825,5 @@ const vkb_srv_handler vkb_srv_handlers[VKB_CMD_COUNT] = {
     [VKB_CMD_vkUpdateDescriptorSets] = vkb_sv_vkUpdateDescriptorSets,
     [VKB_CMD_vkWaitForFences] = vkb_sv_vkWaitForFences,
     [VKB_CMD_vkWaitSemaphores] = vkb_sv_vkWaitSemaphores,
+    [VKB_CMD_vkbAcquireSignal] = vkb_sv_vkbAcquireSignal,
 };

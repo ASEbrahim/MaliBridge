@@ -27,7 +27,12 @@
  *   --bench F R      instead of the plan: F frames of R round trips each (vkGetPipelineCacheData's
  *                    size, which the server answers) and no sleep; prints the frames' wall and CPU
  *                    time ("BENCH ..."), what the default-on statistics cost (host/hitch_test.sh)
+ *   --slow-after MS  MS ms into the steady frames, each frame sleeps 90 ms instead of 16 (the fps collapses from
+ *                    ~60 to ~10, under the 100-ms hitch line: host/perfdiag_test.sh's fps-collapse signal)
+ *   --burn           a thread named "burner" spins on the CPU for the whole run (host/perfdiag_test.sh:
+ *                    a CPU-bound game thread for the per-thread CPU line and the CPU verdict)
  */
+#define _GNU_SOURCE
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -90,6 +95,16 @@ static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
 static VkSemaphore gate;
 static uint64_t gate_value;
 static int hold_ms = 400;
+static volatile int burn_stop;
+
+static void *burner(void *arg)
+{
+    (void)arg;
+    pthread_setname_np(pthread_self(), "burner");
+    volatile unsigned long x = 0;
+    while (!burn_stop) x++;
+    return NULL;
+}
 
 static void *signal_later(void *arg)
 {
@@ -215,14 +230,18 @@ int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *engine = "vkbridge";
-    int first = 1, steady_ms = 0, bench_frames = 0, bench_rt = 0;
+    int first = 1, steady_ms = 0, bench_frames = 0, bench_rt = 0, burn = 0, slow_after_ms = 0;
     while (first < argc && argv[first][0] == '-') {
         if (!strcmp(argv[first], "--engine") && first + 1 < argc) engine = argv[++first];
         else if (!strcmp(argv[first], "--ms") && first + 1 < argc) hold_ms = atoi(argv[++first]);
         else if (!strcmp(argv[first], "--steady") && first + 1 < argc) steady_ms = atoi(argv[++first]);
         else if (!strcmp(argv[first], "--bench") && first + 2 < argc) bench_frames = atoi(argv[++first]), bench_rt = atoi(argv[++first]);
+        else if (!strcmp(argv[first], "--burn")) burn = 1;
+        else if (!strcmp(argv[first], "--slow-after") && first + 1 < argc) slow_after_ms = atoi(argv[++first]);
         first++;
     }
+    pthread_t burn_thread;
+    if (burn && pthread_create(&burn_thread, NULL, burner, NULL) != 0) burn = 0;
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
         printf("FAILED: loader: %s\n", dlerror());
@@ -387,12 +406,18 @@ int main(int argc, char **argv)
             vkQueueSubmit(queue, 1, &wi, work_fence);
             vkWaitForFences(dev, 1, &work_fence, VK_TRUE, 5000000000ull);
             vkResetFences(dev, 1, &work_fence);
-            usleep(16000);
+            /* --slow-after: the fps collapses (about 10 a second) that long into the steady frames */
+            int slow = slow_after_ms && mono_s() >= steady_end - steady_ms / 1000.0 + slow_after_ms / 1000.0;
+            usleep(slow ? 90000 : 16000);
             continue;
         }
         usleep(5000); /* ordinary frames: a few ms */
     }
     vkDeviceWaitIdle(dev);
+    if (burn) {
+        burn_stop = 1;
+        pthread_join(burn_thread, NULL);
+    }
     if (failed) return 1;
     if (bench_frames) {
         double wall = mono_s() - b_wall0, cpu = cpu_s() - b_cpu0;

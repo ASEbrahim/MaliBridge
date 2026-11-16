@@ -1,5 +1,5 @@
 #!/bin/bash
-# Implicit sync for dma-bufs on kernels without dma-buf sync files (client/dmabuf_sync.c): 
+# Implicit sync for dma-bufs on kernels without dma-buf sync files (client/dmabuf_sync.c): a player's
 # Galaxy Tab S9 FE+ (kernel 5.15) and a Kirin 9000 (5.10) showed Steam's GPU-drawn menus with parts
 # of the frame missing at random: Zink's attach of the frame's end to the dma-buf does nothing
 # there, so Xwayland and gamescope took the buffer while the GPU still drew it. The host kernel has

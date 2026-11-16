@@ -17,8 +17,12 @@
 #include "vkb_server.h"
 #include "server_emu.h"
 
+#include <malloc.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #define DL_BUCKETS 1024
 #define DL_BIG 65536   /* bindings smaller than this keep their size; the large ones share the rest */
@@ -60,6 +64,11 @@ typedef struct dl_state {
     dl_pool *pools;             /* pools holding sets of cut layouts */
     uint32_t nlayouts, nsets;   /* read without the lock: 0 = nothing to look up */
     int always_cut;             /* VKBRIDGE_DESC_CUT=1: cut without asking the driver first */
+    int watch;                  /* PowerVR (or VKBRIDGE_DESC_LIMIT): big pools/sets logged with the server heap they cost */
+    uint32_t cap;               /* VKBRIDGE_DESC_LIMIT=<n>: per-type limit; update-after-bind pools are cut to it too */
+    uint32_t reach;             /* highest descriptor element written + 1 (watch only), logged at each power of two from 64k */
+    char reach_file[512];       /* PowerVR + vkd3d: where this program's reach is kept for its next start (cache dir), or "" */
+    uint32_t reach_saved;       /* the reach last written there */
     int told_whole;
     PFN_vkCreateDescriptorSetLayout create_dsl;
     PFN_vkDestroyDescriptorSetLayout destroy_dsl;
@@ -128,6 +137,15 @@ void vkb_emu_desc_limits_get(const vkb_dispatch *d, VkPhysicalDevice pd, uint32_
 #undef MIN
 }
 
+/* With a cut of our own (VKBRIDGE_DESC_LIMIT or the PowerVR probe), uniform buffers count too:
+ * vkd3d's CBV set is one of its six heap-sized sets when the driver allows that many. */
+static unsigned cats_s(const dl_state *s, VkDescriptorType t)
+{
+    unsigned m = cats(t);
+    if (s->cap && (t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)) m |= 1u << CAT_STORAGE_BUFFER;
+    return m;
+}
+
 /* New sizes for ci's bindings in out; 0 when the layout fits as it is (or cannot be made to). */
 static int plan(dl_state *s, const VkDescriptorSetLayoutCreateInfo *ci, uint32_t *out)
 {
@@ -136,7 +154,7 @@ static int plan(dl_state *s, const VkDescriptorSetLayoutCreateInfo *ci, uint32_t
     uint32_t nbig[CAT_N] = {0};
     for (uint32_t i = 0; i < ci->bindingCount; i++) {
         const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i];
-        unsigned m = cats(b->descriptorType);
+        unsigned m = cats_s(s, b->descriptorType);
         for (int c = 0; c < CAT_N; c++) {
             if (!(m & (1u << c))) continue;
             sum[c] += b->descriptorCount;
@@ -157,7 +175,7 @@ static int plan(dl_state *s, const VkDescriptorSetLayoutCreateInfo *ci, uint32_t
     int changed = 0;
     for (uint32_t i = 0; i < ci->bindingCount; i++) {
         const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i];
-        unsigned m = cats(b->descriptorType);
+        unsigned m = cats_s(s, b->descriptorType);
         out[i] = b->descriptorCount;
         if (b->descriptorCount < DL_BIG) continue;
         for (int c = 0; c < CAT_N; c++)
@@ -252,6 +270,80 @@ static void tell_cut(int *told, const char *what, uint32_t binding, uint32_t ele
                  "first 8 logged)", what, binding, elem, elem + count - 1);
 }
 
+
+/* The server's heap in bytes and a monotonic clock, for the big pool and set lines (watch only). */
+static long long heap_bytes(void)
+{
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    struct mallinfo2 mi = mallinfo2();
+#else
+    struct mallinfo mi = mallinfo(); /* bionic: the server's "heap" in its mem lines too */
+#endif
+#if defined(__GLIBC__)
+    /* glibc keeps its mmap'd blocks (over 128 KB) out of uordblks, in hblkhd (radeon host test: the
+     * probe's 1 MB read as 0 bytes without it). Android's scudo counts every block in uordblks; its
+     * hblkhd is all the memory it has mapped, so it is not added there. */
+    return (long long)(size_t)mi.uordblks + (long long)(size_t)mi.hblkhd;
+#else
+    return (long long)(size_t)mi.uordblks;
+#endif
+}
+
+static double now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+#define DL_WATCH 65536 /* pools and sets of this many descriptors and more are logged */
+#define DL_WATCH_LINES 24
+#define DL_POOL_SLACK 256 /* descriptors a cut pool keeps past the cut, per type */
+static int told_watch;
+
+/* The reach a program's descriptor writes had, kept in the cache dir for its next start (desc-reach-<program>.txt: "reach R cap C";
+ * a reach past the cap is writes that were dropped). Written at each power of two from 64k and when the device ends, so a run the
+ * low-memory killer ended still leaves what it reached. */
+static void save_reach(dl_state *s)
+{
+    uint32_t r = __atomic_load_n(&s->reach, __ATOMIC_RELAXED);
+    if (!s->reach_file[0] || r <= __atomic_load_n(&s->reach_saved, __ATOMIC_RELAXED)) return;
+    char tmp[540];
+    snprintf(tmp, sizeof(tmp), "%s.tmp%d", s->reach_file, (int)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "reach %u cap %u\n", r, s->cap);
+    if (fclose(f) == 0 && rename(tmp, s->reach_file) == 0) __atomic_store_n(&s->reach_saved, r, __ATOMIC_RELAXED);
+    else unlink(tmp);
+}
+
+static uint32_t learned_reach(const char *file, uint32_t *cap_then)
+{
+    unsigned r = 0, c = 0;
+    FILE *f = fopen(file, "r");
+    if (!f) return 0;
+    if (fscanf(f, "reach %u cap %u", &r, &c) < 1) r = 0;
+    fclose(f);
+    *cap_then = c;
+    return r;
+}
+
+static void note_reach(dl_state *s, uint32_t end)
+{
+    uint32_t old = __atomic_load_n(&s->reach, __ATOMIC_RELAXED);
+    while (end > old && !__atomic_compare_exchange_n(&s->reach, &old, end, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+    if (end <= old || end < DL_WATCH) return;
+    /* a line each time the reach passes a power of two */
+    if ((32 - __builtin_clz(end - 1)) != (old ? 32 - __builtin_clz(old > 1 ? old - 1 : 1) : 0)) {
+        if (s->cap && end > s->cap)
+            VKB_INFO("descriptor writes reach element %u of a set, past the cut of %u (kept for this program's next start)", end - 1, s->cap);
+        else
+            VKB_INFO("descriptor writes reach element %u of a set (sets made as big as the app asked)", end - 1);
+        save_reach(s);
+    }
+}
+
 /* ------------------------------------------------------------------ wrappers */
 
 static VKAPI_ATTR VkResult VKAPI_CALL d_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *ci,
@@ -262,7 +354,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL d_CreateDescriptorSetLayout(VkDevice devic
     uint32_t cnt_local[DL_LOCAL], *cnt = n <= DL_LOCAL ? cnt_local : malloc(n * sizeof(*cnt));
     if (!cnt || !plan(s, ci, cnt)) {
         if (cnt != cnt_local) free(cnt);
-        return s->create_dsl(device, ci, a, out);
+        uint64_t total = 0;
+        for (uint32_t i = 0; s->watch && i < n; i++) total += ci->pBindings[i].descriptorCount;
+        if (total < DL_WATCH) return s->create_dsl(device, ci, a, out);
+        long long h0 = heap_bytes();
+        double t0 = now_ms();
+        VkResult r = s->create_dsl(device, ci, a, out);
+        if (__atomic_fetch_add(&told_watch, 1, __ATOMIC_RELAXED) < DL_WATCH_LINES)
+            VKB_INFO("descriptor set layout of %llu descriptors in %u binding(s) (flags 0x%x): %d, server heap %+lld MB in %.1f ms",
+                     (unsigned long long)total, n, ci->flags, r, (heap_bytes() - h0) >> 20, now_ms() - t0);
+        return r;
     }
     /* Past the limits the driver advertises, but asked of it as it is first: Mali r44 says
      * 500,000 (and "unsupported" to vkGetDescriptorSetLayoutSupport) yet creates, fills and reads
@@ -384,7 +485,44 @@ static VKAPI_ATTR VkResult VKAPI_CALL d_CreateDescriptorPool(VkDevice device, co
                                                              const VkAllocationCallbacks *a, VkDescriptorPool *out)
 {
     dl_state *s = st();
-    VkResult r = s->create_pool(device, ci, a, out);
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < ci->poolSizeCount; i++) total += ci->pPoolSizes[i].descriptorCount;
+    const VkDescriptorPoolCreateInfo *use = ci;
+    VkDescriptorPoolCreateInfo capped;
+    VkDescriptorPoolSize capped_sizes[16];
+    /* VKBRIDGE_DESC_LIMIT: the sets of an update-after-bind pool hold no more than the cut layouts
+     * allow, so the pool is made that size (on PowerVR a pool costs host memory for every descriptor
+     * it is made for, written or not). */
+    if (s->cap && (ci->flags & VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT) && ci->poolSizeCount <= 16) {
+        int cut = 0;
+        for (uint32_t i = 0; i < ci->poolSizeCount; i++) {
+            capped_sizes[i] = ci->pPoolSizes[i];
+            /* + DL_POOL_SLACK: vkd3d sizes a type's pool as the heap plus its few extra bindings (the
+             * CBV set's SSBOs beside the raw SSBO set), and the cut sets still hold those */
+            if (capped_sizes[i].descriptorCount > s->cap + DL_POOL_SLACK) {
+                capped_sizes[i].descriptorCount = s->cap + DL_POOL_SLACK;
+                cut = 1;
+            }
+        }
+        if (cut) {
+            capped = *ci;
+            capped.pPoolSizes = capped_sizes;
+            use = &capped;
+        }
+    }
+    int watch = s->watch && total >= DL_WATCH;
+    long long h0 = watch ? heap_bytes() : 0;
+    double t0 = watch ? now_ms() : 0;
+    VkResult r = s->create_pool(device, use, a, out);
+    if (watch && __atomic_fetch_add(&told_watch, 1, __ATOMIC_RELAXED) < DL_WATCH_LINES) {
+        char sz[256];
+        int n = 0;
+        for (uint32_t i = 0; i < use->poolSizeCount && n < (int)sizeof(sz) - 24; i++)
+            n += snprintf(sz + n, sizeof(sz) - (size_t)n, "%s%d:%u", i ? " " : "", use->pPoolSizes[i].type, use->pPoolSizes[i].descriptorCount);
+        VKB_INFO("descriptor pool of %llu descriptors%s (type:count %s; maxSets %u, flags 0x%x): %d, server heap %+lld MB in %.1f ms",
+                 (unsigned long long)total, use != ci ? " made smaller (descriptor limits cut)" : "", sz, ci->maxSets, ci->flags, r,
+                 (heap_bytes() - h0) >> 20, now_ms() - t0);
+    }
     if (r == VK_SUCCESS || !ci->poolSizeCount) return r;
     /* Refused: sizes past the per-set limit are cut to it (sets of cut layouts take no more). */
     const uint32_t *lim = s->limit[(ci->flags & VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT) ? 1 : 0];
@@ -439,9 +577,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL d_ResetDescriptorPool(VkDevice device, VkD
     return s->reset_pool(device, pool, flags);
 }
 
+static VkResult d_allocate_sets(dl_state *s, VkDevice device, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out);
+
 static VKAPI_ATTR VkResult VKAPI_CALL d_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out)
 {
     dl_state *s = st();
+    uint32_t n = ai->descriptorSetCount;
+    if (s->watch && n) {
+        uint64_t var_total = 0;
+        for (const VkBaseInStructure *p = ai->pNext; p; p = p->pNext)
+            if (p->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO) {
+                const VkDescriptorSetVariableDescriptorCountAllocateInfo *v = (const void *)p;
+                for (uint32_t i = 0; i < v->descriptorSetCount; i++) var_total += v->pDescriptorCounts[i];
+            }
+        if (var_total >= DL_WATCH) {
+            long long h0 = heap_bytes();
+            double t0 = now_ms();
+            VkResult r = d_allocate_sets(s, device, ai, out);
+            if (__atomic_fetch_add(&told_watch, 1, __ATOMIC_RELAXED) < DL_WATCH_LINES)
+                VKB_INFO("descriptor sets: %u with %llu variable descriptors: %d, server heap %+lld MB in %.1f ms", n,
+                         (unsigned long long)var_total, r, (heap_bytes() - h0) >> 20, now_ms() - t0);
+            return r;
+        }
+    }
+    return d_allocate_sets(s, device, ai, out);
+}
+
+static VkResult d_allocate_sets(dl_state *s, VkDevice device, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out)
+{
     uint32_t n = ai->descriptorSetCount;
     if (!__atomic_load_n(&s->nlayouts, __ATOMIC_RELAXED) || !n) return s->allocate(device, ai, out);
     uint32_t var_local[DL_LOCAL], *var = n <= DL_LOCAL ? var_local : malloc(n * sizeof(*var));
@@ -522,6 +685,17 @@ static VKAPI_ATTR void VKAPI_CALL d_UpdateDescriptorSets(VkDevice device, uint32
                                                          const VkCopyDescriptorSet *cp)
 {
     dl_state *s = st();
+    if (s->watch) {
+        uint32_t end = 0;
+        /* vkd3d's heap zero-fill at creation (one write from element 0 over the whole binding,
+         * d3d12_descriptor_heap_zero_initialize) is no reach of the game's: left out */
+        for (uint32_t i = 0; i < nw; i++)
+            if (!(w[i].dstArrayElement == 0 && w[i].descriptorCount >= DL_BIG) && w[i].dstArrayElement + w[i].descriptorCount > end)
+                end = w[i].dstArrayElement + w[i].descriptorCount;
+        for (uint32_t i = 0; i < nc; i++) /* vkd3d moves descriptors from its CPU heaps by copies */
+            if (cp[i].dstArrayElement + cp[i].descriptorCount > end) end = cp[i].dstArrayElement + cp[i].descriptorCount;
+        if (end > __atomic_load_n(&s->reach, __ATOMIC_RELAXED)) note_reach(s, end);
+    }
     if (!__atomic_load_n(&s->nsets, __ATOMIC_RELAXED)) {
         s->update(device, nw, w, nc, cp);
         return;
@@ -617,11 +791,94 @@ static VKAPI_ATTR VkResult VKAPI_CALL d_CreateDescriptorUpdateTemplate(VkDevice 
     return res;
 }
 
+
+/* ------------------------------------------------------------------ PowerVR: what a descriptor costs */
+
+/* vkd3d-proton's legacy bindless heap (no VK_EXT_mutable_descriptor_type) is six update-after-bind
+ * sets as big as the D3D12 heap: CBV, SRV buffer, SRV image, UAV buffer, UAV image, raw SSBO
+ * (vkd3d_bindless_state_init). Mali makes RE3's 1,000,000-descriptor heap for ~300 MB of server
+ * heap; PowerVR's DXT 25.1 took 313 MB -> 6,472 MB in 10 s and the phone's low-memory killer ended
+ * the app (Pixel 10 Pro XL, 2026-11-10). So on PowerVR each vkd3d device makes a small set as
+ * vkd3d does, measures the server heap it took per descriptor, and cuts vkd3d's layouts and
+ * update-after-bind pools to what DESC_BUDGET of host memory holds for six sets. */
+#define PROBE_N 16384u
+#define VKD3D_SETS 6u
+
+static uint32_t probe_cap(vkb_srv_table *dev, const vkb_dispatch *dt, double *per_desc, const char *reach_file, char *why, size_t why_cap)
+{
+    why[0] = 0;
+    VkDevice d = dev->device;
+    *per_desc = -1;
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, PROBE_N, VK_SHADER_STAGE_ALL, NULL};
+    VkDescriptorBindingFlags bf = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                                  VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bfi = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, NULL, 1, &bf};
+    VkDescriptorSetLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &bfi,
+                                           VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT, 1, &b};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, PROBE_N};
+    VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, 1, 1, &ps};
+    VkDescriptorSetLayout l = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    long long h0 = heap_bytes();
+    if (dt->vkCreateDescriptorSetLayout(d, &lci, NULL, &l) != VK_SUCCESS) return 0;
+    uint32_t want = PROBE_N;
+    VkDescriptorSetVariableDescriptorCountAllocateInfo vci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO, NULL, 1, &want};
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    long long used = -1;
+    if (dt->vkCreateDescriptorPool(d, &pci, NULL, &pool) == VK_SUCCESS) {
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, &vci, pool, 1, &l};
+        if (dt->vkAllocateDescriptorSets(d, &ai, &set) == VK_SUCCESS) used = heap_bytes() - h0;
+        dt->vkDestroyDescriptorPool(d, pool, NULL);
+    }
+    dt->vkDestroyDescriptorSetLayout(d, l, NULL);
+    if (used < 0) return 0;
+    *per_desc = (double)used / PROBE_N;
+    long long ram = (long long)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE);
+    long long budget = ram > 0 ? ram / 16 : (512ll << 20); /* 1 GB on a 16 GB phone, 512 MB on an 8 GB one */
+    if (budget > (1ll << 30)) budget = 1ll << 30;
+    const char *bv = vkb_srv_env("VKBRIDGE_DESC_BUDGET_MB");
+    if (bv && *bv) budget = (long long)strtoull(bv, NULL, 0) << 20;
+    /* vkd3d's 1,000,000 fit (or a driver that keeps nothing per descriptor): no cut */
+    if (*per_desc * VKD3D_SETS * 1000000.0 <= (double)budget) return 0;
+    double n = (double)budget / (*per_desc * VKD3D_SETS);
+    uint32_t cap = n < DL_BIG ? DL_BIG : (uint32_t)n;
+    cap &= ~4095u;
+    /* What this program wrote the last time decides too (writes past that run's cut were dropped and their reach kept): the cut is
+     * raised to cover that reach and a quarter more, up to twice the budget (RAM/8, max 2 GB). Never lowered below the budget's cut:
+     * a later level may reach further than the last run did. */
+    uint32_t cap_then = 0, learned = reach_file && *reach_file ? learned_reach(reach_file, &cap_then) : 0;
+    if (learned > cap) {
+        long long hi = budget * 2;
+        if (hi > (2ll << 30)) hi = 2ll << 30;
+        double want = (double)learned + learned / 4.0 + 4096;
+        if (*per_desc * VKD3D_SETS * (want < 1000000.0 ? want : 1000000.0) <= (double)hi && want >= 1000000.0) {
+            snprintf(why, why_cap, "; the last run reached element %u (cut %u then): sets made as asked", learned - 1, cap_then);
+            return 0;
+        }
+        double hn = (double)hi / (*per_desc * VKD3D_SETS);
+        uint32_t raised = (uint32_t)(want < hn ? want : hn);
+        raised = (raised + 4095u) & ~4095u;
+        if (raised > cap) {
+            snprintf(why, why_cap, "; raised from %u: the last run reached element %u (cut %u then)%s", cap, learned - 1, cap_then,
+                     raised < learned ? ", more than twice the budget holds" : "");
+            cap = raised;
+        }
+    }
+    return cap;
+}
+
 /* ------------------------------------------------------------------ install */
 
 void vkb_emu_desc_install(vkb_srv_table *dev)
 {
-    if (!(dev->emu->flags & VKB_EMU_DESC_LIMITS) || dev->id >= 4096) return;
+    if (dev->id >= 4096) return;
+    /* PowerVR: watched (its descriptor pools cost host memory per descriptor: RE3's vkd3d heap took the
+     * server's heap from 313 MB to 6.4 GB on the Pixel 10 Pro XL, 2026-11-10); VKBRIDGE_DESC_LIMIT=<n>
+     * cuts layouts and update-after-bind pools to n on any GPU. */
+    int img = vkb_driver_id(&dev->real, dev->physical, dev->api_version) == VK_DRIVER_ID_IMAGINATION_PROPRIETARY;
+    const char *lv = vkb_srv_env("VKBRIDGE_DESC_LIMIT");
+    uint32_t cap = lv && *lv ? (uint32_t)strtoul(lv, NULL, 0) : 0;
+    if (!(dev->emu->flags & VKB_EMU_DESC_LIMITS) && !img && !cap) return;
     vkb_dispatch *dt = &dev->dt;
     if (!dt->vkCreateDescriptorSetLayout || !dt->vkDestroyDescriptorSetLayout || !dt->vkCreateDescriptorPool ||
         !dt->vkDestroyDescriptorPool || !dt->vkResetDescriptorPool || !dt->vkAllocateDescriptorSets || !dt->vkFreeDescriptorSets ||
@@ -633,6 +890,34 @@ void vkb_emu_desc_install(vkb_srv_table *dev)
     vkb_emu_desc_limits_get(&dev->real, dev->physical, s->limit);
     const char *cut = vkb_srv_env("VKBRIDGE_DESC_CUT"); /* <cache dir>/env, or the app's environment */
     s->always_cut = cut && *cut && strcmp(cut, "0");
+    s->watch = img || cap;
+    /* PowerVR with vkd3d-proton: the cut from what a descriptor costs here (VKBRIDGE_DESC_LIMIT wins; =0: none) */
+    if (img && !(lv && *lv) && dev->parent && dev->parent->vkd3d) {
+        double per = -1;
+        const char *dir = vkb_pcache_dir();
+        if (dir && *dir && dev->proc && dev->proc->comm[0]) {
+            char prog[40];
+            snprintf(prog, sizeof(prog), "%s", dev->proc->comm);
+            for (char *c = prog; *c; c++)
+                if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '-' || *c == '.')) *c = '_';
+            snprintf(s->reach_file, sizeof(s->reach_file), "%s/desc-reach-%s.txt", dir, prog);
+        }
+        char why[160];
+        cap = probe_cap(dev, dt, &per, s->reach_file, why, sizeof(why));
+        if (cap)
+            VKB_INFO("device %u: a descriptor costs the server %.0f bytes of heap here (update-after-bind set of %u); vkd3d's sets and pools "
+                     "cut to %u (six of them fit the budget%s)", dev->id, per, PROBE_N, cap, why);
+        else
+            VKB_INFO("device %u: a descriptor costs the server %.0f bytes of heap here (update-after-bind set of %u); vkd3d's sets made as asked%s",
+                     dev->id, per, PROBE_N, why);
+    }
+    if (cap) {
+        s->cap = cap;
+        s->always_cut = 1;
+        for (int u = 0; u < 2; u++)
+            for (int c = 0; c < CAT_N; c++)
+                if (!s->limit[u][c] || s->limit[u][c] > cap) s->limit[u][c] = cap;
+    }
     s->create_dsl = dt->vkCreateDescriptorSetLayout;
     s->destroy_dsl = dt->vkDestroyDescriptorSetLayout;
     s->dsl_support = dt->vkGetDescriptorSetLayoutSupport;
@@ -654,14 +939,16 @@ void vkb_emu_desc_install(vkb_srv_table *dev)
     dt->vkUpdateDescriptorSets = d_UpdateDescriptorSets;
     if (s->create_tmpl) dt->vkCreateDescriptorUpdateTemplate = d_CreateDescriptorUpdateTemplate;
     states[dev->id] = s;
-    VKB_INFO("device %u: descriptor limits emulated (sampled/storage image/storage buffer: %u/%u/%u, after bind %u/%u/%u)", dev->id,
-             s->limit[0][0], s->limit[0][1], s->limit[0][2], s->limit[1][0], s->limit[1][1], s->limit[1][2]);
+    VKB_INFO("device %u: descriptor limits emulated (sampled/storage image/storage buffer: %u/%u/%u, after bind %u/%u/%u)%s%s", dev->id,
+             s->limit[0][0], s->limit[0][1], s->limit[0][2], s->limit[1][0], s->limit[1][1], s->limit[1][2],
+             cap ? ", pools cut to VKBRIDGE_DESC_LIMIT" : "", s->watch ? ", big pools and sets logged with their heap cost" : "");
 }
 
 void vkb_emu_desc_uninstall(vkb_srv_table *dev)
 {
     if (dev->id >= 4096 || !states[dev->id]) return;
     dl_state *s = states[dev->id];
+    save_reach(s);
     vkb_dispatch *dt = &dev->dt;
     dt->vkCreateDescriptorSetLayout = s->create_dsl;
     dt->vkDestroyDescriptorSetLayout = s->destroy_dsl;

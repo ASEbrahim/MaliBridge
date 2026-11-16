@@ -179,9 +179,12 @@ set(CHECK_TESTS
     vbstride_check
     viewport_check
     clampzero_check
+    splitvary_check
     begin_check
     cullmode_check
     dedimport_check
+    importrace_check
+    faultsnap_check
     cached_check
     polygon_check
     gpuview_check
@@ -193,6 +196,14 @@ set(CHECK_TESTS
     procaddr_check
     exitclean_check
     exitheap_check
+    pvrdestroy_check
+    pldedup_check
+    pvsusp_check
+    pvmutable_check
+    imgstat_check
+    pvbgra_check
+    ycbcr_compute_check
+    gpuprof_check
     texcap_check
     asyncpipe_check
     robust2_check
@@ -202,6 +213,7 @@ set(CHECK_TESTS
     shmbarrier_check
     stencillayout_check
     dynrend_check
+    gpuprof_report_check
     imageless_check
     wave32_check
     xfb_check
@@ -210,10 +222,27 @@ set(CHECK_TESTS
     gsexport_check
     dmabufsize_check
     present_late_check
+    present_path_check
+    pacer_check
+    fmtcache_check
+    fastcreate_check
+    asynctimer_check
+    querypoll_check
+    asynclock_check
     eventstatus_check
     querystuck_check
     lost_check
     endcb_check
+    hitch_check
+    # in host/Makefile's TESTS since 855d821 but missing here, so run_tests.sh under cmake failed report_stuck_test (it runs
+    # syncfd_check) and wginit_check (PERF bisect 11-08)
+    syncfd_check
+    wginit_check
+    # PVR-ALL (PowerVR line): PV-01 names, PV-04/06 3D views and feedback loops, PV-08 Zink engine name
+    pvnames_check
+    pv3d_check
+    zinkname_check
+    bcupload_check
 )
 foreach(t IN LISTS CHECK_TESTS)
     add_executable(${t}
@@ -225,6 +254,9 @@ foreach(t IN LISTS CHECK_TESTS)
     target_compile_options(${t} PRIVATE -funsigned-char)
     vkb_host_output(${t})
 endforeach()
+
+# fastcreate_check creates on one thread while another ends held work (host/Makefile links it with -lpthread)
+target_link_libraries(fastcreate_check PRIVATE Threads::Threads)
 
 target_sources(bcn_check PRIVATE "${SRV}/bc_spv.h" "${VKB}/tests/bcsink_vert.inc" "${VKB}/tests/bcsink_frag.inc")
 target_sources(divisor_check PRIVATE
@@ -255,12 +287,20 @@ target_sources(polygon_check PRIVATE
     "${VKB}/tests/polygon_frag.inc"
 )
 target_sources(clampzero_check PRIVATE "${VKB}/tests/clampzero_comp.inc")
+target_sources(pvbgra_check PRIVATE "${VKB}/tests/pvbgra_write_comp.inc" "${VKB}/tests/pvbgra_sample_comp.inc")
+target_sources(ycbcr_compute_check PRIVATE "${VKB}/tests/ycbcr_comp.inc")
+file(GLOB SPLITVARY_INC CONFIGURE_DEPENDS "${VKB}/tests/splitvary_*.inc")
+target_sources(splitvary_check PRIVATE ${SPLITVARY_INC})
 target_sources(texcap_check PRIVATE "${VKB}/tests/texcap_comp.inc")
 target_sources(asyncpipe_check PRIVATE
     "${VKB}/tests/cullmode_vert.inc"
     "${VKB}/tests/dynstate_frag.inc"
 )
 target_sources(dynrend_check PRIVATE
+    "${VKB}/tests/polygon_vert.inc"
+    "${VKB}/tests/polygon_frag.inc"
+)
+target_sources(gpuprof_report_check PRIVATE
     "${VKB}/tests/polygon_vert.inc"
     "${VKB}/tests/polygon_frag.inc"
 )
@@ -333,6 +373,40 @@ target_link_libraries(capgate_unit PRIVATE vkb_host_flags)
 target_include_directories(capgate_unit PRIVATE "${SRV}")
 vkb_host_output(capgate_unit)
 
+# The fast cores for the threads a game waits on (server/server_cores.c) on its own, the server stubbed
+# (run_ci_tests.sh, run_tests.sh 'cores'): VKBRIDGE_HOT_CORES off by default
+add_executable(cpuprof_unit "${VKB}/tests/cpuprof_unit.c")
+target_link_libraries(cpuprof_unit PRIVATE vkb_host_flags)
+target_include_directories(cpuprof_unit PRIVATE "${SRV}")
+vkb_host_output(cpuprof_unit)
+
+# PVR-ALL units: the PV-01 SPIR-V pass over its corpus, the dma-buf import's memory-type fallback (server_import_type.c, included by
+# the test), the page size both halves use (common/vkb_page.h)
+add_executable(pvnames_corpus "${VKB}/tests/pvnames_corpus.c" "${SRV}/spirv_names.c" "${SRV}/spirv_edit.c")
+target_link_libraries(pvnames_corpus PRIVATE vkb_host_flags)
+target_include_directories(pvnames_corpus PRIVATE "${SRV}")
+vkb_host_output(pvnames_corpus)
+add_executable(importtype_unit "${VKB}/tests/importtype_unit.c")
+target_link_libraries(importtype_unit PRIVATE vkb_host_flags)
+target_include_directories(importtype_unit PRIVATE "${SRV}")
+vkb_host_output(importtype_unit)
+add_executable(pagesize_unit "${VKB}/tests/pagesize_unit.c")
+target_link_libraries(pagesize_unit PRIVATE vkb_host_flags)
+target_include_directories(pagesize_unit PRIVATE "${VKB}/common")
+vkb_host_output(pagesize_unit)
+
+# The register of dma-bufs holding R8G8B8A8 for a B8G8R8A8 client image (server/server_pvbgra_reg.c, PV-07) on its own
+# (host/pvbgra_test.sh)
+add_executable(pvbgrareg_unit "${VKB}/tests/pvbgrareg_unit.c" "${SRV}/server_pvbgra_reg.c")
+target_link_libraries(pvbgrareg_unit PRIVATE vkb_host_flags Threads::Threads)
+target_include_directories(pvbgrareg_unit PRIVATE "${SRV}")
+vkb_host_output(pvbgrareg_unit)
+
+add_executable(cores_unit "${VKB}/tests/cores_unit.c")
+target_link_libraries(cores_unit PRIVATE vkb_host_flags Threads::Threads)
+target_include_directories(cores_unit PRIVATE "${SRV}")
+vkb_host_output(cores_unit)
+
 # A vertex shader's clip distance drawn (clip_check.sh, capgate_test.sh)
 add_executable(clip_pipeline "${VKB}/tests/clip_pipeline.c")
 target_link_libraries(clip_pipeline PRIVATE vkb_host_flags ${CMAKE_DL_LIBS})
@@ -346,6 +420,16 @@ add_executable(bitwise_corpus
 )
 target_link_libraries(bitwise_corpus PRIVATE vkb_host_warn)
 vkb_host_output(bitwise_corpus)
+
+# The MK-47 SPIR-V pass alone, on splitvary_check's shaders (host/splitvary_test.sh)
+add_executable(splitvary_unit
+    "${VKB}/tests/splitvary_unit.c"
+    "${SRV}/spirv_splitvary.c"
+    "${SRV}/spirv_edit.c"
+)
+target_include_directories(splitvary_unit PRIVATE "${SRV}" "${VKB}/tests")
+target_link_libraries(splitvary_unit PRIVATE vkb_host_warn)
+vkb_host_output(splitvary_unit)
 
 # The MK-32 SPIR-V pass alone, over a corpus (host/clampzero_test.sh)
 add_executable(clampzero_corpus
@@ -429,6 +513,7 @@ add_custom_target(test
         wire_check
         bitwise_corpus
         clampzero_corpus
+        splitvary_unit
         shlbarrier_corpus
         downgrade_corpus
         shmbarrier_corpus
@@ -496,9 +581,11 @@ add_custom_target(ci-test
     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/run_ci_tests.sh"
     DEPENDS
         vkb_mali_profile
+        crash_contain_check
         vkbridge-server
         vulkan_droidbridge
         vkbridge-smoke
+        hitch_check
         timeline_check
         bcn_check
         nulldesc_check
@@ -523,11 +610,21 @@ add_custom_target(ci-test
         wave32_check
         stencillayout_check
         dynrend_check
+        gpuprof_report_check
         robust2_check
         fp16_check
         asyncpipe_check
         xfb_check
+        gsexport_check
+        pcache_check
         capgate_unit
+        pvbgrareg_unit
+        cores_unit
+        cpuprof_unit
+        fmtcache_check
+        asynctimer_check
+        querypoll_check
+        asynclock_check
         clip_pipeline
         downgrade_corpus
         shmbarrier_corpus

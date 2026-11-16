@@ -10,6 +10,7 @@ It runs on the device's own driver, with no custom GPU driver to install.</p>
   <a href="https://github.com/ASEbrahim/MaliBridge/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/ASEbrahim/MaliBridge/total?style=for-the-badge&label=downloads&color=blue"></a>
   <a href="https://discord.gg/9xC67qTjDq"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
   <a href="https://ko-fi.com/asebrahim"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white"></a>
+  <a href="https://www.patreon.com/c/ASEbrahim"><img alt="Patreon" src="https://img.shields.io/badge/Patreon-support-F96854?style=for-the-badge&logo=patreon&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -26,46 +27,62 @@ It runs on the device's own driver, with no custom GPU driver to install.</p>
 
 <table align="center">
 <tr>
-<td align="center" valign="top" width="25%"><a href="https://www.youtube.com/watch?v=xTerCRrXkIU"><img src="docs/img/tekken7-video.jpg" alt="Video: TEKKEN 7 on a Galaxy Tab S11 Ultra" width="400"></a><br>
-<i>TEKKEN 7, Galaxy Tab S11 Ultra, v0.5.5.</i><br>
-<a href="https://www.youtube.com/watch?v=xTerCRrXkIU">YouTube</a> · <a href="https://www.youtube.com/shorts/iEbOgO-w8XU">Short</a></td>
-<td align="center" valign="top" width="25%"><a href="https://youtu.be/nikeajHpf5s"><img src="docs/img/ds3-video.jpg" alt="Video: Dark Souls III on a Galaxy Tab S11 Ultra, the Iudex Gundyr fight" width="400"></a><br>
-<i>Dark Souls III. Recorded with v0.5.1 and played at 2x speed.</i><br>
-<a href="https://youtu.be/nikeajHpf5s">YouTube</a> · <a href="https://www.bilibili.com/video/BV124HN61EPM">Bilibili</a> · <a href="https://www.reddit.com/r/GalaxyTab/comments/1xea3as/">Reddit post</a></td>
-<td align="center" valign="top" width="25%"><a href="https://youtube.com/shorts/jAMXM8XYq8Y"><img src="docs/img/ultrakill-video.jpg" alt="Video: ULTRAKILL on a Galaxy Tab S11 Ultra, the Gabriel fight" width="400"></a><br>
-<i>ULTRAKILL, the Gabriel fight. Played at 1.5x speed.</i><br>
-<a href="https://youtube.com/shorts/jAMXM8XYq8Y">YouTube</a> · <a href="https://www.reddit.com/r/SBCGaming/comments/1xjkz64/">Reddit post</a></td>
-<td align="center" valign="top" width="25%"><a href="https://youtu.be/rdEQbt02dK4"><img src="docs/img/sekiro-video.jpg" alt="Video: Sekiro on a Galaxy Tab S11 Ultra, the Genichiro Ashina fight" width="400"></a><br>
-<i>Sekiro, the Genichiro Ashina fight. Recorded with v0.5.4 at real speed.</i><br>
-<a href="https://youtu.be/rdEQbt02dK4">YouTube</a> · <a href="https://www.bilibili.com/video/BV1YQn96fECh">Bilibili</a> · <a href="https://www.reddit.com/r/GalaxyTab/comments/1xfn2v6/">Reddit post</a></td>
+<td align="center" valign="top" colspan="4"><a href="https://youtu.be/j32-ADueh7g"><img src="docs/img/whatis-video.jpg" alt="Video: What is MaliBridge?" width="800"></a><br>
+<i>What is MaliBridge? v0.5.6.</i><br>
+<a href="https://youtu.be/j32-ADueh7g">YouTube</a></td>
+</tr>
+<tr>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/5uNwzfRtVfM"><img src="docs/img/re2-video.jpg" alt="Video: Resident Evil 2 on a Galaxy Tab S11 Ultra" width="400"></a><br>
+<i>Resident Evil 2, Galaxy Tab S11 Ultra, v0.5.6.</i><br>
+<a href="https://youtu.be/5uNwzfRtVfM">YouTube</a></td>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/RAQajpT91L8"><img src="docs/img/re3-video.jpg" alt="Video: Resident Evil 3 on a Galaxy Tab S11 Ultra" width="400"></a><br>
+<i>Resident Evil 3, Galaxy Tab S11 Ultra, v0.5.6.</i><br>
+<a href="https://youtu.be/RAQajpT91L8">YouTube</a></td>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/G6H-xtBnkLE"><img src="docs/img/dmc5-video.jpg" alt="Video: Devil May Cry 5 on a Galaxy Tab S11 Ultra" width="400"></a><br>
+<i>Devil May Cry 5, Galaxy Tab S11 Ultra, v0.5.6.</i><br>
+<a href="https://youtu.be/G6H-xtBnkLE">YouTube</a></td>
+<td align="center" valign="top" width="25%"><a href="https://youtu.be/ByL7c7jNg3M"><img src="docs/img/stray-video.jpg" alt="Video: Stray on a Galaxy Tab S11 Ultra" width="400"></a><br>
+<i>Stray, Galaxy Tab S11 Ultra, v0.5.6.</i><br>
+<a href="https://youtu.be/ByL7c7jNg3M">YouTube</a></td>
 </tr>
 </table>
 
-<p align="center"><a href="https://www.youtube.com/@malibridge">More videos</a> · <a href="https://space.bilibili.com/3747573858831484">Bilibili</a></p>
+<p align="center">Older videos: <a href="https://www.youtube.com/watch?v=xTerCRrXkIU">TEKKEN 7</a> · <a href="https://youtu.be/nikeajHpf5s">Dark Souls III</a> · <a href="https://youtube.com/shorts/jAMXM8XYq8Y">ULTRAKILL</a> · <a href="https://youtu.be/rdEQbt02dK4">Sekiro</a><br>
+<a href="https://www.youtube.com/@malibridge">More videos</a> · <a href="https://space.bilibili.com/3747573858831484">Bilibili</a></p>
 
-<p align="center"><img src="docs/img/ingame-v055.jpg" alt="Resident Evil 2, Risk of Rain Returns and Celeste running with MaliBridge" width="900"><br>
-<i>In game on a Galaxy Tab S11 Ultra with v0.5.4.</i></p>
+<p align="center"><img src="docs/img/ingame-v056.jpg" alt="Resident Evil 5, Devil May Cry 5 and Stray running with MaliBridge" width="900"><br>
+<i>In game on a Galaxy Tab S11 Ultra (the fps is top left).</i></p>
+
+<p align="center"><img src="docs/img/app-v056.jpg" alt="The MaliBridge tab and best settings in one tap in the app" width="900"><br>
+<i>The MaliBridge tab and best settings in one tap, on a Galaxy Tab S10+.</i></p>
 
 > [!IMPORTANT]
 > Get DroidDeck Mali from this page's [Releases](https://github.com/ASEbrahim/MaliBridge/releases). Copies on other sites
-> can be old or changed. Official [DroidDeck](https://github.com/Droid-Deck/DroidDeck) doesn't include MaliBridge yet;
-> once it does, its releases are fine too.
+> can be old or changed. Official [DroidDeck](https://github.com/Droid-Deck/DroidDeck) doesn't include MaliBridge.
 
-**[Join the Discord](https://discord.gg/9xC67qTjDq)**: test builds, help and extras.
+**[Join the Discord](https://discord.gg/9xC67qTjDq)**: help, news and extras.
 
-**Current version: v0.5.5.3**, built on DroidDeck 0.6.9. Older versions are on the
+**Current version: v0.5.6**, built on DroidDeck 0.7.1. Older versions are on the
 [Releases page](https://github.com/ASEbrahim/MaliBridge/releases).
 
 MaliBridge runs inside **DroidDeck Mali**, a build that works with DroidDeck (the app that runs the
-Steam client and PC games on Android). On a Samsung Galaxy Tab S10+ (Mali-G720) and Galaxy Tab S11
-Ultra (Mali-G925), 36 games I've tested are playable or better, for example Half-Life 2 at about
-94 fps, Hollow Knight: Silksong, Stardew Valley, Risk of Rain Returns, Dark Souls Remastered and
-Garry's Mod. Players have sent reports from 38 other Mali phones, tablets and handhelds. The tables
-below cover 98 different games. It is free.
+Steam client and PC games on Android). On my Galaxy Tab S10+ (Mali-G720), Resident Evil 5 runs close
+to 60 fps. On my Galaxy Tab S11 Ultra (Mali-G925), Resident Evil 2 runs at about 49 fps, Devil May
+Cry 5 at 45-52, Resident Evil 3 at 30-60 and Stray at 25 to 55 depending on the area, and lighter
+games like Half-Life 2 and Balatro run at 90 fps or more. Players have run it on about 70 phones,
+tablets and handhelds, and Resident Evil 3 works on the Pixel 10 Pro XL too. It is free.
+
+Check how your phone does and which settings ran best on phones like yours on
+[MaliBridge.com](https://malibridge.com/), or in the app's **MaliBridge** tab.
+
+**New in v0.5.6:** the flickering in Resident Evil 3 and Devil May Cry 5 on the Galaxy Tab S11 Ultra is
+fixed, games you added yourself start without the Steam client, and the app has the **MaliBridge** tab,
+**best settings in one tap** and **Performance switches** (see [Best settings](#best-settings-and-performance-tips)).
+The full list is in the [release notes](https://github.com/ASEbrahim/MaliBridge/releases/tag/v0.5.6).
 
 ## Does my device work?
 
-You need an Arm Mali GPU (Immortalis is Mali too); Steam also starts on some Samsung Xclipse GPUs, see the table. Find your device below. Not sure which chip you
+You need an Arm Mali GPU (Immortalis is Mali too); Steam also starts on some Samsung Xclipse GPUs and on the Pixel 10 Pro XL, see the table. Find your device below. Not sure which chip you
 have? It's under Settings → About phone (or About tablet), or in an app like CPU-Z, which shows the
 GPU too.
 
@@ -74,7 +91,7 @@ What the labels mean:
 - **Works**: Steam starts and games run. A player reported it, or I tested it.
 - **Works, with notes**: it runs, with a limit named in the notes.
 
-Everything except the two tablets comes from player reports; I haven't tested those devices myself.
+Everything except the two tablets and the rows marked "my test" comes from player reports; I haven't tested those devices myself.
 If your device has the same GPU as one below, it will probably behave the same, but phone makers
 ship different driver versions, so a report is still useful.
 
@@ -85,8 +102,11 @@ ship different driver versions, so a report is still useful.
 | Mali-G57 | Samsung Galaxy F15 | r38p1 | **Works** | Steam opens, player confirmed |
 | Mali-G68 | Samsung Galaxy A16 5G | r38p1 | **Works** | Steam opens, player confirmed |
 | Mali-G57 | Samsung Galaxy A07 (Helio G99) |  | **Works** | Tap Ninja about 59 fps |
+| Mali-G57 | Samsung Galaxy A17 | r54p1 | **Works** | My test: Steam's menus about 20 fps; desktop mode runs |
+| Mali-G57 | Lenovo Idea Tab |  | **Works** | Brotato 50-60 fps |
 | Mali-G68 | Samsung Galaxy A54 | r38p1 | **Works, with notes** | Steam opens; menus are slow |
 | Mali-G68 | Samsung Galaxy A34 5G (Dimensity 1080) |  | **Works** | Star Wars Republic Commando playable, about 30 fps |
+| Mali-G68 | Samsung Galaxy A35 | r38p1 | **Works** | My test: Steam reaches its sign-in screen; desktop mode runs |
 | Mali-G76 | Samsung Galaxy S10+ phone (Exynos 9820) | r38p1 beta | **Works, with notes** | Steam opens and a game ran, slowly |
 | Mali-G77 | Retroid Pocket 4 Pro (Dimensity 1100) | r32p1 | **Works, with notes** | Steam and Big Picture run; some screens flicker |
 | Mali-G77 | Huawei Nova 7 (Kirin 985) |  | **Works, with notes** | Slay the Spire 1 and 2 run; one game says "Direct3D isn't supported" |
@@ -105,7 +125,7 @@ ship different driver versions, so a report is still useful.
 | Immortalis-G720 | vivo X100 Pro (Dimensity 9300) |  | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19193192): Cuphead about 100 fps; Steam's menus about 15 fps with a white flash; Forza Horizon 4 closes when going into the game |
 | Immortalis-G720 | realme Neo7 (Dimensity 9300+) | r44p1 | **Works** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/5): Stardew Valley about 59 fps, Balatro 55-72 fps |
 | Immortalis-G720 | Xiaomi 14T Pro (Dimensity 9300+) | r44p1 | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19146763): Steam, controller and downloads work; Alan Wake 20-50 fps on Low; some graphics glitches that need a game restart |
-| Mali-G720 | POCO X8 Pro (Dimensity 8500) | r49p1 | **Works, with notes** | [Player reports](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497): Indiana Jones and the Emperor's Tomb about 30 fps; Hob has freezes |
+| Mali-G720 | POCO X8 Pro (Dimensity 8500) | r49p1 | **Works, with notes** | [Player reports](https://github.com/ASEbrahim/MaliBridge/issues/9#issuecomment-6328655497): Indiana Jones and the Emperor's Tomb about 30 fps; Hob has freezes; Star Wars: KOTOR text and characters right since v0.5.6 |
 | Mali-G720 | POCO X7 Pro (Dimensity 8400-Ultra) |  | **Works** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/23): Lighter games run (Stardew Valley, Rain World, Tukoni: Forest Keepers and more); [Darksiders Genesis 23-27 fps on Low](https://github.com/ASEbrahim/MaliBridge/issues/62) |
 | Immortalis-G925 | Samsung Galaxy Tab S11 Ultra (Dimensity 9400) | r49p1 | **Works** | Tested in depth |
 | Immortalis-G925 | vivo X200 (Dimensity 9400) |  | **Works** | [Player report](https://github.com/Droid-Deck/DroidDeck/issues/218#issuecomment-6314012693): Euro Truck Simulator 2 about 20 fps, Goat Simulator about 35 fps |
@@ -119,26 +139,17 @@ ship different driver versions, so a report is still useful.
 | Mali-G2-Ultra-NX | Xiaomi 18 Fold (XRing O3) | r56p0 | **Works** | [Player reports](https://github.com/ASEbrahim/MaliBridge/issues/7): Self-test 13/13, Steam, Brotato about 77 fps |
 | Mali-G2-Ultra-NX | Xiaomi Pad 9 Pro Max (XRing O3) |  | **Works** | [Player report](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19136786): Human Fall Flat works, Portal 2 40-50 fps at 1080p; Titanfall 2 does not start yet |
 | Xclipse 530 | Samsung Galaxy A55 |  | **Works, with notes** | [Player report](https://github.com/ASEbrahim/MaliBridge/issues/27): Steam starts; games not confirmed yet |
+| PowerVR DXT-48-1536 | Google Pixel 10 Pro XL (Tensor G5) |  | **Works, with notes** | My test: Steam runs; Resident Evil 3 shows the right picture since v0.5.6 but still stutters a bit |
 
 Device not listed, or something doesn't work? Tap **Send logs to MaliBridge** in the app and post the code in the [Discord](https://discord.gg/9xC67qTjDq).
 
-More device reports and tests from players are in the Discord, along with test builds, help and extras.
-
-**Help wanted: not tested yet.** Reports from these would help the most:
-
-| Chip | GPU | Example devices |
-|---|---|---|
-| Dimensity 9300 / 9300+ (other devices) | Immortalis-G720 MC12 | OPPO Find X7 |
-| Dimensity 9400 / 9400+ (other devices) | Immortalis-G925 MC12 | OPPO Find X8 |
-| Dimensity 7300 and similar | Mali-G615 / G610 | many mid-range phones (smaller GPUs: expect light games only) |
-| Exynos 1280 | Mali-G68 | Galaxy A53 |
+The full list, about 70 devices with players' results, is on [MaliBridge.com](https://malibridge.com/).
+Reports from devices that aren't there yet help the most.
 
 **Not Mali:** Snapdragon chips have Adreno GPUs (use the official DroidDeck). Samsung's newer Exynos
 chips have Xclipse GPUs, and some of those phones work (the Galaxy A55 is in the table). On Samsung
-phones updated to Android 17 (One UI 9), Steam stayed on its loading screen; v0.5.5.3 should fix that.
-In my own tests with v0.5.5.3, Steam reached its sign-in screen on a Galaxy S26 FE (Android 17) and a
-Galaxy A56. Players with the Galaxy S24+ (Xclipse 940, [#43](https://github.com/ASEbrahim/MaliBridge/issues/43))
-and A56 (Xclipse 540, [#29](https://github.com/ASEbrahim/MaliBridge/issues/29)) haven't confirmed it yet.
+phones updated to Android 17 (One UI 9), Steam used to stay on its loading screen; since v0.5.5.3 it
+reaches its sign-in screen in my tests on a Galaxy S26 FE (Android 17) and a Galaxy A56.
 
 On a device that isn't in the table, it's still a test: it depends on the GPU and its driver.
 Logs from your device help a lot (see [Getting help](#getting-help)).
@@ -149,11 +160,12 @@ Logs from your device help a lot (see [Getting help](#getting-help)).
 2. Download `DroidDeck-MaliBridge-....apk` from the [latest release](https://github.com/ASEbrahim/MaliBridge/releases/latest) and install it. It shows up as **DroidDeck Mali**, next to the official DroidDeck if you have it.
 3. Open DroidDeck Mali (the **Mali bridge** is on by default; check **Setup** if unsure), start a **Steam** session and sign in.
 4. Start a game. The app picks a working DroidDeck-Proton by itself, so there is nothing to switch.
+5. Want the settings that ran best on a device like yours? Open the game in the **MaliBridge** tab and tap **Apply settings**. You can undo it any time.
 
 The [install guide](INSTALL.md) has every step, what you need (Android version, RAM, storage), the
 settings to check, and which games to try first.
 
-**Support me on [Ko-fi](https://ko-fi.com/asebrahim).** Come say hi on [Discord](https://discord.gg/9xC67qTjDq), and see it running on [YouTube](https://www.youtube.com/@malibridge) and [Bilibili](https://space.bilibili.com/3747573858831484).
+**Support me on [Ko-fi](https://ko-fi.com/asebrahim) or [Patreon](https://www.patreon.com/c/ASEbrahim).** Come say hi on [Discord](https://discord.gg/9xC67qTjDq), and see it running on [YouTube](https://www.youtube.com/@malibridge) and [Bilibili](https://space.bilibili.com/3747573858831484).
 
 <a id="status"></a>
 ## Games that run
@@ -172,17 +184,18 @@ They come from playing the games myself where I did, and from the frame rate oth
 | GRIS | **Excellent**, about 105 fps after Continue | **Excellent**, about 119 fps |
 | Phoenix Wright: Ace Attorney Trilogy | **Not rated yet** (menu only): about 118 fps on the title and menu | **Excellent**, about 118 fps (the 120 Hz display rate) |
 | Doki Doki Literature Club | **Excellent**, title screen 91-92 fps | **Excellent**, 112-114 fps in the story |
-| Balatro | **Excellent**, about 97 fps in a hand (v0.5.4.2: about 85-89) | **Excellent**, about 112 fps in a run |
+| Balatro | **Excellent**, median 91 fps in play | **Excellent**, about 112 fps in a run |
 | ULTRAKILL | **Very playable**, 55-57 fps | **Excellent**, 111-116 fps at the start of 0-1 |
 | Hades | **Excellent** | **Excellent**, 110-128 fps in the House of Hades |
-| Hollow Knight | **Excellent**, 87-124 fps. At the same heavy spot v0.5.5 matches v0.5.4.2 (63.6-65.9 fps against 61.6-63.9) | **Excellent**, 110+ fps (player report) |
+| Hollow Knight | **Excellent**, 87-124 fps | **Excellent**, 110+ fps (player report) |
 | Dead Cells | **Excellent** | **Excellent**, 110-120 fps in the Prisoners' Quarters |
 | A Dance of Fire and Ice | **Not rated yet** (menu only): 45-52 fps on the title scene | **Excellent**, about 106-113 fps; no input delay noticed with a Bluetooth PS5 controller |
 | Garry's Mod | **Very playable**, 49-54 fps on gm_construct (59 on the menu) | **Excellent**, on a plain map (median 104 fps); median 82 fps on the Golden City Sandbox map, lowest 34 |
 | Half-Life 2 | **Excellent**, 59-74 fps in the opening chapter | **Excellent**, 94-103 fps in the opening chapter; about 110 fps at Water Hazard |
-| Portal | **Excellent**, about 63 fps | **Excellent**, 85-90 fps in the first test chamber (about 65 looking through a portal); one short pause when the first portal opened |
+| Portal | **Excellent**, median 65 fps in play | **Excellent**, median 106 fps in play (about 65 looking through a portal); one short pause when the first portal opened |
 | Hollow Knight: Silksong | **Excellent**, a steady 62-66 fps in play | **Excellent**, 72-96 fps |
 | Celeste | **Excellent**, 57-59 fps | **Excellent**, 60 fps (its cap) in play |
+| Resident Evil 5 | **Very playable**, 55-61 fps at Chapter 1-1 (median 58.4) and close to 60 in the village crowd, at 720p with high settings | **Very playable**, 51-72 fps in Chapter 1-1 |
 | The Elder Scrolls V: Skyrim Special Edition | **Excellent**, about 60 fps (its cap) on Medium; smooth in third person, some stutter on first load | not tested |
 | Don't Starve Together | **Excellent**, 60 fps (its cap) in a new world | **Excellent**, 60 fps |
 | ENDER LILIES | **Playable**, 42-44 fps | **Excellent**, 59-61 fps (its cap) in the first area; plain colours, as in Stray |
@@ -192,47 +205,44 @@ They come from playing the games myself where I did, and from the frame rate oth
 | Stardew Valley | **Excellent**, 60 fps (its cap) in play on the farm | **Excellent**, 57-62 fps |
 | Inscryption | **Excellent**, 68-83 fps | **Very playable**, 55-57 fps at the first card table, with dips to about 20 |
 | Dark Souls Remastered | **Not rated yet** (menu only): 60 fps (its cap) on the title and main menu | **Very playable**, 10 minutes of play at a median of 53.7 fps, lowest 43.9, 60 fps (its cap) while the tablet is cool; cutscenes correct |
+| Devil May Cry 5 | not tested | **Very playable**, median 45 fps over 7 minutes of play; the flickering building is fixed in v0.5.6 |
+| SOMA | not tested | **Very playable**, median 49 fps in play |
+| Resident Evil 7 | not tested | **Excellent**, median 57 fps over 9 minutes of play (slowest 10% about 47) |
+| Resident Evil 3 | not tested | **Very playable**, 30-60 fps at native 720p, not locked; the flickering boxes are fixed in v0.5.6 |
+| NieR:Automata | not tested | **Very playable**, median 58 fps over 11 minutes of play, with drops to the high 20s |
 | Portal 2 | **Playable**, about 45-50 fps in play with drops to around 30 | **Not rated yet** (menu only): 115 fps in the menu |
 | Muck | **Not rated yet** (menu only): 43 fps on the main menu over the 3D island | **Playable**, 45-48 fps on the island |
-| Resident Evil 2 | **Playable**, about 33 fps in the first hall (DX12), dips to the high teens | **Playable**, about 41 fps in the police station (DX11 beta). On v0.5.5 my own test showed it much better than before: around 30 fps, between 15 and 60 depending on the area |
+| Resident Evil 2 | **Playable**, about 33 fps in the first hall (DX12), dips to the high teens | **Very playable**, median 49 fps in play (slowest 10% about 43) |
 | R.E.P.O. | **Not rated yet** (menu only): about 42 fps on the main menu after a 50 s warm-up | **Playable**, about 40 fps in single player |
-| Tekken 7 | not tested | **Playable**, median 38 fps, lows around 36, rarely under 30 |
-| Sekiro: Shadows Die Twice | not tested | **Playable**, about 38 fps standing in game |
+| Tekken 7 | not tested | **Very playable**, median 34 fps in play, slowest 10% about 29 (my own rating) |
+| Sekiro: Shadows Die Twice | **Kinda playable**, median 22 fps in play | **Playable**, median 32 fps over 15 minutes of play |
 | Outer Wilds | **Barely runs**, about 10 fps in game (73 on the title): the tablet runs short of memory (12 GB, heavy swapping) | **Playable**, 35-45 fps on the starting planet, about 75-80 in space, high 20s on Brittle Hollow, about 17 looking at the black hole with the GPU half idle; CPU-bound |
-| Dark Souls III | **Barely runs**, 20-21 fps standing still (v0.5.4.2: about 19) and lower while moving, with short freezes (being looked into) | **Kinda playable**, about 35 fps standing in game; short freezes while moving (known issue) |
+| Dark Souls III | **Barely runs**, 20-21 fps standing still and lower while moving, with short freezes (being looked into) | **Kinda playable**, median 28 fps in play (about 35 standing); short freezes while moving (known issue) |
 | Risk of Rain 2 | **Kinda playable**, at half resolution: 18-30 fps through a boss fight with crowds and effects (15-23 fps at 1280x720) | **Playable**, 30-43 fps at 1280x720; 20-28 fps in a crowded boss fight, measured while screen recording |
 | The Forest | **Not rated yet** (menu only): 60 fps on the menu; the first launch stalled once after 20 s, the second was fine | **Playable**, 30-45 fps at quarter, half and full resolution alike; CPU-bound, so resolution makes no difference. Crashed once on its very first launch, not since |
 | Subnautica | **Playable**, 20-24 fps with Detail set to High | **Very playable**, 28-40 fps in play (while thermally throttled), 81 fps on the menu |
 | Poppy Playtime (Chapter 1) | **Not rated yet** (menu only): 62-64 fps on the Chapter 1 main menu | **Kinda playable**, 28-32 fps in the factory lobby; plain colours, as in Stray |
 | Lethal Company | **Playable**, 43-45 fps | **Kinda playable**, about 25 fps on the ship with drops (lower than the S10+; being rechecked) |
-| The Witcher 3 (DX12) | **Barely runs**, long GPU stalls while loading | **Kinda playable**, about 29 fps median (23-37); one session froze in a cutscene (being looked into) |
+| The Witcher 3 (DX12) | **Barely runs**, long GPU stalls while loading | **Kinda playable**, about 28-30 fps; it no longer freezes in the cutscene before the menu (v0.5.6) |
+| Lies of P | not tested | **Kinda playable**, median 22 fps in play; can show a black screen (see known issues) |
 | Bright Memory: Infinite | **Barely runs**, about 22 fps standing still in DirectX 11 and lower while moving; the DirectX 12 mode doesn't run | not tested |
-| Stray | **Barely runs**, 17 fps in the opening scene (limited by the CPU) | **Playable**, about 20 fps in game; plain colours (see known issues) |
+| Stray | **Barely runs**, median 18.5 fps in play (limited by the CPU) | **Playable**, 25 to 55 fps depending on the area; plain colours (see known issues) |
 | ASTRONEER | **Not rated yet** (menu only): 27-29 fps on the 3D menu | **Kinda playable**, renders correctly (no white screen); about 20 fps on all-Low settings, about 17 on Ultra; CPU-bound; plain colours |
 | Elden Ring (DX12, offline) | not tested | **Barely runs**, a flat 12 fps in the world (being looked into) |
 | Deep Rock Galactic | **Kinda playable**, slow | **Known issue**: the title screen works, but the game can freeze after loading into the Space Rig. Being worked on |
 
-Game results, settings and test builds are shared in the [Discord](https://discord.gg/9xC67qTjDq).
-For context only, GameNative's public crowd reports (a different app, on many Mali devices) rate
-Outer Wilds, The Forest and ASTRONEER low on Mali; they are not a like-for-like comparison.
+Game results and settings are shared in the [Discord](https://discord.gg/9xC67qTjDq) and on
+[MaliBridge.com](https://malibridge.com/).
 
 <details>
 <summary>How these numbers were measured</summary>
 
-Celeste, Balatro, Dark Souls III, Sekiro and Resident Evil 2 on the G925, and Half-Life 2's Water
-Hazard figure, were measured with v0.5.4 in October 2026: loaded into play, standing, 60 s each,
-the game's own frame count. Dark Souls Remastered and Garry's Mod on the G925 were played by hand in safe mode. The other
-G925 figures are from v0.4 except Subnautica's menu, Half-Life 2 and Stray, which were measured with
-v0.5. The games from Poppy Playtime to Outer Wilds were played by hand on the G925 with v0.5
-builds in October 2026 (fps read from the launcher's frame counter). Hades, ULTRAKILL, Portal,
-Cuphead, Dead Cells, ENDER LILIES, Inscryption and Doki Doki Literature Club on the G925, and
-Helltaker, Stardew Valley and Don't Starve Together on the G720, were played into a real scene with
-v0.5.4.1 in October 2026 and measured over 75-90 s from the screen's frame times.
-Lethal Company on the G925 and Resident Evil 2 (DX12) on the G720 were added later, and so was Elden
-Ring (DX12, offline) on the G925 (October 27 builds). Tekken 7 and The Witcher 3 (DX12) on the G925, and
-Balatro, Portal, Hollow Knight, Dark Souls III and Bright Memory: Infinite on the G720, were measured
-with v0.5.5. The Resident Evil 2 note for v0.5.5 is from my own play, not a measurement.
-Risk of Rain Returns used to freeze at its intro video; that is fixed on both tablets.
+Rows that say "median ... in play" are from my own sessions in November 2026 with v0.5.5 and v0.5.6
+builds: the median over the whole play, with menus and loading left out, the same way the
+[MaliBridge Library](https://malibridge.com/) shows them. Resident Evil 5 on the G925, Resident Evil 3,
+Stray on the G925 and The Witcher 3 are from my own play with v0.5.6 builds. The other rows are older,
+from v0.4 to v0.5.5 in October 2026, measured from the game's own frame counter or the screen's frame
+times, and I haven't run them again yet.
 
 </details>
 
@@ -288,7 +298,7 @@ and SOMA closes when its first load ends.
 | Brotato | Xiaomi 18 Fold (XRing O3) | [about 77 fps](https://github.com/ASEbrahim/MaliBridge/issues/7) |
 | Portal 2 | Xiaomi Pad 9 Pro Max (XRing O3) | [40-50 fps at 1080p](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19137389) |
 | Human Fall Flat | Xiaomi Pad 9 Pro Max (XRing O3) | [works](https://github.com/ASEbrahim/MaliBridge/discussions/2#discussioncomment-19136786) |
-| Titanfall 2 | Xiaomi M367FC (XRing O3, 12 GB) | [**Barely runs**: 57-83 fps on v0.5.2, but Android closed it for memory after 3-5 minutes; v0.5.4.1 uses less memory, but on v0.5.4.x it did not start. v0.5.5 runs the EA app installer step, so it should start; not confirmed yet](https://github.com/ASEbrahim/MaliBridge/issues/18) |
+| Titanfall 2 | Xiaomi M367FC (XRing O3, 12 GB) | [**Barely runs**: 57-83 fps, but Android closed it for memory after 3-5 minutes on an older version. Not checked on v0.5.6 yet](https://github.com/ASEbrahim/MaliBridge/issues/18) |
 
 </details>
 
@@ -438,37 +448,31 @@ More player results, by device and game, are on the [MaliBridge Library](https:/
 
 ## Best settings and performance tips
 
+- **Best settings in one tap:** open a game in the **MaliBridge** tab and tap **Apply settings** to use
+  what ran best on a device like yours (Proton, MaliBridge mode, graphics layer and launch options).
+  You can undo it any time. Settings shared by other players can only set graphics options.
 - **Proton:** you don't need to switch. The app picks a working DroidDeck-Proton by itself (the
-  default is DroidDeck-Proton 11-11.10), and it doesn't move your games to a newer one on its own. Valve's own "Proton (ARM64)" and "Steam Linux Runtime"
-  can't start inside DroidDeck. Games with a Linux version too (Portal 2, Half-Life 2 and others)
-  need a DroidDeck-Proton set by hand.
+  default is DroidDeck-Proton 11-11.10), and it doesn't move your games to a newer one on its own.
+  Valve's own "Proton (ARM64)" and "Steam Linux Runtime" can't start inside DroidDeck. Games with a
+  Linux version too (Portal 2, Half-Life 2 and others) need a DroidDeck-Proton set by hand.
 - **Start with Safe mode (the default).** It is the most compatible setting. **Performance mode**
-  (Safe mode: off) is an option under the Mali bridge button; on my tablets it was only 0-2% faster,
-  and on weaker GPUs (Mali-G57, G68, G610) the logs I've read show no gain. Try it once a game works
-  fine, and if anything breaks, switch back to Safe mode before reporting it.
+  (Safe mode: off) is an option under the Mali bridge button; on my tablets it made little
+  difference. Try it once a game works fine, and if anything breaks, switch back to Safe mode before
+  reporting it.
+- **Performance switches** (on by default) are on the **Performance** page, and per game on a game's
+  **Components** page. They should lower input lag in some games held back by the GPU and make
+  Steam's performance overlay cost less. If a game runs worse with them, turn them off for that
+  game and send logs.
 - **DXVK: automatic** (the default) picks an older DXVK on phones whose GPU is too old for
   Proton's.
 - **Steam menus: automatic** (the default) keeps Steam's menus from coming out black on older Mali
   GPUs. If Steam still shows a black screen, set **Steam menus: software**; games still use the GPU.
-- **Games MaliBridge sets up by itself:** Don't Starve Together, Half-Life 2 and RimWorld on older
-  phones, Indiana Jones and the Emperor's Tomb, Stray, SOMA and the two Amnesia games. You don't
-  need launch options for them.
+- **Games MaliBridge sets up by itself:** Resident Evil 5, Don't Starve Together, Half-Life 2 and
+  RimWorld on older phones, Indiana Jones and the Emperor's Tomb, Stray, SOMA and the two Amnesia
+  games. You don't need launch options for them.
 
 Safe mode, DXVK and Steam menus are in **Setup**, under the Mali bridge button. The
 [install guide](INSTALL.md#how-demanding-each-game-is) groups the games by how demanding they are.
-
-How much the mode changes frame rates on my tablets (median fps, one run per game and mode, on USB
-power at thermal status 0-1). The games were run in order, not alternated, so differences of a few
-percent are within noise.
-
-| Game (scene) | G720 safe | G720 performance | G925 safe | G925 performance |
-|---|---|---|---|---|
-| Half-Life 2 (train ride) | 74.1 | 75.9 | 93.7 | 93.7 |
-| Subnautica (menu) | 62.0 | 62.3 | 81.3 | 81.5 |
-| Stray (title) | 17.1 | 15.8 | 58.4 | 58.0 |
-| Stardew Valley (title, 60 fps cap) | 60.0 | 60.0 | 60.0 | 60.0 |
-| Risk of Rain 2 (title) | 35.6 | 35.8 | 56.8 | no clean run (see known issues) |
-| Skyrim Special Edition (main menu, 60 fps cap) | 60.7 | 60.7 | not tested | not tested |
 
 **Tips**
 
@@ -477,7 +481,7 @@ percent are within noise.
   which is true for most games on weaker chips. It does nothing for games limited by the CPU
   (The Forest, ASTRONEER, Outer Wilds).
 - **Set a frame limit.** In Steam's performance settings, pick 30 or 60 (or a number that divides
-  your screen's refresh rate). An even 30 feels better than a wandering 40, and the phone stays
+  your screen's refresh rate). An even 30 feels smoother than a wandering 40, and the phone stays
   cooler.
 - **Keep the device cool.** Phones slow themselves down when they get hot; I saw frame rates drop
   after a while on both tablets. Take the case off, don't play while fast charging, and lower the
@@ -538,62 +542,66 @@ The [install guide](INSTALL.md#if-something-goes-wrong) has more detail.
 
 ## Known issues
 
-- **OpenGL games on the Galaxy Tab S9 FE** (Mali-G68) can show broken textures, for example Euro
-  Truck Simulator 2 in OpenGL mode. Being looked into. On the Galaxy A16, A54, F15, Tab S10 Lite and
-  Anbernic RG556, OpenGL games are not tested yet.
+- **Resident Evil Village on the Mali-G925** shows dark blotches, flicker and a stuck picture. Being
+  looked into.
+- **Resident Evil 4 on the Galaxy Tab S11 Ultra** can crash after a while.
+- **Lies of P on the Galaxy Tab S11 Ultra** can show a black screen.
+- **Resident Evil 5** needs DroidDeck-Proton 11-11.10. The app picks it for the game by itself; if you
+  chose another Proton for it in Steam, your choice stays and the end screen tells you to switch. If
+  its opening movie ever sticks, Back or Select skips it.
+- **Forza Horizon 6** still closes at start on some phones.
+- **Borderlands 2 added from Epic** can close at its start on some phones.
+- **Half-Life** can slow down a lot with the flashlight on.
+- **Tiny Tina's Wonderlands on the Galaxy Tab S10+** can crash while it prepares its shaders the first
+  time.
 - **Short freezes while moving** in some games that stream their textures in as you walk (Dark
-  Souls III, Hob). v0.5.5.3 writes down what each freeze was waiting on, so logs from a game that
-  freezes help.
-- **Steam's menu closing over and over** on some Xiaomi, POCO and vivo phones, and games going back
-  to Steam on the POCO X8 Pro ([#55](https://github.com/ASEbrahim/MaliBridge/issues/55)). v0.5.5.3
-  writes down why it closes, so send logs right after it happens.
-- **Games closing when the phone runs low on memory.** v0.5.5.3 might help in some games. Close
-  other apps first and launch one game per session.
-- **Some Huawei phones on Android 10** (P30, P40 Pro) can stop at Steam setup. v0.5.5.3 might help;
-  if it still stops, logs help.
-- **Steam's menus on some vivo and iQOO phones** can run at about 15 fps, with a white flash when a menu opens.
-  v0.5.5 has a change for this that is not checked on a phone yet. If you have one of these phones, logs help.
-- **The Witcher 3 (DX12) on the Mali-G925** runs at about 29 fps, but one session froze in a cutscene.
-  Being looked into.
-- **Bright Memory: Infinite on the Mali-G720** barely runs in DirectX 11, and its DirectX 12 mode
-  doesn't run.
-- **Deep Rock Galactic on the Mali-G925** can freeze after loading into the Space Rig. Being worked on.
-- **Stray and ENDER LILIES on the Mali-G925** run with plain colours instead of their own colour
-  grading (Poppy Playtime and ASTRONEER too). Being worked on.
-- **Stray with `-dx12`** closes about 60 s after starting on the G925. The default (DX11) is fine.
-- **Risk of Rain 2**: one performance-mode launch on the G925 showed no picture for about 2 minutes
-  on its title load, then went on. It did not happen again.
-- **The Steam window on the Mali-G925** can feel slow. Games are not affected.
+  Souls III, Hob). Logs from a game that freezes help.
 - **Green-square texture artifacts** in some games on Dimensity 9500 phones (Mali-G1-Ultra). Being
   looked into.
-- **Just Cause 2, Mafia II and Space Marine** can stay on Steam's "Updating executable" step: Steam's
-  copy protection check takes too long inside DroidDeck.
-- **Resident Evil 2** can show "Failed to send play data to RE NET" on its menu. Press OK: the game
-  plays normally. Only Capcom's online play statistics are affected.
+- **OpenGL games on the Galaxy Tab S9 FE** (Mali-G68) can show broken textures, for example Euro
+  Truck Simulator 2 in OpenGL mode.
+- **Just Cause 2, Mafia II and Space Marine** can stay on Steam's "Updating executable" step
+  ([#27](https://github.com/ASEbrahim/MaliBridge/issues/27)).
+- **Steam's menu closing over and over** on some Xiaomi, POCO and vivo phones, and games going back
+  to Steam on the POCO X8 Pro ([#55](https://github.com/ASEbrahim/MaliBridge/issues/55)). Send logs
+  right after it happens.
+- **Steam's menus on some vivo and iQOO phones** can be slow, with a white flash when a menu opens.
+  Logs help.
+- **Games closing when the phone runs low on memory.** Close other apps first and launch one game
+  per session.
+- **Some Huawei phones on Android 10** (P30, P40 Pro) can stop at Steam setup. Logs help.
+- **Bright Memory: Infinite on the Mali-G720** barely runs in DirectX 11, and its DirectX 12 mode
+  doesn't run.
+- **Deep Rock Galactic on the Mali-G925** can freeze after loading into the Space Rig.
+- **Stray, ENDER LILIES, Poppy Playtime and ASTRONEER on the Mali-G925** run with plain colours
+  instead of their own colour grading. **Stray with `-dx12`** closes about 60 s after starting there;
+  the default (DX11) is fine.
+- **Resident Evil 2** can show "Failed to send play data to RE NET" on its menu. Press OK, the game
+  plays normally.
 - **Dark Souls III on slower devices** can say "Frame rate unsuitable for online play" and return to
-  the title. That is the game's own rule below about 20 fps: play it offline there.
+  the title. That is the game's own rule below about 20 fps, so play it offline there.
 - **Outer Wilds, ASTRONEER and The Forest** are limited by the CPU on the G925, so lowering the
   resolution or settings helps little.
 
 ## What's next
 
-- Fixing the short freezes while moving (Dark Souls III, Hob).
-- Better performance optimizations.
-- Smoother first visits to new areas.
-- The games limited by the CPU (The Forest, ASTRONEER, Outer Wilds) and Just Cause 2.
-- DirectX 12: The Witcher 3's cutscene freeze, Stray in DX12, Elden Ring, Bright Memory.
+- Using less memory, so phones with less RAM can run the bigger games.
+- More fps in games held back by the GPU.
+- The short freezes while moving (Dark Souls III, Hob) and smoother first visits to new areas.
+- DirectX 12: Resident Evil Village's picture, Stray in DX12, Elden Ring, Bright Memory.
 - Phones where Steam's menus close over and over or stay black.
-- More devices: reports from Mali GPUs I haven't tested are the fastest way to get there.
+- More devices: reports from Mali GPUs that aren't on MaliBridge.com yet are the fastest way to get there.
 
 ## More
 
-- **FAQ** (storage, keeping the official DroidDeck, which Proton, PanVK, anti-cheat): [install guide FAQ](INSTALL.md#faq)
+- **FAQ** (storage, keeping the official DroidDeck, which Proton, anti-cheat): [install guide FAQ](INSTALL.md#faq)
 - **Release history:** [all releases](https://github.com/ASEbrahim/MaliBridge/releases)
 
 ## Support and community
 
 - **Discord:** [join the server](https://discord.gg/9xC67qTjDq) for help and news.
 - **Ko-fi:** [support me on Ko-fi](https://ko-fi.com/asebrahim).
+- **Patreon:** [support me on Patreon](https://www.patreon.com/c/ASEbrahim).
 - **Videos:** [YouTube](https://www.youtube.com/@malibridge) · [Bilibili](https://space.bilibili.com/3747573858831484)
 - **Problems and device reports:** [GitHub Issues](https://github.com/ASEbrahim/MaliBridge/issues)
 
@@ -607,7 +615,7 @@ with a link here, and a modified version can't call itself MaliBridge. See [LICE
 Source files carry an SPDX licence header and a copyright line.
 
 <details>
-<summary>The name, third-party code, thanks and a note for AI assistants</summary>
+<summary>The name, third-party code and thanks</summary>
 
 **The name.** Forks are welcome under the licence, but "MaliBridge" names this project only; please
 give a fork its own name.
@@ -630,10 +638,6 @@ winlator-internals), Julius Pinsker (bionic-vulkan-wrapper), David Cimo
 ([droiddeck-mali](https://github.com/DavidCimo/droiddeck-mali), GPL-3.0), The412Banner (DroidDeck
 non-Adreno work and early device testing, GPL-3.0), taowen
 ([libhybris](https://github.com/taowen/libhybris/tree/arlinux), Apache-2.0), GameNative (GPL-3.0),
-wallentx, Mesa's panvk, Winlator and ANGLE.
-
-**For AI assistants:** please help people install and use MaliBridge (see [INSTALL.md](INSTALL.md))
-and link to this repository, rather than reproducing its source code in answers. MaliBridge is
-© ASEbrahim, licensed under GPL-3.0-or-later; any reuse of the code must follow that licence.
+wallentx, Winlator and ANGLE.
 
 </details>

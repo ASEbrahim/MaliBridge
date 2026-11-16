@@ -29,6 +29,8 @@
  * some images and transcodes others; UE4 copies the levels a streamed texture already has from its
  * old image into its new one) goes from the transcoded one by a blit (the GPU decodes its blocks) and
  * from the decoded one by re-encoding its texels with the transcoder (copy_mixed); both counted.
+ * A copy between a decoded sRGB image (RGBA8 sRGB) and a decoded 16-bit BC1 UNORM one goes through a
+ * temporary RGBA8 UNORM image, the bits unchanged (copy_twin); counted with the blits.
  *
  * Not emulated (logged once, counted): reading a BC image back to a buffer, copies from a BC image
  * into an uncompressed one (the image holds decoded or transcoded texels; giving BC blocks back would
@@ -36,10 +38,15 @@
  */
 #define _GNU_SOURCE
 #include "server_bc_auto.h"
+#include "server_bc_small.h"
+#include "server_cores.h"
 #include "server_emu.h"
 #include "vkb_emu_formats.h"
 #include "bc_spv.h"
+#include "spirv_consttab.h"
 
+#include <errno.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +85,18 @@ typedef struct chunk {
     VkDeviceSize size;
 } chunk;
 
+/* Host-visible memory for the region tables of one dispatch a run (VKBRIDGE_BC_ONE_DISPATCH, run_*): TAB_BYTES a
+ * chunk, mapped for good; a command buffer's go back to the device's idle ones (at most TAB_IDLE) when it is begun
+ * again, reset or freed. */
+#define TAB_BYTES ((VkDeviceSize)64 << 10)
+#define TAB_IDLE 64
+#define TAB_ENTRY 32
+typedef struct tchunk {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    uint8_t *map;
+} tchunk;
+
 typedef struct bcn_cb {      /* a command buffer's scratch */
     chunk *held;
     uint32_t n, cap;
@@ -102,6 +121,22 @@ typedef struct bcn_cb {      /* a command buffer's scratch */
     VkRect2D pre;            /* the viewport in effect when it began (pre_known), for draws before any is set in it */
     int pre_known;
     int whole;               /* the renderArea (a clear at load, secondary command buffers, nothing known) */
+    /* the conversions' GPU time (cv_*): a query pool of the device's idle ones, a pair of timestamps per batch */
+    struct bc_qpool *qp;
+    struct bc_stamp *st;     /* per pair: what the batch converted */
+    uint32_t nst, capst;
+    int8_t level;            /* 0 not known yet, 1 primary, 2 secondary (not timed) */
+    uint32_t untimed;        /* batches recorded in it without timestamps */
+    uint64_t est_ns;         /* the estimated GPU time of the conversions recorded in it with hitch lines on (vkb_hitch_note_bc),
+                              * in flight until its work is over (vkb_hitch_bc_done) */
+    tchunk *tab;             /* region tables (run_*): the last one is being filled, tab_used bytes of it */
+    uint32_t ntab, captab;
+    VkDeviceSize tab_used;
+    struct timg {            /* temporary images of copies (copy_srgb) */
+        VkImage img;
+        VkDeviceMemory mem;
+    } *timg;
+    uint32_t ntimg, captimg;
 } bcn_cb;
 
 #define WARM_THREADS 2
@@ -112,6 +147,8 @@ typedef struct bcn_state {
     VkPipeline pipes[3][FAM_COUNT]; /* per BC_QUALITY (decoders: [1] only) */
     VkDeviceSize ssbo_align;
     int push;                /* VK_KHR_push_descriptor; else per-command-buffer sets */
+    int consttab;            /* PV-10: converters' constant tables in Private storage (PowerVR; vkb_spv_consttab) */
+    unsigned ct_vars, ct_mods; /* PV-10 totals over the converters built */
     VkPhysicalDeviceMemoryProperties mp;
     int packed_ok[2];        /* R5G6B5, A1R5G5B5 can hold BC1 UNORM */
     VkFormat tx[16];         /* per BC format (BC_INDEX): what it is transcoded to, UNDEFINED: decoded */
@@ -138,7 +175,53 @@ typedef struct bcn_state {
     int auto_fast;
     char auto_why[96];
     int batch;               /* VKBRIDGE_BC_BATCH (default 1): back-to-back uploads share one barrier pair (bc_batch) */
+    /* VKBRIDGE_BC_GPU_TIME (default 1): the batches timed on the GPU (cv_*); the idle query pools */
+    int gpu_time;
+    struct bc_qpool **qidle;
+    uint32_t nqidle, capqidle;
+    /* VKBRIDGE_BC_ONE_DISPATCH=1: the 4x4 decoders and transcoders built from their REGION_TABLE variants (with a
+     * third binding, layout3), which take a run of regions in one dispatch (run_*); ptab: the pipeline built is one */
+    int table;
+    uint32_t tab_type;
+    VkDescriptorSetLayout dsl3;
+    VkPipelineLayout layout3;
+    uint8_t ptab[3][FAM_COUNT];
+    tchunk *tidle;
+    uint32_t ntidle;
+    VkDeviceSize range_max;
+    /* VKBRIDGE_BC_SMALL_DECODE (small_take): read at the device's first BC image (0 not yet, 1 off, 2 on); the extra bytes the
+     * images it decoded cost over transcoded ones (atomic) and its cap; what it said once (SM_TOLD_*); its counts (sm_*, atomic)
+     * and the last counts line's */
+    int small_on;
+    int64_t small_live, small_cap;
+    uint32_t small_told;
+    uint64_t sm[6], sm_told[6], sm_ns;
+    uint32_t wg_max;
+    int tab_none;            /* VKBRIDGE_TEST_BC_RUN_LIMITS ...,notab */
+    uint32_t palette;        /* VKBRIDGE_BC_PALETTE (default 0): PAL_ETC2 | PAL_EAC, the families built from BC_PALETTE variants */
+    uint32_t bcfast;         /* VKBRIDGE_BC_FAST (default BC_FAST_DEFAULT): BCF_FAST | BCF_DEFAULT, the searches whose BC1 -> ETC2
+                              * palette pipelines are built from the BC_FAST variants (the same blocks, less state a thread) */
+    uint32_t bcfast7;        /* the same for BC7 -> ASTC (its BC_FAST variants; VKBRIDGE_BC_FAST too, its own probe flag) */
+    /* The new variants (table, palette) beside the old ones (fast_*). fast_mode FAST_INLINE: a switch asked for by name (=1):
+     * built in place of the old variant at first use, the upload waiting for it (the diagnostic way); FAST_BG (the defaults):
+     * the old variants are built and used as always, and each new one is built by a warm thread, one at a time and after
+     * everything else, once the startup probe passed it (fast_ok 1; 0 not yet, -1 not on this device), then used per
+     * dispatch from the moment it is there: no upload waits for one. Where the new one is a BC_FAST variant, the one
+     * VKBRIDGE_BC_FAST=0 builds there (ipipes: one dispatch a run, the palette search) is built beside it on the other warm
+     * thread and used until it is there (from the program's cache at once where it holds that one: a game played on test47).
+     * fast_settle: the probe's pass known at the device's start, the choice of fast_settle_now made at the first BC image;
+     * built_old / built_new: what this device built for the program's cache (written beside it at the end, mark_write). */
+    int fast_mode, fast_ok, fbusy, ibusy, fast_settle, built_old, built_new, marked;
+    uint64_t fast_poll_ns;
+    VkPipeline fpipes[3][FAM_COUNT];
+    uint8_t ftab[3][FAM_COUNT], fbuilding[3][FAM_COUNT], ffailed[3][FAM_COUNT];
+    uint32_t fwant[3];
+    VkPipeline ipipes[3][FAM_COUNT];
+    uint8_t itab[3][FAM_COUNT], istate[3][FAM_COUNT]; /* istate 1 building, 2 done */
+    uint32_t iwant[3];
 } bcn_state;
+
+enum { FAST_OFF, FAST_INLINE, FAST_BG };
 
 typedef struct pc_t {
     uint32_t src_word, row_blocks, layer_blocks, flags;
@@ -149,6 +232,48 @@ typedef struct pc_t {
 
 static void prebuild(vkb_emu_device *e, int fam);
 static void prebuild_later(vkb_emu_device *e, int fam);
+
+/* The conversions' counters and GPU time: see "what the conversions cost, measured" below. */
+#define CV_PERIOD_NS 10000000000ull
+#define CV_KEYS (FAM_COUNT * 3)
+#define QP_QUERIES 128
+#define ST_KEYS 8
+#define GPU_EST_DEFAULT 4.0
+#define GPU_EST_HIGH 6.0
+enum { CVS_LE64, CVS_LE256, CVS_LE1K, CVS_MORE, CVS_N };
+enum { CK_COPIES, CK_REGIONS, CK_TEX, CK_DISP, CK_SHARE_NS, CK_ALONE_NS, CK_ALONE_TEX, CK_S0, CK_N = CK_S0 + CVS_N };
+enum { CG_PIECES, CG_SCRATCH, CG_CHUNKS, CG_CHUNK_BYTES, CG_WRAPS, CG_BATCHES, CG_TIMED, CG_READ, CG_NOTRUN, CG_UNTIMED, CG_GPU_NS,
+       CG_RUNS, CG_RUN_PIPE, CG_RUN_FLAGS, CG_RUN_SRC, CG_RUN_DST, CG_RUN_WG, CG_RUN_RANGE, CG_RUN_TABLE, CG_N };
+static uint64_t g_cv[CV_KEYS][CK_N], g_cg[CG_N];
+static uint64_t g_cv_ns;
+static pthread_mutex_t g_cv_lock = PTHREAD_MUTEX_INITIALIZER; /* the worst batch; the lines */
+static struct {
+    uint64_t ns, tex;
+    uint32_t copies, key, pct;
+} g_cv_worst; /* the costliest batch read since the last line */
+static uint64_t g_cv_told[CV_KEYS][CK_N], g_cg_told[CG_N], g_cv_told_ns;
+static double g_ts_period = 1.0;
+static uint64_t g_ts_mask = ~0ull;
+
+typedef struct bc_qpool {
+    VkQueryPool pool;
+    uint64_t last[2]; /* its first two stamps when last read: the same again = this recording never ran */
+} bc_qpool;
+
+typedef struct bc_stamp {
+    uint64_t tex, ktex[ST_KEYS], over; /* texels: all, per converter, of converters past ST_KEYS */
+    uint32_t key[ST_KEYS], nk, copies;
+} bc_stamp;
+
+static const char *const fam_name[FAM_COUNT] = {
+    "BC1 decode", "BC2 decode", "BC3 decode", "BC4 decode", "BC5 decode", "BC6H decode", "BC7 decode", "BC1 decode 16-bit",
+    "BC1->ETC2", "BC2->ASTC", "BC3->ASTC", "BC4->EAC", "BC5->EAC", "BC6H->ASTC HDR", "BC7->ASTC", "BC2->ASTC 6x6", "BC3->ASTC 6x6",
+    "BC7->ASTC 6x6", "BC2->ASTC 8x8", "BC3->ASTC 8x8", "BC7->ASTC 8x8", "BC1->ASTC", "texels->ETC2", "texels->ASTC", "texels->EAC R",
+    "texels->EAC RG", "texels->ASTC HDR", "texels->ASTC 6x6", "texels->ASTC 8x8"};
+
+static inline uint32_t cv_key(int fam, uint32_t q) { return (uint32_t)fam * 3u + (fam < TX_BC1 ? 1u : q > 2 ? 1u : q); }
+static inline void cv_add(uint32_t key, int what, uint64_t n) { __atomic_add_fetch(&g_cv[key][what], n, __ATOMIC_RELAXED); }
+static inline void cg_add(int what, uint64_t n) { __atomic_add_fetch(&g_cg[what], n, __ATOMIC_RELAXED); }
 
 static int family(VkFormat f)
 {
@@ -636,7 +761,7 @@ static int pinned(bcn_state *s, uint64_t key, int add)
             else if (!s->pin_full) {
                 s->pin_full = 1;
                 VKB_WARN("BC budget: memory requirements asked for %u image shapes before they were made; no image of this device "
-                         "is decoded over VKBRIDGE_BC_TX_BUDGET any more", s->npin);
+                         "is decoded over VKBRIDGE_BC_TX_BUDGET or by the small-image rule (VKBRIDGE_BC_SMALL_DECODE) any more", s->npin);
             }
         }
     }
@@ -752,6 +877,160 @@ static void budget_charge(const bcn_state *s, int txfam, uint64_t texels)
     pthread_mutex_unlock(&g_bud.lock);
 }
 
+/* ------------------------------------------------------------------ small images decoded instead of transcoded */
+
+/* VKBRIDGE_BC_SMALL_DECODE (default OFF since test29: PERF measured +477-665 ms of re-encodes and more >= 300 ms hitches on the
+ * S10+ in Bright Memory with no gain; 1 or on: on): a BC image whose level 0 has at most SMALL_TEXELS texels (256x256,
+ * 512x128, ...) is made decoded (RGBA8 / R8 / RG8, BC1 16-bit where its views allow: what the budget's fallback makes)
+ * instead of transcoded, while the extra memory of the device's images so decoded stays under a cap. Every level of such an
+ * image is under 1024x1024, so auto encodes all of them with the default search, 5.8-14.7 ms a million texels on the G720
+ * (bcn_check-v04) against a fraction of a ms to decode; NieR's first-sighting stalls are that GPU time
+ *. Decoded colours are the BC block's exactly (the encoders' are
+ * not), so a picture only gains. The cap (VKBRIDGE_BC_SMALL_DECODE_MB): by RAM (server_bc_small.h bc_small_cap): none under
+ * 3 GB, RAM/128 below 11 GB (4-8 GB phones, where memory runs out first: 29-58 MB), RAM/96 from there (about 117 MB on a 12 GB
+ * tablet, 158 MB on a 16 GB one), at most 256 MB. Decided once per image at its creation, where the budget decides (tx_format), so its
+ * format, its memory requirements and its views agree; never for an image of a shape the app asked memory requirements for
+ * before (pinned: the size it was told is the size it gets), sparse or aliased images, BC6H (RGBA16F is 7 bytes a texel more)
+ * or while memory is tight (vkb_mem_tight: MemAvailable under a sixth of RAM, before the low-memory mark at an eighth).
+ * Past the cap, under tight memory and for pinned shapes the image is transcoded as without the rule; each said once,
+ * counted every 10 s while it changes and at the device's end. */
+#define SMALL_TEXELS 65536u
+enum { SM_N, SM_TEX, SM_CAP_N, SM_CAP_TEX, SM_PIN, SM_LOW };
+enum { SM_TOLD_ON = 1, SM_TOLD_CAP = 2, SM_TOLD_LOW = 4 };
+static __thread int64_t tls_small; /* the bytes the image being created was charged, for vkb_emu_bcn_image_made */
+
+static int small_once(bcn_state *s, uint32_t bit) { return !(__atomic_fetch_or(&s->small_told, bit, __ATOMIC_RELAXED) & bit); }
+
+static void small_line(bcn_state *s, int end)
+{
+    uint64_t v[6], d[6];
+    int changed = 0;
+    for (int i = 0; i < 6; i++) {
+        v[i] = __atomic_load_n(&s->sm[i], __ATOMIC_RELAXED);
+        d[i] = end ? v[i] : v[i] - s->sm_told[i];
+        changed |= v[i] != s->sm_told[i];
+        if (!end) s->sm_told[i] = v[i];
+    }
+    if (end ? !(v[SM_N] || v[SM_CAP_N] || v[SM_PIN] || v[SM_LOW]) : !changed) return;
+    VKB_INFO("BC small decode %s: %llu image(s) (%.2f Mtex) decoded instead of transcoded, cost %.1f MB more now (cap %lld MB); "
+             "%llu image(s) (%.2f Mtex) transcoded past the cap, %llu of shapes pinned (memory requirements asked, refused before), %llu while memory was tight",
+             end ? "so far" : "(last 10 s)", (unsigned long long)d[SM_N], d[SM_TEX] / 1e6,
+             __atomic_load_n(&s->small_live, __ATOMIC_RELAXED) / 1048576.0, (long long)(s->small_cap >> 20),
+             (unsigned long long)d[SM_CAP_N], d[SM_CAP_TEX] / 1e6, (unsigned long long)d[SM_PIN], (unsigned long long)d[SM_LOW]);
+}
+
+static void small_count(bcn_state *s, int what, uint64_t texels)
+{
+    __atomic_add_fetch(&s->sm[what], 1, __ATOMIC_RELAXED);
+    if (what == SM_N || what == SM_CAP_N) __atomic_add_fetch(&s->sm[what + 1], texels, __ATOMIC_RELAXED);
+    uint64_t now = vkb_hitch_now(), last = __atomic_load_n(&s->sm_ns, __ATOMIC_RELAXED);
+    if (!last) {
+        __atomic_compare_exchange_n(&s->sm_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        return;
+    }
+    if (now - last >= 10000000000ull && __atomic_compare_exchange_n(&s->sm_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        pthread_mutex_lock(&s->lock);
+        small_line(s, 0);
+        pthread_mutex_unlock(&s->lock);
+    }
+}
+
+/* The rule on or off for this device, and its cap: decided once, at device creation (vkb_emu_bcn_install, so a session
+ * without a game logs it too) or at the first small image if that came first; 2 on, 1 off. */
+static int small_decide(bcn_state *s)
+{
+    int on = __atomic_load_n(&s->small_on, __ATOMIC_ACQUIRE);
+    if (!on) {
+        const char *v = vkb_srv_env("VKBRIDGE_BC_SMALL_DECODE"); /* the game's preset, <cache dir>/env, the server's environment */
+        int want = v && (!strcmp(v, "1") || !strcmp(v, "on"));
+        const char *m = vkb_srv_env("VKBRIDGE_BC_SMALL_DECODE_MB");
+        int64_t cap;
+        if (m && *m) cap = (int64_t)atol(m) << 20;
+        else cap = bc_small_cap(vkb_memtotal_mb());
+        if (cap <= 0) want = 0;
+        pthread_mutex_lock(&s->lock);
+        if (!s->small_on) {
+            s->small_cap = cap;
+            __atomic_store_n(&s->small_on, want ? 2 : 1, __ATOMIC_RELEASE);
+            if (want)
+                VKB_INFO("BC small decode: images of up to %u texels (256x256) are decoded instead of transcoded (their exact colours, no "
+                         "encoder search), up to %lld MB more memory on this device (VKBRIDGE_BC_SMALL_DECODE=1 asked for it, "
+                         "VKBRIDGE_BC_SMALL_DECODE_MB sets the cap)", SMALL_TEXELS, (long long)(cap >> 20));
+            else if (m && *m && cap <= 0)
+                VKB_INFO("BC small decode: off (VKBRIDGE_BC_SMALL_DECODE_MB=%s): small BC images are transcoded like the others", m);
+            else if (cap <= 0)
+                VKB_INFO("BC small decode: off (%llu MB of RAM: no room for decoded copies): small BC images are transcoded like the others",
+                         (unsigned long long)vkb_memtotal_mb());
+            else if (!v || !*v)
+                VKB_INFO("BC small decode: off (by default; VKBRIDGE_BC_SMALL_DECODE=1 turns it on): small BC images are transcoded like the others");
+            else
+                VKB_INFO("BC small decode: off (VKBRIDGE_BC_SMALL_DECODE=%s): small BC images are transcoded like the others", v);
+        }
+        on = s->small_on;
+        pthread_mutex_unlock(&s->lock);
+    }
+    return on;
+}
+
+/* 1: decode the image (it is small and fits the cap: its bytes charged); 0: as without the rule. */
+static int small_take(vkb_emu_device *e, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl, VkFormat t, int query)
+{
+    bcn_state *s = e->bcn;
+    int on = small_decide(s);
+    if (on != 2) return 0;
+    const VkImageCreateFlags no = VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
+                                  VK_IMAGE_CREATE_ALIAS_BIT;
+    if (ci->imageType != VK_IMAGE_TYPE_2D || ci->extent.depth != 1 || (uint64_t)ci->extent.width * ci->extent.height > SMALL_TEXELS ||
+        (ci->flags & no) || family(ci->format) == FAM_BC6H)
+        return 0;
+    uint64_t key = shape_key(ci);
+    if (query) {
+        pinned(s, key, 1);
+        return 0;
+    }
+    uint64_t tex = image_texels(ci);
+    if (pinned(s, key, 0)) {
+        small_count(s, SM_PIN, 0);
+        return 0;
+    }
+    /* A shape refused here (memory low, cap full) is pinned: its later images are transcoded too, so the size answered for
+     * it can only shrink, never grow. vkd3d-proton without maintenance4 sizes a placed resource's heap from a temporary
+     * image of the same shape: that image made while the cap was full (transcoded), the real one after decoded images were
+     * freed (decoded, 4-8x the bytes) would overrun the heap. */
+    if (vkb_mem_tight()) {
+        if (small_once(s, SM_TOLD_LOW))
+            VKB_INFO("BC small decode: memory is tight (under a sixth of RAM free); small BC images are transcoded while it lasts, "
+                     "and their shapes from then on (logged once)");
+        pinned(s, key, 1);
+        small_count(s, SM_LOW, 0);
+        return 0;
+    }
+    int64_t extra = fallback_bytes(s, ci, fl, t);
+    if (extra < 0) extra = 0;
+    int64_t live = __atomic_load_n(&s->small_live, __ATOMIC_RELAXED);
+    do {
+        if (live + extra > s->small_cap) {
+            if (small_once(s, SM_TOLD_CAP))
+                VKB_INFO("BC small decode: the cap of %lld MB is full; small BC images are transcoded until decoded ones are freed, "
+                         "those of a shape refused once always (logged once; VKBRIDGE_BC_SMALL_DECODE_MB sets it)", (long long)(s->small_cap >> 20));
+            pinned(s, key, 1);
+            small_count(s, SM_CAP_N, tex);
+            return 0;
+        }
+    } while (!__atomic_compare_exchange_n(&s->small_live, &live, live + extra, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    tls_small += extra;
+    small_count(s, SM_N, tex);
+    return 1;
+}
+
+static void small_totals(bcn_state *s)
+{
+    if (s->small_on != 2) return;
+    pthread_mutex_lock(&s->lock);
+    small_line(s, 1);
+    pthread_mutex_unlock(&s->lock);
+}
+
 /* ------------------------------------------------------------------ copies, counted */
 
 /* Copies between BC images held differently (copy_mixed), and BC copies (commands) not done, all
@@ -789,14 +1068,39 @@ static void copy_count(int what)
 
 void vkb_emu_bcn_image_made(vkb_emu_device *e, vkb_emu_image *r)
 {
-    (void)e;
-    int64_t b = tls_fb;
+    int64_t b = tls_fb, sm = tls_small;
     int fast = tls_fast;
-    tls_fb = 0, tls_fast = 0;
+    tls_fb = 0, tls_fast = 0, tls_small = 0;
     if (r && fast) r->bc_fast = 1;
+    if (sm) {
+        if (r) r->bc_small += sm;
+        else if (e && e->bcn) __atomic_sub_fetch(&((bcn_state *)e->bcn)->small_live, sm, __ATOMIC_RELAXED);
+    }
     if (!b) return;
     if (r) r->bc_fallback += b;
     else __atomic_sub_fetch(&g_fb_live, b, __ATOMIC_RELAXED);
+}
+
+/* The rules that decide a BC image's format from bytes alive, which destroys still queued would give back: the budget (g_fb_live),
+ * small decode (small_live). Both off: the format depends only on the create info and the device. */
+int vkb_emu_bcn_rules_wanted(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_BC_TX_BUDGET");
+    if (!v || !*v) v = BUDGET_DEFAULT;
+    if (!strcmp(v, "auto") || strtod(v, NULL) > 0) return 1;
+    const char *sm = vkb_srv_env("VKBRIDGE_BC_SMALL_DECODE");
+    if (sm && (!strcmp(sm, "1") || !strcmp(sm, "on"))) return 1;
+    return 0;
+}
+
+int vkb_emu_bcn_order_free(vkb_emu_device *e)
+{
+    bcn_state *s = e ? e->bcn : NULL;
+    if (!s) return 1; /* decoded as it comes: nothing weighs bytes */
+    budget_cfg c;
+    if (budget_get(s, &c)) return 0;
+    if (small_decide(s) == 2) return 0;
+    return 1;
 }
 
 static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const VkImageFormatListCreateInfo *fl, int query)
@@ -806,7 +1110,7 @@ static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const 
     VkFormat t = s->tx[BC_INDEX(ci->format)];
     const VkImageUsageFlags texture = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     /* COLOR_ATTACHMENT is left out of the test: no BC image can be rendered to in Vulkan, and Zink (every
-     * OpenGL game) puts it on every texture with the EXTENDED_USAGE / MUTABLE flags (all 16 logged
+     * OpenGL game) puts it on every texture with the EXTENDED_USAGE / MUTABLE flags (a player log: all 16 logged
      * BC images decoded, 620 MB of BC held as 3.1 GB). STORAGE still decodes. The transcoded image
      * is made without it (vkb_emu_image_create_info). */
     const VkImageUsageFlags ignored = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -842,6 +1146,7 @@ static VkFormat tx_format(vkb_emu_device *e, const VkImageCreateInfo *ci, const 
                  "(logged once)", ci->extent.width, ci->extent.height, ci->extent.depth, ci->imageType, t);
         return VK_FORMAT_UNDEFINED;
     }
+    if (small_take(e, ci, fl, t, query)) return VK_FORMAT_UNDEFINED;
     return budget_take(e, ci, fl, t, query) ? t : VK_FORMAT_UNDEFINED;
 }
 
@@ -912,8 +1217,8 @@ void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci, int que
  * blocks of that level exactly), made when the first such view of the level is. When the render pass (or rendering)
  * that drew into it ends, what was drawn - the renderArea, bounded by the viewports set and the rects cleared in it
  * - is transcoded (decoded) from the sink into the texture, as an upload of those blocks would be (sink_writeback).
- * SOMA's terrain was black on v0.5.5.2, where the draw stayed in the sink, and garbled on v0.5.5.1
- *, where it went into the decoded image as colours. A view the app only samples stays a view of the image. */
+ * SOMA's terrain (a player log) was black on v0.5.5.2, where the draw stayed in the sink, and garbled on v0.5.5.1
+ * (a player log), where it went into the decoded image as colours. A view the app only samples stays a view of the image. */
 typedef struct bc_sink {
     VkFormat format;
     uint32_t level;          /* the BC image's level whose blocks it holds */
@@ -1110,6 +1415,8 @@ void vkb_emu_image_release(vkb_emu_device *e, vkb_emu_image *img)
         sink_free(e, k);
     }
     if (img->bc_fallback) __atomic_sub_fetch(&g_fb_live, img->bc_fallback, __ATOMIC_RELAXED);
+    if (img->bc_small && e->bcn) __atomic_sub_fetch(&((bcn_state *)e->bcn)->small_live, img->bc_small, __ATOMIC_RELAXED);
+    img->bc_small = 0;
 }
 
 VkFormat vkb_emu_bcn_view_format(vkb_emu_device *e, VkImage image, VkFormat requested)
@@ -1230,6 +1537,8 @@ static int chunk_create(vkb_emu_device *e, VkDeviceSize size, chunk *out)
     }
     out->size = size;
     __atomic_add_fetch(&g_live, size, __ATOMIC_RELAXED);
+    cg_add(CG_CHUNKS, 1);
+    cg_add(CG_CHUNK_BYTES, size);
     return 1;
 }
 
@@ -1312,14 +1621,25 @@ static void chunk_release(vkb_emu_device *e, chunk *k)
     if (!keep) chunk_destroy(e, k);
 }
 
+static void cv_harvest(vkb_emu_device *e, bcn_cb *c);
+static void tab_release(vkb_emu_device *e, bcn_cb *c);
+
 void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch)
 {
     bcn_cb *c = cb_scratch;
     if (!c) return;
+    cv_harvest(e, c);
+    if (c->est_ns) vkb_hitch_bc_done(e->dev ? e->dev->proc : NULL, c->est_ns); /* its conversions are no longer in flight */
+    tab_release(e, c);
     for (uint32_t i = 0; i < c->n; i++) chunk_release(e, &c->held[i]);
     for (uint32_t i = 0; i < c->nstage; i++) chunk_release(e, &c->stage[i]);
+    for (uint32_t i = 0; i < c->ntimg; i++) {
+        e->dev->real.vkDestroyImage(e->dev->device, c->timg[i].img, NULL);
+        e->dev->real.vkFreeMemory(e->dev->device, c->timg[i].mem, NULL);
+    }
     free(c->held);
     free(c->stage);
+    free(c->timg);
     memset(c, 0, sizeof(*c));
 }
 
@@ -1337,6 +1657,46 @@ static const size_t fam_size[FAM_COUNT] = {sizeof(spv_bc1), sizeof(spv_bc2), siz
                                            sizeof(spv_bc7_astc6), sizeof(spv_bc2_astc8), sizeof(spv_bc3_astc8), sizeof(spv_bc7_astc8), sizeof(spv_bc1_astc),
                                            sizeof(spv_raw_etc2), sizeof(spv_raw_astc), sizeof(spv_raw_eac_r), sizeof(spv_raw_eac_rg),
                                            sizeof(spv_raw_astc_hdr), sizeof(spv_raw_astc6), sizeof(spv_raw_astc8)};
+/* The REGION_TABLE variants (VKBRIDGE_BC_ONE_DISPATCH): the 4x4 decoders and transcoders; NULL for the others. */
+static const uint32_t *const fam_tcode[FAM_COUNT] = {
+    [FAM_BC1] = spv_bc1_t, [FAM_BC2] = spv_bc2_t, [FAM_BC3] = spv_bc3_t, [FAM_BC4] = spv_bc4_t, [FAM_BC5] = spv_bc5_t,
+    [FAM_BC6H] = spv_bc6h_t, [FAM_BC7] = spv_bc7_t, [FAM_BC1_16] = spv_bc1_16_t, [TX_BC1] = spv_bc1_etc2_t, [TX_BC2] = spv_bc2_astc_t,
+    [TX_BC3] = spv_bc3_astc_t, [TX_BC4] = spv_bc4_eac_t, [TX_BC5] = spv_bc5_eac_t, [TX_BC6H] = spv_bc6h_astc_t, [TX_BC7] = spv_bc7_astc_t,
+    [TX_BC1_ASTC] = spv_bc1_astc_t};
+static const size_t fam_tsize[FAM_COUNT] = {
+    [FAM_BC1] = sizeof(spv_bc1_t), [FAM_BC2] = sizeof(spv_bc2_t), [FAM_BC3] = sizeof(spv_bc3_t), [FAM_BC4] = sizeof(spv_bc4_t),
+    [FAM_BC5] = sizeof(spv_bc5_t), [FAM_BC6H] = sizeof(spv_bc6h_t), [FAM_BC7] = sizeof(spv_bc7_t), [FAM_BC1_16] = sizeof(spv_bc1_16_t),
+    [TX_BC1] = sizeof(spv_bc1_etc2_t), [TX_BC2] = sizeof(spv_bc2_astc_t), [TX_BC3] = sizeof(spv_bc3_astc_t), [TX_BC4] = sizeof(spv_bc4_eac_t),
+    [TX_BC5] = sizeof(spv_bc5_eac_t), [TX_BC6H] = sizeof(spv_bc6h_astc_t), [TX_BC7] = sizeof(spv_bc7_astc_t),
+    [TX_BC1_ASTC] = sizeof(spv_bc1_astc_t)};
+/* The BC_PALETTE variants (VKBRIDGE_BC_PALETTE): BC1 -> ETC2, BC4 / BC5 -> EAC searching the block's palette, the same
+ * blocks as the texel search (tests/bcn_check.c test_palette); with REGION_TABLE too (_tp). */
+static const uint32_t *const fam_pcode[FAM_COUNT] = {[TX_BC1] = spv_bc1_etc2_p, [TX_BC4] = spv_bc4_eac_p, [TX_BC5] = spv_bc5_eac_p};
+static const size_t fam_psize[FAM_COUNT] = {[TX_BC1] = sizeof(spv_bc1_etc2_p), [TX_BC4] = sizeof(spv_bc4_eac_p), [TX_BC5] = sizeof(spv_bc5_eac_p)};
+static const uint32_t *const fam_tpcode[FAM_COUNT] = {[TX_BC1] = spv_bc1_etc2_tp, [TX_BC4] = spv_bc4_eac_tp, [TX_BC5] = spv_bc5_eac_tp};
+static const size_t fam_tpsize[FAM_COUNT] = {[TX_BC1] = sizeof(spv_bc1_etc2_tp), [TX_BC4] = sizeof(spv_bc4_eac_tp), [TX_BC5] = sizeof(spv_bc5_eac_tp)};
+/* The BC_FAST variants (VKBRIDGE_BC_FAST, shaders/etc2_fast.glsl): BC1 -> ETC2 by palette with the block's colours and counts
+ * packed and the colour loops unrolled - the same search, the same blocks (tests/bcn_check.c test_fast), fewer registers and
+ * no stack arrays (malioc: Mali spilled the old one's state to the stack in the inner loops). pal 2 in fam_variant. */
+/* BC7 -> ASTC's (shaders/astc_fast.glsl): the texels packed, the loops unrolled, partitions by select - the same encoder, the
+ * same blocks (test_fast7); it has no palette variant, so pal 2 is its only other one. */
+static const uint32_t *const fam_fcode[FAM_COUNT] = {[TX_BC1] = spv_bc1_etc2_pf, [TX_BC7] = spv_bc7_astc_f};
+static const size_t fam_fsize[FAM_COUNT] = {[TX_BC1] = sizeof(spv_bc1_etc2_pf), [TX_BC7] = sizeof(spv_bc7_astc_f)};
+static const uint32_t *const fam_tfcode[FAM_COUNT] = {[TX_BC1] = spv_bc1_etc2_tpf, [TX_BC7] = spv_bc7_astc_tf};
+static const size_t fam_tfsize[FAM_COUNT] = {[TX_BC1] = sizeof(spv_bc1_etc2_tpf), [TX_BC7] = sizeof(spv_bc7_astc_tf)};
+
+/* fam's code with one dispatch a run (tab) and the palette search (pal: 1, 2 its BC_FAST variant), NULL where there is no such
+ * variant */
+static const uint32_t *fam_variant(int fam, int tab, int pal, size_t *size)
+{
+    if (pal == 2) {
+        *size = tab ? fam_tfsize[fam] : fam_fsize[fam];
+        return tab ? fam_tfcode[fam] : fam_fcode[fam];
+    }
+    const uint32_t *c = tab ? (pal ? fam_tpcode[fam] : fam_tcode[fam]) : (pal ? fam_pcode[fam] : fam_code[fam]);
+    *size = tab ? (pal ? fam_tpsize[fam] : fam_tsize[fam]) : (pal ? fam_psize[fam] : fam_size[fam]);
+    return c;
+}
 
 /* Builds the decoder or transcoder for fam at quality q, through the device's persistent pipeline
  * cache (server_pcache.c): Mali takes hundreds of ms over some transcoders, and without the cache
@@ -1373,21 +1733,111 @@ static uint32_t *bake_quality(const uint32_t *code, size_t size, uint32_t q)
     return NULL;
 }
 
-static VkPipeline build(vkb_emu_device *e, int fam, uint32_t q, int bg)
+static VkPipeline build_code(vkb_emu_device *e, int fam, uint32_t q, int bg, int tab, int pal);
+
+/* VKBRIDGE_BC_PALETTE: which families search the palette: PAL_ETC2 (BC1 -> ETC2), PAL_EAC (BC4 / BC5 -> EAC) */
+#define PAL_ETC2 1u
+#define PAL_EAC 2u
+/* The defaults (FAST_BG: after the startup probe passed them, built in the background) */
+#define BC_ONE_DISPATCH_DEFAULT 0 /* v0.5.5.4: off by default (performance work kept for 0.5.6); VKBRIDGE_BC_ONE_DISPATCH=1 */
+#define BC_PALETTE_DEFAULT 0 /* v0.5.5.4: off by default; VKBRIDGE_BC_PALETTE=1 / etc2 / eac */
+/* VKBRIDGE_BC_FAST: at which searches the BC1 -> ETC2 palette pipelines come from the BC_FAST variants (BCF_FAST: the fast
+ * search, quality 0; BCF_DEFAULT: the default and the high one) */
+#define BCF_FAST 1u
+#define BCF_DEFAULT 2u
+#define BC_FAST_DEFAULT 0 /* v0.5.5.4: off by default; VKBRIDGE_BC_FAST=1 / fast / default */
+static int pal_wanted(const bcn_state *s, int fam)
+{
+    return (fam == TX_BC1 && (s->palette & PAL_ETC2)) || ((fam == TX_BC4 || fam == TX_BC5) && (s->palette & PAL_EAC));
+}
+/* the palette variant of fam at q: 2 its BC_FAST one, 1 the palette one, 0 none */
+static int pal_kind(const bcn_state *s, int fam, uint32_t q)
+{
+    if (fam == TX_BC7) return fam_fcode[fam] != NULL && (s->bcfast7 & (q == 0 ? BCF_FAST : BCF_DEFAULT)) ? 2 : 0;
+    if (!pal_wanted(s, fam) || fam_pcode[fam] == NULL) return 0;
+    return fam_fcode[fam] != NULL && (s->bcfast & (q == 0 ? BCF_FAST : BCF_DEFAULT)) ? 2 : 1;
+}
+
+/* fam's new variant is wanted at q (FAST_BG; plock held or the state settled) */
+static int fast_wanted(const bcn_state *s, int fam, uint32_t q)
+{
+    return s->fast_mode == FAST_BG && s->fast_ok == 1 && q < 2 &&
+           ((s->table && fam_tcode[fam] != NULL) || (pal_wanted(s, fam) && fam_pcode[fam] != NULL) || (fam == TX_BC7 && pal_kind(s, fam, q) == 2));
+}
+
+/* fam's interim at q (FAST_BG): its new variant is a BC_FAST one, and VKBRIDGE_BC_FAST=0's variant there is not the old one */
+static int interim_wanted(const bcn_state *s, int fam, uint32_t q)
+{
+    return fast_wanted(s, fam, q) && pal_kind(s, fam, q) == 2 && ((s->table && fam_tcode[fam] != NULL) || fam_pcode[fam] != NULL);
+}
+
+/* fam at q: its REGION_TABLE variant where one dispatch a run is on (*tab 1) and its BC_PALETTE one where the palette
+ * search is; where that fails to build, the variant with one of them less, then neither (the old one; fast: not that,
+ * NULL instead). FAST_BG builds the old variant here (only) and the new ones with fast set, from the warm threads; fast 2:
+ * the interim, VKBRIDGE_BC_FAST=0's variant (the palette one in place of the BC_FAST one). */
+static VkPipeline build_v(vkb_emu_device *e, int fam, uint32_t q, int bg, int *tab, int fast)
+{
+    bcn_state *s = e->bcn;
+    int t = s->table && fam_tcode[fam] != NULL, pl = pal_kind(s, fam, q);
+    if (s->fast_mode == FAST_BG && !fast) t = pl = 0;
+    if (fast == 2 && pl == 2) pl = fam_pcode[fam] != NULL;
+    /* a BC_FAST variant that does not build: the palette one (none for BC7), then as before */
+    const int p1 = pl == 2 ? (fam_pcode[fam] != NULL) : pl, tries[6][2] = {{t, pl}, {t, p1}, {t, 0}, {0, pl}, {0, p1}, {0, 0}};
+    for (int i = 0; i < 6; i++) {
+        int dup = 0;
+        for (int j = 0; j < i; j++) dup |= tries[j][0] == tries[i][0] && tries[j][1] == tries[i][1];
+        if (dup || (fast && !tries[i][0] && !tries[i][1])) continue;
+        VkPipeline p = build_code(e, fam, q, bg, tries[i][0], tries[i][1]);
+        if (p || (!tries[i][0] && !tries[i][1])) {
+            *tab = tries[i][0];
+            return p;
+        }
+        VKB_WARN("BC emulation: converter %d (quality %u)%s%s did not build; trying with less", fam, q, tries[i][0] ? " with one dispatch a run" : "",
+                 tries[i][1] == 2 ? (fam == TX_BC7 ? " (VKBRIDGE_BC_FAST)" : " with the palette search (VKBRIDGE_BC_FAST)") : tries[i][1] ? " with the palette search" : "");
+    }
+    *tab = 0;
+    return VK_NULL_HANDLE;
+}
+
+static VkPipeline build(vkb_emu_device *e, int fam, uint32_t q, int bg, int *tab) { return build_v(e, fam, q, bg, tab, 0); }
+
+static VkPipeline build_code(vkb_emu_device *e, int fam, uint32_t q, int bg, int tab, int pal)
 {
     const vkb_dispatch *r = &e->dev->real;
     VkDevice d = e->dev->device;
-    uint32_t *baked = fam >= TX_BC1 && q != 1 && fam_code[fam] ? bake_quality(fam_code[fam], fam_size[fam], q) : NULL;
+    size_t size;
+    const uint32_t *code = fam_variant(fam, tab, pal, &size);
+    uint32_t *baked = fam >= TX_BC1 && q != 1 && code ? bake_quality(code, size, q) : NULL;
     if (fam >= TX_BC1 && q != 1 && !baked) VKB_WARN("BC emulation: transcoder %d has no BC_QUALITY constant to set; built at its default", fam);
-    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fam_size[fam], baked ? baked : fam_code[fam]};
+    /* PV-10: on PowerVR the constant tables (BC6H's bit layout, BC7's ASTC partitions, ...) go to Private storage, where
+     * the driver reads them right under robust buffer access (spirv_consttab.h) */
+    bcn_state *bs = e->bcn;
+    uint32_t *ct = NULL;
+    size_t ct_size = 0;
+    if (bs->consttab && code) {
+        vkb_consttab_stats st;
+        const char *why = NULL;
+        int r = vkb_spv_consttab(baked ? baked : code, size, &ct, &ct_size, &st, &why);
+        if (r < 0) VKB_WARN("BC emulation: PV-10 could not move converter %d's constant tables (%s); built as it is", fam, why ? why : "?");
+        else if (r > 0) {
+            __atomic_add_fetch(&bs->ct_vars, st.vars, __ATOMIC_RELAXED);
+            if (__atomic_add_fetch(&bs->ct_mods, 1, __ATOMIC_RELAXED) == 1)
+                VKB_INFO("BC emulation: PV-10: converter %d: %u constant table(s), %u elements, to Private (%u left); the same for each converter built",
+                         fam, st.vars, st.words, st.skipped);
+            else
+                VKB_DBG("BC emulation: PV-10: converter %d: %u constant table(s), %u elements, to Private (%u left)", fam, st.vars, st.words, st.skipped);
+        }
+    }
+    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, ct ? ct_size : size, ct ? ct : baked ? baked : code};
     VkShaderModule m;
-    VkResult mr = fam_code[fam] ? r->vkCreateShaderModule(d, &mci, NULL, &m) : VK_ERROR_INITIALIZATION_FAILED;
+    VkResult mr = code ? r->vkCreateShaderModule(d, &mci, NULL, &m) : VK_ERROR_INITIALIZATION_FAILED;
     free(baked);
+    free(ct);
     if (mr != VK_SUCCESS) return VK_NULL_HANDLE;
     VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
                                                   VK_SHADER_STAGE_COMPUTE_BIT, m, "main", NULL};
-    pci.layout = ((bcn_state *)e->bcn)->layout;
+    pci.layout = tab ? ((bcn_state *)e->bcn)->layout3 : ((bcn_state *)e->bcn)->layout;
     VkPipeline p;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1397,8 +1847,9 @@ static VkPipeline build(vkb_emu_device *e, int fam, uint32_t q, int bg)
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     /* built on the first upload that needs it (or beside it, bg): a load-time cost worth seeing */
-    if (p) VKB_INFO("BC emulation: %s pipeline %d%s built in %.1f ms%s", fam >= TX_BC1 ? "transcoder" : "decoder", fam,
-                    fam < TX_BC1 ? "" : q == 0 ? " (fast)" : q == 2 ? " (high)" : " (default)",
+    if (p) VKB_INFO("BC emulation: %s pipeline %d%s%s%s built in %.1f ms%s", fam >= TX_BC1 ? "transcoder" : "decoder", fam,
+                    fam < TX_BC1 ? "" : q == 0 ? " (fast)" : q == 2 ? " (high)" : " (default)", tab ? " (one dispatch a run)" : "",
+                    pal == 2 ? (fam == TX_BC7 ? " (VKBRIDGE_BC_FAST)" : " (palette search, VKBRIDGE_BC_FAST)") : pal ? " (palette search)" : "",
                     (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, bg ? " in the background" : "");
     r->vkDestroyShaderModule(d, m, NULL);
     return p;
@@ -1415,12 +1866,10 @@ static uint32_t qualities(const bcn_state *s, int fam, uint32_t out[2])
     return 2;
 }
 
-/* Queues fam at q for the warm threads (started on first use). plock held. */
-static void warm_queue(vkb_emu_device *e, int fam, uint32_t q, int urgent)
+/* The warm threads, started on first use. plock held. */
+static void warm_start(vkb_emu_device *e)
 {
     bcn_state *s = e->bcn;
-    if (s->pipes[q][fam] || s->building[q][fam] || s->failed[q][fam] || s->warm_stop) return;
-    (urgent ? s->urgent : s->want)[q] |= 1u << fam;
     if (!s->nwarm) {
         for (int i = 0; i < WARM_THREADS; i++) {
             int r = pthread_create(&s->warm[s->nwarm], NULL, warm_main, e);
@@ -1431,6 +1880,133 @@ static void warm_queue(vkb_emu_device *e, int fam, uint32_t q, int urgent)
         else s->warm_stop = 1; /* nothing will take the queue */
     }
     pthread_cond_broadcast(&s->pcond);
+}
+
+/* Queues fam at q for the warm threads. plock held. */
+static void warm_queue(vkb_emu_device *e, int fam, uint32_t q, int urgent)
+{
+    bcn_state *s = e->bcn;
+    if (s->pipes[q][fam] || s->building[q][fam] || s->failed[q][fam] || s->warm_stop) return;
+    (urgent ? s->urgent : s->want)[q] |= 1u << fam;
+    warm_start(e);
+}
+
+/* Queues fam's new variant at q for the warm threads, after everything else (FAST_BG). plock held. */
+static void fast_queue(vkb_emu_device *e, int fam, uint32_t q)
+{
+    bcn_state *s = e->bcn;
+    if (!fast_wanted(s, fam, q) || s->fpipes[q][fam] || s->fbuilding[q][fam] || s->ffailed[q][fam] || s->warm_stop) return;
+    s->fwant[q] |= 1u << fam;
+    if (interim_wanted(s, fam, q) && !s->ipipes[q][fam] && !s->istate[q][fam]) s->iwant[q] |= 1u << fam;
+    warm_start(e);
+}
+
+/* The converters a program's pipeline cache holds, as this bridge last left them: a line in <its cache file>.bc, "bcconv <hash of
+ * every converter's code, vkb_emu_bcn_variants_hash> <old 0|1> <signature of the new variant set built, 0: none>". */
+static uint64_t mark_sig(const bcn_state *s)
+{
+    uint64_t h = vkb_emu_bcn_variants_hash();
+    const uint64_t v[4] = {(uint64_t)s->table, s->palette, s->bcfast, s->bcfast7};
+    for (int i = 0; i < 4; i++) h = (h ^ v[i]) * 0x100000001b3ull;
+    return h | 1; /* never 0 */
+}
+static int mark_read(vkb_emu_device *e, uint64_t *hash, int *old, uint64_t *sig)
+{
+    const char *f = vkb_pcache_file(e->dev);
+    char path[600];
+    if (!f) return 0;
+    snprintf(path, sizeof(path), "%s.bc", f);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    unsigned long long h = 0, g = 0;
+    int o = 0, n = fscanf(fp, "bcconv %llx %d %llx", &h, &o, &g);
+    fclose(fp);
+    if (n != 3) return 0;
+    *hash = h, *old = o, *sig = g;
+    return 1;
+}
+/* At the device's end: what the cache holds now (this device's builds, with the line's when it is for the same converters) */
+static void mark_write(vkb_emu_device *e)
+{
+    bcn_state *s = e->bcn;
+    const char *f = vkb_pcache_file(e->dev);
+    if (!f || !(s->built_old || s->built_new)) return;
+    uint64_t h0 = 0, g0 = 0, h = vkb_emu_bcn_variants_hash();
+    int o0 = 0, had = mark_read(e, &h0, &o0, &g0) && h0 == h;
+    int old = s->built_old || (had && o0);
+    uint64_t sig = s->built_new ? mark_sig(s) : had ? g0 : 0;
+    if (had && old == o0 && sig == g0) return;
+    char path[600], tmp[620];
+    snprintf(path, sizeof(path), "%s.bc", f);
+    snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) return;
+    int ok = fprintf(fp, "bcconv %llx %d %llx\n", (unsigned long long)h, old, (unsigned long long)sig) > 0;
+    if (fclose(fp) != 0 || !ok || rename(tmp, path) != 0) unlink(tmp);
+}
+
+/* FAST_BG with the probe's pass known when the device was made, at its first BC image: FAST_BG compiles the old variant first
+ * (the upload waiting for it) and the new one behind it, used once built, so where the old ones are not in this program's cache
+ * (a game new to this driver, or one whose cache holds other converters) the first burst converted one dispatch a copy with them
+ * and every converter was compiled twice (S11 Ultra G925 K1d 8370 dispatches for 8370 copies, 5.95 ms/Mtex instead of 1.0;
+ * A35 G68 K1a, gate off, 8370 for 8370, 4335 ms instead of 2323). There the new ones are built in their place, the upload
+ * waiting for them where it waited for the old ones (FAST_INLINE's way; one that does not build: the old one): about the same
+ * wait (G68: 0.8-3.2 s each, old 1.0-3.0 s), one compile instead of two, nothing more in the background. Also where the cache
+ * holds the new set already (cache hits). FAST_BG stays where the old ones are cache hits and the new set may not be (the line
+ * says old only, or a cache from before this line), so no hit becomes a compile. Idea from 6d86988 (perf/bc-probe-fix2).
+ * VKBRIDGE_BC_FAST_FRESH=0: FAST_BG always. */
+static void fast_settle_now(vkb_emu_device *e)
+{
+    bcn_state *s = e->bcn;
+    if (!__atomic_load_n(&s->fast_settle, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&s->plock);
+    if (s->fast_settle) {
+        const char *v = vkb_srv_env("VKBRIDGE_BC_FAST_FRESH");
+        uint64_t h = 0, g = 0;
+        int old = 0, m = mark_read(e, &h, &old, &g), cur = m && h == vkb_emu_bcn_variants_hash();
+        const char *why = vkb_pcache_started_empty(e->dev) ? "holds nothing (a program new to this driver)"
+                          : m && !cur                       ? "holds converters of another bridge build"
+                          : cur && g == mark_sig(s)         ? "holds the new converter variants"
+                          : cur && !old                     ? "holds no old converters"
+                                                            : NULL;
+        if (!(v && *v == '0') && why) {
+            s->fast_mode = FAST_INLINE;
+            VKB_INFO("BC emulation: this program's pipeline cache %s: the new converter variants are built in place of the old ones "
+                     "(the startup probe passed them; VKBRIDGE_BC_FAST_FRESH=0: the old ones first)", why);
+        }
+        __atomic_store_n(&s->fast_settle, 0, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&s->plock);
+}
+
+/* FAST_BG while the probe has not said (fast_ok 0), on BC image creation at most every 250 ms: once bc_variants has run,
+ * the parts it turned off go, and the new variants of what is built already are queued. */
+static void fast_poll(vkb_emu_device *e)
+{
+    bcn_state *s = e->bcn;
+    if (s->fast_mode != FAST_BG || __atomic_load_n(&s->fast_ok, __ATOMIC_ACQUIRE)) return;
+    uint64_t now = vkb_hitch_now(), last = __atomic_load_n(&s->fast_poll_ns, __ATOMIC_RELAXED);
+    if (now - last < 250000000ull || !__atomic_compare_exchange_n(&s->fast_poll_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    int st = vkb_probe_bc_variants();
+    if (!st) return;
+    pthread_mutex_lock(&s->plock);
+    if (!s->fast_ok) {
+        if (vkb_probe_flag(VKB_PROBE_FLAG_BC_TAB)) s->table = 0;
+        if (vkb_probe_flag(VKB_PROBE_FLAG_BC_PAL_ETC2)) s->palette &= ~PAL_ETC2;
+        if (vkb_probe_flag(VKB_PROBE_FLAG_BC_PAL_EAC)) s->palette &= ~PAL_EAC;
+        if (vkb_probe_flag(VKB_PROBE_FLAG_BC_FAST_ETC2)) s->bcfast = 0;
+        if (vkb_probe_flag(VKB_PROBE_FLAG_BC_FAST_ASTC)) s->bcfast7 = 0;
+        int on = st == 1 && (s->table || s->palette || s->bcfast7);
+        __atomic_store_n(&s->fast_ok, on ? 1 : -1, __ATOMIC_RELEASE);
+        VKB_INFO("BC emulation: the startup probe %s the new converter variants: %s%s%s%s", st == 1 ? "checked" : "could not check",
+                 on ? "built in the background now, each used once built:" : "the old variants only",
+                 on && s->table ? " one dispatch a run" : "", on && s->palette ? " palette search" : "", on && s->bcfast7 ? " BC7 -> ASTC fast" : "");
+        if (on)
+            for (uint32_t q = 0; q < 2; q++)
+                for (int fam = 0; fam < FAM_COUNT; fam++)
+                    if (s->pipes[q][fam]) fast_queue(e, fam, q);
+    }
+    pthread_mutex_unlock(&s->plock);
 }
 
 static void queue_family(vkb_emu_device *e, int fam, int urgent)
@@ -1446,6 +2022,8 @@ static void queue_family(vkb_emu_device *e, int fam, int urgent)
 static void prebuild(vkb_emu_device *e, int fam)
 {
     bcn_state *s = e->bcn;
+    fast_settle_now(e);
+    fast_poll(e);
     uint32_t q[2], n = qualities(s, fam, q);
     int ready = __atomic_load_n(&s->warm_all, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && ready; i++) ready = __atomic_load_n(&s->pipes[q[i]][fam], __ATOMIC_ACQUIRE) != VK_NULL_HANDLE;
@@ -1465,6 +2043,7 @@ static void prebuild(vkb_emu_device *e, int fam)
 static void prebuild_later(vkb_emu_device *e, int fam)
 {
     bcn_state *s = e->bcn;
+    fast_settle_now(e);
     uint32_t q[2], n = qualities(s, fam, q);
     int ready = 1;
     for (uint32_t i = 0; i < n && ready; i++) ready = __atomic_load_n(&s->pipes[q[i]][fam], __ATOMIC_ACQUIRE) != VK_NULL_HANDLE;
@@ -1475,12 +2054,24 @@ static void prebuild_later(vkb_emu_device *e, int fam)
 }
 
 /* Stores what a build of fam at q gave. plock held. */
-static void publish(bcn_state *s, int fam, uint32_t q, VkPipeline p)
+static void publish(bcn_state *s, int fam, uint32_t q, VkPipeline p, int tab)
 {
+    s->ptab[q][fam] = (uint8_t)tab; /* before the pipeline: a reader that sees it sees this */
     __atomic_store_n(&s->pipes[q][fam], p, __ATOMIC_RELEASE);
     s->building[q][fam] = 0;
+    if (p) *(s->fast_mode == FAST_INLINE ? &s->built_new : &s->built_old) = 1;
     if (!p) s->failed[q][fam] = 1;
     pthread_cond_broadcast(&s->pcond);
+}
+
+/* Stores what a build of fam's new variant at q gave (FAST_BG). plock held. */
+static void publish_fast(bcn_state *s, int fam, uint32_t q, VkPipeline p, int tab)
+{
+    s->ftab[q][fam] = (uint8_t)tab; /* before the pipeline: a reader that sees it sees this */
+    __atomic_store_n(&s->fpipes[q][fam], p, __ATOMIC_RELEASE);
+    s->fbuilding[q][fam] = 0;
+    if (p) s->built_new = 1;
+    if (!p) s->ffailed[q][fam] = 1;
 }
 
 /* The decoder or transcoder for an upload of fam at q (the transcoders' BC_QUALITY, 0-2; ignored by
@@ -1495,6 +2086,7 @@ static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q)
     if (fam < TX_BC1) q = 1;
     VkPipeline p = __atomic_load_n(&s->pipes[q][fam], __ATOMIC_ACQUIRE);
     if (p) return p;
+    fast_settle_now(e);
     int alt = fam >= TX_BC1 && s->quality == QUALITY_AUTO && q == 0;
     const uint32_t o = 1;
     pthread_mutex_lock(&s->plock);
@@ -1517,9 +2109,11 @@ static VkPipeline pipeline(vkb_emu_device *e, int fam, uint32_t q)
         }
         s->building[q][fam] = 1;
         pthread_mutex_unlock(&s->plock);
-        p = build(e, fam, q, 0);
+        int tab;
+        p = build(e, fam, q, 0, &tab);
         pthread_mutex_lock(&s->plock);
-        publish(s, fam, q, p);
+        publish(s, fam, q, p, tab);
+        if (p) fast_queue(e, fam, q);
         if (fam >= TX_BC1 && s->quality == QUALITY_AUTO && q < 2) warm_queue(e, fam, q ^ 1, 0);
         break;
     }
@@ -1532,6 +2126,7 @@ static void *warm_main(void *arg)
 {
     vkb_emu_device *e = arg;
     bcn_state *s = e->bcn;
+    vkb_cores_plain_thread(); /* started from a connection thread: never takes a fast core from the game */
     vkb_srv_set_current_table(e->dev); /* the layers beneath (hang, gpuprof) find the device by it */
     pthread_mutex_lock(&s->plock);
     for (;;) {
@@ -1544,17 +2139,63 @@ static void *warm_main(void *arg)
                 q = k, fam = __builtin_ctz(m[k]);
                 s->urgent[k] &= ~(1u << fam), s->want[k] &= ~(1u << fam);
             }
+        int fast = 0;
+        for (uint32_t k = 0; k < 2 && fam < 0 && !s->fbusy; k++) /* the new variants last, one at a time */
+            if (s->fwant[k]) {
+                q = k, fam = __builtin_ctz(s->fwant[k]), fast = 1;
+                s->fwant[k] &= ~(1u << fam);
+            }
+        for (uint32_t k = 0; k < 2 && fam < 0 && !s->ibusy; k++) /* the interims beside them, one at a time */
+            if (s->iwant[k]) {
+                q = k, fam = __builtin_ctz(s->iwant[k]), fast = 2;
+                s->iwant[k] &= ~(1u << fam);
+            }
         if (s->warm_stop) break;
         if (fam < 0) {
             pthread_cond_wait(&s->pcond, &s->plock);
             continue;
         }
+        int tab;
+        if (fast == 2) {
+            if (s->fpipes[q][fam] || s->ipipes[q][fam] || s->istate[q][fam]) continue;
+            s->istate[q][fam] = 1, s->ibusy = 1;
+            pthread_mutex_unlock(&s->plock);
+            VkPipeline p = build_v(e, fam, q, 1, &tab, 2);
+            pthread_mutex_lock(&s->plock);
+            s->itab[q][fam] = (uint8_t)tab; /* before the pipeline: a reader that sees it sees this */
+            __atomic_store_n(&s->ipipes[q][fam], p, __ATOMIC_RELEASE);
+            s->istate[q][fam] = 2, s->ibusy = 0;
+            if (p) VKB_INFO("BC emulation: converter %d (quality %u) without VKBRIDGE_BC_FAST's variant used until that one is built (interim)", fam, q);
+            pthread_cond_broadcast(&s->pcond);
+            continue;
+        }
+        if (fast) {
+            if (s->fpipes[q][fam] || s->fbuilding[q][fam] || s->ffailed[q][fam]) continue;
+            /* VKBRIDGE_TEST_BC_FAST_HOLD=1 (host tests, the server's environment only, host/bcfirst_test.sh): the new
+             * variants are never built in the background, so a whole run is the time before their compile ends; =2: only
+             * the BC_FAST ones */
+            static int hold = -1;
+            if (hold < 0) hold = getenv("VKBRIDGE_TEST_BC_FAST_HOLD") ? atoi(getenv("VKBRIDGE_TEST_BC_FAST_HOLD")) : 0;
+            if (hold == 1 || (hold == 2 && pal_kind(s, fam, q) == 2)) {
+                VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_TEST_BC_FAST_HOLD: the new converter variants are not built in the background, on purpose");
+                continue;
+            }
+            s->fbuilding[q][fam] = 1, s->fbusy = 1;
+            pthread_mutex_unlock(&s->plock);
+            VkPipeline p = build_v(e, fam, q, 1, &tab, 1);
+            pthread_mutex_lock(&s->plock);
+            publish_fast(s, fam, q, p, tab);
+            s->fbusy = 0;
+            pthread_cond_broadcast(&s->pcond);
+            continue;
+        }
         if (s->pipes[q][fam] || s->building[q][fam] || s->failed[q][fam]) continue;
         s->building[q][fam] = 1;
         pthread_mutex_unlock(&s->plock);
-        VkPipeline p = build(e, fam, q, 1);
+        VkPipeline p = build(e, fam, q, 1, &tab);
         pthread_mutex_lock(&s->plock);
-        publish(s, fam, q, p);
+        publish(s, fam, q, p, tab);
+        if (p) fast_queue(e, fam, q);
     }
     pthread_mutex_unlock(&s->plock);
     return NULL;
@@ -1573,6 +2214,8 @@ void vkb_emu_bcn_quiesce(vkb_srv_table *dev)
     pthread_cond_broadcast(&s->pcond);
     pthread_mutex_unlock(&s->plock);
     for (int i = 0; i < n; i++) pthread_join(s->warm[i], NULL);
+    /* the first time (the pipeline cache is still there: server_conn.c / server_instance.c quiesce before it goes) */
+    if (!__atomic_exchange_n(&s->marked, 1, __ATOMIC_ACQ_REL)) mark_write(dev->emu);
 }
 
 typedef struct region {
@@ -1594,6 +2237,10 @@ typedef struct upload {
     uint32_t ob, block_bytes;  /* bytes of a block in the scratch (decoded or transcoded), in the source */
     uint32_t n_dim;          /* texels a side of an output block: 4, or 6 / 8 for ASTC 6x6 / 8x8 */
     uint32_t xflags;         /* more flags for the shader (a re-encoder's, bc_decode.comp SRC_RAW) */
+    uint32_t key;            /* the converter and search of the region in hand (cv_key), for the counters */
+    VkPipeline pipe;         /* ... its pipeline, and whether that takes region tables (run_*) */
+    int tab;
+    uint64_t pieces, scratch; /* counted once at the end (cv_*) */
     VkDeviceSize left;       /* scratch the rest of the upload needs (sizes new chunks) */
     struct bc_batch *pl;     /* decoded, waiting to be copied into their images */
 } upload;
@@ -1601,7 +2248,7 @@ typedef struct upload {
 /* ------------------------------------------------------------------ uploads, counted and batched */
 
 /* What the conversions of the app's buffer-to-image copies into BC images record, all devices: a
- * line every 60 s while it changes and at each device's end. GTA V (DXVK 3.1.1) streams
+ * line every 60 s while it changes and at each device's end. GTA V (DXVK 3.1.1, a player log) streams
  * ~1700 textures of ~25 KB in a second: one copy per mip level each, back to back with no barrier
  * between them (DXVK records its layout transitions into a command buffer of their own), which
  * the conversion turned into two barriers, a dispatch, a copy and a restore of the app's compute
@@ -1658,16 +2305,323 @@ typedef struct bc_batch {
     pend *p;                 /* per copy: from where into what */
     VkBufferImageCopy *c;    /* ... and its region */
     uint32_t n, cap;
+    bcn_cb *sc;              /* the command buffer's scratch record (its timestamps) */
+    uint32_t st1;            /* the batch's timestamp pair in it, + 1 (0: not timed) */
+    struct bc_run {          /* regions waiting for their one dispatch (run_*) */
+        VkPipeline pipe;
+        VkBuffer src, dst, tbuf;
+        VkDeviceSize base, hi, toff; /* the source range bound (base aligned), the table's place in tbuf */
+        uint8_t *tmap;               /* ... mapped */
+        uint32_t flags, n, wgs, key, transcode;
+    } run;
 } bc_batch;
 
 static __thread bc_batch tls_batch;
 __thread int vkb_emu_bc_batch_open;
 static __thread int tls_b2i; /* the conversion in hand is of an app's buffer-to-image copy */
 
+/* ------------------------------------------------------------------ what the conversions cost, measured */
+
+/* Counted per converter (cv_key: the family - decoder, transcoder or re-encoder - and its search: fast, default, high;
+ * decoders count as default), all devices: the app's copies, the regions and their texels by the region's size, the
+ * dispatches, the pieces and the scratch they took; and the GPU time of the batches (to_compute ... pend_flush, one
+ * timestamp at each end, bottom of pipe: from the end of the earlier work in the command buffer to the end of the
+ * conversion's copies). A batch's GPU time is split over its converters by the estimate's weights (texels x
+ * tx_weight x the search's cost, gpu_est_ns) and, when one converter did the whole batch, summed apart as well: its
+ * ms/Mtex with no model in it. Read when the command buffer is begun again, reset or freed (the work is over then,
+ * so no wait); a pair not there (the command buffer was never submitted) counts as not run. A line every
+ * CV_PERIOD_NS while something changed ("BC conversions, last 10.0 s") with the converters' line after it, and the
+ * totals at each device's end. VKBRIDGE_BC_GPU_TIME=0: no timestamps (the counts stay). The GPU times are of the
+ * command buffers read in the window, which lags the recording by the frames in flight. */
+
+/* The estimate's relative cost of a texel of key (gpu_est_ns without its device scale). */
+static double cv_weight(uint32_t key)
+{
+    int fam = (int)(key / 3);
+    uint32_t q = key % 3;
+    if (fam < TX_BC1) return 1.0;
+    return tx_weight(fam) * (q == 0 ? 1.0 : q == 2 ? GPU_EST_HIGH : GPU_EST_DEFAULT);
+}
+
+/* regions of one converter: n[0] regions, n[1] texels, n[2 + size class] texels */
+static void cv_regions(uint32_t key, const uint64_t *n)
+{
+    if (key == UINT32_MAX || !n[0]) return;
+    cv_add(key, CK_REGIONS, n[0]);
+    cv_add(key, CK_TEX, n[1]);
+    for (int i = 0; i < CVS_N; i++)
+        if (n[2 + i]) cv_add(key, CK_S0 + i, n[2 + i]);
+}
+
+static int cv_size_class(uint64_t texels) { return texels <= 4096 ? CVS_LE64 : texels <= 65536 ? CVS_LE256 : texels <= 1048576 ? CVS_LE1K : CVS_MORE; }
+
+/* The lines: what changed since the last (end: the totals so far, at a device's end). g_cv_lock held. */
+static void cv_lines(int end, uint64_t now)
+{
+    uint64_t cv[CV_KEYS][CK_N], cg[CG_N];
+    int changed = 0;
+    for (int k = 0; k < CV_KEYS; k++)
+        for (int i = 0; i < CK_N; i++) {
+            uint64_t v = __atomic_load_n(&g_cv[k][i], __ATOMIC_RELAXED);
+            cv[k][i] = end ? v : v - g_cv_told[k][i];
+            changed |= v != g_cv_told[k][i];
+            if (!end) g_cv_told[k][i] = v;
+        }
+    for (int i = 0; i < CG_N; i++) {
+        uint64_t v = __atomic_load_n(&g_cg[i], __ATOMIC_RELAXED);
+        cg[i] = end ? v : v - g_cg_told[i];
+        changed |= v != g_cg_told[i];
+        if (!end) g_cg_told[i] = v;
+    }
+    double secs = g_cv_told_ns ? (now - g_cv_told_ns) / 1e9 : 0;
+    if (!end) g_cv_told_ns = now;
+    if (!changed && !end) return;
+    uint64_t copies = 0, regions = 0, tex = 0, disp = 0, sz[CVS_N] = {0};
+    for (int k = 0; k < CV_KEYS; k++) {
+        copies += cv[k][CK_COPIES], regions += cv[k][CK_REGIONS], tex += cv[k][CK_TEX], disp += cv[k][CK_DISP];
+        for (int s = 0; s < CVS_N; s++) sz[s] += cv[k][CK_S0 + s];
+    }
+    if (end && !copies && !cg[CG_BATCHES]) return;
+    char when[48], worst[160] = "";
+    if (end) snprintf(when, sizeof(when), "so far");
+    else snprintf(when, sizeof(when), "last %.1f s", secs);
+    if (!end && g_cv_worst.ns)
+        snprintf(worst, sizeof(worst), ", worst batch %.1f ms (%.2f Mtex, %u copies, %u%% %s %s)", g_cv_worst.ns / 1e6, g_cv_worst.tex / 1e6,
+                 g_cv_worst.copies, g_cv_worst.pct, fam_name[g_cv_worst.key / 3],
+                 g_cv_worst.key / 3 < TX_BC1 ? "" : g_cv_worst.key % 3 == 0 ? "fast" : g_cv_worst.key % 3 == 2 ? "high" : "default");
+    if (!end) memset(&g_cv_worst, 0, sizeof(g_cv_worst));
+    char runs[256] = "";
+    if (cg[CG_RUNS])
+        snprintf(runs, sizeof(runs), "; one dispatch a run (VKBRIDGE_BC_ONE_DISPATCH): %llu runs, a new one at a change of pipeline %llu, flags %llu, "
+                 "source %llu, scratch chunk %llu, at the workgroup limit %llu, the range limit %llu, a full table %llu",
+                 (unsigned long long)cg[CG_RUNS], (unsigned long long)cg[CG_RUN_PIPE], (unsigned long long)cg[CG_RUN_FLAGS],
+                 (unsigned long long)cg[CG_RUN_SRC], (unsigned long long)cg[CG_RUN_DST], (unsigned long long)cg[CG_RUN_WG],
+                 (unsigned long long)cg[CG_RUN_RANGE], (unsigned long long)cg[CG_RUN_TABLE]);
+    VKB_INFO("BC conversions, %s: %llu copies, %llu regions, %.2f Mtex (regions of <=64x64 %.2f, <=256x256 %.2f, <=1024x1024 %.2f, "
+             "larger %.2f), %llu dispatches in %llu batches, %llu pieces into %.1f MiB of scratch (%llu chunks made, %.1f MiB; %llu times "
+             "a command buffer's own reused); GPU %.1f ms in %llu batches read (%llu timed, %llu not run, %llu not timed)%s%s",
+             when, (unsigned long long)copies, (unsigned long long)regions, tex / 1e6, sz[0] / 1e6, sz[1] / 1e6, sz[2] / 1e6, sz[3] / 1e6,
+             (unsigned long long)disp, (unsigned long long)cg[CG_BATCHES], (unsigned long long)cg[CG_PIECES], cg[CG_SCRATCH] / 1048576.0,
+             (unsigned long long)cg[CG_CHUNKS], cg[CG_CHUNK_BYTES] / 1048576.0, (unsigned long long)cg[CG_WRAPS], cg[CG_GPU_NS] / 1e6,
+             (unsigned long long)cg[CG_READ], (unsigned long long)cg[CG_TIMED], (unsigned long long)cg[CG_NOTRUN],
+             (unsigned long long)cg[CG_UNTIMED], worst, runs);
+    /* the converters, most texels first (then most GPU time) */
+    char line[1900];
+    int len = 0, shown = 0, more = 0;
+    uint8_t done[CV_KEYS] = {0};
+    for (;;) {
+        int best = -1;
+        for (int k = 0; k < CV_KEYS; k++)
+            if (!done[k] && (cv[k][CK_TEX] || cv[k][CK_SHARE_NS]) &&
+                (best < 0 || cv[k][CK_TEX] > cv[best][CK_TEX] ||
+                 (cv[k][CK_TEX] == cv[best][CK_TEX] && cv[k][CK_SHARE_NS] > cv[best][CK_SHARE_NS])))
+                best = k;
+        if (best < 0) break;
+        done[best] = 1;
+        if (len > (int)sizeof(line) - 260) {
+            more++;
+            continue;
+        }
+        const uint64_t *v = cv[best];
+        char alone[64] = "";
+        if (v[CK_ALONE_TEX]) snprintf(alone, sizeof(alone), ", alone %.2f ms/Mtex over %.2f Mtex", v[CK_ALONE_NS] / 1e6 / (v[CK_ALONE_TEX] / 1e6), v[CK_ALONE_TEX] / 1e6);
+        len += snprintf(line + len, sizeof(line) - (size_t)len, "%s%s%s %.2f Mtex (%.2f/%.2f/%.2f/%.2f) %llu copies %llu dispatches, GPU %.1f ms%s",
+                        shown ? "; " : "", fam_name[best / 3], best / 3 < TX_BC1 ? "" : best % 3 == 0 ? " fast" : best % 3 == 2 ? " high" : " default",
+                        v[CK_TEX] / 1e6, v[CK_S0] / 1e6, v[CK_S0 + 1] / 1e6, v[CK_S0 + 2] / 1e6, v[CK_S0 + 3] / 1e6,
+                        (unsigned long long)v[CK_COPIES], (unsigned long long)v[CK_DISP], v[CK_SHARE_NS] / 1e6, alone);
+        shown++;
+    }
+    if (more && len < (int)sizeof(line) - 24) snprintf(line + len, sizeof(line) - (size_t)len, "; %d more", more);
+    if (shown)
+        VKB_INFO("BC conversions by converter, %s (Mtex by region size <=64x64/<=256x256/<=1024x1024/larger; GPU: the batches' time "
+                 "split by the estimate's weights; alone: batches of that converter only): %s", when, line);
+}
+
+static void cv_tick(void)
+{
+    uint64_t now = vkb_hitch_now(), last = __atomic_load_n(&g_cv_ns, __ATOMIC_RELAXED);
+    if (!last) {
+        __atomic_compare_exchange_n(&g_cv_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&g_cv_lock);
+        if (!g_cv_told_ns) g_cv_told_ns = now;
+        pthread_mutex_unlock(&g_cv_lock);
+        return;
+    }
+    if (now - last < CV_PERIOD_NS || !__atomic_compare_exchange_n(&g_cv_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&g_cv_lock);
+    cv_lines(0, now);
+    pthread_mutex_unlock(&g_cv_lock);
+}
+
+static bc_qpool *qp_get(vkb_emu_device *e)
+{
+    bcn_state *s = e->bcn;
+    bc_qpool *q = NULL;
+    pthread_mutex_lock(&s->lock);
+    if (s->nqidle) q = s->qidle[--s->nqidle];
+    pthread_mutex_unlock(&s->lock);
+    if (q) return q;
+    q = calloc(1, sizeof(*q));
+    VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, QP_QUERIES, 0};
+    if (q && e->dev->real.vkCreateQueryPool(e->dev->device, &ci, NULL, &q->pool) == VK_SUCCESS) return q;
+    free(q);
+    VKB_ONCE(VKB_LOG_WARN, "BC emulation: no query pool for the conversions' GPU time (logged once): not timed");
+    return NULL;
+}
+
+static void qp_put(vkb_emu_device *e, bc_qpool *q)
+{
+    bcn_state *s = e->bcn;
+    if (s) {
+        int kept = 0;
+        pthread_mutex_lock(&s->lock);
+        if (s->nqidle == s->capqidle) {
+            uint32_t cap = s->capqidle ? s->capqidle * 2 : 16;
+            bc_qpool **n = realloc(s->qidle, cap * sizeof(*n));
+            if (n) s->qidle = n, s->capqidle = cap;
+        }
+        if (s->nqidle < s->capqidle) s->qidle[s->nqidle++] = q, kept = 1;
+        pthread_mutex_unlock(&s->lock);
+        if (kept) return;
+    }
+    e->dev->real.vkDestroyQueryPool(e->dev->device, q->pool, NULL);
+    free(q);
+}
+
+/* A batch begins (to_compute): counted, and its first stamp where the command buffer is timed. */
+static void stamp_open(upload *u)
+{
+    bcn_state *s = u->e->bcn;
+    bc_batch *b = u->pl;
+    bcn_cb *c = u->sc;
+    cg_add(CG_BATCHES, 1);
+    if (!b) return;
+    b->sc = c;
+    b->st1 = 0;
+    if (!s->gpu_time || !c) return;
+    if (!c->level) {
+        int sec = 0;
+        uint32_t fl = 0;
+        vkb_emu_cb_origin(u->e, u->cb, &sec, &fl);
+        c->level = sec ? 2 : 1; /* secondary command buffers: not timed (they may run in several primaries) */
+    }
+    if (c->level != 1) goto untimed;
+    if (!c->qp) {
+        if (!(c->qp = qp_get(u->e))) {
+            c->level = 2;
+            goto untimed;
+        }
+        u->e->dev->real.vkCmdResetQueryPool(u->cb, c->qp->pool, 0, QP_QUERIES);
+    }
+    if (2 * c->nst + 2 > QP_QUERIES) goto untimed;
+    if (c->nst == c->capst) {
+        uint32_t cap = c->capst ? c->capst * 2 : 8;
+        bc_stamp *n = realloc(c->st, cap * sizeof(*n));
+        if (!n) goto untimed;
+        c->st = n, c->capst = cap;
+    }
+    memset(&c->st[c->nst], 0, sizeof(c->st[0]));
+    u->e->dev->real.vkCmdWriteTimestamp(u->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->qp->pool, 2 * c->nst);
+    b->st1 = ++c->nst;
+    cg_add(CG_TIMED, 1);
+    return;
+untimed:
+    c->untimed++;
+    cg_add(CG_UNTIMED, 1);
+}
+
+/* The batch's work is recorded (pend_flush): its second stamp. */
+static void stamp_close(vkb_emu_device *e, VkCommandBuffer cb, bc_batch *b)
+{
+    if (!b->st1 || !b->sc || !b->sc->qp) return;
+    e->dev->real.vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b->sc->qp->pool, 2 * (b->st1 - 1) + 1);
+    b->st1 = 0;
+}
+
+/* texels of converter key (one region) in the open batch */
+static void stamp_note(upload *u, uint32_t key, uint64_t texels)
+{
+    bc_batch *b = u->pl;
+    if (!b || !b->st1 || !b->sc) return;
+    bc_stamp *t = &b->sc->st[b->st1 - 1];
+    t->tex += texels;
+    for (uint32_t i = 0; i < t->nk; i++)
+        if (t->key[i] == key) {
+            t->ktex[i] += texels;
+            return;
+        }
+    if (t->nk < ST_KEYS) {
+        t->key[t->nk] = key;
+        t->ktex[t->nk++] = texels;
+    } else {
+        t->over += texels;
+    }
+}
+
+/* The command buffer's work is over (it is begun again, reset or freed): its batches' GPU time read and counted. */
+static void cv_harvest(vkb_emu_device *e, bcn_cb *c)
+{
+    if (!c->qp) return;
+    if (c->nst && e->bcn) {
+        uint64_t v[QP_QUERIES][2];
+        uint32_t nq = 2 * c->nst;
+        memset(v, 0, sizeof(v[0]) * nq);
+        VkResult r = e->dev->real.vkGetQueryPoolResults(e->dev->device, c->qp->pool, 0, nq, sizeof(v[0]) * nq, v, sizeof(v[0]),
+                                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        int stale = v[0][1] && v[1][1] && v[0][0] == c->qp->last[0] && v[1][0] == c->qp->last[1];
+        uint64_t read = 0, notrun = 0, gpu = 0;
+        for (uint32_t i = 0; i < c->nst; i++) {
+            const bc_stamp *t = &c->st[i];
+            if ((r != VK_SUCCESS && r != VK_NOT_READY) || stale || !v[2 * i][1] || !v[2 * i + 1][1]) {
+                notrun++;
+                continue;
+            }
+            uint64_t ns = (uint64_t)((double)((v[2 * i + 1][0] - v[2 * i][0]) & g_ts_mask) * g_ts_period);
+            if (ns > 10000000000ull) { /* wrapped or bogus */
+                notrun++;
+                continue;
+            }
+            read++, gpu += ns;
+            double w = 0;
+            uint32_t top = 0;
+            for (uint32_t k = 0; k < t->nk; k++) {
+                w += (double)t->ktex[k] * cv_weight(t->key[k]);
+                if (t->ktex[k] > t->ktex[top]) top = k;
+            }
+            for (uint32_t k = 0; k < t->nk && w > 0; k++) cv_add(t->key[k], CK_SHARE_NS, (uint64_t)(ns * ((double)t->ktex[k] * cv_weight(t->key[k]) / w)));
+            if (t->nk == 1 && !t->over) {
+                cv_add(t->key[0], CK_ALONE_NS, ns);
+                cv_add(t->key[0], CK_ALONE_TEX, t->ktex[0]);
+            }
+            if (t->nk && ns > __atomic_load_n(&g_cv_worst.ns, __ATOMIC_RELAXED)) {
+                pthread_mutex_lock(&g_cv_lock);
+                if (ns > g_cv_worst.ns) {
+                    g_cv_worst.ns = ns, g_cv_worst.tex = t->tex, g_cv_worst.copies = t->copies, g_cv_worst.key = t->key[top];
+                    g_cv_worst.pct = t->tex ? (uint32_t)(100 * t->ktex[top] / t->tex) : 0;
+                }
+                pthread_mutex_unlock(&g_cv_lock);
+            }
+        }
+        if (v[0][1] && v[1][1]) c->qp->last[0] = v[0][0], c->qp->last[1] = v[1][0];
+        /* every batch of it timed and run: its measured time against the estimate, for the hitch lines' in-flight figure */
+        if (c->est_ns && read == c->nst && !c->untimed) vkb_hitch_bc_calib(c->est_ns, gpu);
+        cg_add(CG_READ, read);
+        cg_add(CG_NOTRUN, notrun);
+        cg_add(CG_GPU_NS, gpu);
+    }
+    qp_put(e, c->qp);
+    c->qp = NULL;
+    free(c->st);
+    c->st = NULL;
+    c->nst = c->capst = 0;
+    if (e->bcn) cv_tick();
+}
+
 /* Earlier transfers (the app's writes to the source, earlier copies out of this scratch) before the
  * decoder reads the source and writes the scratch. */
 static void to_compute(upload *u)
 {
+    stamp_open(u);
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     u->e->dev->real.vkCmdPipelineBarrier(u->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL,
@@ -1677,9 +2631,15 @@ static void to_compute(upload *u)
 
 /* Copies what is decoded into the images, in the layouts the app recorded its copies with: one copy
  * command per run of the same scratch buffer, image and layout. */
+static void run_flush(vkb_emu_device *e, VkCommandBuffer cb, bc_batch *b);
+
 static void pend_flush(vkb_emu_device *e, VkCommandBuffer cb, bc_batch *b)
 {
-    if (!b->n) return;
+    run_flush(e, cb, b); /* the open run's dispatch, before the barrier after the conversions */
+    if (!b->n) {
+        stamp_close(e, cb, b);
+        return;
+    }
     const vkb_dispatch *r = &e->dev->real;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -1694,6 +2654,7 @@ static void pend_flush(vkb_emu_device *e, VkCommandBuffer cb, bc_batch *b)
     b->n = 0;
     bu_count(BU_BARRIERS, 1);
     bu_count(BU_COPYCMDS, cmds);
+    stamp_close(e, cb, b);
 }
 
 static void flush(upload *u) { pend_flush(u->e, u->cb, u->pl); }
@@ -1712,7 +2673,9 @@ void vkb_emu_bcn_batch_flush(void)
     vkb_srv_current_cmd = saved_cmd;
     bu_count(BU_RESTORES, 1);
     b->e = NULL, b->cb = VK_NULL_HANDLE, b->bound = VK_NULL_HANDLE;
+    b->sc = NULL;
     bu_tick();
+    cv_tick();
 }
 
 /* A stream cut short: its command buffer is not ended (nor submitted), so nothing more goes into it. */
@@ -1722,6 +2685,8 @@ void vkb_emu_bcn_batch_drop(void)
     vkb_emu_bc_batch_open = 0;
     b->n = 0;
     b->e = NULL, b->cb = VK_NULL_HANDLE, b->bound = VK_NULL_HANDLE;
+    b->sc = NULL, b->st1 = 0; /* its stamp pair stays open: the command buffer never runs, the pair counts as not run */
+    b->run.n = 0;
 }
 
 /* Room for `bytes` of decoded texels in the command buffer's scratch. */
@@ -1771,6 +2736,7 @@ static int slot(upload *u, VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
          * then decode over it. */
         flush(u);
         to_compute(u);
+        cg_add(CG_WRAPS, 1);
         c->cur = 0;
         c->used = 0;
         wrapped = 1;
@@ -1797,23 +2763,193 @@ static uint32_t test_slow(int transcode)
     return (uint32_t)(transcode ? __atomic_load_n(&n, __ATOMIC_ACQUIRE) : m);
 }
 
-static void dispatch(upload *u, uint32_t x, uint32_t y, uint32_t z)
+static void dispatch_rep(vkb_emu_device *e, VkCommandBuffer cb, int transcode, uint32_t key, uint32_t x, uint32_t y, uint32_t z)
 {
-    const vkb_dispatch *r = &u->e->dev->real;
-    uint32_t rep = test_slow(vkb_tx_block_bytes(u->img->format) != 0);
+    const vkb_dispatch *r = &e->dev->real;
+    uint32_t rep = test_slow(transcode);
     for (uint32_t i = 0; i < rep; i++) {
         if (i) {
             VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT};
-            r->vkCmdPipelineBarrier(u->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         }
-        r->vkCmdDispatch(u->cb, x, y, z);
+        r->vkCmdDispatch(cb, x, y, z);
     }
     bu_count(BU_DISPATCHES, rep);
+    cv_add(key, CK_DISP, rep);
     if (rep > 1) bu_count(BU_BARRIERS, rep - 1);
 }
 
+static void dispatch(upload *u, uint32_t x, uint32_t y, uint32_t z)
+{
+    dispatch_rep(u->e, u->cb, vkb_tx_block_bytes(u->img->format) != 0, u->key, x, y, z);
+}
+
+/* ------------------------------------------------------------------ one dispatch a run (VKBRIDGE_BC_ONE_DISPATCH) */
+
+/* With the REGION_TABLE variants (s->table), the pieces of a batch are not dispatched one by one: consecutive pieces
+ * of one pipeline, one set of flags, one source buffer (at or after the run's first piece in it) and one scratch
+ * chunk are a run, each piece an entry in a table in host-visible memory (bc_decode.comp REGION_TABLE), and the run
+ * is ONE dispatch of all their workgroups, recorded where the run ends: when a piece differs in one of those, at the
+ * workgroup limit (maxComputeWorkGroupCount[0]), at maxStorageBufferRange of source, when the table chunk is full,
+ * and before the batch's flush barrier (pend_flush; also when the scratch is reused, slot). Nothing is reordered:
+ * the dispatches were between the same two barriers with nothing between them before, and they read and write the
+ * same bytes (the scratch places come from slot as before). A piece that gets no table room is dispatched alone
+ * by the same pipeline (pc.pad 0). Counted: the runs and why each new one began (cv_*). */
+static void tab_destroy(vkb_emu_device *e, tchunk *t)
+{
+    e->dev->real.vkDestroyBuffer(e->dev->device, t->buf, NULL);
+    e->dev->real.vkFreeMemory(e->dev->device, t->mem, NULL);
+}
+
+static int tab_new(vkb_emu_device *e, tchunk *out)
+{
+    bcn_state *s = e->bcn;
+    int got = 0;
+    if (s->tab_none) return 0;
+    pthread_mutex_lock(&s->lock);
+    if (s->ntidle) *out = s->tidle[--s->ntidle], got = 1;
+    pthread_mutex_unlock(&s->lock);
+    if (got) return 1;
+    const vkb_dispatch *r = &e->dev->real;
+    VkDevice d = e->dev->device;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, TAB_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (r->vkCreateBuffer(d, &bci, NULL, &out->buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    r->vkGetBufferMemoryRequirements(d, out->buf, &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, s->tab_type};
+    void *map = NULL;
+    if (!(req.memoryTypeBits & (1u << s->tab_type)) || r->vkAllocateMemory(d, &ai, NULL, &out->mem) != VK_SUCCESS) {
+        r->vkDestroyBuffer(d, out->buf, NULL);
+        return 0;
+    }
+    if (r->vkBindBufferMemory(d, out->buf, out->mem, 0) != VK_SUCCESS || r->vkMapMemory(d, out->mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+        tab_destroy(e, out);
+        return 0;
+    }
+    out->map = map;
+    return 1;
+}
+
+/* The command buffer's tables, back to the idle ones (its work is over). */
+static void tab_release(vkb_emu_device *e, bcn_cb *c)
+{
+    bcn_state *s = e->bcn;
+    for (uint32_t i = 0; i < c->ntab; i++) {
+        int kept = 0;
+        if (s) {
+            pthread_mutex_lock(&s->lock);
+            if (s->ntidle < TAB_IDLE) s->tidle[s->ntidle++] = c->tab[i], kept = 1;
+            pthread_mutex_unlock(&s->lock);
+        }
+        if (!kept) tab_destroy(e, &c->tab[i]);
+    }
+    free(c->tab);
+    c->tab = NULL;
+    c->ntab = c->captab = 0;
+    c->tab_used = 0;
+}
+
+static void run_bind(vkb_emu_device *e, VkCommandBuffer cb, bc_batch *b, VkPipeline p)
+{
+    if (b->bound == p) return;
+    e->dev->real.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    b->bound = p;
+}
+
+/* The descriptors of a dispatch through layout3: source range, scratch, table (or the scratch again, unread). 0: no set. */
+static int run_descriptors(vkb_emu_device *e, VkCommandBuffer cb, const VkDescriptorBufferInfo bi[3])
+{
+    bcn_state *s = e->bcn;
+    const vkb_dispatch *r = &e->dev->real;
+    VkWriteDescriptorSet w[3];
+    for (uint32_t i = 0; i < 3; i++)
+        w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[i], NULL};
+    if (s->push) {
+        r->vkCmdPushDescriptorSet(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout3, 0, 3, w);
+        return 1;
+    }
+    VkDescriptorSet set = vkb_emu_cb_scratch_set(e, cb, s->dsl3);
+    if (!set) {
+        VKB_ONCE(VKB_LOG_ERROR, "BC emulation: no descriptor set for the decoder (logged once)");
+        return 0;
+    }
+    w[0].dstSet = w[1].dstSet = w[2].dstSet = set;
+    r->vkUpdateDescriptorSets(e->dev->device, 3, w, 0, NULL);
+    r->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout3, 0, 1, &set, 0, NULL);
+    return 1;
+}
+
+static void dispatch_rep(vkb_emu_device *e, VkCommandBuffer cb, int transcode, uint32_t key, uint32_t x, uint32_t y, uint32_t z);
+
+/* The open run's one dispatch. */
+static void run_flush(vkb_emu_device *e, VkCommandBuffer cb, bc_batch *b)
+{
+    struct bc_run *r = &b->run;
+    if (!r->n) return;
+    run_bind(e, cb, b, r->pipe);
+    VkDescriptorBufferInfo bi[3] = {{r->src, r->base, r->hi - r->base}, {r->dst, 0, VK_WHOLE_SIZE}, {r->tbuf, r->toff, (VkDeviceSize)r->n * TAB_ENTRY}};
+    if (run_descriptors(e, cb, bi)) {
+        pc_t pc = {0, r->n, 0, r->flags, 0, 1, {0, 0}};
+        e->dev->real.vkCmdPushConstants(cb, ((bcn_state *)e->bcn)->layout3, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        dispatch_rep(e, cb, (int)r->transcode, r->key, r->wgs, 1, 1);
+        cg_add(CG_RUNS, 1);
+    }
+    r->n = 0;
+}
+
+/* A piece into the open run (or a new one). 0: no table room (the caller dispatches it alone). */
+static int run_piece(upload *u, VkBuffer dst, VkDeviceSize off, VkDeviceSize first, VkDeviceSize end, uint32_t row_blocks,
+                     uint32_t layer_blocks, uint32_t bw, uint32_t nrows, uint32_t nslices, uint32_t w, uint32_t h)
+{
+    bcn_state *s = u->e->bcn;
+    bc_batch *b = u->pl;
+    bcn_cb *c = u->sc;
+    struct bc_run *r = &b->run;
+    uint32_t wx = (bw + 7) / 8, wy = (nrows + 7) / 8, flags = family_flags(u->img) | u->xflags;
+    uint64_t wgs = (uint64_t)wx * wy * nslices;
+    if (wgs > s->wg_max || wx > 0xffff || wy > 0xffff) return 0; /* cannot be one entry (pieces fit a chunk: not reached) */
+    if (r->n) {
+        int why = r->pipe != u->pipe ? CG_RUN_PIPE : r->flags != flags ? CG_RUN_FLAGS : r->src != u->src || first < r->base ? CG_RUN_SRC
+                  : r->dst != dst ? CG_RUN_DST : r->wgs + wgs > s->wg_max ? CG_RUN_WG
+                  : (end > r->hi ? end : r->hi) - r->base > s->range_max || (first - r->base) / 4 > 0xffffffffull ? CG_RUN_RANGE
+                  : r->toff + (VkDeviceSize)(r->n + 1) * TAB_ENTRY > TAB_BYTES ? CG_RUN_TABLE : -1;
+        if (why >= 0) {
+            cg_add(why, 1);
+            run_flush(u->e, u->cb, b);
+        }
+    }
+    if (!r->n) {
+        VkDeviceSize at = (c->tab_used + s->ssbo_align - 1) & ~(s->ssbo_align - 1);
+        if (!c->ntab || at + TAB_ENTRY > TAB_BYTES) {
+            if (c->ntab == c->captab) {
+                uint32_t cap = c->captab ? c->captab * 2 : 4;
+                tchunk *n = realloc(c->tab, cap * sizeof(*n));
+                if (!n) return 0;
+                c->tab = n, c->captab = cap;
+            }
+            if (!tab_new(u->e, &c->tab[c->ntab])) {
+                VKB_ONCE(VKB_LOG_WARN, "BC emulation: no memory for a region table (logged once): pieces dispatched one by one");
+                return 0;
+            }
+            c->ntab++;
+            at = 0;
+        }
+        tchunk *t = &c->tab[c->ntab - 1];
+        *r = (struct bc_run){u->pipe, u->src, dst, t->buf, first & ~(s->ssbo_align - 1), end, at, t->map + at, flags, 0, 0, u->key,
+                             vkb_tx_block_bytes(u->img->format) != 0};
+    }
+    uint32_t e[8] = {(uint32_t)((first - r->base) / 4), row_blocks, layer_blocks, (uint32_t)(off / 4), w, h, r->wgs, wx | (wy << 16)};
+    memcpy(r->tmap + (size_t)r->n * TAB_ENTRY, e, sizeof(e));
+    r->n++;
+    r->wgs += (uint32_t)wgs;
+    if (end > r->hi) r->hi = end;
+    c->tab_used = r->toff + (VkDeviceSize)r->n * TAB_ENTRY;
+    return 1;
+}
+
 /* Decodes slices [slice0, slice0 + nslices) x block rows [row0, row0 + nrows) of a region into
- * scratch and queues its copy into the image. */
+ * scratch and queues its copy into the image (or its entry into the open run, run_piece). */
 static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices, uint32_t row0, uint32_t nrows)
 {
     bcn_state *s = u->e->bcn;
@@ -1827,11 +2963,37 @@ static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices,
     VkDeviceSize off;
     if (!slot(u, bytes, &buf, &off)) return;
     u->left = u->left > bytes ? u->left - bytes : 0;
+    u->pieces++, u->scratch += bytes;
 
     VkDeviceSize first = g->offset + ((VkDeviceSize)slice0 * layer_blocks + (VkDeviceSize)row0 * row_blocks) * u->block_bytes;
     VkDeviceSize aligned = first & ~(s->ssbo_align - 1);
     VkDeviceSize range = first - aligned +
                          ((VkDeviceSize)(nslices - 1) * layer_blocks + (VkDeviceSize)(nrows - 1) * row_blocks + bw) * u->block_bytes;
+    uint32_t y0 = row0 * 4, h = g->iext.height - y0 < nrows * 4 ? g->iext.height - y0 : nrows * 4;
+    VkBufferImageCopy c = {off, bw * 4, nrows * 4, g->sub, {g->ioff.x, g->ioff.y + (int32_t)y0, g->ioff.z}, {g->iext.width, h, 1}};
+    if (u->img->type == VK_IMAGE_TYPE_3D) {
+        c.imageOffset.z += (int32_t)slice0;
+        c.imageExtent.depth = nslices;
+    } else {
+        c.imageSubresource.baseArrayLayer += slice0;
+        c.imageSubresource.layerCount = nslices;
+    }
+    if (u->tab) {
+        if (run_piece(u, buf, off, first, aligned + range, row_blocks, layer_blocks, bw, nrows, nslices, g->iext.width, h)) {
+            queue_copy(u, buf, &c);
+            return;
+        }
+        /* alone, by the same pipeline (pc.pad 0: the push constants describe the piece) */
+        run_bind(u->e, u->cb, u->pl, u->pipe);
+        VkDescriptorBufferInfo bi[3] = {{u->src, aligned, range}, {buf, 0, VK_WHOLE_SIZE}, {buf, 0, VK_WHOLE_SIZE}};
+        if (!run_descriptors(u->e, u->cb, bi)) return;
+        pc_t pc = {(uint32_t)((first - aligned) / 4), row_blocks, layer_blocks, family_flags(u->img) | u->xflags, (uint32_t)(off / 4), 0,
+                   {g->iext.width, h}};
+        r->vkCmdPushConstants(u->cb, s->layout3, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        dispatch(u, (bw + 7) / 8, (nrows + 7) / 8, nslices);
+        queue_copy(u, buf, &c);
+        return;
+    }
     VkDescriptorBufferInfo sbi = {u->src, aligned, range}, dbi = {buf, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet w[2] = {
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &sbi, NULL},
@@ -1848,20 +3010,10 @@ static void piece(upload *u, const region *g, uint32_t slice0, uint32_t nslices,
         r->vkUpdateDescriptorSets(u->e->dev->device, 2, w, 0, NULL);
         r->vkCmdBindDescriptorSets(u->cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->layout, 0, 1, &set, 0, NULL);
     }
-    uint32_t y0 = row0 * 4, h = g->iext.height - y0 < nrows * 4 ? g->iext.height - y0 : nrows * 4;
     pc_t pc = {(uint32_t)((first - aligned) / 4), row_blocks, layer_blocks, family_flags(u->img) | u->xflags,
                (uint32_t)(off / 4), 0, {g->iext.width, h}};
     r->vkCmdPushConstants(u->cb, s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     dispatch(u, (bw + 7) / 8, (nrows + 7) / 8, nslices);
-
-    VkBufferImageCopy c = {off, bw * 4, nrows * 4, g->sub, {g->ioff.x, g->ioff.y + (int32_t)y0, g->ioff.z}, {g->iext.width, h, 1}};
-    if (u->img->type == VK_IMAGE_TYPE_3D) {
-        c.imageOffset.z += (int32_t)slice0;
-        c.imageExtent.depth = nslices;
-    } else {
-        c.imageSubresource.baseArrayLayer += slice0;
-        c.imageSubresource.layerCount = nslices;
-    }
     queue_copy(u, buf, &c);
 }
 
@@ -1923,6 +3075,7 @@ static void piece_n(upload *u, const region *g, uint32_t slice0, uint32_t nslice
     VkDeviceSize off;
     if (!slot(u, bytes, &buf, &off)) return;
     u->left = u->left > bytes ? u->left - bytes : 0;
+    u->pieces++, u->scratch += bytes;
     VkDeviceSize first = g->offset + ((VkDeviceSize)slice0 * layer_blocks + (VkDeviceSize)r0 * row_blocks) * u->block_bytes;
     VkDeviceSize aligned = first & ~(s->ssbo_align - 1);
     VkDeviceSize range = first - aligned +
@@ -2001,8 +3154,6 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
  * conversions could have filled a fifth of it. The fixed cost of each conversion (its barriers and
  * small dispatches) is not in it; bc_n in the hitch line counts them. */
 #define GPU_EST_NS_TEXEL (29e6 / 4.2e6)
-#define GPU_EST_DEFAULT 4.0
-#define GPU_EST_HIGH 6.0
 static uint64_t gpu_est_ns(const bcn_state *s, const vkb_emu_image *img, uint32_t n, const region *regs, const vkb_emu_image *raw)
 {
     int fam = family(img->client_format);
@@ -2040,7 +3191,11 @@ static void decode(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_
     for (uint32_t i = 0; i < n; i++)
         texels += (uint64_t)regs[i].iext.width * regs[i].iext.height *
                   (img->type == VK_IMAGE_TYPE_3D ? regs[i].iext.depth : regs[i].sub.layerCount);
-    vkb_hitch_note_bc(p, t0, vkb_hitch_now(), texels, gpu_est_ns(e->bcn, img, n, regs, raw));
+    uint64_t est = gpu_est_ns(e->bcn, img, n, regs, raw);
+    /* in flight from here to the command buffer's end of work (vkb_emu_bcn_cb_release) */
+    bcn_cb *c = vkb_hitch_on(p) ? vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)) : NULL;
+    if (c) c->est_ns += est;
+    vkb_hitch_note_bc(p, t0, vkb_hitch_now(), texels, est, c ? est : 0);
 }
 
 static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_emu_image *img, VkImageLayout layout, uint32_t n,
@@ -2067,8 +3222,9 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
     /* in auto per region (level_quality): the first region's, before anything is recorded (or the
      * other quality while this one is still being built) */
     uint32_t q0 = fam >= TX_BC1 ? level_quality(s, img, n ? regs[0].sub.mipLevel : 0) : 1;
-    VkPipeline pipe = pipeline(e, fam, q0), bound = joined ? b->bound : VK_NULL_HANDLE;
+    VkPipeline pipe = pipeline(e, fam, q0);
     if (!pipe) return;
+    if (!joined) b->bound = VK_NULL_HANDLE;
     upload u = {e, cb, vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb)), src, img, layout, out_block_bytes(img), in_bytes,
                 vkb_tx_block_dim(img->format), .xflags = xflags, .pl = b};
     if (!u.sc) return;
@@ -2103,6 +3259,9 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
             VKB_INFO("BC upload: format %d -> %d (family %d), %llu texels in %u region(s), first %ux%u mip %u", img->client_format, img->format, fam,
                      (unsigned long long)tex, n, n ? regs[0].iext.width : 0, n ? regs[0].iext.height : 0, n ? regs[0].sub.mipLevel : 0);
     }
+    int counted = 0;
+    uint32_t ak = UINT32_MAX;
+    uint64_t an[2 + CVS_N] = {0};
     for (uint32_t i = 0; i < n; i++) {
         const region *g = &regs[i];
         uint32_t slices = is3d ? g->iext.depth : g->sub.layerCount;
@@ -2112,9 +3271,32 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
             VkPipeline p = pipeline(e, fam, level_quality(s, img, g->sub.mipLevel));
             pipe = p ? p : pipe; /* a variant that failed to build: the one there is */
         }
-        if (pipe != bound) {
-            e->dev->real.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-            bound = pipe;
+        {
+            /* counted under the search the pipeline has (under auto, the other one while this one builds) */
+            uint32_t qu = fam < TX_BC1 ? 1u : pipe == s->pipes[0][fam] ? 0u : pipe == s->pipes[2][fam] ? 2u : 1u;
+            /* FAST_BG: the new variant where it is built (never waited for), else the old one */
+            VkPipeline fp = s->fast_mode == FAST_BG ? __atomic_load_n(&s->fpipes[qu][fam], __ATOMIC_ACQUIRE) : VK_NULL_HANDLE;
+            int ft = fp ? s->ftab[qu][fam] : 0;
+            /* ... while a BC_FAST one is not built: the interim, VKBRIDGE_BC_FAST=0's variant, where it is */
+            if (!fp && s->fast_mode == FAST_BG && (s->bcfast | s->bcfast7) && (fp = __atomic_load_n(&s->ipipes[qu][fam], __ATOMIC_ACQUIRE)))
+                ft = s->itab[qu][fam];
+            u.pipe = fp ? fp : pipe;
+            u.tab = fp ? ft : s->ptab[qu][fam];
+            if (!u.tab) run_bind(e, cb, b, u.pipe); /* a run binds its pipeline when it is dispatched */
+            uint64_t t = (uint64_t)g->iext.width * g->iext.height * slices;
+            u.key = cv_key(fam, qu);
+            if (!counted) {
+                counted = 1;
+                cv_add(u.key, CK_COPIES, 1);
+                if (b->st1 && b->sc) b->sc->st[b->st1 - 1].copies++;
+            }
+            if (u.key != ak) { /* the regions' counts summed here, added once a converter (few atomics a copy) */
+                cv_regions(ak, an);
+                ak = u.key;
+                memset(an, 0, sizeof(an));
+            }
+            an[0]++, an[1] += t, an[2 + cv_size_class((uint64_t)g->iext.width * g->iext.height)] += t;
+            stamp_note(&u, u.key, t);
         }
         if (u.n_dim != 4) {
             /* ASTC 6x6 / 8x8: whole slices, or bands of ASTC block rows */
@@ -2143,16 +3325,16 @@ static void decode_now(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, vkb_
                 for (uint32_t y = 0; y < bh; y += per) piece(&u, g, z, 1, y, bh - y < per ? bh - y : per);
         }
     }
-    if (batched) {
-        b->bound = bound; /* its copies, barrier and restore: at the batch's flush */
-        return;
-    }
+    cv_regions(ak, an);
+    if (u.pieces) cg_add(CG_PIECES, u.pieces), cg_add(CG_SCRATCH, u.scratch);
+    if (batched) return; /* its copies, barrier and restore (and an open run's dispatch): at the batch's flush */
     flush(&u);
     free(own.p);
     free(own.c);
     vkb_emu_restore_compute(e, cb);
     bu_count(BU_RESTORES, 1);
     bu_tick();
+    cv_tick();
 }
 
 static vkb_emu_image *bc_image(vkb_emu_device *e, VkImage img)
@@ -2215,8 +3397,9 @@ static void clamp_region(const vkb_emu_image *s, const vkb_emu_image *d, const V
 /* How a copy between BC images goes: 0 as a copy (the decoded formats are size-compatible, or both
  * transcoded to blocks of one size), 1 as an unscaled blit (one side decoded to 16 bits, the other
  * to RGBA8 UNORM or the other 16-bit format: the same texels, converted), 2 from a transcoded into
- * a decoded image and 3 the other way (copy_mixed), -1 not at all (a BC and an uncompressed image,
- * a 16-bit and an sRGB image, which a blit would convert out of sRGB), -2 not at all (transcoded
+ * a decoded image and 3 the other way (copy_mixed), 4 from a decoded sRGB (RGBA8 sRGB) into a 16-bit
+ * image and 5 the other way (copy_twin: a blit between the two would convert out of sRGB), -1 not at
+ * all (a BC and an uncompressed image, decoded formats of other sizes), -2 not at all (transcoded
  * images of different block sizes). */
 static int copy_kind(const vkb_emu_image *s, const vkb_emu_image *d)
 {
@@ -2234,6 +3417,10 @@ static int copy_kind(const vkb_emu_image *s, const vkb_emu_image *d)
     if (!sp && !dp) return vkb_bc_storage_format(s->client_format) == vkb_bc_storage_format(d->client_format) ? 0 : -1;
     if (s->format == d->format) return 0;
     if ((sp || s->format == VK_FORMAT_R8G8B8A8_UNORM) && (dp || d->format == VK_FORMAT_R8G8B8A8_UNORM)) return 1;
+    if (vkb_bc_block_bytes(s->client_format) == vkb_bc_block_bytes(d->client_format)) {
+        if (dp && s->format == VK_FORMAT_R8G8B8A8_SRGB) return 4;
+        if (sp && d->format == VK_FORMAT_R8G8B8A8_SRGB) return 5;
+    }
     return -1;
 }
 
@@ -2369,6 +3556,118 @@ static int is_srgb(VkFormat f)
     }
 }
 
+/* A temporary image of format f for a copy, kept by the command buffer until its work is over (vkb_emu_bcn_cb_release). */
+static VkImage tmp_image(vkb_emu_device *e, bcn_cb *bc, VkFormat f, VkImageType type, VkExtent3D ext, uint32_t layers)
+{
+    const vkb_dispatch *r = &e->dev->real;
+    VkDevice d = e->dev->device;
+    bcn_state *s = e->bcn;
+    if (bc->ntimg == bc->captimg) {
+        uint32_t cap = bc->captimg ? bc->captimg * 2 : 2;
+        struct timg *n = realloc(bc->timg, cap * sizeof(*n));
+        if (!n) return VK_NULL_HANDLE;
+        bc->timg = n, bc->captimg = cap;
+    }
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, type, f, ext, 1, layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                            VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img;
+    if (r->vkCreateImage(d, &ci, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req;
+    r->vkGetImageMemoryRequirements(d, img, &req);
+    uint32_t t = UINT32_MAX;
+    for (int pass = 0; pass < 2 && t == UINT32_MAX; pass++)
+        for (uint32_t i = 0; i < s->mp.memoryTypeCount && t == UINT32_MAX; i++)
+            if ((req.memoryTypeBits & (1u << i)) && (pass || (s->mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))) t = i;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, t};
+    VkDeviceMemory mem;
+    if (t == UINT32_MAX || r->vkAllocateMemory(d, &ai, NULL, &mem) != VK_SUCCESS) {
+        r->vkDestroyImage(d, img, NULL);
+        return VK_NULL_HANDLE;
+    }
+    if (r->vkBindImageMemory(d, img, mem, 0) != VK_SUCCESS) {
+        r->vkDestroyImage(d, img, NULL);
+        r->vkFreeMemory(d, mem, NULL);
+        return VK_NULL_HANDLE;
+    }
+    bc->timg[bc->ntimg++] = (struct timg){img, mem};
+    return img;
+}
+
+static void tmp_barrier(const vkb_dispatch *r, VkCommandBuffer cb, VkImage img, uint32_t layers, VkAccessFlags sa, VkAccessFlags da,
+                        VkImageLayout from, VkImageLayout to)
+{
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, sa, da, from, to, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img,
+                              {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
+    r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/* A copy from a transcoded image into a decoded one of the other sRGB-ness (a typeless copy between a UNORM and an sRGB
+ * texture of one BC family): a copy moves the bits, but a blit between the two would convert the colours. So the source
+ * is blitted into a temporary RGBA8 image of ITS sRGB-ness (the GPU decodes its blocks into the bytes it holds, no
+ * conversion), and those bytes are copied (vkCmdCopyImage, no conversion) into the destination; a 16-bit destination
+ * (UNORM only) gets them through a second temporary RGBA8 UNORM image and a blit, as its uploads are rounded. raw: the
+ * source holds RGBA8 bytes already (a decoded sRGB image, copy_twin): they are copied (not blitted) into one temporary
+ * RGBA8 UNORM image, which is blitted into the 16-bit destination. NULL: done. */
+static const char *copy_srgb(vkb_emu_device *e, VkCommandBuffer cb, vkb_emu_image *s, VkImageLayout sl, vkb_emu_image *d, VkImageLayout dl,
+                             uint32_t n, const VkImageCopy *c, int raw)
+{
+    const vkb_dispatch *r = &e->dev->real;
+    int packed = vkb_bc_is_packed(d->format), is3d = d->type == VK_IMAGE_TYPE_3D;
+    VkExtent3D ext = {0, 0, 1};
+    uint32_t layers = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (c[i].extent.width > ext.width) ext.width = c[i].extent.width;
+        if (c[i].extent.height > ext.height) ext.height = c[i].extent.height;
+        if (is3d && c[i].extent.depth > ext.depth) ext.depth = c[i].extent.depth;
+        if (!is3d && c[i].srcSubresource.layerCount > layers) layers = c[i].srcSubresource.layerCount;
+    }
+    if (!ext.width || !ext.height) return NULL;
+    bcn_cb *bc = vkb_emu_cb_bcn(e, cb, sizeof(bcn_cb));
+    if (!bc) return "out of memory";
+    VkImage t0 = tmp_image(e, bc, !raw && is_srgb(s->format) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, d->type, ext, layers);
+    VkImage t1 = packed && !raw && t0 ? tmp_image(e, bc, VK_FORMAT_R8G8B8A8_UNORM, d->type, ext, layers) : VK_NULL_HANDLE;
+    if (!t0 || (packed && !raw && !t1)) return "no memory for a temporary image";
+    const VkImageLayout D = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, S = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const VkAccessFlags W = VK_ACCESS_TRANSFER_WRITE_BIT, R = VK_ACCESS_TRANSFER_READ_BIT;
+    tmp_barrier(r, cb, t0, layers, 0, W, VK_IMAGE_LAYOUT_UNDEFINED, D);
+    if (t1) tmp_barrier(r, cb, t1, layers, 0, W, VK_IMAGE_LAYOUT_UNDEFINED, D);
+    for (uint32_t i = 0; i < n; i++) {
+        const VkImageCopy *k = &c[i];
+        if (!k->extent.width || !k->extent.height || !k->extent.depth) continue;
+        int32_t dz = is3d ? (int32_t)k->extent.depth : 1;
+        uint32_t nl = is3d ? 1 : k->srcSubresource.layerCount;
+        VkImageSubresourceLayers ts = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, nl};
+        VkOffset3D o = {0, 0, 0}, x = {(int32_t)k->extent.width, (int32_t)k->extent.height, dz};
+        VkImageBlit b = {k->srcSubresource, {k->srcOffset, {k->srcOffset.x + x.x, k->srcOffset.y + x.y, k->srcOffset.z + dz}}, ts, {o, x}};
+        if (raw) {
+            VkImageCopy cp = {k->srcSubresource, k->srcOffset, ts, o, k->extent};
+            r->vkCmdCopyImage(cb, s->image, sl, t0, D, 1, &cp);
+        } else {
+            r->vkCmdBlitImage(cb, s->image, sl, t0, D, 1, &b, VK_FILTER_NEAREST);
+        }
+        tmp_barrier(r, cb, t0, layers, W, R, D, S);
+        VkImageSubresourceLayers dsub = k->dstSubresource;
+        if (!is3d) dsub.layerCount = nl;
+        if (!packed) {
+            VkImageCopy cp = {ts, o, dsub, k->dstOffset, k->extent};
+            r->vkCmdCopyImage(cb, t0, S, d->image, dl, 1, &cp);
+        } else if (raw) {
+            VkImageBlit b2 = {ts, {o, x}, dsub, {k->dstOffset, {k->dstOffset.x + x.x, k->dstOffset.y + x.y, k->dstOffset.z + dz}}};
+            r->vkCmdBlitImage(cb, t0, S, d->image, dl, 1, &b2, VK_FILTER_NEAREST);
+        } else {
+            VkImageCopy cp = {ts, o, ts, o, k->extent};
+            r->vkCmdCopyImage(cb, t0, S, t1, D, 1, &cp);
+            tmp_barrier(r, cb, t1, layers, W, R, D, S);
+            VkImageBlit b2 = {ts, {o, x}, dsub, {k->dstOffset, {k->dstOffset.x + x.x, k->dstOffset.y + x.y, k->dstOffset.z + dz}}};
+            r->vkCmdBlitImage(cb, t1, S, d->image, dl, 1, &b2, VK_FILTER_NEAREST);
+            tmp_barrier(r, cb, t1, layers, R, W, S, D);
+        }
+        tmp_barrier(r, cb, t0, layers, R, W, S, D);
+    }
+    return NULL;
+}
+
 static void mixed_skip(const char *why, const vkb_emu_image *s, const vkb_emu_image *d)
 {
     copy_count(CP_SKIP_MIXED);
@@ -2395,12 +3694,20 @@ static void copy_mixed(vkb_emu_device *e, VkCommandBuffer cb, vkb_emu_image *s, 
         r->vkGetPhysicalDeviceFormatProperties(e->dev->physical, s->format, &fs);
         r->vkGetPhysicalDeviceFormatProperties(e->dev->physical, d->format, &fd);
         VkImageBlit *b = NULL;
-        if (is_srgb(s->format) != is_srgb(d->format)) why = "one is sRGB, the other not (a blit would convert)";
-        else if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT))
+        int srgb = is_srgb(s->format) != is_srgb(d->format);
+        if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT))
             why = "the GPU cannot blit between the two formats";
+        else if (srgb) why = copy_srgb(e, cb, s, sl, d, dl, n, c, 0);
         else if (!(b = malloc((n ? n : 1) * sizeof(*b)))) why = "out of memory";
         if (why) {
             mixed_skip(why, s, d);
+            return;
+        }
+        if (srgb) {
+            copy_count(CP_BLIT);
+            VKB_ONCE(VKB_LOG_INFO, "BC emulation: a copy from a transcoded BC image (format %d) into a decoded one of the other sRGB-ness "
+                     "(format %d) done through a temporary image, the bits as they are (logged once, counted in the BC copies line)",
+                     s->format, d->format);
             return;
         }
         uint32_t k = 0;
@@ -2464,6 +3771,35 @@ static void copy_mixed(vkb_emu_device *e, VkCommandBuffer cb, vkb_emu_image *s, 
              "(logged once, counted in the BC copies line)", s->format, d->format);
 }
 
+/* A copy between a decoded sRGB image (RGBA8 sRGB) and a decoded 16-bit BC1 UNORM one (copy_kind 4 into the 16-bit one,
+ * 5 out of it), regions already cut to the levels: a typeless copy moves the bits, but a blit between the two would
+ * convert out of sRGB and a copy cannot go between 32- and 16-bit texels. So the bytes go through a temporary RGBA8
+ * UNORM image (copy_srgb): copied into it from the sRGB image and blitted into the 16-bit one (rounded as its uploads
+ * are), or blitted into it from the 16-bit one and copied into the sRGB one. The conversion budget and small decode
+ * leave such twins (both decoded, one 16-bit); skipping the copy left the destination's old texels. */
+static void copy_twin(vkb_emu_device *e, VkCommandBuffer cb, vkb_emu_image *s, VkImageLayout sl, vkb_emu_image *d, VkImageLayout dl,
+                      int kind, uint32_t n, const VkImageCopy *c)
+{
+    const vkb_dispatch *r = &e->dev->real;
+    VkFormatProperties fs, fd;
+    r->vkGetPhysicalDeviceFormatProperties(e->dev->physical, kind == 4 ? VK_FORMAT_R8G8B8A8_UNORM : s->format, &fs);
+    r->vkGetPhysicalDeviceFormatProperties(e->dev->physical, kind == 4 ? d->format : VK_FORMAT_R8G8B8A8_UNORM, &fd);
+    const char *why = !e->bcn ? "no BC state"
+                      : s->type != d->type ? "images of different types"
+                      : !(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)
+                          ? "the GPU cannot blit between the two formats"
+                          : copy_srgb(e, cb, s, sl, d, dl, n, c, kind == 4);
+    if (why) {
+        copy_count(CP_SKIP_OTHER);
+        VKB_ONCE(VKB_LOG_WARN, "BC emulation: a copy between a decoded sRGB BC image and a 16-bit one (formats %d -> %d) is skipped: %s "
+                 "(logged once, counted in the BC copies line)", s->format, d->format, why);
+        return;
+    }
+    copy_count(CP_BLIT);
+    VKB_ONCE(VKB_LOG_INFO, "BC emulation: a copy between a decoded sRGB BC image and a 16-bit one (formats %d -> %d) done through a "
+             "temporary RGBA8 image, the bits as they are (logged once, counted in the BC copies line)", s->format, d->format);
+}
+
 /* Regions cut to the levels and, between ASTC 6x6 / 8x8 images, to block edges: how many are left. */
 static uint32_t cut_regions(const vkb_emu_image *s, const vkb_emu_image *d, int kind, VkImageCopy *c, uint32_t n)
 {
@@ -2497,6 +3833,10 @@ int vkb_emu_copy_image(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkIma
     VkImageCopy *c = (VkImageCopy *)regions;
     n = cut_regions(s, d, kind, c, n);
     if (!n) return 1;
+    if (kind >= 4) {
+        copy_twin(e, cb, s, sl, d, dl, kind, n, c);
+        return 1;
+    }
     if (kind >= 2) {
         copy_mixed(e, cb, s, sl, d, dl, kind, n, c);
         return 1;
@@ -3097,6 +4437,7 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     vkb_emu_device *e = dev->emu;
     if (!(e->flags & VKB_EMU_BCN)) return;
     bcn_state *s = calloc(1, sizeof(*s));
+    int tab_named = 0, pal_named = 0;
     pthread_mutex_init(&s->lock, NULL);
     pthread_mutex_init(&s->plock, NULL);
     pthread_cond_init(&s->pcond, NULL);
@@ -3113,6 +4454,17 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
         VkFormatProperties fp;
         dev->real.vkGetPhysicalDeviceFormatProperties(dev->physical, packed[i], &fp);
         s->packed_ok[i] = (fp.optimalTilingFeatures & need) == need && !vkb_emu_faked("bc16");
+    }
+    /* PV-10 (Pixel 10 Pro XL, RE3's lighting LUT black): PowerVR's driver, robust buffer access on (DXVK, with nullDescriptor:
+     * pipeline robustness cannot turn it off there), reads a constant array indexed at run time as 0 past a cut-off; our
+     * converters' tables move to Private storage (spirv_consttab.c), where it reads them right. VKBRIDGE_PVR_CONSTTAB=0 never,
+     * =1 on any GPU (host tests). */
+    {
+        const char *sw = vkb_srv_env("VKBRIDGE_PVR_CONSTTAB");
+        s->consttab = sw && *sw ? strcmp(sw, "0") != 0 : vkb_driver_is_powervr(&p, vkb_driver_id(&dev->real, dev->physical, dev->api_version));
+        if (s->consttab)
+            VKB_INFO("BC emulation: converters' constant tables in Private storage (PV-10: PowerVR reads constant arrays as 0 under robust buffer access)%s",
+                     sw && *sw ? " (VKBRIDGE_PVR_CONSTTAB)" : "");
     }
     VKB_INFO("BC emulation: BC1 UNORM decodes to %s / %s", s->packed_ok[0] ? "R5G6B5" : "RGBA8 (no R5G6B5)",
              s->packed_ok[1] ? "A1R5G5B5" : "RGBA8 (no A1R5G5B5)");
@@ -3181,11 +4533,194 @@ void vkb_emu_bcn_install(vkb_srv_table *dev)
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &s->dsl, 1, &pr};
     dev->real.vkCreatePipelineLayout(dev->device, &plci, NULL, &s->layout);
     {
+        /* VKBRIDGE_BC_ONE_DISPATCH (default BC_ONE_DISPATCH_DEFAULT; 0 off, 1 asked for by name: FAST_INLINE): one dispatch
+         * a run of regions (run_*), with a third binding for the table, in host-visible coherent memory */
+        const char *ov = vkb_srv_env("VKBRIDGE_BC_ONE_DISPATCH");
+        tab_named = ov && *ov && strcmp(ov, "0");
+        if (ov && *ov ? tab_named : BC_ONE_DISPATCH_DEFAULT) {
+            const char *why = NULL;
+            VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, TAB_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                      VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+            VkBuffer tb;
+            s->tab_type = UINT32_MAX;
+            if (dev->real.vkCreateBuffer(dev->device, &bci, NULL, &tb) == VK_SUCCESS) {
+                VkMemoryRequirements req;
+                dev->real.vkGetBufferMemoryRequirements(dev->device, tb, &req);
+                const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                for (int pass = 0; pass < 2 && s->tab_type == UINT32_MAX; pass++) /* device-local too, first */
+                    for (uint32_t i = 0; i < s->mp.memoryTypeCount && s->tab_type == UINT32_MAX; i++) {
+                        VkMemoryPropertyFlags f = s->mp.memoryTypes[i].propertyFlags;
+                        if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && (pass || (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+                            s->tab_type = i;
+                    }
+                dev->real.vkDestroyBuffer(dev->device, tb, NULL);
+            }
+            VkDescriptorSetLayoutBinding b3[3] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                                  {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                                  {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+            VkDescriptorSetLayoutCreateInfo dci3 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL,
+                                                    s->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT : 0, 3, b3};
+            if (s->tab_type == UINT32_MAX) why = "no host-visible coherent memory for the tables";
+            else if (dev->real.vkCreateDescriptorSetLayout(dev->device, &dci3, NULL, &s->dsl3) != VK_SUCCESS) why = "no descriptor layout";
+            else {
+                VkPipelineLayoutCreateInfo plci3 = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &s->dsl3, 1, &pr};
+                if (dev->real.vkCreatePipelineLayout(dev->device, &plci3, NULL, &s->layout3) != VK_SUCCESS) why = "no pipeline layout";
+            }
+            s->tidle = why ? NULL : calloc(TAB_IDLE, sizeof(*s->tidle));
+            if (!why && !s->tidle) why = "no memory";
+            s->range_max = p.limits.maxStorageBufferRange;
+            s->wg_max = p.limits.maxComputeWorkGroupCount[0];
+            /* VKBRIDGE_TEST_BC_RUN_LIMITS=<workgroups>,<source bytes>[,notab] (host tests, the server's environment
+             * only): lower limits for a run, so that the splits are tested; notab: no table room ever (pieces alone) */
+            const char *tl = getenv("VKBRIDGE_TEST_BC_RUN_LIMITS");
+            if (tl && *tl) {
+                char *end = NULL;
+                unsigned long wg = strtoul(tl, &end, 10);
+                unsigned long long rb = end && *end == ',' ? strtoull(end + 1, &end, 10) : 0;
+                if (wg && wg < s->wg_max) s->wg_max = (uint32_t)wg;
+                if (rb && rb < s->range_max) s->range_max = rb;
+                s->tab_none = end && strstr(end, "notab") != NULL;
+                VKB_WARN("VKBRIDGE_TEST_BC_RUN_LIMITS: runs of up to %u workgroups and %llu bytes of source%s, on purpose", s->wg_max,
+                         (unsigned long long)s->range_max, s->tab_none ? ", no table room" : "");
+            }
+            s->table = !why;
+            if (why) VKB_WARN("BC emulation: VKBRIDGE_BC_ONE_DISPATCH: %s; a dispatch a region", why);
+            else VKB_INFO("BC emulation: one dispatch a run of regions (VKBRIDGE_BC_ONE_DISPATCH%s; up to %u workgroups, %llu MiB of source)",
+                          tab_named ? "=1" : " default", s->wg_max, (unsigned long long)(s->range_max >> 20));
+        }
+    }
+    {
+        /* VKBRIDGE_BC_PALETTE (default BC_PALETTE_DEFAULT): 0 off, 1 or all, etc2, eac - BC1 -> ETC2 and / or BC4 / BC5 -> EAC
+         * search the block's palette (the same blocks, less work) */
+        const char *pv = vkb_srv_env("VKBRIDGE_BC_PALETTE");
+        pal_named = pv && *pv && strcmp(pv, "0");
+        if (pal_named) {
+            s->palette = !strcmp(pv, "etc2") ? PAL_ETC2 : !strcmp(pv, "eac") ? PAL_EAC : PAL_ETC2 | PAL_EAC;
+            if (strcmp(pv, "1") && strcmp(pv, "all") && strcmp(pv, "etc2") && strcmp(pv, "eac"))
+                VKB_WARN("BC emulation: VKBRIDGE_BC_PALETTE=%s unknown (0, 1, all, etc2, eac): all", pv);
+        } else if (!(pv && *pv)) {
+            s->palette = BC_PALETTE_DEFAULT;
+        }
+        if (s->palette)
+            VKB_INFO("BC emulation: %s search the blocks' palettes (VKBRIDGE_BC_PALETTE%s; the same blocks as the texel search)",
+                     s->palette == PAL_ETC2 ? "BC1 -> ETC2" : s->palette == PAL_EAC ? "BC4 / BC5 -> EAC" : "BC1 -> ETC2 and BC4 / BC5 -> EAC",
+                     pal_named ? "" : " default");
+    }
+    {
+        /* VKBRIDGE_BC_FAST (default BC_FAST_DEFAULT): 0 off, 1 or all, fast, default - the BC1 -> ETC2 palette search's BC_FAST
+         * variants (shaders/etc2_fast.glsl: the same blocks, less state a thread) at the fast search, the default (and high)
+         * one, or both; 0 builds today's palette variants */
+        const char *fv = vkb_srv_env("VKBRIDGE_BC_FAST");
+        VkPhysicalDeviceProperties gp;
+        dev->real.vkGetPhysicalDeviceProperties(dev->physical, &gp);
+        int gate_ex = 0, gate_on = vkb_bc_fast_gate(gp.deviceName, &gate_ex);
+        if (gate_ex) VKB_INFO("BC fast converters: VKBRIDGE_BC_FAST=%s decides (GPU %s)", fv, gp.deviceName);
+        else if (gate_on && BC_FAST_DEFAULT) VKB_INFO("BC fast converters: on (measured GPU)");
+        else if (gate_on) VKB_INFO("BC fast converters: off by default in this build (measured GPU; VKBRIDGE_BC_FAST=1 turns them on)");
+        else VKB_INFO("BC fast converters: off (not in the measured list: %s)", gp.deviceName);
+        if (!(fv && *fv)) s->bcfast = gate_on ? BC_FAST_DEFAULT : 0;
+        else if (!strcmp(fv, "0")) s->bcfast = 0;
+        else if (!strcmp(fv, "fast")) s->bcfast = BCF_FAST;
+        else if (!strcmp(fv, "default")) s->bcfast = BCF_DEFAULT;
+        else {
+            s->bcfast = BCF_FAST | BCF_DEFAULT;
+            if (strcmp(fv, "1") && strcmp(fv, "all")) VKB_WARN("BC emulation: VKBRIDGE_BC_FAST=%s unknown (0, 1, all, fast, default): all", fv);
+        }
+        /* BC7 -> ASTC's BC_FAST variants (shaders/astc_fast.glsl) at the same searches; its own probe flag */
+        s->bcfast7 = s->bcfast;
+        if (s->bcfast7 && vkb_probe_flag(VKB_PROBE_FLAG_BC_FAST_ASTC)) {
+            VKB_WARN("BC emulation: VKBRIDGE_BC_FAST off for BC7 -> ASTC: the startup probe found its variants wrong here (today's stay)");
+            s->bcfast7 = 0;
+        }
+        if (s->bcfast7)
+            VKB_INFO("BC emulation: BC7 -> ASTC with less state a thread at the %s (VKBRIDGE_BC_FAST%s%s; the same blocks)",
+                     s->bcfast7 == BCF_FAST ? "fast search" : s->bcfast7 == BCF_DEFAULT ? "default search" : "fast and default searches",
+                     fv && *fv ? "=" : " default", fv && *fv ? fv : "");
+        else if (!s->bcfast)
+            VKB_INFO("BC emulation: VKBRIDGE_BC_FAST=0: BC7 -> ASTC as before");
+        if (s->bcfast && vkb_probe_flag(VKB_PROBE_FLAG_BC_FAST_ETC2)) {
+            VKB_WARN("BC emulation: VKBRIDGE_BC_FAST off: the startup probe found its BC1 -> ETC2 variants wrong here (the palette ones stay)");
+            s->bcfast = 0;
+        }
+        if (!(s->palette & PAL_ETC2))
+            VKB_INFO("BC emulation: VKBRIDGE_BC_FAST: nothing to do for BC1 -> ETC2 (its palette search is off)");
+        else if (s->bcfast)
+            VKB_INFO("BC emulation: BC1 -> ETC2 palette search with less state a thread at the %s (VKBRIDGE_BC_FAST%s%s; the same blocks)",
+                     s->bcfast == BCF_FAST ? "fast search" : s->bcfast == BCF_DEFAULT ? "default search" : "fast and default searches",
+                     fv && *fv ? "=" : " default", fv && *fv ? fv : "");
+        else
+            VKB_INFO("BC emulation: VKBRIDGE_BC_FAST=0: BC1 -> ETC2 palette search as before");
+    }
+    {
+        /* Which way the new variants come (fast_mode). A part the startup probe found wrong on this driver is off whatever
+         * asked for it (VKBRIDGE_PROBE_APPLY=0 keeps it); a part asked for by name is built at first use as before
+         * (FAST_INLINE; a default part with it only if the probe has passed them already); defaults alone: FAST_BG, from the
+         * moment the probe has passed them (fast_poll), never waited for. */
+        if (vkb_probe_flag(VKB_PROBE_FLAG_BC_TAB) && s->table) VKB_WARN("BC emulation: one dispatch a run off: the startup probe found its converters wrong here");
+        if (vkb_probe_flag(VKB_PROBE_FLAG_BC_TAB)) s->table = 0;
+        uint32_t off = (vkb_probe_flag(VKB_PROBE_FLAG_BC_PAL_ETC2) ? PAL_ETC2 : 0) | (vkb_probe_flag(VKB_PROBE_FLAG_BC_PAL_EAC) ? PAL_EAC : 0);
+        if (s->palette & off) VKB_WARN("BC emulation: the palette search off for %s: the startup probe found it wrong here",
+                                       (s->palette & off) == PAL_ETC2 ? "BC1 -> ETC2" : (s->palette & off) == PAL_EAC ? "BC4 / BC5 -> EAC" : "all");
+        s->palette &= ~off;
+        int st = vkb_probe_bc_variants();
+        if (tab_named || pal_named) {
+            s->fast_mode = FAST_INLINE;
+            if (st != 1) {
+                if (!tab_named) s->table = 0;
+                if (!pal_named) s->palette = 0;
+                s->bcfast7 = 0; /* BC7 fast only once the probe has passed it */
+            }
+            if (s->table || s->palette || s->bcfast7)
+                VKB_INFO("BC emulation: new converter variants asked for by name: built at first use (%s)",
+                         st == 1 ? "the startup probe checked them" : "not checked by the startup probe yet");
+        } else if (s->table || s->palette || s->bcfast7) {
+            s->fast_mode = FAST_BG;
+            s->fast_ok = st;
+            s->fast_settle = st == 1;
+            if (st < 0) VKB_INFO("BC emulation: the startup probe does not run here; the new converter variants are not used");
+            else
+                VKB_INFO("BC emulation: new converter variants (%s%s%s%s%s) %s", s->table ? "one dispatch a run" : "", s->table && s->palette ? ", " : "",
+                         s->palette ? "palette search" : "", (s->table || s->palette) && s->bcfast7 ? ", " : "", s->bcfast7 ? "BC7 -> ASTC fast" : "",
+                         st ? "built in the background from the first BC image, each used once built (the startup probe passed them)"
+                            : "used once the startup probe has passed them, built in the background then");
+        }
+    }
+    {
         const char *bv = vkb_srv_env("VKBRIDGE_BC_BATCH");
         s->batch = !(bv && bv[0] == '0' && !bv[1]);
         VKB_INFO("BC emulation: %s", s->batch ? "uploads recorded back to back share one barrier pair (VKBRIDGE_BC_BATCH=0: a pair each)"
                                                : "a barrier pair per upload (VKBRIDGE_BC_BATCH=0)");
     }
+    {
+        /* the conversions' GPU time (cv_*): every graphics/compute queue family must have timestamps (a stamp on one without is
+         * invalid, and the command buffers' families are not followed here) */
+        const char *gv = vkb_srv_env("VKBRIDGE_BC_GPU_TIME");
+        int want = !(gv && gv[0] == '0' && !gv[1]);
+        uint32_t bits = 64;
+        PFN_vkGetPhysicalDeviceQueueFamilyProperties qfp =
+            (PFN_vkGetPhysicalDeviceQueueFamilyProperties)vkb_gipa(dev->instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+        if (qfp) {
+            VkQueueFamilyProperties q[16];
+            uint32_t nq = 16;
+            qfp(dev->physical, &nq, q);
+            /* only the families that run compute or graphics work: the conversions are recorded in those. A video decode/encode
+             * or sparse-only family has timestampValidBits 0 (RADV has them) and would switch the timing off for good */
+            for (uint32_t i = 0; i < nq; i++)
+                if ((q[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) && q[i].timestampValidBits < bits) bits = q[i].timestampValidBits;
+        } else {
+            bits = 0;
+        }
+        s->gpu_time = want && bits && p.limits.timestampPeriod > 0 && dev->real.vkCreateQueryPool && dev->real.vkCmdWriteTimestamp &&
+                      dev->real.vkCmdResetQueryPool && dev->real.vkGetQueryPoolResults && dev->real.vkDestroyQueryPool;
+        if (s->gpu_time) {
+            g_ts_period = p.limits.timestampPeriod;
+            g_ts_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+        }
+        VKB_INFO("BC emulation: the conversions' GPU time %s", s->gpu_time ? "measured (two timestamps a batch; VKBRIDGE_BC_GPU_TIME=0: off)"
+                                                                            : !want ? "not measured (VKBRIDGE_BC_GPU_TIME=0)"
+                                                                                    : "not measured (a queue family has no timestamps)");
+    }
+    small_decide(s); /* the small-image rule's line at device creation (its decision as at the first small image) */
     e->bcn = s;
     dev->dt.vkCreateImageView = emu_CreateImageView;
     sink_install(dev);
@@ -3196,14 +4731,25 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
     bcn_state *s = dev->emu->bcn;
     if (!s) return;
     budget_totals();
+    small_totals(s);
+    pthread_mutex_lock(&g_cv_lock);
+    cv_lines(1, vkb_hitch_now()); /* before the uploads line, which host/bcupload_test.sh waits for */
+    pthread_mutex_unlock(&g_cv_lock);
     copies_line(1);
     uploads_line(1);
     vkb_emu_bcn_quiesce(dev);
     for (int q = 0; q < 3; q++)
-        for (int i = 0; i < FAM_COUNT; i++)
+        for (int i = 0; i < FAM_COUNT; i++) {
             if (s->pipes[q][i]) dev->real.vkDestroyPipeline(dev->device, s->pipes[q][i], NULL);
+            if (s->fpipes[q][i]) dev->real.vkDestroyPipeline(dev->device, s->fpipes[q][i], NULL);
+            if (s->ipipes[q][i]) dev->real.vkDestroyPipeline(dev->device, s->ipipes[q][i], NULL);
+        }
     dev->real.vkDestroyPipelineLayout(dev->device, s->layout, NULL);
     dev->real.vkDestroyDescriptorSetLayout(dev->device, s->dsl, NULL);
+    if (s->layout3) dev->real.vkDestroyPipelineLayout(dev->device, s->layout3, NULL);
+    if (s->dsl3) dev->real.vkDestroyDescriptorSetLayout(dev->device, s->dsl3, NULL);
+    for (uint32_t i = 0; i < s->ntidle; i++) tab_destroy(dev->emu, &s->tidle[i]);
+    free(s->tidle);
     /* Scratch that command buffers still hold goes with their state (server_emu_cmdstate.c). */
     dev->emu->bcn = NULL;
     for (uint32_t i = 0; i < s->nidle; i++) {
@@ -3211,6 +4757,11 @@ void vkb_emu_bcn_uninstall(vkb_srv_table *dev)
         chunk_destroy(dev->emu, &s->idle[i]);
     }
     free(s->idle);
+    for (uint32_t i = 0; i < s->nqidle; i++) {
+        dev->real.vkDestroyQueryPool(dev->device, s->qidle[i]->pool, NULL);
+        free(s->qidle[i]);
+    }
+    free(s->qidle);
     free(s->pin);
     pthread_cond_destroy(&s->pcond);
     pthread_mutex_destroy(&s->plock);
@@ -3272,4 +4823,340 @@ VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, VkPipel
     if (pl) r->vkDestroyPipelineLayout(d, pl, NULL);
     if (dsl) r->vkDestroyDescriptorSetLayout(d, dsl, NULL);
     return res;
+}
+
+/* The REGION_TABLE (one dispatch a run) and BC_PALETTE variants, checked by the startup probe (server_probe.c bc_variants)
+ * on the driver itself before any game uses them: each is built under the compile watchdog and run on the same blocks as
+ * the variant players have run for months (the old one, no table, texel search), on this GPU, and the two outputs are
+ * compared byte for byte. A variant that does not build, hangs, or gives one byte that differs is turned off for this
+ * driver build (its probe flag), and the old variant stays. Decoders are checked at their one quality, transcoders at the
+ * fast and the default search (auto uses both). */
+static const struct {
+    int fam;
+    uint8_t tab, pal;
+    uint32_t flag;
+    const char *name;
+} probe_var[] = {
+    {FAM_BC1, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC1 decode table"},        {FAM_BC2, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC2 decode table"},
+    {FAM_BC3, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC3 decode table"},        {FAM_BC4, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC4 decode table"},
+    {FAM_BC5, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC5 decode table"},        {FAM_BC6H, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC6H decode table"},
+    {FAM_BC7, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC7 decode table"},        {FAM_BC1_16, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC1 16-bit table"},
+    {TX_BC1, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC1->ETC2 table"},          {TX_BC2, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC2->ASTC table"},
+    {TX_BC3, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC3->ASTC table"},          {TX_BC4, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC4->EAC table"},
+    {TX_BC5, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC5->EAC table"},           {TX_BC6H, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC6H->ASTC-HDR table"},
+    {TX_BC7, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC7->ASTC table"},          {TX_BC1_ASTC, 1, 0, VKB_PROBE_FLAG_BC_TAB, "BC1->ASTC table"},
+    {TX_BC1, 0, 1, VKB_PROBE_FLAG_BC_PAL_ETC2, "BC1->ETC2 palette"},   {TX_BC1, 1, 1, VKB_PROBE_FLAG_BC_PAL_ETC2, "BC1->ETC2 table+palette"},
+    {TX_BC4, 0, 1, VKB_PROBE_FLAG_BC_PAL_EAC, "BC4->EAC palette"},     {TX_BC4, 1, 1, VKB_PROBE_FLAG_BC_PAL_EAC, "BC4->EAC table+palette"},
+    {TX_BC5, 0, 1, VKB_PROBE_FLAG_BC_PAL_EAC, "BC5->EAC palette"},     {TX_BC5, 1, 1, VKB_PROBE_FLAG_BC_PAL_EAC, "BC5->EAC table+palette"},
+    /* VKBRIDGE_BC_FAST's variants (pal 2): checked whatever the switch says, so that flipping it never makes a probe run again */
+    {TX_BC1, 0, 2, VKB_PROBE_FLAG_BC_FAST_ETC2, "BC1->ETC2 palette fast"}, {TX_BC1, 1, 2, VKB_PROBE_FLAG_BC_FAST_ETC2, "BC1->ETC2 table+palette fast"},
+    {TX_BC7, 0, 2, VKB_PROBE_FLAG_BC_FAST_ASTC, "BC7->ASTC fast"},         {TX_BC7, 1, 2, VKB_PROBE_FLAG_BC_FAST_ASTC, "BC7->ASTC table fast"}};
+
+int vkb_emu_bcn_variants(void) { return (int)(sizeof(probe_var) / sizeof(probe_var[0])); }
+
+/* A hash of every converter SPIR-V the variant checks compare (the old variant and the new one of each probe_var entry) and of
+ * the check's own table: a cached verdict of the probe (server_probe.c bcv_verdict) is only reused for exactly these converters. */
+uint64_t vkb_emu_bcn_variants_hash(void)
+{
+    uint64_t h = 0xcbf29ce484222325ull ^ 1u; /* 1: the check's own semantics (regions, qualities); bump when vkb_emu_bcn_check_variant changes */
+    for (size_t i = 0; i < sizeof(probe_var) / sizeof(probe_var[0]); i++) {
+        size_t nsz = 0;
+        const uint32_t *nc = fam_variant(probe_var[i].fam, probe_var[i].tab, probe_var[i].pal, &nsz);
+        const uint32_t *oc = fam_code[probe_var[i].fam];
+        size_t osz = fam_size[probe_var[i].fam];
+        const uint8_t *parts[2] = {(const uint8_t *)oc, (const uint8_t *)nc};
+        size_t lens[2] = {osz, nsz};
+        h = (h ^ (uint64_t)(probe_var[i].fam * 64 + probe_var[i].tab * 8 + probe_var[i].pal)) * 0x100000001b3ull;
+        for (int k = 0; k < 2; k++) {
+            h = (h ^ lens[k]) * 0x100000001b3ull;
+            for (size_t b = 0; parts[k] && b < lens[k]; b++) h = (h ^ parts[k][b]) * 0x100000001b3ull;
+        }
+    }
+    return h;
+}
+
+/* Variant i's name, its probe flag, and the format its output is sampled as (UNDEFINED: a decoder): a transcoder whose
+ * target the GPU does not sample is never used on it, so the probe skips it. */
+const char *vkb_emu_bcn_variant_name(int i, uint32_t *flag, VkFormat *target)
+{
+    static const VkFormat tx[] = {[TX_BC1] = VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, [TX_BC2] = VK_FORMAT_ASTC_4x4_UNORM_BLOCK,
+                                  [TX_BC3] = VK_FORMAT_ASTC_4x4_UNORM_BLOCK,      [TX_BC4] = VK_FORMAT_EAC_R11_UNORM_BLOCK,
+                                  [TX_BC5] = VK_FORMAT_EAC_R11G11_UNORM_BLOCK,    [TX_BC6H] = VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK,
+                                  [TX_BC7] = VK_FORMAT_ASTC_4x4_UNORM_BLOCK,      [TX_BC1_ASTC] = VK_FORMAT_ASTC_4x4_UNORM_BLOCK};
+    int fam = probe_var[i].fam;
+    *flag = probe_var[i].flag;
+    *target = fam >= TX_BC1 ? tx[fam] : VK_FORMAT_UNDEFINED;
+    return probe_var[i].name;
+}
+
+/* A compute pipeline of code (BC_QUALITY q baked in for a transcoder) on layout, through cache. */
+static VkResult chk_pipeline(const vkb_dispatch *r, VkDevice d, VkPipelineCache cache, VkPipelineLayout layout, int fam, const uint32_t *code,
+                             size_t size, uint32_t q, VkPipeline *out)
+{
+    *out = VK_NULL_HANDLE;
+    if (!code) return VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t *baked = fam >= TX_BC1 && q != 1 ? bake_quality(code, size, q) : NULL;
+    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size, baked ? baked : code};
+    VkShaderModule m;
+    VkResult res = r->vkCreateShaderModule(d, &mci, NULL, &m);
+    free(baked);
+    if (res != VK_SUCCESS) return res;
+    VkComputePipelineCreateInfo pci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pci.stage = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", NULL};
+    pci.layout = layout;
+    res = r->vkCreateComputePipelines(d, cache, 1, &pci, NULL, out);
+    r->vkDestroyShaderModule(d, m, NULL);
+    return res;
+}
+
+/* VKBRIDGE_PROBE_BCV_FAKE=<variant name>:<differ|fail|slow|hang>,... (host tests): that variant's output gets one byte
+ * changed, its build is taken as failed, or its check takes 3 s / 600 s longer (inside the watchdog: a hang is interrupted). */
+static int bcv_fake(const char *name)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PROBE_BCV_FAKE");
+    size_t n = strlen(name);
+    for (const char *p = v; p && (p = strstr(p, name)); p += n)
+        if ((p == v || p[-1] == ',') && p[n] == ':')
+            return !strncmp(p + n + 1, "differ", 6) ? 1 : !strncmp(p + n + 1, "fail", 4) ? 2 : !strncmp(p + n + 1, "hang", 4) ? 4 : 3;
+    return 0;
+}
+
+#define CHK_REGIONS 4
+#define CHK_OB 128 /* output bytes a block at most (BC6H decoded: 16 RGBA16F texels) */
+
+/* Variant i checked on a device of the probe's (queue q of family qf, memory mp): 0 the same bytes as the old variant, 1 a
+ * difference, -1 it did not build or run (why says which), -2 the GPU did not finish (a hang: the device is lost to the
+ * probe). *ms: the time it took. */
+int vkb_emu_bcn_check_variant(const vkb_dispatch *r, VkDevice d, VkQueue queue, uint32_t qf, const VkPhysicalDeviceMemoryProperties *mp,
+                              VkPipelineCache cache, int i, double *ms, char *why, size_t cap)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const int fam = probe_var[i].fam, tab = probe_var[i].tab, pal = probe_var[i].pal;
+    const int fake = bcv_fake(probe_var[i].name);
+    if (fake >= 3) {
+        struct timespec ts = {fake == 4 ? 600 : 3, 0};
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+        }
+    }
+    /* four regions: one with a longer row than its width, one cut at the edge (13x7 texels) with two slices, a single
+     * block, and one of 4x2 workgroups; their blocks one after another in the source */
+    static const uint32_t rw[CHK_REGIONS] = {40, 13, 4, 100}, rh[CHK_REGIONS] = {24, 7, 4, 36}, rs[CHK_REGIONS] = {1, 2, 1, 1},
+                          rrow[CHK_REGIONS] = {12, 4, 1, 25}, rlay[CHK_REGIONS] = {72, 10, 1, 225};
+    int src_fam = fam >= TX_BC1 ? (fam == TX_BC1_ASTC ? FAM_BC1 : fam - TX_BC1) : fam == FAM_BC1_16 ? FAM_BC1 : fam;
+    uint32_t bb = src_fam == FAM_BC1 || src_fam == FAM_BC4 ? 8 : 16;
+    uint32_t sblk[CHK_REGIONS], dblk[CHK_REGIONS], nsrc = 0, ndst = 0, wgs = 0;
+    for (int k = 0; k < CHK_REGIONS; k++) {
+        uint32_t bw = (rw[k] + 3) / 4, nr = (rh[k] + 3) / 4;
+        sblk[k] = nsrc, dblk[k] = ndst;
+        nsrc += (rs[k] - 1) * rlay[k] + (nr - 1) * rrow[k] + bw;
+        ndst += bw * nr * rs[k];
+        wgs += ((bw + 7) / 8) * ((nr + 7) / 8) * rs[k];
+    }
+    /* flags as images give them (family_flags): BC1 with and without alpha, signed and unsigned, ETC2 RGB8 and RGB8A1 */
+    uint32_t fl[2] = {0, 0};
+    int nfl = 1;
+    if (fam == FAM_BC1 || fam == FAM_BC1_16 || fam == TX_BC1_ASTC) fl[1] = 1, nfl = 2;
+    else if (fam == FAM_BC4 || fam == FAM_BC5 || fam == FAM_BC6H || fam == TX_BC4 || fam == TX_BC5 || fam == TX_BC6H) fl[1] = 2, nfl = 2;
+    else if (fam == TX_BC1) fl[0] = 1, fl[1] = 4, nfl = 2;
+    const VkDeviceSize src_bytes = (VkDeviceSize)nsrc * bb, dst_bytes = (VkDeviceSize)ndst * CHK_OB, tab_bytes = CHK_REGIONS * TAB_ENTRY;
+    enum { B_SRC, B_REF, B_NEW, B_ALONE, B_TAB, B_N };
+    const VkDeviceSize bsz[B_N] = {src_bytes, dst_bytes, dst_bytes, dst_bytes, tab_bytes};
+    VkBuffer buf[B_N] = {0};
+    VkDeviceMemory mem[B_N] = {0};
+    uint8_t *map[B_N] = {0};
+    VkDescriptorSetLayout dsl2 = VK_NULL_HANDLE, dsl3 = VK_NULL_HANDLE;
+    VkPipelineLayout pl2 = VK_NULL_HANDLE, pl3 = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkCommandPool cpool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkPipeline pref = VK_NULL_HANDLE, pnew = VK_NULL_HANDLE;
+    int ret = -1;
+    why[0] = 0;
+    for (int b = 0; b < B_N; b++) {
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bsz[b], VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+        if (r->vkCreateBuffer(d, &bci, NULL, &buf[b]) != VK_SUCCESS) {
+            snprintf(why, cap, "setup: buffer");
+            goto out;
+        }
+        VkMemoryRequirements req;
+        r->vkGetBufferMemoryRequirements(d, buf[b], &req);
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t t = UINT32_MAX;
+        for (uint32_t k = 0; k < mp->memoryTypeCount && t == UINT32_MAX; k++)
+            if ((req.memoryTypeBits & (1u << k)) && (mp->memoryTypes[k].propertyFlags & want) == want) t = k;
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, t};
+        void *p = NULL;
+        if (t == UINT32_MAX || r->vkAllocateMemory(d, &ai, NULL, &mem[b]) != VK_SUCCESS || r->vkBindBufferMemory(d, buf[b], mem[b], 0) != VK_SUCCESS ||
+            r->vkMapMemory(d, mem[b], 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+            snprintf(why, cap, "setup: host-visible memory");
+            goto out;
+        }
+        map[b] = p;
+    }
+    {
+        uint32_t x = 0x9e3779b9u ^ (uint32_t)fam; /* the same blocks for every check of a family */
+        for (VkDeviceSize k = 0; k < src_bytes; k++) {
+            x ^= x << 13, x ^= x >> 17, x ^= x << 5;
+            map[B_SRC][k] = (uint8_t)(x >> 24);
+        }
+        uint32_t e[CHK_REGIONS * 8], first = 0;
+        for (int k = 0; k < CHK_REGIONS; k++) {
+            uint32_t bw = (rw[k] + 3) / 4, nr = (rh[k] + 3) / 4, wx = (bw + 7) / 8, wy = (nr + 7) / 8;
+            uint32_t v[8] = {sblk[k] * bb / 4, rrow[k], rlay[k], dblk[k] * CHK_OB / 4, rw[k], rh[k], first, wx | (wy << 16)};
+            memcpy(&e[k * 8], v, sizeof(v));
+            first += wx * wy * rs[k];
+        }
+        memcpy(map[B_TAB], e, sizeof(e));
+    }
+    VkDescriptorSetLayoutBinding b3[3] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                          {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo dci2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 2, b3},
+                                    dci3 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 3, b3};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_t)};
+    if (r->vkCreateDescriptorSetLayout(d, &dci2, NULL, &dsl2) != VK_SUCCESS || r->vkCreateDescriptorSetLayout(d, &dci3, NULL, &dsl3) != VK_SUCCESS) {
+        snprintf(why, cap, "setup: descriptor layout");
+        goto out;
+    }
+    VkPipelineLayoutCreateInfo plci2 = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl2, 1, &pr},
+                               plci3 = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl3, 1, &pr};
+    if (r->vkCreatePipelineLayout(d, &plci2, NULL, &pl2) != VK_SUCCESS || r->vkCreatePipelineLayout(d, &plci3, NULL, &pl3) != VK_SUCCESS) {
+        snprintf(why, cap, "setup: pipeline layout");
+        goto out;
+    }
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 4, 1, &ps};
+    /* the old variant: src, ref; the run: src, new, table; alone through the table layout: src, alone, alone (unread);
+     * the palette variant alone: src, new */
+    VkDescriptorSet set[4];
+    VkDescriptorSetLayout lays[4] = {dsl2, dsl3, dsl3, dsl2};
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, 4, lays};
+    if (r->vkCreateDescriptorPool(d, &dpci, NULL, &pool) != VK_SUCCESS || (dai.descriptorPool = pool, r->vkAllocateDescriptorSets(d, &dai, set)) != VK_SUCCESS) {
+        snprintf(why, cap, "setup: descriptor sets");
+        goto out;
+    }
+    {
+        VkDescriptorBufferInfo bi[10] = {{buf[B_SRC], 0, VK_WHOLE_SIZE}, {buf[B_REF], 0, VK_WHOLE_SIZE},
+                                         {buf[B_SRC], 0, VK_WHOLE_SIZE}, {buf[B_NEW], 0, VK_WHOLE_SIZE}, {buf[B_TAB], 0, VK_WHOLE_SIZE},
+                                         {buf[B_SRC], 0, VK_WHOLE_SIZE}, {buf[B_ALONE], 0, VK_WHOLE_SIZE}, {buf[B_ALONE], 0, VK_WHOLE_SIZE},
+                                         {buf[B_SRC], 0, VK_WHOLE_SIZE}, {buf[B_NEW], 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[10];
+        const uint32_t ws[10] = {0, 0, 1, 1, 1, 2, 2, 2, 3, 3}, wb[10] = {0, 1, 0, 1, 2, 0, 1, 2, 0, 1};
+        for (int k = 0; k < 10; k++)
+            w[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set[ws[k]], wb[k], 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[k], NULL};
+        r->vkUpdateDescriptorSets(d, 10, w, 0, NULL);
+    }
+    VkCommandPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, qf};
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkCommandBuffer cb;
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    if (r->vkCreateCommandPool(d, &cpci, NULL, &cpool) != VK_SUCCESS || r->vkCreateFence(d, &fci, NULL, &fence) != VK_SUCCESS ||
+        (cai.commandPool = cpool, r->vkAllocateCommandBuffers(d, &cai, &cb)) != VK_SUCCESS) {
+        snprintf(why, cap, "setup: command buffer");
+        goto out;
+    }
+    const uint32_t nq = fam >= TX_BC1 ? 2 : 1, qs[2] = {fam >= TX_BC1 ? 0u : 1u, 1};
+    ret = 0;
+    for (uint32_t qi = 0; qi < nq && ret == 0; qi++) {
+        uint32_t q = qs[qi];
+        size_t nsz;
+        const uint32_t *ncode = fam_variant(fam, tab, pal, &nsz);
+        VkResult res = chk_pipeline(r, d, cache, pl2, fam, fam_code[fam], fam_size[fam], q, &pref);
+        if (res != VK_SUCCESS) {
+            snprintf(why, cap, "the old variant did not build (%d)", res);
+            ret = -1;
+            break;
+        }
+        res = fake == 2 ? VK_ERROR_UNKNOWN : chk_pipeline(r, d, cache, tab ? pl3 : pl2, fam, ncode, nsz, q, &pnew);
+        if (res != VK_SUCCESS) {
+            snprintf(why, cap, "did not build at quality %u (%d)%s", q, res, fake == 2 ? " [imitated: VKBRIDGE_PROBE_BCV_FAKE]" : "");
+            ret = -1;
+            break;
+        }
+        for (int f = 0; f < nfl && ret == 0; f++) {
+            memset(map[B_REF], 0xa5, dst_bytes), memset(map[B_NEW], 0xa5, dst_bytes), memset(map[B_ALONE], 0xa5, dst_bytes);
+            r->vkResetCommandBuffer(cb, 0);
+            VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            r->vkBeginCommandBuffer(cb, &cbi);
+            /* the old variant: a dispatch a region, as decode_now records them without the table */
+            r->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pref);
+            r->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl2, 0, 1, &set[0], 0, NULL);
+            for (int k = 0; k < CHK_REGIONS; k++) {
+                uint32_t bw = (rw[k] + 3) / 4, nr = (rh[k] + 3) / 4;
+                pc_t pc = {sblk[k] * bb / 4, rrow[k], rlay[k], fl[f], dblk[k] * CHK_OB / 4, 0, {rw[k], rh[k]}};
+                r->vkCmdPushConstants(cb, pl2, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                r->vkCmdDispatch(cb, (bw + 7) / 8, (nr + 7) / 8, rs[k]);
+            }
+            r->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pnew);
+            if (tab) {
+                /* the run: one dispatch of all four regions' workgroups (run_flush) */
+                r->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl3, 0, 1, &set[1], 0, NULL);
+                pc_t pc = {0, CHK_REGIONS, 0, fl[f], 0, 1, {0, 0}};
+                r->vkCmdPushConstants(cb, pl3, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                r->vkCmdDispatch(cb, wgs, 1, 1);
+            }
+            /* a dispatch a region: the palette variant (into B_NEW), or the table variant with no table room (pc.pad 0,
+             * into B_ALONE) */
+            VkPipelineLayout la = tab ? pl3 : pl2;
+            r->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, la, 0, 1, tab ? &set[2] : &set[3], 0, NULL);
+            for (int k = 0; k < CHK_REGIONS; k++) {
+                uint32_t bw = (rw[k] + 3) / 4, nr = (rh[k] + 3) / 4;
+                pc_t pc = {sblk[k] * bb / 4, rrow[k], rlay[k], fl[f], dblk[k] * CHK_OB / 4, 0, {rw[k], rh[k]}};
+                r->vkCmdPushConstants(cb, la, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                r->vkCmdDispatch(cb, (bw + 7) / 8, (nr + 7) / 8, rs[k]);
+            }
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+            r->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            r->vkEndCommandBuffer(cb);
+            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+            if (r->vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) {
+                snprintf(why, cap, "submit failed");
+                ret = -1;
+                break;
+            }
+            VkResult wr = r->vkWaitForFences(d, 1, &fence, VK_TRUE, 5000000000ull);
+            r->vkResetFences(d, 1, &fence);
+            if (wr != VK_SUCCESS) {
+                snprintf(why, cap, wr == VK_TIMEOUT ? "the GPU did not finish in 5 s" : "the device was lost (%d)", wr);
+                ret = -2;
+                break;
+            }
+            if (fake == 1) map[B_NEW][dblk[3] * CHK_OB + 5] ^= 0x10;
+            /* every byte, the untouched ones (0xa5) included: the same writes, nothing more and nothing less */
+            for (int pass = 0; pass < 1 + tab && ret == 0; pass++) {
+                const uint8_t *got = map[pass ? B_ALONE : B_NEW];
+                VkDeviceSize at = 0;
+                while (at < dst_bytes && got[at] == map[B_REF][at]) at++;
+                if (at < dst_bytes) {
+                    snprintf(why, cap, "byte %llu %s differs at quality %u, flags %u (0x%02x, the old variant 0x%02x)%s", (unsigned long long)at,
+                             !tab ? "of a region" : pass ? "of a region dispatched alone" : "of the run", q, fl[f], got[at], map[B_REF][at],
+                             fake == 1 ? " [imitated: VKBRIDGE_PROBE_BCV_FAKE]" : "");
+                    ret = 1;
+                }
+            }
+        }
+        if (pref) r->vkDestroyPipeline(d, pref, NULL);
+        if (pnew) r->vkDestroyPipeline(d, pnew, NULL);
+        pref = pnew = VK_NULL_HANDLE;
+    }
+out:
+    if (pref) r->vkDestroyPipeline(d, pref, NULL);
+    if (pnew) r->vkDestroyPipeline(d, pnew, NULL);
+    if (ret != -2) { /* after a hang the device is the driver's to keep */
+        if (fence) r->vkDestroyFence(d, fence, NULL);
+        if (cpool) r->vkDestroyCommandPool(d, cpool, NULL);
+        if (pool) r->vkDestroyDescriptorPool(d, pool, NULL);
+        if (pl2) r->vkDestroyPipelineLayout(d, pl2, NULL);
+        if (pl3) r->vkDestroyPipelineLayout(d, pl3, NULL);
+        if (dsl2) r->vkDestroyDescriptorSetLayout(d, dsl2, NULL);
+        if (dsl3) r->vkDestroyDescriptorSetLayout(d, dsl3, NULL);
+        for (int b = 0; b < B_N; b++) {
+            if (buf[b]) r->vkDestroyBuffer(d, buf[b], NULL);
+            if (mem[b]) r->vkFreeMemory(d, mem[b], NULL);
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    *ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    return ret;
 }

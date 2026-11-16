@@ -1,5 +1,28 @@
 #!/bin/bash
-# server_apicap.c's Vulkan version cap for Steam mode's processes per driver version and switch, a server per step.
+# The Steam-mode black screen's gate and its Vulkan 1.1 cap (server_apicap.c vkb_black_gate /
+# vkb_steam_api_cap, client/physdev.c cap_api), with a server of its own per step. The processes are
+# vulkaninfo copies named like Steam mode's (the server goes by the client's process name):
+#   0  Arm r40p0 on a job manager GPU (the Anbernic RG556), the default: Xwayland, steam and
+#      steamwebhelper see Vulkan 1.1, gamescope 1.2 (the S21's levels), a game ("vulkaninfo") the driver's;
+#      the server says so and why in one line;
+#   1  ... VKBRIDGE_STEAM_API_CAP=0: nothing capped, no "api cap" line;
+#   2  r44p1 (CSF, the S10+'s G720): the gate is off, nothing capped;
+#   3  ... VKBRIDGE_STEAM_API_CAP=1.1: capped anyway (Xwayland 1.1, gamescope 1.2);
+#   4  r40p0 on a job manager GPU with VKBRIDGE_STEAM_API_CAP_GAMESCOPE=1.1: gamescope 1.1 too;
+#   5  r38p0 on a job manager GPU taken as a Vulkan 1.1 driver without VK_EXT_extended_dynamic_state (the
+#      S21's case, VKBRIDGE_FAKE_API=1.1, the extension hidden from the server): the gate is off, no "api cap"
+#      line (gamescope gets the promotion's own version);
+#   5b r38p1 beta on a job manager GPU as a Vulkan 1.1 driver with the extension (S10 / Note10+ phones):
+#      the gate is on (the "a1:" line), Xwayland, steam and steamwebhelper stay at the driver's 1.1;
+#   6  VKBRIDGE_STEAM_API_CAP=1.x9 (not a version): a warning, nothing capped;
+#   7  r38p1 on a job manager GPU at the driver's own version (Galaxy A16 / Tab S9 FE / F15 / A54): capped
+#      by default, as step 0;
+#   8  r54p1 (CSF, the Dimensity 9500's G1-Ultra), r49p1:csf (the S11 Ultra's G925) and r54p1:jm (a player log's
+#      Redmi G57 MC2, Big Picture shown without the cap): nothing capped;
+#   9  r38p1:csf (#45, a player log: Dimensity 9200's Immortalis-G715 on the A1 devices' driver): capped by
+#      default, as step 7, the line says CSF; r43p0:csf capped too; unknown:csf (no release) and r32p1:csf as a
+#      Vulkan 1.1 driver without the extension (the G610/G710 phones): nothing capped.
+# Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
 work=$(mktemp -d)

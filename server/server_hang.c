@@ -10,14 +10,28 @@
  * (the BCn decoder's dispatches) are seen too. The Witcher 3 (D3D12, 2026-10-11): a job held the
  * whole GPU past Mali's watchdog, the device was lost and the game presented black frames; the
  * logs could not say which job. Off unless asked for; a debugging aid, not a feature.
+ *
+ * Fault-armed, one launch: a device confirmed lost whose driver fault report has a memory address
+ * (server_lostlog.c) writes <cache dir>/hang-detect-next/<program@key>, and the next launch of that
+ * program (same name and pipeline cache key = the same game) has the detector on for its own devices,
+ * once: the file is taken at its first device. God of War on a player's POCO X6 Pro (Mali-G615 MC6 r44p1,
+ * a player log 2026-11-09-08): 'TRANSLATION_FAULT at level 1 ... Write' 23 s in; the loss record named the
+ * submission's command buffers, not the writer, and a player cannot switch the detector on. Nothing
+ * changes on a device until such a loss; then that one game pays a fence and an empty submission per
+ * submit for one launch (it was unplayable in the launch that lost it). A launch that had the detector
+ * on does not arm it again. OFF by default since test59 (the armed launch costs ~10% fps, see arm_off());
+ * VKBRIDGE_FAULT_ARM=1 turns it on.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "server_emu.h"
 #include "vkb_emu_formats.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -64,7 +78,7 @@ typedef struct hg_mod {
 #define OBJ_BUCKETS 16384
 typedef struct hg_obj {
     uint64_t key;
-    int kind;              /* 1 image, 2 view, 3 sampler, 4 descriptor set (freed: 5), 6 memory */
+    int kind;              /* 1 image, 2 view, 3 sampler, 4 descriptor set (freed: 5), 6 memory, 7 buffer */
     int dead;              /* destroyed or freed */
     double dead_t;
     union {
@@ -73,6 +87,7 @@ typedef struct hg_obj {
         struct { uint32_t mag, min, mip, u, v, w, aniso, compare, border, unnorm; float max_aniso, lod_bias, min_lod, max_lod; } smp;
         struct { VkDescriptorPool pool; VkDescriptorSetLayout layout; uint32_t var, writes, copies_in; double t; } set;
         struct { VkDeviceSize size; uint32_t type; } mem;
+        struct { VkDeviceSize size; uint32_t usage; } buf;
     };
     struct hg_obj *next;
 } hg_obj;
@@ -83,6 +98,30 @@ typedef struct hg_set {
     uint64_t *slot;        /* the view or sampler written there */
     struct hg_set *next;
 } hg_set;
+
+/* Buffer descriptors (storage and uniform buffers) of every binding of a set: vkd3d-proton's bindless CBVs are an
+ * array of storage buffers (The Witcher 3's light-culling compute reads its light count from one: h-96e7965da9ba6414,
+ * BindlessCBV[pc[1]+12][2628]). With robustness2 emulated on Mali (core robustBufferAccess, server_emu.c), a read past
+ * the descriptor's range may give an in-bounds value instead of zero; the range is what tells. */
+typedef struct hg_bd {
+    uint64_t buf;
+    uint64_t off, range;
+} hg_bd;
+typedef struct hg_bset {
+    VkDescriptorSet set;
+    uint32_t binding, n;
+    hg_bd *d;
+    struct hg_bset *next;
+} hg_bset;
+
+#define CB_DISPS 6
+typedef struct hg_disp {
+    VkPipeline p;            /* the compute pipeline bound at the dispatch */
+    uint32_t x, y, z, indirect;
+    VkDescriptorSet sets[4]; /* compute sets 0-3 bound at the dispatch */
+    uint32_t pc_size;        /* compute push constants as they were at the dispatch */
+    uint8_t pc[160];
+} hg_disp;
 
 typedef struct hg_draw {
     VkPipeline p;          /* the graphics pipeline bound at the draw */
@@ -120,13 +159,17 @@ typedef struct hg_cb {
     uint32_t ncopy;
     uint32_t n, dispatches, draws, ndraws;
     VkPipeline pipes[CB_PIPES];
-    VkPipeline gfx_bound;
+    VkPipeline gfx_bound, cmp_bound; /* cmp_bound: VKBRIDGE_SKIP_SHADERS on dispatches */
     VkExtent2D area;
     uint32_t pc_size;
     uint8_t pc[PC_BYTES];
     VkDescriptorSet sets[4];
     VkImageView rt[3];
     hg_draw draw[CB_DRAWS];
+    uint32_t cpc_size, ndisp;
+    uint8_t cpc[PC_BYTES];
+    VkDescriptorSet csets[4];
+    hg_disp disp[CB_DISPS];
     struct hg_cb *next;
 } hg_cb;
 
@@ -145,6 +188,8 @@ typedef struct hg_entry {
     uint32_t seq, ncb, npipes, dispatches, draws, ndraws;
     VkPipeline pipes[CB_PIPES];
     hg_draw draw[CB_DRAWS];
+    hg_disp disp[CB_DISPS];
+    uint32_t ndisp;
     int told;
 } hg_entry;
 
@@ -207,6 +252,8 @@ typedef struct vkb_hang {
     /* Descriptor evidence (hg_obj, hg_set). */
     hg_obj *objs[OBJ_BUCKETS];
     hg_set *sets[OBJ_BUCKETS];
+    hg_bset *bsets[OBJ_BUCKETS];
+    PFN_vkCreateBuffer create_buf;
     PFN_vkCreateImage create_img;
     PFN_vkCreateImageView create_view;
     PFN_vkCreateSampler create_smp;
@@ -303,9 +350,39 @@ static VKAPI_ATTR VkResult VKAPI_CALL hg_CreateShaderModule(VkDevice d, const Vk
                                                            VkShaderModule *out)
 {
     vkb_hang *h = cur();
-    VkResult r = h->create_mod(d, ci, a, out);
+    uint64_t hash = ci->pCode ? spv_hash(ci->pCode, ci->codeSize) : 0;
+    /* VKBRIDGE_HANG_SUBST=1 (a bisect switch, like VKBRIDGE_SKIP_SHADERS): <cache dir>/hang-subst/h-<hash>.spv, named by the hash of
+     * the code the driver gets (the HANG lines' and dump-spirv's name), goes to the driver in its place; for proving which part of a
+     * stuck job's shader the driver never finishes (RE8 / The Witcher 3 on the G925: vkd3d-proton's layered copy, h-d59637f9efbe652b).
+     * VKBRIDGE_SPIRV_SUBST works on the app's code, before the bridge's own rewrites, so it cannot name such a module. */
+    uint32_t *sub = NULL;
+    VkShaderModuleCreateInfo sci;
+    const char *se = vkb_srv_env("VKBRIDGE_HANG_SUBST");
+    const char *sdir = vkb_pcache_dir();
+    if (hash && se && *se && strcmp(se, "0") != 0 && sdir) {
+        char sp[600];
+        snprintf(sp, sizeof(sp), "%s/hang-subst/h-%016llx.spv", sdir, (unsigned long long)hash);
+        FILE *in = fopen(sp, "rb");
+        if (in) {
+            long n = fseek(in, 0, SEEK_END) == 0 ? ftell(in) : -1;
+            if (n >= 20 && n < (16l << 20) && !(n & 3) && fseek(in, 0, SEEK_SET) == 0 && (sub = malloc((size_t)n)) &&
+                fread(sub, 1, (size_t)n, in) == (size_t)n && sub[0] == 0x07230203u) {
+                sci = *ci;
+                sci.pCode = sub;
+                sci.codeSize = (size_t)n;
+                VKB_ERR("HANG subst: module h-%016llx (%zu bytes) replaced by hang-subst/h-%016llx.spv (%ld bytes)", (unsigned long long)hash,
+                        ci->codeSize, (unsigned long long)hash, n);
+            } else {
+                VKB_WARN("HANG subst: %s is not a SPIR-V module; not used", sp);
+                free(sub);
+                sub = NULL;
+            }
+            fclose(in);
+        }
+    }
+    VkResult r = h->create_mod(d, sub ? &sci : ci, a, out);
+    free(sub);
     if (r != VK_SUCCESS || !ci->pCode) return r;
-    uint64_t hash = spv_hash(ci->pCode, ci->codeSize);
     /* With dump-spirv on, each distinct module once more under its hash: dump-spirv/h-<hash>.spv. */
     const char *dir = vkb_pcache_dir();
     char path[600];
@@ -448,10 +525,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL hg_BeginCommandBuffer(VkCommandBuffer cb, 
     hg_cb *e = cb_get(h, cb, 1);
     if (e) {
         e->n = e->dispatches = e->draws = e->ndraws = 0;
-        e->gfx_bound = VK_NULL_HANDLE;
+        e->gfx_bound = e->cmp_bound = VK_NULL_HANDLE;
         e->area = (VkExtent2D){0, 0};
         e->pc_size = 0;
         memset(e->sets, 0, sizeof(e->sets));
+        e->cpc_size = e->ndisp = 0;
+        memset(e->csets, 0, sizeof(e->csets));
         memset(e->k, 0, sizeof(e->k));
         e->nwaited = 0;
         e->ncopy = 0;
@@ -470,33 +549,51 @@ static VKAPI_ATTR void VKAPI_CALL hg_CmdBindPipeline(VkCommandBuffer cb, VkPipel
         while (i < e->n && e->pipes[i] != p) i++;
         if (i == e->n && e->n < CB_PIPES) e->pipes[e->n++] = p;
         if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) e->gfx_bound = p;
+        if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) e->cmp_bound = p;
     }
     pthread_mutex_unlock(&h->lock);
     h->bind(cb, bp, p);
 }
 
+/* Called with the lock held: whether the draw or dispatch using pipeline bound is to be dropped (VKBRIDGE_SKIP_SHADERS). */
+static int skip_pipe(vkb_hang *h, VkPipeline bound, const char *what)
+{
+    if (!h->nskip || !bound) return 0;
+    hg_pipe *p = find_pipe(h, bound);
+    for (uint32_t s = 0; p && s < p->n; s++)
+        for (uint32_t k = 0; k < h->nskip; k++)
+            if (p->hash[s] == h->skip[k]) {
+                if (h->skipped++ < 4) VKB_ERR("HANG bisect: %s with h-%016llx dropped", what, (unsigned long long)h->skip[k]);
+                return 1;
+            }
+    return 0;
+}
+static int skip_draw(vkb_hang *h, hg_cb *e) { return e ? skip_pipe(h, e->gfx_bound, "draw") : 0; }
+
+/* Called with the lock held: the dispatch kept for a HANG report (the first of each pipeline in the command buffer). */
+static void note_disp(hg_cb *e, uint32_t x, uint32_t y, uint32_t z, uint32_t indirect)
+{
+    for (uint32_t i = 0; i < e->ndisp; i++)
+        if (e->disp[i].p == e->cmp_bound) return;
+    if (e->ndisp == CB_DISPS) return;
+    hg_disp *d = &e->disp[e->ndisp++];
+    d->p = e->cmp_bound;
+    d->x = x, d->y = y, d->z = z, d->indirect = indirect;
+    memcpy(d->sets, e->csets, sizeof(d->sets));
+    d->pc_size = e->cpc_size;
+    memcpy(d->pc, e->cpc, sizeof(d->pc));
+}
+
+/* Compute work too: the job that hangs a D3D12 game on the G925 may be a dispatch (RE Village / The Witcher 3, player logs) */
 static VKAPI_ATTR void VKAPI_CALL hg_CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z)
 {
     vkb_hang *h = for_cmd();
     pthread_mutex_lock(&h->lock);
     hg_cb *e = cb_get(h, cb, 1);
-    if (e) e->dispatches++;
+    if (e) e->dispatches++, note_disp(e, x, y, z, 0);
+    int skip = e ? skip_pipe(h, e->cmp_bound, "dispatch") : 0;
     pthread_mutex_unlock(&h->lock);
-    h->dispatch(cb, x, y, z);
-}
-
-/* Called with the lock held: whether the draw is to be dropped (VKBRIDGE_SKIP_SHADERS). */
-static int skip_draw(vkb_hang *h, hg_cb *e)
-{
-    if (!h->nskip || !e || !e->gfx_bound) return 0;
-    hg_pipe *p = find_pipe(h, e->gfx_bound);
-    for (uint32_t s = 0; p && s < p->n; s++)
-        for (uint32_t k = 0; k < h->nskip; k++)
-            if (p->hash[s] == h->skip[k]) {
-                if (h->skipped++ < 4) VKB_ERR("HANG bisect: draw with h-%016llx dropped", (unsigned long long)h->skip[k]);
-                return 1;
-            }
-    return 0;
+    if (!skip) h->dispatch(cb, x, y, z);
 }
 
 /* Called with the lock held: the first draws, and after that the largest ones. */
@@ -598,6 +695,7 @@ static void add_cb(vkb_hang *h, hg_entry *en, VkCommandBuffer cb)
     for (uint32_t i = 0; i < c->ncopy && en->ncopy < COPIES; i++) en->copy[en->ncopy++] = c->copy[i];
     en->draws += c->draws;
     for (uint32_t i = 0; i < c->ndraws && en->ndraws < CB_DRAWS; i++) en->draw[en->ndraws++] = c->draw[i];
+    for (uint32_t i = 0; i < c->ndisp && en->ndisp < CB_DISPS; i++) en->disp[en->ndisp++] = c->disp[i];
     for (uint32_t i = 0; i < c->n && en->npipes < CB_PIPES; i++) {
         uint32_t k = 0;
         while (k < en->npipes && en->pipes[k] != c->pipes[i]) k++;
@@ -754,9 +852,11 @@ static VKAPI_ATTR VkDeviceAddress VKAPI_CALL hg_GetBufferDeviceAddress(VkDevice 
     return a;
 }
 
+static void mark_dead(vkb_hang *h, uint64_t key);
 static VKAPI_ATTR void VKAPI_CALL hg_DestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks *al)
 {
     vkb_hang *h = cur();
+    if (b) mark_dead(h, (uint64_t)b);
     if (b && h->live) {
         pthread_mutex_lock(&h->lock);
         for (uint32_t i = 0; i < h->nlive; i++)
@@ -801,6 +901,16 @@ static VKAPI_ATTR void VKAPI_CALL hg_CmdPushConstants(VkCommandBuffer cb, VkPipe
             uint32_t n = size < PC_BYTES - off ? size : PC_BYTES - off;
             memcpy(e->pc + off, data, n);
             if (off + n > e->pc_size) e->pc_size = off + n;
+        }
+        pthread_mutex_unlock(&h->lock);
+    }
+    if (st & VK_SHADER_STAGE_COMPUTE_BIT) {
+        pthread_mutex_lock(&h->lock);
+        hg_cb *e = cb_get(h, cb, 1);
+        if (e && off < PC_BYTES) {
+            uint32_t n = size < PC_BYTES - off ? size : PC_BYTES - off;
+            memcpy(e->cpc + off, data, n);
+            if (off + n > e->cpc_size) e->cpc_size = off + n;
         }
         pthread_mutex_unlock(&h->lock);
     }
@@ -857,6 +967,50 @@ static hg_set *set_get(vkb_hang *h, VkDescriptorSet set, uint32_t need)
         e->n = n;
     }
     return e;
+}
+
+/* Called with the lock held: the buffer descriptors of <binding> of <set>, grown to <need> (0: look up only). */
+static hg_bset *bset_get(vkb_hang *h, VkDescriptorSet set, uint32_t binding, uint32_t need)
+{
+    unsigned b = hk((uint64_t)set * 31u + binding, OBJ_BUCKETS);
+    hg_bset *e = h->bsets[b];
+    while (e && (e->set != set || e->binding != binding)) e = e->next;
+    if (!need) return e;
+    if (!e) {
+        if (!(e = calloc(1, sizeof(*e)))) return NULL;
+        e->set = set;
+        e->binding = binding;
+        e->next = h->bsets[b];
+        h->bsets[b] = e;
+    }
+    if (need > e->n) {
+        uint32_t n = e->n ? e->n : 64;
+        while (n < need) n *= 2;
+        hg_bd *g = realloc(e->d, (size_t)n * sizeof(*g));
+        if (!g) return NULL;
+        memset(g + e->n, 0, (size_t)(n - e->n) * sizeof(*g));
+        e->d = g;
+        e->n = n;
+    }
+    return e;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL hg_CreateBuffer(VkDevice d, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *out)
+{
+    vkb_hang *h = cur();
+    VkResult r = h->create_buf(d, ci, a, out);
+    if (r == VK_SUCCESS) {
+        pthread_mutex_lock(&h->lock);
+        hg_obj *o = obj_get(h, (uint64_t)*out, 1);
+        if (o) {
+            o->kind = 7;
+            o->dead = 0;
+            o->buf.size = ci->size;
+            o->buf.usage = (uint32_t)ci->usage;
+        }
+        pthread_mutex_unlock(&h->lock);
+    }
+    return r;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL hg_CreateImage(VkDevice d, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out)
@@ -947,6 +1101,14 @@ static VKAPI_ATTR void VKAPI_CALL hg_UpdateDescriptorSets(VkDevice d, uint32_t n
     for (uint32_t i = 0; i < nw; i++) {
         hg_obj *so = obj_get(h, (uint64_t)w[i].dstSet, 0);
         if (so && so->kind == 4) so->set.writes++;
+        if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) &&
+            w[i].pBufferInfo) {
+            hg_bset *be = bset_get(h, w[i].dstSet, w[i].dstBinding, w[i].dstArrayElement + w[i].descriptorCount);
+            for (uint32_t k = 0; be && k < w[i].descriptorCount; k++)
+                be->d[w[i].dstArrayElement + k] = (hg_bd){(uint64_t)w[i].pBufferInfo[k].buffer, w[i].pBufferInfo[k].offset,
+                                                          w[i].pBufferInfo[k].range};
+            continue;
+        }
         if (w[i].dstBinding != 0 || !w[i].pImageInfo) continue;
         int smp = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER;
         if (!smp && w[i].descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) continue;
@@ -957,6 +1119,13 @@ static VKAPI_ATTR void VKAPI_CALL hg_UpdateDescriptorSets(VkDevice d, uint32_t n
     for (uint32_t i = 0; i < nc; i++) {
         hg_obj *so = obj_get(h, (uint64_t)c[i].dstSet, 0);
         if (so && so->kind == 4) so->set.copies_in++;
+        hg_bset *bsrc = bset_get(h, c[i].srcSet, c[i].srcBinding, 0);
+        if (bsrc) {
+            hg_bset *bdst = bset_get(h, c[i].dstSet, c[i].dstBinding, c[i].dstArrayElement + c[i].descriptorCount);
+            bsrc = bset_get(h, c[i].srcSet, c[i].srcBinding, 0); /* the same list may have grown */
+            for (uint32_t k = 0; bdst && k < c[i].descriptorCount; k++)
+                bdst->d[c[i].dstArrayElement + k] = c[i].srcArrayElement + k < bsrc->n ? bsrc->d[c[i].srcArrayElement + k] : (hg_bd){0, 0, 0};
+        }
         if (c[i].srcBinding != 0 || c[i].dstBinding != 0) continue;
         hg_set *src = set_get(h, c[i].srcSet, 0);
         if (!src) continue;
@@ -1044,6 +1213,13 @@ static VKAPI_ATTR void VKAPI_CALL hg_CmdBindDescriptorSets(VkCommandBuffer cb, V
                                                           uint32_t n, const VkDescriptorSet *sets, uint32_t nd, const uint32_t *dyn)
 {
     vkb_hang *h = for_cmd();
+    if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        pthread_mutex_lock(&h->lock);
+        hg_cb *e = cb_get(h, cb, 1);
+        for (uint32_t i = 0; e && i < n; i++)
+            if (first + i < 4) e->csets[first + i] = sets[i];
+        pthread_mutex_unlock(&h->lock);
+    }
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         pthread_mutex_lock(&h->lock);
         hg_cb *e = cb_get(h, cb, 1);
@@ -1190,7 +1366,17 @@ CNT(fill, K_FILL, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize 
 CNT(update, K_UPDATE, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize sz, const void *d), (cb, b, o, sz, d))
 CNT(draw_indirect, K_DRAW_INDIRECT, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st), (cb, b, o, n, st))
 CNT(draw_indexed_indirect, K_DRAW_INDEXED_INDIRECT, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st), (cb, b, o, n, st))
-CNT(dispatch_indirect, K_DISPATCH_INDIRECT, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o), (cb, b, o))
+static VKAPI_ATTR void VKAPI_CALL hg_dispatch_indirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o)
+{
+    count(cb, K_DISPATCH_INDIRECT, 0, NULL);
+    vkb_hang *h = for_cmd();
+    pthread_mutex_lock(&h->lock);
+    hg_cb *e = cb_get(h, cb, 0);
+    if (e) note_disp(e, 0, 0, 0, 1);
+    int skip = e ? skip_pipe(h, e->cmp_bound, "indirect dispatch") : 0;
+    pthread_mutex_unlock(&h->lock);
+    if (!skip) h->c_dispatch_indirect(cb, b, o);
+}
 CNT(resolve, K_RESOLVE, (VkCommandBuffer cb, VkImage a, VkImageLayout al, VkImage b, VkImageLayout bl, uint32_t n, const VkImageResolve *r), (cb, a, al, b, bl, n, r))
 CNT(copy_buffer2, K_COPY_BUFFER2, (VkCommandBuffer cb, const VkCopyBufferInfo2 *i), (cb, i))
 static void note_copy(VkCommandBuffer cb, const hg_copy *c)
@@ -1284,6 +1470,10 @@ static void describe_addr(vkb_hang *h, VkDeviceAddress v, uint32_t off)
 /* Called with the lock held, once the device is lost: what the driver says faulted. */
 static void tell_fault(vkb_hang *h)
 {
+    /* With the loss record on (the default) the driver is asked there, under the crash guard and a time limit
+     * (a player log's r54p3 faulted inside its own fault recording), and its addresses come back here through
+     * vkb_hang_fault_addr; a second, unguarded query from this thread could take the server down. */
+    if (vkb_ll_wanted()) return;
     if (!h->fault_info) return;
     VkDeviceFaultCountsEXT counts = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
     VkResult r = h->fault_info(h->dev, &counts, NULL);
@@ -1315,6 +1505,49 @@ static void tell_fault(vkb_hang *h)
     for (uint32_t i = 0; i < counts.vendorInfoCount; i++)
         VKB_ERR("HANG   vendor: \"%s\" code %llx data %llx", vend[i].description, (unsigned long long)vend[i].vendorFaultCode,
                 (unsigned long long)vend[i].vendorFaultData);
+}
+
+/* The loss record's driver fault address (server_lostlog.c, after its guarded query): which buffer it falls in,
+ * among those whose address the program asked for (DXVK 3 asks for every memory chunk's; images have none). */
+static pthread_mutex_t fault_addr_lock = PTHREAD_MUTEX_INITIALIZER; /* vs vkb_hang_device_destroy: the loss record's thread may outlive the device */
+
+void vkb_hang_fault_addr(vkb_srv_table *t, VkDeviceAddress a)
+{
+    pthread_mutex_lock(&fault_addr_lock);
+    vkb_hang *h = t && t->id < 4096 ? hangs[t->id] : NULL;
+    if (!h) {
+        pthread_mutex_unlock(&fault_addr_lock);
+        return;
+    }
+    pthread_mutex_lock(&h->lock);
+    const hg_addr *below = NULL, *above = NULL;
+    int below_dead = 0, above_dead = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t n = pass ? h->ndead : h->nlive;
+        const hg_addr *v = pass ? h->dead : h->live;
+        for (uint32_t i = 0; v && i < n; i++) {
+            if (a >= v[i].a && a < v[i].a + v[i].size) {
+                VKB_ERR("HANG   fault address %llx = %s buffer %llx + %llu (size %llu)", (unsigned long long)a, pass ? "DESTROYED" : "live",
+                        (unsigned long long)(uintptr_t)v[i].b, (unsigned long long)(a - v[i].a), (unsigned long long)v[i].size);
+                pthread_mutex_unlock(&h->lock);
+                pthread_mutex_unlock(&fault_addr_lock);
+                return;
+            }
+            if (v[i].a + v[i].size <= a && (!below || v[i].a + v[i].size > below->a + below->size)) below = &v[i], below_dead = pass;
+            if (v[i].a > a && (!above || v[i].a < above->a)) above = &v[i], above_dead = pass;
+        }
+    }
+    char nb[160] = "none", na[160] = "none";
+    if (below)
+        snprintf(nb, sizeof(nb), "%sbuffer %llx (%llx + %llu) ends %llu B below", below_dead ? "destroyed " : "", (unsigned long long)(uintptr_t)below->b,
+                 (unsigned long long)below->a, (unsigned long long)below->size, (unsigned long long)(a - (below->a + below->size)));
+    if (above)
+        snprintf(na, sizeof(na), "%sbuffer %llx (%llx + %llu) starts %llu B above", above_dead ? "destroyed " : "", (unsigned long long)(uintptr_t)above->b,
+                 (unsigned long long)above->a, (unsigned long long)above->size, (unsigned long long)(above->a - a));
+    VKB_ERR("HANG   fault address %llx is in no buffer whose address was asked for (%u live, %u destroyed kept); nearest below: %s; above: %s",
+            (unsigned long long)a, h->nlive, h->ndead, nb, na);
+    pthread_mutex_unlock(&h->lock);
+    pthread_mutex_unlock(&fault_addr_lock);
 }
 
 /* Called with the lock held. */
@@ -1385,6 +1618,57 @@ static void tell(vkb_hang *h, uint32_t qi, hg_entry *en, uint32_t behind, double
                                 (unsigned long long)p->hash[s]);
         }
         VKB_ERR("%s", line);
+    }
+    for (uint32_t i = 0; i < en->ndisp; i++) {
+        hg_disp *d = &en->disp[i];
+        hg_pipe *p = find_pipe(h, d->p);
+        char line[600];
+        int len = 0;
+        for (uint32_t s2 = 0; p && s2 < p->n && len < 200; s2++)
+            len += snprintf(line + len, sizeof(line) - (size_t)len, " %s=h-%016llx", stage_name(p->stage[s2]), (unsigned long long)p->hash[s2]);
+        if (d->indirect)
+            VKB_ERR("HANG   dispatch indirect, pipeline %llx%s", (unsigned long long)(uintptr_t)d->p, len ? line : " (not seen created)");
+        else
+            VKB_ERR("HANG   dispatch %u x %u x %u, pipeline %llx%s", d->x, d->y, d->z, (unsigned long long)(uintptr_t)d->p, len ? line : " (not seen created)");
+        len = 0;
+        for (uint32_t o = 0; o + 4 <= d->pc_size && len < (int)sizeof(line) - 24; o += 4) {
+            uint32_t v;
+            memcpy(&v, d->pc + o, 4);
+            len += snprintf(line + len, sizeof(line) - (size_t)len, " %u:%u", o, v);
+        }
+        VKB_ERR("HANG     compute push constants (%u B, u32):%s", d->pc_size, len ? line : " none");
+        VKB_ERR("HANG     compute sets bound: %llx %llx %llx %llx", (unsigned long long)d->sets[0], (unsigned long long)d->sets[1],
+                (unsigned long long)d->sets[2], (unsigned long long)d->sets[3]);
+        /* vkd3d-proton's root descriptor tables: a push-constant word is a heap index, the shader adds a constant offset
+         * (h-96e7: pc[1] + 11, + 12). The buffer descriptors there, with their range: a read past it is what robustness
+         * decides (zero with robustBufferAccess2, maybe an in-bounds value with core robustBufferAccess). */
+        int lines = 0;
+        for (uint32_t si = 0; si < 4 && lines < 32; si++) {
+            if (!d->sets[si]) continue;
+            for (uint32_t bi = 0; bi < 8 && lines < 32; bi++) {
+                hg_bset *be = bset_get(h, d->sets[si], bi, 0);
+                if (!be) continue;
+                for (uint32_t o = 0; o + 4 <= d->pc_size && o < 32 && lines < 32; o += 4) {
+                    uint32_t base;
+                    memcpy(&base, d->pc + o, 4);
+                    for (uint32_t k = 0; k < 16 && lines < 32; k++) {
+                        uint64_t idx = (uint64_t)base + k;
+                        if (idx >= be->n || !be->d[idx].buf) continue;
+                        hg_obj *bo = obj_get(h, be->d[idx].buf, 0);
+                        char bb[120] = "buffer not seen created";
+                        if (bo && bo->kind == 7)
+                            snprintf(bb, sizeof(bb), "buffer size %llu usage 0x%x%s", (unsigned long long)bo->buf.size, bo->buf.usage,
+                                     bo->dead ? " DESTROYED" : "");
+                        uint64_t rng = be->d[idx].range == VK_WHOLE_SIZE && bo && bo->kind == 7 && bo->buf.size >= be->d[idx].off
+                                           ? bo->buf.size - be->d[idx].off : be->d[idx].range;
+                        VKB_ERR("HANG       pc u32 at %u = %u, + %u: set %u binding %u [%llu] = buffer %llx offset %llu range %llu (%llu vec4s); %s", o,
+                                base, k, si, bi, (unsigned long long)idx, (unsigned long long)be->d[idx].buf, (unsigned long long)be->d[idx].off,
+                                (unsigned long long)be->d[idx].range, (unsigned long long)(rng / 16), bb);
+                        lines++;
+                    }
+                }
+            }
+        }
     }
     for (uint32_t i = 0; i < en->ndraws; i++) {
         hg_draw *d = &en->draw[i];
@@ -1476,6 +1760,116 @@ int vkb_hang_wanted(void)
     return dir && access(path, F_OK) == 0;
 }
 
+/* ------------------------------------------------------------------ fault-armed, one launch */
+
+/* <cache dir>/hang-detect-next[/<program@key>], the key's characters kept to a file name's */
+static int arm_path(const vkb_srv_proc *p, char *path, size_t cap)
+{
+    const char *dir = vkb_pcache_dir();
+    if (!dir || !*dir) return 0;
+    if (!p) return snprintf(path, cap, "%s/hang-detect-next", dir) < (int)cap;
+    char raw[96], name[96];
+    snprintf(raw, sizeof(raw), "%s%s%s", p->comm, p->pkey[0] ? "@" : "", p->pkey);
+    size_t j = 0;
+    for (size_t i = 0; raw[i] && j + 1 < sizeof(name); i++) {
+        unsigned char ch = (unsigned char)raw[i];
+        name[j++] = (char)(isalnum(ch) || ch == '.' || ch == '-' || ch == '_' || ch == '@' ? ch : '_');
+    }
+    name[j] = 0;
+    if (!j || name[0] == '.') return 0;
+    return snprintf(path, cap, "%s/hang-detect-next/%s", dir, name) < (int)cap;
+}
+
+/* Off unless VKBRIDGE_FAULT_ARM=1 (test59, 2026-11-14): the armed launch runs with the detector, which cost
+ * Devil May Cry 5 on the S11 Ultra ~10% fps and ~6.5 ms of round trip (45 vs 49.5 fps, B A A B), a regression a player
+ * would feel. Both sides: nothing is armed, and an arm file an older build left is not taken (it stays, harmless). */
+static int arm_off(void)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_FAULT_ARM");
+    return !(v && *v && strcmp(v, "0"));
+}
+
+/* Writes <cache dir>/hang-detect-next/<program@key> = file_why; prefix starts each line ("loss record", "wait_retry") */
+static void arm_write(vkb_srv_table *t, const char *prefix, const char *file_why)
+{
+    char dir[600], path[700];
+    if (!arm_path(NULL, dir, sizeof(dir)) || !arm_path(t->proc, path, sizeof(path))) return;
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        VKB_WARN("%s, device %u: the hang detector could not be armed (%s: %s)", prefix, t->id, dir, strerror(errno));
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        VKB_WARN("%s, device %u: the hang detector could not be armed (%s: %s)", prefix, t->id, path, strerror(errno));
+        return;
+    }
+    char why[200];
+    snprintf(why, sizeof(why), "%s", file_why);
+    for (char *c = why; *c; c++)
+        if (*c == '\n' || *c == '\r') *c = ' ';
+    fprintf(f, "%s\n", why);
+    fclose(f);
+    VKB_INFO("%s, device %u: the hang detector is armed for the next launch of %s%s%s (that program's devices, one launch; "
+             "VKBRIDGE_FAULT_ARM=0: never)",
+             prefix, t->id, t->proc->comm, t->proc->pkey[0] ? "@" : "", t->proc->pkey);
+}
+
+void vkb_hang_arm_next(vkb_srv_table *t, const char *what)
+{
+    if (!t || !t->proc || arm_off()) return;
+    if (t->id < 4096 && hangs[t->id]) {
+        VKB_INFO("loss record, device %u: the hang detector was on for this launch: not armed again", t->id);
+        return;
+    }
+    arm_write(t, "loss record", what && *what ? what : "a GPU fault");
+}
+
+/* A GPU job that never finished with the device not lost (Elden Ring on the S11 Ultra, Mali-G925 r49p1, a player log:
+ * 83 GPU read faults, then the GPU 99-100% busy for 130 s, no frame, the driver failing vkd3d's timeline wait with
+ * -3 every 5 s and never losing the device; the fault-arm above needs a loss, so nothing named the job). Called by
+ * wait_retry (server_wait.c) when a wait with no deadline is given up at the retry cap, or a semaphore wait is still
+ * not done at the end of the grace. Once per device; not for a launch that had the detector on. */
+void vkb_hang_arm_hung(vkb_srv_table *t, const char *what)
+{
+    static unsigned char said[4096];
+    if (!t || !t->proc || t->id >= 4096 || arm_off() || hangs[t->id]) return;
+    if (__atomic_exchange_n(&said[t->id], 1, __ATOMIC_RELAXED)) return;
+    char why[200];
+    snprintf(why, sizeof(why), "hung: %s", what && *what ? what : "a GPU wait that never finished");
+    arm_write(t, "wait_retry", why);
+}
+
+/* 1: this launch of the program has the detector on (armed by its last launch's loss); taken once */
+static int armed_for(vkb_srv_proc *p)
+{
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    if (!p) return 0;
+    pthread_mutex_lock(&lk);
+    if (!p->hang_arm) {
+        p->hang_arm = 2;
+        char path[700];
+        FILE *f = !arm_off() && arm_path(p, path, sizeof(path)) ? fopen(path, "r") : NULL;
+        if (f) {
+            char why[200] = "";
+            if (!fgets(why, sizeof(why), f)) why[0] = 0;
+            fclose(f);
+            why[strcspn(why, "\r\n")] = 0;
+            if (unlink(path) == 0) {
+                p->hang_arm = 1;
+                int hung = !strncmp(why, "hung: ", 6);
+                VKB_INFO("hang detector on for %s%s%s: its last launch %s (%s); this launch only", p->comm, p->pkey[0] ? "@" : "",
+                         p->pkey, hung ? "had a GPU wait that never finished" : "lost a device with a GPU fault",
+                         hung ? why + 6 : why[0] ? why : "?");
+            } else {
+                VKB_WARN("hang detector armed for %s but its file could not be taken (%s): left off", p->comm, strerror(errno));
+            }
+        }
+    }
+    int on = p->hang_arm == 1;
+    pthread_mutex_unlock(&lk);
+    return on;
+}
+
 /* Hooks the driver-level table (t->real) and the dispatch table where it still points at the same
  * call, as the crash guard does: emulations that call the driver directly are seen too. */
 #define HOOK(field, mine, saved)                                    \
@@ -1489,7 +1883,7 @@ int vkb_hang_wanted(void)
 
 void vkb_hang_device_init(vkb_srv_table *t)
 {
-    if (t->id >= 4096 || !vkb_hang_wanted()) return;
+    if (t->id >= 4096 || !(vkb_hang_wanted() || armed_for(t->proc))) return;
     if (!t->real.vkCreateFence || !t->real.vkGetFenceStatus || !t->real.vkDestroyFence || !t->real.vkQueueSubmit) return;
     vkb_hang *h = calloc(1, sizeof(*h));
     if (!h) return;
@@ -1506,7 +1900,7 @@ void vkb_hang_device_init(vkb_srv_table *t)
         h->skip[h->nskip++] = v;
         sk = end;
     }
-    if (h->nskip) VKB_INFO("device %u: hang bisect drops draws using %u listed shader(s)", t->id, h->nskip);
+    if (h->nskip) VKB_INFO("device %u: hang bisect drops draws and dispatches using %u listed shader(s)", t->id, h->nskip);
     pthread_mutex_init(&h->lock, NULL);
     h->create_fence = t->real.vkCreateFence;
     h->destroy_fence = t->real.vkDestroyFence;
@@ -1539,6 +1933,7 @@ void vkb_hang_device_init(vkb_srv_table *t)
     HOOK(vkDestroyBuffer, hg_DestroyBuffer, destroy_buf);
     HOOK(vkCmdPushConstants, hg_CmdPushConstants, push);
     HOOK(vkCreateImage, hg_CreateImage, create_img);
+    HOOK(vkCreateBuffer, hg_CreateBuffer, create_buf);
     HOOK(vkCreateImageView, hg_CreateImageView, create_view);
     HOOK(vkCreateSampler, hg_CreateSampler, create_smp);
     HOOK(vkUpdateDescriptorSets, hg_UpdateDescriptorSets, update_ds);
@@ -1615,6 +2010,7 @@ void vkb_hang_device_destroy(vkb_srv_table *t)
     UNHOOK(vkDestroyBuffer, hg_DestroyBuffer, destroy_buf);
     UNHOOK(vkCmdPushConstants, hg_CmdPushConstants, push);
     UNHOOK(vkCreateImage, hg_CreateImage, create_img);
+    UNHOOK(vkCreateBuffer, hg_CreateBuffer, create_buf);
     UNHOOK(vkCreateImageView, hg_CreateImageView, create_view);
     UNHOOK(vkCreateSampler, hg_CreateSampler, create_smp);
     UNHOOK(vkUpdateDescriptorSets, hg_UpdateDescriptorSets, update_ds);
@@ -1651,7 +2047,9 @@ void vkb_hang_device_destroy(vkb_srv_table *t)
     UNHOOK(vkDestroySampler, hg_DestroySampler, destroy_smp);
     UNHOOK(vkAllocateMemory, hg_AllocateMemory, alloc_mem);
     UNHOOK(vkFreeMemory, hg_FreeMemory, free_mem);
+    pthread_mutex_lock(&fault_addr_lock); /* a loss record's lookup in flight finishes first; none starts after */
     hangs[t->id] = NULL;
+    pthread_mutex_unlock(&fault_addr_lock);
     if (__atomic_load_n(&last, __ATOMIC_ACQUIRE) == h) {
         vkb_hang *o = NULL;
         for (int i = 0; i < 4096 && !o; i++) o = hangs[i];
@@ -1683,6 +2081,11 @@ void vkb_hang_device_destroy(vkb_srv_table *t)
         for (hg_set *e = h->sets[b], *n; e; e = n) {
             n = e->next;
             free(e->slot);
+            free(e);
+        }
+        for (hg_bset *e = h->bsets[b], *n; e; e = n) {
+            n = e->next;
+            free(e->d);
             free(e);
         }
     }

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * xfb_check: transform feedback (VK_EXT_transform_feedback) through the bridge, the way DXVK uses it
  * for D3D11 stream output (Metro Redux, Unity's GPU skinning):
  *   pass 1  bind two capture buffers (sizes given; the second at an offset), begin without counters,
@@ -13,7 +12,7 @@
  * must keep what was there, and the counters must hold the bytes written.
  *
  *   xfb_check       the vertex shader captures its own outputs (Xfb in the vertex stage)
- *   xfb_check zink  Zink's shape: an instance of engine "mesa zink", the vertex input
+ *   xfb_check zink  Zink's shape (a player log): an instance of engine "mesa zink", the vertex input
  *                   dynamic (VK_EXT_vertex_input_dynamic_state, which the server gives Zink and whose
  *                   pipelines it binds at the draw: server_vidyn.c), the capture buffers bound before
  *                   the pipeline, vkCmdSetVertexInputEXT, then begin - as zink_draw.cpp records them.

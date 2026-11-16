@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * MaliBridge - client ICD (libvulkan_droidbridge.so, glibc).
  *
  * A Vulkan driver for the Vulkan loader inside the Linux session. It owns no GPU: every call is
@@ -148,6 +147,8 @@ typedef struct vkb_memory {
     uint32_t client_type;
     int shared;
     int cached;              /* CPU-cached pages: reads need vkInvalidateMappedMemoryRanges first */
+    int nosync;              /* shared, uncached, in a server type the self-test found coherent without flushes: flushes and
+                              * invalidates of it are no-ops (memory.c, VKBRIDGE_FLUSH_ELIDE) */
 } vkb_memory;
 
 static inline vkb_device *vkb_dev(VkDevice d) { return (vkb_device *)d; }
@@ -177,6 +178,18 @@ int vkb_call_exec_async(vkb_call *c);
 void vkb_call_poll_next(void);
 uint64_t vkb_async_seq_last(void);
 int vkb_async_ran(uint64_t seq);
+/* VKBRIDGE_FAST_CREATE (conn.c): send vkCreateImage / vkCreateBuffer with VKB_F_FAST_CREATE (client/memory.c). 0 off; bit 1 on,
+ * bit 2 BC images too, bit 4 every create (VKBRIDGE_TEST_FAST_CREATE_ALL) */
+int vkb_fast_create(void);
+/* the next vkb_call_begin on this thread sends VKB_F_FAST_CREATE; after a vkCreateImage so sent, take: the requirements its
+ * reply carried (have 0: none) */
+typedef struct vkb_fast_reqs {
+    int have;
+    VkMemoryRequirements req;
+    uint32_t prefers, requires;
+} vkb_fast_reqs;
+void vkb_call_fast_next(uint32_t flags);
+void vkb_fast_reqs_take(vkb_fast_reqs *q);
 int vkb_async_results(void);
 /* Descriptor batching: asynchronous requests framed as one vkbBatch message (on by default, VKBRIDGE_DESC_BATCH=0 or
  * VKBRIDGE_NO_DESC_BATCH=1 off) and vkUpdateDescriptorSets packed (off unless VKBRIDGE_DESC_PACK=1); vkb_async_framed
@@ -230,6 +243,10 @@ void vkb_bufview_buffer_destroyed(vkb_device *d, VkBuffer buffer);
 /* syncmirror.c */
 void vkb_quiet_over(void); /* icd.c: the poll quiet windows end */
 void vkb_hostop_note(uint64_t key); /* icd.c: a host reset/set of a fence (handle*2) or event (handle*2+1) */
+void vkb_query_host_reset_note(VkQueryPool pool, uint32_t first, uint32_t count);
+void vkb_query_gpu_reset_note(VkQueryPool pool);
+void vkb_query_pool_gone(VkQueryPool pool);
+int vkb_query_detect_ask(VkQueryPool pool, uint32_t first, uint32_t count); /* query.c */
 void vkb_event_hostop(VkEvent event); /* icd.c */
 void vkb_sm_init_device(vkb_device *d);
 void vkb_sm_destroy_device(vkb_device *d);
@@ -331,6 +348,8 @@ void vkb_lat_flush(void);                             /* a swapchain destroyed: 
 void vkb_dxvkcfg_engine(const VkApplicationInfo *app);
 void vkb_dxvkcfg_check(void);
 int vkb_dxvkcfg_own_latency(void); /* DXVK with a maxFrameLatency in its DXVK_CONFIG (the frame queue stands aside, wsi.c) */
+/* DXVK paces frames itself (DXVK_CONFIG: latencySleep on, a frame rate limit): what it sets, else NULL (pacer.c stands aside) */
+const char *vkb_dxvkcfg_pacer_conflict(void);
 
 /* conn.c: logs the first time each call returns each error. The test stays at the call site, so a
  * call that succeeds costs one compare. */
@@ -359,7 +378,7 @@ static inline VkResult vkb_note_fail(const char *call, VkResult r)
 
 /* vkWaitForFences / vkWaitSemaphores: errors, and with no timeout (UINT64_MAX) anything but
  * VK_SUCCESS - such a wait may not time out, and DXVK's timeline wait treats VK_TIMEOUT as a lost
- * device without a log line of its own (Stray on the Dimensity 9500). */
+ * device without a log line of its own (Stray on the Dimensity 9500, a player log). */
 static inline VkResult vkb_note_wait(const char *call, const char *endless, VkResult r, uint64_t timeout)
 {
     if (__builtin_expect(r < 0, 0)) vkb_first_error(call, r);

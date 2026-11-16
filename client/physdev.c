@@ -390,6 +390,59 @@ static int bridged_device_ext(const char *name)
 }
 
 static void cap_api(const vkb_physdev *pd, uint32_t *api);
+static void patch_props(vkb_physdev *pd, VkPhysicalDeviceProperties *p);
+
+/*
+ * "adapter:": once per physical device, what the app is
+ * shown at the Vulkan level after every spoof and cap - name, vendor/device ids, type, API and driver version,
+ * the heaps (as vkGetPhysicalDeviceMemoryProperties answers) - next to the real GPU, so a game's preset picked
+ * from the adapter (TR2013's default quality, Unity's VRAM tiers) can be explained from the log. A D3D layer
+ * above (DXVK's dxgi.customDeviceDesc, vkd3d's) may show the game yet another name: that is in DXVK's own log.
+ * Written at the default log level (vkb_log_info_always), to vkbridge-client.log in the session folder.
+ */
+static void adapter_line(vkb_physdev *pd)
+{
+    VkPhysicalDeviceProperties shown = pd->props;
+    patch_props(pd, &shown);
+    vkb_emu_patch_limits(pd, &shown);
+    const VkPhysicalDeviceProperties *real = &pd->caps.real_props;
+    char heaps[256] = "";
+    size_t o = 0;
+    const VkPhysicalDeviceMemoryProperties *m = &pd->client_mem;
+    for (uint32_t h = 0; h < m->memoryHeapCount && o < sizeof(heaps); h++)
+        o += (size_t)snprintf(heaps + o, sizeof(heaps) - o, "%s%u:%lluM%s", h ? "," : "", h, (unsigned long long)(m->memoryHeaps[h].size >> 20),
+                              m->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? ":local" : "");
+    const char *from = "";
+    VkDeviceSize cap = heap_cap(pd, &from);
+    int budget = 0;
+    for (uint32_t i = 0; i < pd->next; i++) budget |= !strcmp(pd->exts[i].extensionName, "VK_EXT_memory_budget");
+    const char *sp_from = "";
+    uint32_t sp = spoof_choice(pd, &sp_from);
+    char line[1024];
+    snprintf(line, sizeof(line), "adapter: shown name=\"%s\" vendor=0x%04x device=0x%04x type=%u api=%u.%u.%u driver=0x%08x heaps=%s heap_cap=%lluM budget_ext=%s"
+             " | real name=\"%s\" vendor=0x%04x device=0x%04x | spoof=%s%s | heap_cap_from=%s",
+             shown.deviceName, shown.vendorID, shown.deviceID, (unsigned)shown.deviceType, VK_API_VERSION_MAJOR(shown.apiVersion),
+             VK_API_VERSION_MINOR(shown.apiVersion), VK_API_VERSION_PATCH(shown.apiVersion), shown.driverVersion, heaps,
+             (unsigned long long)(cap >> 20), budget ? "yes" : "no", real->deviceName, real->vendorID, real->deviceID,
+             sp == VKB_SPOOF_NVIDIA ? "nvidia" : sp == VKB_SPOOF_AMD ? "amd" : "off", sp ? (getenv("VKBRIDGE_SPOOF_GPU") && *getenv("VKBRIDGE_SPOOF_GPU") ? "(guest)" : "(server)") : "",
+             !cap ? "none" : getenv("VKBRIDGE_HEAP_MAX_MB") && *getenv("VKBRIDGE_HEAP_MAX_MB") ? "guest" : "server");
+    /* once per process per distinct line: each instance has physical device objects of its own, and a process that
+     * makes several instances (DXVK enumerates adapters with one, then makes the device's) would repeat it */
+    static uint64_t said[8];
+    static pthread_mutex_t said_lock = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t h = 1469598103934665603ull;
+    for (const char *c = line; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    int dup = 0;
+    pthread_mutex_lock(&said_lock);
+    for (int i = 0; i < 8 && said[i] && !dup; i++) dup = said[i] == h;
+    for (int i = 0; i < 8 && !dup; i++)
+        if (!said[i]) {
+            said[i] = h;
+            break;
+        }
+    pthread_mutex_unlock(&said_lock);
+    if (!dup) vkb_log_info_always("%s", line);
+}
 
 int vkb_physdev_ready(vkb_physdev *pd)
 {
@@ -489,6 +542,7 @@ int vkb_physdev_ready(vkb_physdev *pd)
              vkb_mem_strategy_name(pd->info.strategy), pd->info.emu);
     pd->ready = 1;
     pthread_mutex_unlock(&pd->lock);
+    adapter_line(pd);
     return 1;
 }
 
@@ -666,10 +720,10 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties(VkPhysical
     pthread_mutex_unlock(&fmt_lock);
 }
 
-VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format,
-                                                                       VkFormatProperties2 *pFormatProperties)
+/* The driver's own answer to the v2 query (no emulation applied), kept for no chain and for one VkFormatProperties3. Also what the
+ * emulation (emu.c) asks for the formats it describes: those took a round trip each time (~1,370 in 11 s of a Sekiro load). */
+void vkb_pd_raw_format_properties2(VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2 *pFormatProperties)
 {
-    if (vkb_emu_format_properties(vkb_pd(physicalDevice), format, &pFormatProperties->formatProperties, pFormatProperties)) return;
     VkBaseOutStructure *next = pFormatProperties->pNext;
     VkFormatProperties3 *p3 = NULL;
     if (next && next->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 && !next->pNext) p3 = (VkFormatProperties3 *)next;
@@ -701,6 +755,35 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties2(VkPhysica
         if (p3) e->props3 = *p3;
         pthread_mutex_unlock(&fmt_lock);
     }
+}
+
+/* The driver's own answer to the v1 query, kept (with3 = 3: apart from the v1 query's answer, which may be an emulated format's). */
+void vkb_pd_raw_format_properties(VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties *out)
+{
+    unsigned slot = fmt_slot(physicalDevice, format, 3);
+    pthread_mutex_lock(&fmt_lock);
+    fmt_entry *e = &fmt_cache[slot];
+    if (e->pd == physicalDevice && e->format == format && e->with3 == 3) {
+        *out = e->props;
+        pthread_mutex_unlock(&fmt_lock);
+        return;
+    }
+    pthread_mutex_unlock(&fmt_lock);
+    vkb_wire_vkGetPhysicalDeviceFormatProperties(physicalDevice, format, out);
+    pthread_mutex_lock(&fmt_lock);
+    e = &fmt_cache[slot];
+    e->pd = physicalDevice;
+    e->format = format;
+    e->with3 = 3;
+    e->props = *out;
+    pthread_mutex_unlock(&fmt_lock);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format,
+                                                                       VkFormatProperties2 *pFormatProperties)
+{
+    if (vkb_emu_format_properties(vkb_pd(physicalDevice), format, &pFormatProperties->formatProperties, pFormatProperties)) return;
+    vkb_pd_raw_format_properties2(physicalDevice, format, pFormatProperties);
 }
 
 /* Image format answers never change either: DXVK and vkd3d ask before creating images (each

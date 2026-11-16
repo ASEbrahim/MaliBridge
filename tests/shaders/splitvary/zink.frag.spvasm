@@ -1,0 +1,40 @@
+; splitvary_check: split.frag written like Zink's fixed-function FS dump (SPIR-V 1.6, Vulkan memory model,
+; %slot_4 v2float Location 1 + %slot_4_c3 float Location 1 Component 3, colour vec4 Location 0).
+               OpCapability Shader
+               OpCapability VulkanMemoryModel
+               OpMemoryModel Logical Vulkan
+               OpEntryPoint Fragment %main "main" %slot_1 %slot_4 %slot_4_c3 %o
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %slot_1 Location 0
+               OpDecorate %slot_4 Location 1
+               OpDecorate %slot_4_c3 Location 1
+               OpDecorate %slot_4_c3 Component 3
+               OpDecorate %o Location 0
+               OpDecorate %o Index 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+   %p_in_v4 = OpTypePointer Input %v4float
+   %p_in_v2 = OpTypePointer Input %v2float
+    %p_in_f = OpTypePointer Input %float
+  %p_out_v4 = OpTypePointer Output %v4float
+       %f05 = OpConstant %float 0.5
+     %slot_1 = OpVariable %p_in_v4 Input
+     %slot_4 = OpVariable %p_in_v2 Input
+  %slot_4_c3 = OpVariable %p_in_f Input
+          %o = OpVariable %p_out_v4 Output
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+         %st = OpLoad %v2float %slot_4
+          %q = OpLoad %float %slot_4_c3
+          %c = OpLoad %v4float %slot_1
+          %s = OpCompositeExtract %float %st 0
+          %t = OpCompositeExtract %float %st 1
+         %qh = OpFMul %float %q %f05
+         %cy = OpCompositeExtract %float %c 1
+         %r = OpCompositeConstruct %v4float %s %t %qh %cy
+               OpStore %o %r
+               OpReturn
+               OpFunctionEnd

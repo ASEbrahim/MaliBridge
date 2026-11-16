@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mali-G615 MC2 r44p1, No Man's Sky: after the third contained compile crash the device's
+# a player log (Mali-G615 MC2 r44p1, No Man's Sky): after the third contained compile crash the device's
 # pipelines failed (server_guard.c), the game skipped the binds and drew; Mali's vkCmdDrawIndexed read
 # through the missing pipeline (0x7a0) and the one server died with every program. The replay leaves
 # out a draw or dispatch with no pipeline bound in its command buffer, and a vkCmdBindPipeline of

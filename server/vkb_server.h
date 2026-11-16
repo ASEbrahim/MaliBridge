@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * MaliBridge - server side (bionic on the device, glibc for host tests).
  *
  * The server owns the real Vulkan objects. Linux programs in the session talk to it through the
@@ -31,6 +30,7 @@ typedef struct vkb_srv_proc {
     char comm[32];                 /* the client's process name (per-program pipeline caches) */
     char pkey[48];                 /* the client's pipeline cache key ("name@key" in the hello), or "" */
     struct vkb_preset *preset;     /* server_presets.c: the game's preset (by Steam app id), or NULL */
+    int hang_arm;                  /* server_hang.c: the fault-armed hang detector for this launch: 0 not looked, 1 on, 2 off */
     struct vkb_srv_proc *next;
     /* Ordering of the process's asynchronous requests (vkb_msg_hdr.seq/barrier). */
     pthread_mutex_t olock;
@@ -43,6 +43,18 @@ typedef struct vkb_srv_proc {
     uint32_t heap_free_mb;         /* server_presets.c: the default heap cap from the memory free at its first query (MB + 1; 0: not yet; atomic) */
     int start_short;               /* server_presets.c: it started with less memory free than the default heap cap (atomic; the bridge's
                                     * VK_EXT_memory_budget is offered to it: vkb_emu_membudget_for) */
+    /* server_conn.c: the swapchain's own fence waits (VKB_F_PRESENT_WAIT): time waiting for the process's earlier
+     * asynchronous requests, time in the handler (the driver's wait), how many (atomics; server_perf.c reads them) */
+    uint64_t pw_order_ns, pw_srv_ns, pw_n;
+    /* server_conn.c vkb_srv_count_work: the GPU work the process recorded and sent, counted as each request runs
+     * (render pass instances begun, buffer-to-image copies, vkCreateBuffer, queue submits; atomics; server_perf.c
+     * prints this window's share on the perf line) */
+    uint64_t wk_rpass, wk_b2i, wk_bufs, wk_submits;
+    int fast_create;               /* VKBRIDGE_FAST_CREATE as told at its first vkbQueryServer: 0 not yet, 1 off, 2 on (atomic) */
+    int hk_slot;                   /* server_heapkind.c: its slot + 1 in the by-kind memory table (0: not yet; atomic) */
+    uint64_t hud_last_ns;          /* server_syncfd.c: Steam's performance overlay (mangoapp): when its last frame's acquire was
+                                    * signalled (VKBRIDGE_HUD_FPS; atomic) */
+    uint64_t hud_frames, hud_paced, hud_paced_ns; /* its acquires, how many waited for the cap, and how long in all (atomics) */
 } vkb_srv_proc;
 
 /* The last commands of a replayed stream whose ids a connection keeps for other threads to read (conn->replay_ring). */
@@ -67,7 +79,11 @@ typedef struct vkb_srv_conn {
     uint32_t replay_pos, replay_total;
     uint16_t replay_ring[VKB_REPLAY_RING];
     int tid; /* the thread's kernel id, for the stall probe (/proc/self/task/<tid>) */
+    /* What its thread is doing, for order_wait's gap check (atomic): VKB_CONN_IDLE waiting for a message with none
+     * begun, VKB_CONN_ORDER in order_wait, VKB_CONN_BUSY anything else (a message partly read, run, answered). */
+    uint32_t phase;
 } vkb_srv_conn;
+enum { VKB_CONN_IDLE, VKB_CONN_ORDER, VKB_CONN_BUSY, VKB_CONN_PARKED };
 
 /* Startup knowledge about each physical device (keyed by deviceUUID). */
 typedef struct vkb_pd_knowledge {
@@ -137,6 +153,16 @@ typedef struct vkb_srv_table {
     PFN_vkGetPhysicalDeviceFeatures2 gs_f2;
     PFN_vkGetPhysicalDeviceProperties gs_p1;
     PFN_vkGetPhysicalDeviceProperties2 gs_p2;
+    /* instance: pv_zink_name (PV-08, server_errata_zink.c) for an instance made under the neutral engine name: the
+     * queries beneath its wrappers, which hide again what PowerVR's "mesa zink" profile hid, vertexInputDynamicState aside */
+    int zink_renamed;
+    PFN_vkGetPhysicalDeviceFeatures zk_f1;
+    PFN_vkGetPhysicalDeviceFeatures2 zk_f2;
+    PFN_vkEnumerateDeviceExtensionProperties zk_ext;
+    /* device: VK_EXT_device_fault for the loss record (server_lostlog.c): 1 enabled, 2 imitated (host tests), 0 not
+     * offered (or off), -1 refused at vkCreateDevice (made without it), -2 listed without its deviceFault feature */
+    int device_fault;
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 pvm_f2; /* instance: the image-format query beneath pv_mutable_linear's (server_errata_pvmutable.c) */
 } vkb_srv_table;
 
 /* server_main.c */
@@ -163,7 +189,7 @@ void vkb_srv_note_pipeline_layout(const VkPipelineLayoutCreateInfo *ci);
 void vkb_crashctx_memory(VkDeviceMemory mem, uint64_t size, uint32_t type, uint64_t dedicated_image, const char *path);
 int vkb_crashctx_describe(char *buf, size_t cap, const char *cmd);
 int vkb_crashctx_where(char *buf, size_t cap, const void *addr); /* the faulting thread's name and what the address is in */
-/* server_lost.c: a lost device stays one program's problem */
+/* server_lost.c: a lost device stays one program's problem (a player log) */
 void vkb_lost_device_init(vkb_srv_table *t);    /* beneath every layer: the latch (and its host imitation) */
 void vkb_lost_device_destroy(vkb_srv_table *t);
 void vkb_lost_mark(vkb_srv_table *t, const char *why); /* the bridge takes the device as lost (a contained bind fault) */
@@ -172,6 +198,14 @@ int vkb_srv_instance_orphans(vkb_srv_table *inst); /* server_conn.c: an instance
 int vkb_lost_stopped(const vkb_srv_table *t);   /* a device (or an instance with one) never to be touched again */
 int vkb_lost_refuse(const vkb_srv_table *t);    /* run_request: refuse the request */
 void vkb_lost_stop(vkb_srv_table *t, const char *why); /* taken as lost and stopped: refused, never destroyed */
+int vkb_lost_settle(vkb_srv_table *t);          /* before a device goes: its loss record's driver query done (0), or stuck: stopped (1) */
+/* server_lostlog.c: what a lost device was given (the loss record, ledger 225) */
+int vkb_ll_wanted(void);    /* not off (VKBRIDGE_LOST_REPORT=0) */
+int vkb_ll_test_mode(void); /* VKBRIDGE_TEST_DEVICE_FAULT: 0 none, 1 va, 2 crash, 3 hang, 4 refuse */
+void vkb_ll_cb_recorded(VkCommandBuffer cb, uint32_t cmds, size_t bytes, uint32_t draws, uint32_t disp, uint32_t copies,
+                        const uint64_t *pipes, uint32_t npipes); /* server_conn.c: a client's stream ended */
+void vkb_ll_pipeline(VkPipeline p, const uint64_t *h, const uint32_t *stg, uint32_t nh, int compute); /* server_guard.c */
+int vkb_lost_async(const vkb_srv_table *t, const char *cmd); /* server_conn.c: an asynchronous call's lost answer on a lost device, counted (1) */
 typedef struct vkb_srv_stuck_req {
     int pid;
     char comm[32];
@@ -183,20 +217,43 @@ int vkb_srv_stuck(double min_s, vkb_srv_stuck_req *out, int max); /* server_conn
 int vkb_srv_end_proc(int pid, const char *why);                   /* server_conn.c: a program's session ended, the driver untouched */
 void vkb_lost_fault(int sig, const void *addr, uintptr_t pc, const char *lib, const char *lib_name, uintptr_t lib_off);
 void vkb_crash_log_raw(const char *line, size_t n); /* server_main.c: a line from the crash handler */
+int vkb_crash_frames(char *out, size_t cap, void *ucontext); /* server_crashsym.c: "crash-frame #NN pc ... (BuildId: ...)" lines */
 void vkb_crashctx_test_init(vkb_srv_table *t); /* VKBRIDGE_TEST_CRASH_CMD (host tests) */
 /* server_conn.c, for the crash line: the client this thread serves (NULL: none), and the calls
  * other connection threads are inside of ("" if none). */
 const vkb_srv_proc *vkb_srv_crash_client(void);
 int vkb_srv_crash_others(char *buf, size_t cap);
+/* A call in the driver at a contained fault, copied inside the signal handler (server_guard.c): a request of a
+ * connection thread (cmd = command id + 1) or a guarded compile on any other thread (cmd 0: the server's background workers). */
+typedef struct vkb_crash_call {
+    int tid, pid;           /* pid: the request's program (0 for a compile) */
+    uint32_t cmd;           /* command id + 1; 0: a compile */
+    uint32_t device;        /* a compile's device (table id) */
+    uint64_t since_ns;      /* when it began: a request on CLOCK_MONOTONIC_COARSE (conn->running_ns), a compile on CLOCK_MONOTONIC */
+    const char *call, *ctx; /* a compile: its call, and what its thread was running (vkb_srv_current_cmd), or NULL; static strings */
+    char comm[32];          /* a request's program */
+    unsigned char torn;     /* its marker changed while it was copied (the call ended or a new one began meanwhile) */
+} vkb_crash_call;
+/* server_conn.c: the connection threads' requests running now, other than thread `self`'s, into out[max] (*more: those past max).
+ * Async-signal-safe: atomic loads and plain copies, no lock. */
+int vkb_srv_crash_snap(vkb_crash_call *out, int max, int self, int *more);
 
 /* server_guard.c */
 void vkb_guard_device_init(vkb_srv_table *t);
 void vkb_guard_device_destroy(vkb_srv_table *t);
-void vkb_guard_fault(int sig, void *addr, int code, uintptr_t pc); /* crash handler: jumps back into a guarded driver call, if any */
+int vkb_guard_mem_faults(const vkb_srv_table *t); /* memory faults contained on this device so far */
+void vkb_guard_fault(int sig, void *addr, int code, uintptr_t pc, void *uc); /* crash handler: jumps back into a guarded driver call, if any */
+/* crash handler, an uncontained fault: the pipeline compiles in flight become crash suspects for the next start (stuck-pipelines x=1) */
+void vkb_guard_crash_suspects(int sig, const char *lib, int in_call);
 /* fn(arg) armed like a driver compile (the startup probe): a fault in it, or a run past limit_s
  * (0: VKBRIDGE_COMPILE_TIMEOUT_S, < 0: none), jumps back; *sig: the fault's signal. */
 enum { VKB_GUARD_DONE = 0, VKB_GUARD_CRASHED = 1, VKB_GUARD_TIMED_OUT = 2 };
 int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *arg, int *sig);
+int vkb_guard_armable(void); /* containment on and not used up */
+void vkb_guard_watch_start(void); /* the compile watchdog's thread, started now if not yet (the switches read again) */
+/* a fault or a time-out vkb_guard_run contained in a driver call of device dev: counted, and the memory fault
+ * watchdog started (a call that then blocks on a lock the driver held ends its program) */
+void vkb_guard_contained_elsewhere(const char *call, uint32_t dev);
 /* One guard around every driver call a connection thread makes for its client (server_conn.c conn_main):
  * loop(arg) runs with a base arm; a fault outside any specific arm (compile, memory, End) jumps back and
  * vkb_guard_serve returns 1 with *f filled (loop is then called again by the caller after its recovery);
@@ -206,6 +263,9 @@ typedef struct vkb_guard_caught {
     int sig, code;
     void *addr;
     uintptr_t pc;
+    unsigned snap; /* server_guard.c: the calls in flight at the fault, copied in the handler (0: none) */
+    uintptr_t ra[6]; /* the return addresses above the fault (frame records), newest first */
+    int nra;
 } vkb_guard_caught;
 int vkb_guard_serve(void (*loop)(void *), void *arg, vkb_guard_caught *f);
 /* After vkb_guard_serve caught a fault in a client's request: the CONTAINED line (call: the request or the
@@ -228,7 +288,19 @@ double vkb_guard_timeout_s(int mode, const char **why);
 #define VKB_PROBE_FLAG_TX_ASTC_HDR 0x40u
 #define VKB_PROBE_FLAG_TX_BC7 0x10000u   /* BC7 -> ASTC: its own (the biggest; BC2 and BC3 build where it does not). Was 0x8000, MK_FP16's bit: a died bc_transcoders read as MK-20 */
 #define VKB_PROBE_FLAG_TX_ALL 0x10078u
-#define VKB_PROBE_FLAG_WAIT_LOST 0x20000u /* waits: a timed-out wait answered VK_ERROR_DEVICE_LOST; server_wait.c checks such answers */
+/* BC converter variants the probe found wrong on this driver (bc_variants: did not build, hung, or a byte differed from
+ * the old variant's output): one dispatch a run (REGION_TABLE) off, the palette search off for BC1 -> ETC2 / BC4 / BC5 -> EAC */
+#define VKB_PROBE_FLAG_BC_TAB 0x40000u
+#define VKB_PROBE_FLAG_BC_PAL_ETC2 0x80000u
+#define VKB_PROBE_FLAG_BC_PAL_EAC 0x100000u
+/* ... and VKBRIDGE_BC_FAST's BC1 -> ETC2 palette variants (the palette ones stay) */
+#define VKB_PROBE_FLAG_BC_FAST_ETC2 0x400000u
+/* ... and its BC7 -> ASTC variants (today's stay). 0x400000 and 0x1000000 stay the BC fast ones (test49p's bits); the PowerVR
+ * line had them too (PV_NAMES, PV_V3D_ARRAY1) and moved in test50 (PV_NAMES 0x40000000, PV_V3D_ARRAY1 bit 32: 33 flags, so 64 bits) */
+#define VKB_PROBE_FLAG_BC_FAST_ASTC 0x1000000u
+#define VKB_PROBE_FLAG_BC_ALL 0x15c0000u
+#define VKB_PROBE_FLAG_WAIT_LOST 0x20000u /* waits: a timeline wait that timed out answered VK_ERROR_DEVICE_LOST, the device
+                                           * fine after (Arm job-manager drivers); server_wait.c checks such answers */
 /* The MK probes (one per Mali driver erratum it can tell): the bug's own pattern was seen. Their
  * results reach the errata decisions (server_errata.c) through vkb_errata_set_probe_source. */
 #define VKB_PROBE_FLAG_MK_WAIT 0x80u        /* wait_eintr: a wait failed or ended early after a signal (MK-01) */
@@ -241,7 +313,37 @@ double vkb_guard_timeout_s(int mode, const char **why);
 #define VKB_PROBE_FLAG_MK_VIEW3D 0x4000u    /* view3d_layers: a 3D image's REMAINING slices view wrong (MK-07) */
 #define VKB_PROBE_FLAG_MK_FP16 0x8000u      /* fp16_math: 16-bit float arithmetic gave wrong results (MK-20) */
 #define VKB_PROBE_FLAG_MK_ALL 0xff80u
-int vkb_probe_flag(uint32_t f);
+/* The PowerVR probes (PV-nn: Imagination's driver), used like the MK ones. 0x200000 is the first bit free on this line
+ * (0x40000-0x100000 are the BC variants' here; feat/powervr-bridge used 0x80000 for PV-02) */
+#define VKB_PROBE_FLAG_PV_MUTABLE 0x200000u /* pv_mutable_linear: a mutable-format LINEAR dma-buf image query refused though the image works (PV-02) */
+/* PV-01: 0x40000000, the last 32-bit bit free (test50: 0x400000, PVR-ALL's pick, is VKBRIDGE_BC_FAST's BC1 -> ETC2 verdict on the
+ * PERF line; feat/powervr-bridge had PV-01 at 0x40000, the BC table's bit on this line) */
+#define VKB_PROBE_FLAG_PV_NAMES 0x40000000u /* pv_names: an input reads zero beside an output of the same OpName (PV-01) */
+#define VKB_PROBE_FLAG_PV_BGRA_STORE 0x800000u /* pv_bgra_store: storage writes to a B8G8R8A8 image land in R8G8B8A8 byte order (PV-07) */
+#define VKB_PROBE_FLAG_PV_ALL 0x40a00000u
+/* view3d_layers on PowerVR (PV-04): the base layer of a 3D image's 2D-array view ignored with explicit counts too (the pattern),
+ * and which forms of the fix the same run proved on the driver (the others are only set beside it). feat/powervr-bridge had the
+ * pattern at 0x800000, pv_bgra_store's bit on this line; it is 0x8000000 here (PV-03's _STORAGE_READ bit there, not on this line) */
+#define VKB_PROBE_FLAG_PV_VIEW3D 0x8000000u        /* the pattern: view_counts cannot fix it */
+#define VKB_PROBE_FLAG_PV_V3D_ARRAY1 0x100000000ull /* a one-slice 2D-array view keeps its base layer (views of one slice need no fix) */
+#define VKB_PROBE_FLAG_PV_V3D_2D1 0x2000000u       /* a 2D view of a slice keeps its base layer (a one-slice view is rendered through one) */
+#define VKB_PROBE_FLAG_PV_V3D_COPY 0x4000000u      /* rendering through a 2D-array image of the bridge's own, copied in and out, is right */
+#define VKB_PROBE_FLAG_PV_V3D_FB 0x10000000u       /* a feedback loop in a 3D image's multi-slice 2D-array view reads wrong where the same loop in a plain 2D-array
+                                                    * image is right (sub-case 5 and 7; PowerVR CXTP 25.3): the second pattern of pv_view3d_base */
+#define VKB_PROBE_FLAG_PV_V3D_FBCOPY 0x20000000u   /* ... and the loop through the copy form (a 2D-array image of the bridge's own, the pass split at the
+                                                    * barrier) is right (sub-case 6) */
+#define VKB_PROBE_FLAG_PV_V3D_ALL 0x13e000000ull
+#define VKB_PROBE_FLAG_PV_FBLOOP 0x80000000u       /* view3d_layers sub-case 8 (pv_fbloop_split, PV-06; PowerVR CXTP 25.3, Pixel 11): a feedback loop in a plain
+                                                    * 2D-array image reads wrong (sub-case 7) and the same loop with the pass ended at the barrier and begun again
+                                                    * with LOAD, no copy, is right */
+int vkb_probe_flag(uint64_t f);
+/* The bc_variants probe on this server's GPU: 1 it ran (VKB_PROBE_FLAG_BC_* say what it turned off), 0 not yet (left to
+ * the background part, or no profile yet), -1 it will not run in this process (the probe off, could not set up, skipped).
+ * Lock-free: read on BC image creation. */
+int vkb_probe_bc_variants(void);
+/* BC fast converters on only on measured GPUs (G720, G925); the bc_variants probe checks their variants only then (or with VKBRIDGE_BC_FAST set); the rest of it is test47's */
+int vkb_bc_gpu_measured(const char *name);
+int vkb_bc_fast_gate(const char *deviceName, int *explicit_env);
 void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *idt, VkPhysicalDevice pd);
 void vkb_probe_start_background(void); /* what did not fit the start's budget */
 void vkb_probe_write_md(FILE *f);
@@ -250,7 +352,7 @@ int vkb_probe_issues(void (*cb)(void *arg, const char *line), void *arg);
 /* What a GPU's probe results decide in a mode (VKB_MODE_*), re-run on the raw results as recorded
  * (switching mode never re-probes): the emulation mask (from what the GPU had before the probe)
  * and the runtime flags. 0 when the GPU has no profile. For feat/safe-mode's per-mode masks. */
-int vkb_probe_decide_mode(const uint8_t uuid[VK_UUID_SIZE], int mode, uint32_t *emu, uint32_t *flags);
+int vkb_probe_decide_mode(const uint8_t uuid[VK_UUID_SIZE], int mode, uint32_t *emu, uint64_t *flags);
 /* How the process ends, for a probe in flight (async-signal-safe): a stop (SIGTERM, the app gone)
  * leaves it to be run again, a crash outside the probe's guard makes it died. */
 void vkb_probe_mark_end(int sig, int crashed);
@@ -268,12 +370,22 @@ void vkb_report_device(vkb_srv_table *inst, const VkDeviceCreateInfo *ci, VkResu
                        const char *not_passed_exts);
 void vkb_report_device_init(vkb_srv_table *t); /* device-lost watch on submissions and waits */
 void vkb_report_device_destroy(vkb_srv_table *t);
+void vkb_report_lost_cause(int pid, const char *line); /* the loss record's line (server_lostlog.c): the first per process */
 void vkb_report_features(const VkPhysicalDeviceFeatures *want, const VkPhysicalDeviceFeatures *have, char *out, size_t cap);
 const char *vkb_srv_env_list(char *out, size_t cap); /* <cache dir>/env as applied (server_pcache.c) */
 void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, VkResult r, const char *slow_stages);
 /* Pipelines the driver built with creation feedback, and how many of them it found in the pipeline cache (server_guard.c). */
 void vkb_report_cache_hits(vkb_srv_table *t, uint64_t built, uint64_t hits);
 int vkb_report_frames(uint64_t *presents, double *t_last); /* busiest live process's presents (frames line) */
+/* server_heapkind.c: memory by kind of object (memkind:/memtop: lines). vkb_hk_cmd[cmd]: 0, or the command's kind
+ * (bits 0-4) | 0x40 destroy/free | 0x80 measured; run_request brackets such a handler with begin/end. */
+extern uint8_t vkb_hk_cmd[];
+long vkb_hk_begin(uint8_t hk);
+void vkb_hk_end(uint8_t hk, vkb_srv_proc *p, long before_kb);
+long vkb_hk_anon_kb(void);
+int vkb_hk_kind_line(char *buf, size_t cap, int force);
+int vkb_hk_top_line(char *buf, size_t cap, int low_entered);
+void vkb_hk_tick(int low_entered, int lines); /* the mem: thread, every 5 s: memkind/memtop lines when due */
 double vkb_srv_running_longest(int pid, const char **name, char *detail, size_t cap); /* server_conn.c: the process's longest running request (s, 0: none); detail (may be NULL): where inside it (the replayed command, the thread's state) or "" */
 
 /* server_async.c: graphics pipelines compiled in the background (VKBRIDGE_ASYNC_COMPILE) */
@@ -296,6 +408,7 @@ void vkb_promote_device_destroy(vkb_srv_table *t);
  * device; destroy_left (a process gone without destroying its device): what is left is destroyed */
 void vkb_children_device_init(vkb_srv_table *t);
 void vkb_children_device_destroy(vkb_srv_table *t, int destroy_left);
+void vkb_children_fake_init(vkb_srv_table *t); /* host tests: VKBRIDGE_FAKE_MISSING=pvrdestroy */
 /* The version offered and the driver's for a GPU, and what the next version lacks; 0: not known */
 int vkb_promote_describe(const uint8_t uuid[VK_UUID_SIZE], uint32_t *offered, uint32_t *drv, const char **missing);
 void vkb_promote_write_apps_file(void);           /* <cache dir>/apps-vulkan, after the self-test */
@@ -335,6 +448,15 @@ enum {
     VKB_ERRATUM_STENCIL_LAYOUT,  /* MK-11 a separate stencil layout in a render pass ignored */
     VKB_ERRATUM_VB_BAKE,         /* MK-05 option B: dynamic strides wrong in single-binding calls too */
     VKB_ERRATUM_GS_HIDE,         /* r38p1 beta segfaults compiling Zink's geometry shaders */
+    VKB_ERRATUM_SPLIT_VARYING,   /* MK-47 a fragment input at a Component > 0 of a whole-vector output reads wrong */
+    VKB_ERRATUM_IMPORT_SERIAL,   /* MK-48 r44: an import beside another device's memory calls faults in the driver */
+    VKB_ERRATUM_PV_MUTABLE_LINEAR, /* PV-02 PowerVR: the query for a mutable-format LINEAR dma-buf image says no, the image works */
+    VKB_ERRATUM_PV_BGRA_STORE,   /* PV-07 PowerVR: storage writes to a B8G8R8A8 image land in R8G8B8A8 byte order */
+    VKB_ERRATUM_PV_NAMES,        /* PV-01 PowerVR: a vertex input reads zero beside an output of its OpName */
+    VKB_ERRATUM_PV_VIEW3D_BASE,  /* PV-04 PowerVR: a 3D image's 2D-array view renders from slice 0 whatever its base layer (explicit counts too) */
+    VKB_ERRATUM_PV_FBLOOP_SPLIT, /* PV-06 PowerVR: an in-pass feedback loop (ATTACHMENT_FEEDBACK_LOOP_OPTIMAL, a barrier inside the pass) reads wrong; the pass is split at the barrier */
+    VKB_ERRATUM_PV_ZINK_NAME,    /* PV-08: PowerVR's driver hides features from the engine name "mesa zink" */
+    VKB_ERRATUM_FRAGDEPTH_NODEPTH, /* MK-49 G925 r49p1: a fragment shader writing FragDepth into a rendering with no depth attachment never finishes */
     VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };
@@ -368,7 +490,7 @@ int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driv
  * builds), its imitation goes beneath *d, which the probe then calls - the probe sees the bug an
  * affected driver has. Returns what vkb_errata_probe_end takes (NULL: nothing imitated). */
 void *vkb_errata_probe_begin(int id, vkb_dispatch *d, VkDevice dev, VkPhysicalDevice pd, uint32_t api);
-int vkb_wait_fake_lost(void); /* server_wait.c: VKBRIDGE_WAIT_FAKE_LOST */
+int vkb_wait_fake_lost(void); /* server_wait.c: VKBRIDGE_WAIT_FAKE_LOST (the imitation of VKB_PROBE_FLAG_WAIT_LOST's bug) */
 void vkb_errata_probe_end(void *h);
 /* FNV-1a of a module's SPIR-V as the app made it: a module an erratum rewrote is named by the
  * code it was rewritten from (server_errata_bitwise.c); what layers beneath the errata hash with */
@@ -382,7 +504,7 @@ enum { VKB_VIDYN_OFF = 0, VKB_VIDYN_NATIVE = 1, VKB_VIDYN_EMULATED = 2 };
 int vkb_vidyn_mode(const vkb_srv_table *inst, VkPhysicalDevice pd);
 int vkb_vidyn_variants(const vkb_srv_table *inst, VkPhysicalDevice pd); /* the layer makes pipeline variants there */
 /* Extended dynamic state 1 and 2 for Zink where the driver has no usable ones (Mali Vulkan 1.1
- * drivers; the Steam-mode fix's): 1 when the server offers its own, made static in the vertex input's
+ * drivers; the A1 fix's): 1 when the server offers its own, made static in the vertex input's
  * pipeline variants (server_vidyn.c). vkb_vidyn_device_create_info's result has VKB_VIDYN_EDS then. */
 int vkb_eds_mode(const vkb_srv_table *inst, VkPhysicalDevice pd);
 #define VKB_VIDYN_EDS 4
@@ -407,10 +529,36 @@ int vkb_errata_gs_driver(const vkb_srv_table *inst, VkPhysicalDevice pd, char *w
 int vkb_errata_gs_process(const vkb_srv_proc *p);    /* the process half alone: its name is in the list */
 void vkb_errata_gs_instance_install(vkb_srv_table *inst); /* over every other query wrapper: last */
 void vkb_errata_gs_device_create_info(vkb_srv_table *inst, VkPhysicalDevice pd, VkDeviceCreateInfo *ci);
+/* pv_mutable_linear (PV-02, server_errata_pvmutable.c): the erratum's decision for this physical device
+ * (the probe, VKBRIDGE_ERRATA=+/-pv_mutable_linear); the pattern of query it answers; the image-format
+ * query's wrapper (instance); 1 when VKBRIDGE_ERRATA_IMITATE names erratum id (host builds) */
+int vkb_errata_pvmutable_driver(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
+int vkb_errata_pvmutable_pattern(const VkPhysicalDeviceImageFormatInfo2 *info);
+int vkb_errata_pvmutable_probe_refuses(const VkPhysicalDeviceImageFormatInfo2 *info);
+void vkb_errata_pvmutable_instance_install(vkb_srv_table *inst);
+int vkb_errata_imitating(int id);
+/* pv_bgra_store (PV-07, server_errata_pvbgra.c): the top of a device's table (after vkb_mem_export_install): memory of an
+ * image made R8G8B8A8 for a B8G8R8A8 client registered at export for the compositor; an image's format as the driver
+ * holds it (the dma-buf-over-AHB record) */
+void vkb_errata_pvbgra_export_install(vkb_srv_table *t);
+VkFormat vkb_errata_pvbgra_format(vkb_srv_table *t, VkImage image, VkFormat f);
+/* pv_zink_name (PV-08, server_errata_zink.c): the self-test's profile probe per physical device; the
+ * probe's record (VKB_ERRATA_PROBE_*); vkCreateInstance's engine name for a client (NULL: as it is) */
+void vkb_zink_profile_probe(const uint8_t uuid[VK_UUID_SIZE], uint32_t vendor, uint32_t driver_id, uint32_t api);
+int vkb_zink_profile_result(void);
+const char *vkb_errata_zink_engine(const char *engine, char *why, size_t cap);
+int vkb_errata_zink_name_on(char *why, size_t cap); /* server_errata.c: the erratum's decision for an instance */
+void vkb_errata_zink_instance_install(vkb_srv_table *inst); /* a renamed instance: the profile kept but for vertexInputDynamicState */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
+void vkb_hang_arm_next(vkb_srv_table *t, const char *what); /* server_lostlog.c: a loss with a GPU fault address */
+void vkb_hang_arm_hung(vkb_srv_table *t, const char *what); /* server_wait.c: a GPU wait given up with the device not lost */
+void vkb_hang_fault_addr(vkb_srv_table *t, VkDeviceAddress a); /* server_lostlog.c: the driver's fault address, looked up */
 void vkb_qlock_device_init(vkb_srv_table *t); /* server_qlock.c: per-queue locks, beneath every layer */
 void vkb_qlock_device_destroy(vkb_srv_table *t);
+/* server_pvsusp.c (errata pv_suspend, PowerVR): suspended/resumed dynamic renderings reach the driver as whole passes */
+void vkb_pvsusp_device_init(vkb_srv_table *t);
+void vkb_pvsusp_device_destroy(vkb_srv_table *t);
 void vkb_hang_device_destroy(vkb_srv_table *t);
 
 /* server_gpuprof.c */
@@ -420,6 +568,9 @@ void vkb_gprof_device_destroy(vkb_srv_table *t);
 /* server_hwcnt.c: Mali hardware counters (VKBRIDGE_GPU_PROF=counters): a summary every 5 s */
 void vkb_hwcnt_start(void);
 void vkb_trace_device_destroy(vkb_srv_table *t);
+/* server_pldedup.c: pipeline layouts made the same way share one driver layout (PowerVR; VKBRIDGE_PL_SHARE) */
+void vkb_pldedup_device_init(vkb_srv_table *t);
+void vkb_pldedup_device_destroy(vkb_srv_table *t);
 
 /* server_nulldesc.c */
 void vkb_nulldesc_device_init(vkb_srv_table *t);
@@ -454,11 +605,17 @@ const char *vkb_srv_env_override(const char *name);        /* <cache dir>/env's 
 const char *vkb_env_src_name(int src);                     /* "<cache dir>/env", "the environment", ... */
 void vkb_pcache_device_init(vkb_srv_table *t);
 void vkb_pcache_device_destroy(vkb_srv_table *t);
+void vkb_pcache_wedged(vkb_srv_table *t, const char *call); /* the compile watchdog: a timeout after a contained crash on t */
+int vkb_pcache_aside(const vkb_srv_table *t);                /* 1: t's cache wedged the driver and was set aside */
 /* Pipelines made through the persistent caches so far, and the caches' size in the driver at their
  * last save (every device; 0 and 0 without them). */
 void vkb_pcache_stats(uint64_t *pipelines, uint64_t *bytes);
 /* a pipeline the server builds for itself, through the device's cache (VK_NULL_HANDLE without one) */
 VkResult vkb_pcache_create_compute(vkb_srv_table *t, const VkComputePipelineCreateInfo *ci, VkPipeline *out);
+/* the device's persistent cache: its program's file handed the driver nothing at its start (a program new to this driver), or none */
+int vkb_pcache_started_empty(vkb_srv_table *t);
+/* the program's cache file (things kept beside it), NULL: none, or one never written */
+const char *vkb_pcache_file(vkb_srv_table *t);
 /* a cache for the server's own compiles on a device without a table (the startup probe's) */
 VkPipelineCache vkb_pcache_own_open(const vkb_dispatch *r, const VkPhysicalDeviceProperties *gpu, VkDevice d, const char *name, char *path,
                                     size_t cap);
@@ -473,10 +630,30 @@ void vkb_hitch_enable(vkb_srv_proc *p, uint32_t ms);
 static inline int vkb_hitch_on(const vkb_srv_proc *p) { return p && __atomic_load_n(&p->hitch, __ATOMIC_RELAXED) != NULL; }
 void vkb_hitch_note(vkb_srv_proc *p, int cls, uint64_t t0, uint64_t t1, uint32_t n, uint64_t bytes);
 /* a BC conversion recorded: its texels and the most GPU time it can take on this GPU (server_emu_bcn.c) */
-void vkb_hitch_note_bc(vkb_srv_proc *p, uint64_t t0, uint64_t t1, uint64_t texels, uint64_t gpu_est_ns);
+/* inflight_ns: added to the conversions in flight on the GPU (bc_inflight_est_ms), taken off by vkb_hitch_bc_done when the
+ * command buffer's work is over; vkb_hitch_bc_calib: a command buffer's estimate against its measured GPU time (F0) */
+void vkb_hitch_note_bc(vkb_srv_proc *p, uint64_t t0, uint64_t t1, uint64_t texels, uint64_t gpu_est_ns, uint64_t inflight_ns);
+void vkb_hitch_bc_done(vkb_srv_proc *p, uint64_t inflight_ns);
+void vkb_hitch_bc_calib(uint64_t est_ns, uint64_t gpu_ns);
 void vkb_hitch_compile(vkb_srv_proc *p, const char *what, uint32_t n, uint64_t t0, uint64_t t1, int result);
 void vkb_hitch_proc_gone(vkb_srv_proc *p); /* the summary line, and the ring freed */
 int vkb_test_hitch_delay_ms(void);         /* server_emu_bcn.c: VKBRIDGE_TEST_HITCH_DELAY_MS (host tests) */
+
+/* server_perf.c: always-on performance diagnostics: per 10-s window "perf:" and
+ * "perf-threads:" lines, and the report's Performance section. VKBRIDGE_PERF_DIAG=0: off. */
+#define VKB_PERF_CAUSES 6 /* server_hitch.c's hitch causes: compile, bc, alloc, pcache, wait, other */
+typedef struct vkb_perf_win {
+    uint64_t t0, t1, susp_ns, frames, over, repeats, worst_ns; /* one of the client's per-second windows */
+    uint64_t causes[VKB_PERF_CAUSES];                           /* its hitches by cause */
+    double app_ms, present_ms, present_rt_ms, compile_ms, bc_ms, alloc_ms;
+    uint32_t ft_p50_us, ft_p90_us;
+} vkb_perf_win;
+int vkb_perf_on(void);
+void vkb_perf_window(vkb_srv_proc *p, const vkb_perf_win *w); /* server_hitch.c, at each window message */
+void vkb_perf_proc_gone(vkb_srv_proc *p);
+void vkb_perf_session(void);                 /* a new session: the run's sums of processes still alive start again */
+void vkb_perf_report(FILE *f, int json);     /* the report's section (under the report's lock) */
+int vkb_report_thermal(void);                /* server_report.c: Android's thermal status from vkbridge-clocks.log, -1 unknown */
 
 /* server_latency.c: the latency log (VKBRIDGE_LATLOG); the lines come from the client's vkbLatency */
 uint32_t vkb_present_wait_setting(void); /* VKBRIDGE_PRESENT_WAIT the same way: 0 unset, VKB_PRESENT_WAIT_ON/OFF */
@@ -503,6 +680,18 @@ uint32_t vkb_syncfd_client_knobs(uint32_t driver_id);  /* VKB_KNOB_SYNCFD_SIDE_S
 int vkb_srv_order_skipped(void);
 void vkb_srv_order_finish(void);
 void vkb_srv_order_done(void);
+/* server_conn.c, VKBRIDGE_FAST_CREATE (VKB_F_FAST_CREATE): a create the client let run ahead of its process's queued work. pre:
+ * the handler's first act before the driver's create (image or buffer create info, the other NULL): at once where nothing
+ * queued can change what it makes, else the order wait as without the bit. reply: the tail of vkCreateImage's reply (the
+ * image's requirements). set: what the process was told at its first vkbQueryServer (1 off, 2 on). */
+/* (pre and reply: common/vkb_server_iface.h, for the generated handlers) */
+void vkb_srv_fast_create_set(vkb_srv_proc *p, int on);
+/* server_emu_bcn.c: 1 when the switches ask for a BC rule that weighs bytes alive (the game's preset, <cache dir>/env, the
+ * environment): VKB_KNOB_FAST_CREATE_BC_SHIFT OFF */
+int vkb_emu_bcn_rules_wanted(void);
+/* A request that waits on the CPU for a later request of its program (an emulated timeline's wait-before-signal,
+ * server_timeline.c): 1 before the wait, 0 after. order_wait does not take it for one still running. */
+void vkb_srv_parked(int on);
 void vkb_sparse_instance_install(vkb_srv_table *t); /* server_emu_sparse.c */
 void vkb_sparse_device_init(vkb_srv_table *t);
 void vkb_sparse_device_destroy(vkb_srv_table *t);
@@ -522,6 +711,7 @@ const char *vkb_preset_text(const vkb_srv_proc *p, char *out, size_t cap); /* "K
 /* "preset for steam<appid>: a built-in preset exists but was not tested on <gpu>; ...", or "" */
 const char *vkb_preset_note(const vkb_srv_proc *p, char *out, size_t cap);
 uint32_t vkb_preset_client_knobs(void);  /* vkb_server_pd_info.client_knobs for this thread's client */
+uint32_t vkb_preset_perf_src(void);      /* vkb_server_pd_info.perf_src, the same way */
 void vkb_preset_client_values(vkb_server_pd_info *info, vkb_srv_proc *proc); /* its .heap_max_mb, .spoof_gpu and .present_timeout_s, the same way */
 uint64_t vkb_memtotal_mb(void); /* RAM in MB (MemTotal; VKBRIDGE_FAKE_MEMTOTAL_MB for tests), 0: unknown */
 /* server_compile_gate.c: at most VKBRIDGE_COMPILE_THREADS pipeline compiles in the driver at once (1 while
@@ -537,6 +727,7 @@ uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb); /* the safe-mode he
 
 /* server_instance.c */
 void vkb_selftest_all(void);
+extern int vkb_selftest_too_old;
 const vkb_pd_knowledge *vkb_pd_lookup(const vkb_dispatch *dt, VkPhysicalDevice pd);
 extern vkb_pd_knowledge vkb_pds[VKB_MAX_PDS];
 int vkb_pds_select_mode(void); /* the mode read again, its emulation masks in force; returns it */
@@ -550,6 +741,7 @@ const char *vkb_mem_export_backing_name(void);
 const char *vkb_mem_ahb_export_result(void); /* the start's check of the AHardwareBuffer pages; "" where not checked */
 void vkb_mem_export_install(vkb_srv_table *t);
 void vkb_mem_instance_install(vkb_srv_table *t); /* VKBRIDGE_FAKE_MISSING=lazymem: Mali's memory types (host tests) */
+void vkb_mem_mutable_instance_install(vkb_srv_table *t); /* PR #31: a refused mutable LINEAR-modifier dma-buf query asked without the flag */
 void vkb_mem_device_install(vkb_srv_table *t);   /* VKBRIDGE_FAKE_MISSING=dmabuftypes: Mali's dma-buf fd properties (host tests) */
 /* VKBRIDGE_FAKE_MISSING=xringmem or g720mem: another Mali's memory table beneath the whole server (host tests) */
 PFN_vkGetInstanceProcAddr vkb_mem_imitate_gipa(PFN_vkGetInstanceProcAddr gipa);
@@ -566,12 +758,19 @@ void vkb_mem_free_all(vkb_srv_table *dev);
 /* Accounting, one line every ~5 s while it changes (VKBRIDGE_MEM_STATS=0: off). */
 uint8_t vkb_memstat_dedicated(const VkMemoryAllocateInfo *ai);
 void vkb_memstat_image(VkFormat bc, int64_t bytes, int64_t bc_src_bytes, int64_t bc_decoded_bytes); /* bc 0: not BC */
+/* A non-BC image's shape for the memory line's per-format table (bytes < 0: destroyed). */
+#define VKB_IMG_SHAPE_TARGET 1 /* colour/depth attachment or storage */
+#define VKB_IMG_SHAPE_MIPS 2   /* not a target, a mip chain */
+#define VKB_IMG_SHAPE_OVER 4   /* and 2D with a side over 1024 */
+void vkb_memstat_image_shape(VkFormat format, int shape, int64_t bytes);
 void vkb_memstat_buffer(int64_t bytes);
 void vkb_memstat_query(int pid, int64_t *pid_bytes, int64_t *total, int64_t *images, int64_t *bc_images, int64_t *bc_src);
 /* 1 while the device's memory is low (MemAvailable under an eighth of RAM, until it is over a sixth
  * again; VKBRIDGE_FAKE_MEMAVAIL_MB / _MEMTOTAL_MB for tests): what the server holds without need is
  * let go. Watched every ~5 s by the accounting thread, VKBRIDGE_MEM_STATS=0 too. */
 int vkb_mem_low(void);
+/* MemAvailable under a sixth of RAM (the mark low memory clears at), or low: no new optional memory (BC small decode) */
+int vkb_mem_tight(void);
 
 /* OPAQUE_FD on dma-bufs (server_opaque.c) */
 void vkb_opaque_instance_install(vkb_srv_table *t);
@@ -581,7 +780,10 @@ int vkb_opaque_shared_info(vkb_srv_table *t, VkMemoryAllocateInfo *ai);
 void vkb_opaque_shared_done(vkb_srv_mem *m, int out_fd);
 const VkMemoryGetFdInfoKHR *vkb_opaque_get_fd_info(vkb_srv_table *t, const VkMemoryGetFdInfoKHR *gi, VkMemoryGetFdInfoKHR *tmp);
 
-/* server_apicap.c: Steam mode's own processes capped on the gate (vkbQueryServer's api_cap). */
+/* server_apicap.c: Steam mode's own processes (Xwayland, steam, steamwebhelper) shown Vulkan 1.1 and
+ * gamescope 1.2 on the black-screen gate: Arm job-manager Malis below r54 with VK_EXT_extended_dynamic_state
+ * (the Steam-mode black screen/#15/#28, #11;
+ * VKBRIDGE_STEAM_API_CAP, vkbQueryServer's api_cap). */
 int vkb_errata_arm_release_pd(const vkb_srv_table *t, VkPhysicalDevice pd, int *arm, int *jm);
 int vkb_black_gate(const vkb_srv_table *t, VkPhysicalDevice pd, const char **why);
 uint32_t vkb_steam_api_cap(const vkb_srv_table *t, VkPhysicalDevice pd);
@@ -592,6 +794,7 @@ uint32_t vkb_steam_api_cap(const vkb_srv_table *t, VkPhysicalDevice pd);
  * or without one vendor 0x13B5 (driver_id 0: what was asked before). */
 uint32_t vkb_driver_id(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api);
 int vkb_driver_is_arm(const VkPhysicalDeviceProperties *p, uint32_t driver_id);
+int vkb_driver_is_powervr(const VkPhysicalDeviceProperties *p, uint32_t driver_id); /* IMAGINATION_PROPRIETARY, else vendor 0x1010 */
 int vkb_arm_driver(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api);
 const char *vkb_driver_id_name(uint32_t id);
 void vkb_driver_log(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api); /* the self-test's line */

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Per-hitch attribution. With VKBRIDGE_HITCH_MS=<ms> (the game's preset, <cache dir>/env, the
  * server's or the guest's environment; HITCH_DEFAULT_MS when none says anything, 0 or off: off) a
  * frame of the process that takes longer than that gets one line in this log naming what the frame
@@ -23,6 +22,11 @@
  * often the next. bc_n / bc_recent_n count the conversions (one per BC copy the app recorded), and
  * bc_gpu_est_ms is the most GPU time the recent ones can take on this GPU (server_emu_bcn.c
  * gpu_est_ns: texels x the family's weight x the search's cost, from the G720's measured rate).
+ * bc_inflight_est_ms is the conversions' GPU work still in flight: estimated when recorded, kept until the command buffer
+ * holding them has finished (begun again, reset or freed: DXVK does so right after its fence), the most of it while this
+ * frame and the one before ran (a conversion recorded frames earlier and still queued, which the frame waits for and its
+ * bc_n does not show:), scaled by what the conversions' GPU timestamps measured against the estimate
+ * (server_emu_bcn.c cv_harvest; once 20 ms of estimate were read, the factor in the process's summary). cause= does not use it.
  *
  * cause= is the largest of compile, bc (the conversions' recording, or, when the waits are the
  * largest, the GPU time of the textures converted in this frame or the one before - only when that
@@ -30,8 +34,8 @@
  * swapchain's waits; GPU-bound frames and a server busy elsewhere land here); other when none
  * reaches a fifth of the frame - the game's own work, FEX translating, CPU clocks (S6-S8 in the
  * stutter plan). Each class is capped at the frame's length: compiles on several threads can sum
- * past it. Until 2026-11-05 any texel converted in the two frames made a wait "bc": GTA V,
- * G615 had 394 ms waits after 0.1 Mtex called bc; the summary now
+ * past it. Until 2026-11-05 any texel converted in the two frames made a wait "bc": a player log (GTA V,
+ * G615) had 394 ms waits after 0.1 Mtex called bc; the summary now
  * counts the waits that came after conversions too small to explain them.
  *
  * At the process's end one line counts the hitches by cause, and while it runs a "so far" line
@@ -41,7 +45,7 @@
  *
  * Suspend: the app stops the whole session (SIGSTOP, SessionSuspendController) when its screen goes
  * away and continues it later; CLOCK_MONOTONIC runs on meanwhile, so the frame that spans it is as
- * long as the suspend (GTA5.exe 2812 ms and 45016 ms, 2026-11-05).
+ * long as the suspend (a player log: GTA5.exe 2812 ms and 45016 ms, 2026-11-05).
  * The server notices its own stop: a beat thread ticks every BEAT_NS and a tick, or a hitch/window
  * message arriving before one, that finds more than SUSP_GAP_NS since the last records the interval as
  * suspended (from one beat after the last tick, so a real hitch is never hidden by the estimate).
@@ -182,6 +186,7 @@ static uint64_t susp_overlap(uint64_t t0, uint64_t t1)
 
 typedef struct hev {
     uint64_t t0, t1, ns, bytes, gpu_ns; /* gpu_ns: BC conversions' estimated GPU time (vkb_hitch_note_bc) */
+    uint64_t inflight_ns;               /* BC: the conversions in flight after this one was recorded (the most, merged) */
     uint32_t n;
     uint32_t cls;
 } hev;
@@ -220,7 +225,25 @@ struct vkb_hitch {
     uint64_t skipped_total; /* hitch lines the rate limit left out */
     uint64_t susp_frames, susp_total_ns, win_susp_frames, susp_lines; /* frames that spanned a suspend (see the header) */
     int presented; /* a window or a hitch came: the process shows frames (else no summary at its end) */
+    uint64_t bc_inflight_ns; /* BC conversions recorded and not finished, estimated (vkb_hitch_note_bc / vkb_hitch_bc_done; atomic) */
 };
+
+/* The estimate against the conversions' measured GPU time, every process (vkb_hitch_bc_calib; atomic) */
+static uint64_t g_cal_est, g_cal_gpu;
+#define CAL_MIN_NS 20000000ull
+
+void vkb_hitch_bc_calib(uint64_t est_ns, uint64_t gpu_ns)
+{
+    __atomic_add_fetch(&g_cal_est, est_ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_cal_gpu, gpu_ns, __ATOMIC_RELAXED);
+}
+
+/* measured / estimated, 0 until CAL_MIN_NS of estimate were read */
+static double cal_scale(void)
+{
+    uint64_t e = __atomic_load_n(&g_cal_est, __ATOMIC_RELAXED), g = __atomic_load_n(&g_cal_gpu, __ATOMIC_RELAXED);
+    return e >= CAL_MIN_NS ? (double)g / (double)e : 0;
+}
 
 uint64_t vkb_hitch_now(void)
 {
@@ -270,11 +293,12 @@ void vkb_hitch_enable(vkb_srv_proc *p, uint32_t ms)
              p->comm[0] ? p->comm : "?", ms);
 }
 
-static void note(vkb_srv_proc *p, int cls, uint64_t t0, uint64_t t1, uint32_t n, uint64_t bytes, uint64_t gpu_ns)
+static void note(vkb_srv_proc *p, int cls, uint64_t t0, uint64_t t1, uint32_t n, uint64_t bytes, uint64_t gpu_ns, uint64_t inflight_add)
 {
     struct vkb_hitch *h = p ? __atomic_load_n(&p->hitch, __ATOMIC_ACQUIRE) : NULL;
     if (!h || cls < 0 || cls >= VKB_HITCH_CLASSES) return;
     if (t1 < t0) t1 = t0;
+    uint64_t inflight = inflight_add ? __atomic_add_fetch(&h->bc_inflight_ns, inflight_add, __ATOMIC_RELAXED) : 0;
     pthread_mutex_lock(&h->lock);
     hev *last = h->written ? &h->ev[(h->written - 1) % HITCH_RING] : NULL;
     if (last && last->cls == (uint32_t)cls && t0 <= last->t1 + MERGE_NS && t1 >= last->t0) {
@@ -284,8 +308,9 @@ static void note(vkb_srv_proc *p, int cls, uint64_t t0, uint64_t t1, uint32_t n,
         last->n += n;
         last->bytes += bytes;
         last->gpu_ns += gpu_ns;
+        if (inflight > last->inflight_ns) last->inflight_ns = inflight;
     } else {
-        h->ev[h->written % HITCH_RING] = (hev){t0, t1, t1 - t0, bytes, gpu_ns, n, (uint32_t)cls};
+        h->ev[h->written % HITCH_RING] = (hev){t0, t1, t1 - t0, bytes, gpu_ns, inflight, n, (uint32_t)cls};
         h->written++;
     }
     pthread_mutex_unlock(&h->lock);
@@ -293,12 +318,22 @@ static void note(vkb_srv_proc *p, int cls, uint64_t t0, uint64_t t1, uint32_t n,
 
 void vkb_hitch_note(vkb_srv_proc *p, int cls, uint64_t t0, uint64_t t1, uint32_t n, uint64_t bytes)
 {
-    note(p, cls, t0, t1, n, bytes, 0);
+    note(p, cls, t0, t1, n, bytes, 0, 0);
 }
 
-void vkb_hitch_note_bc(vkb_srv_proc *p, uint64_t t0, uint64_t t1, uint64_t texels, uint64_t gpu_est_ns)
+void vkb_hitch_note_bc(vkb_srv_proc *p, uint64_t t0, uint64_t t1, uint64_t texels, uint64_t gpu_est_ns, uint64_t inflight_ns)
 {
-    note(p, VKB_HITCH_BC, t0, t1, 1, texels, gpu_est_ns);
+    note(p, VKB_HITCH_BC, t0, t1, 1, texels, gpu_est_ns, inflight_ns);
+}
+
+/* A command buffer's conversions are over: off the in-flight sum (never below 0: hitch lines turned on after some were recorded) */
+void vkb_hitch_bc_done(vkb_srv_proc *p, uint64_t inflight_ns)
+{
+    struct vkb_hitch *h = p ? __atomic_load_n(&p->hitch, __ATOMIC_ACQUIRE) : NULL;
+    if (!h || !inflight_ns) return;
+    uint64_t v = __atomic_load_n(&h->bc_inflight_ns, __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(&h->bc_inflight_ns, &v, v > inflight_ns ? v - inflight_ns : 0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
 }
 
 /* A compile taking at least half the threshold gets a line of its own (the hitch line has only
@@ -320,10 +355,10 @@ void vkb_hitch_compile(vkb_srv_proc *p, const char *what, uint32_t n, uint64_t t
  * what size, and the GPU time estimated for it (whole entries); *lost: the ring no longer reaches
  * back to ws. */
 static void sum_gpu(struct vkb_hitch *h, int cls, uint64_t ws, uint64_t we, double *ms, uint64_t *n, uint64_t *bytes, double *gpu_ms,
-                    int *lost)
+                    int *lost, uint64_t *inflight_peak)
 {
     double ns = 0, gns = 0;
-    uint64_t cnt = 0, b = 0;
+    uint64_t cnt = 0, b = 0, peak = 0;
     uint64_t have = h->written < HITCH_RING ? h->written : HITCH_RING;
     uint64_t i = 0;
     for (; i < have; i++) {
@@ -338,8 +373,10 @@ static void sum_gpu(struct vkb_hitch *h, int cls, uint64_t ws, uint64_t we, doub
         cnt += e->n;
         b += e->bytes;
         gns += (double)e->gpu_ns;
+        if (e->inflight_ns > peak) peak = e->inflight_ns;
     }
     if (i == have && h->written > HITCH_RING) *lost = 1;
+    if (inflight_peak) *inflight_peak = peak;
     *ms = ns / 1e6;
     if (n) *n = cnt;
     if (bytes) *bytes = b;
@@ -348,7 +385,7 @@ static void sum_gpu(struct vkb_hitch *h, int cls, uint64_t ws, uint64_t we, doub
 
 static void sum(struct vkb_hitch *h, int cls, uint64_t ws, uint64_t we, double *ms, uint64_t *n, uint64_t *bytes, int *lost)
 {
-    sum_gpu(h, cls, ws, we, ms, n, bytes, NULL, lost);
+    sum_gpu(h, cls, ws, we, ms, n, bytes, NULL, lost, NULL);
 }
 
 static double cap(double v, double lim) { return v > lim ? lim : v; }
@@ -504,6 +541,11 @@ static void window(vkb_srv_proc *p, struct vkb_hitch *h, const vkb_hitch_msg *m)
     }
     have3 = sofar_text(p, h, m->t_end, l3, sizeof(l3));
     pthread_mutex_unlock(&h->lock);
+    /* the 10-s performance window (server_perf.c): this second's numbers */
+    vkb_perf_win pw = {m->t_start, m->t_end, susp, m->frames, w.over, m->repeats, w.worst_ns, {0}, w.wns[VKB_HITCH_W_APP] / 1e6,
+                       w.wns[VKB_HITCH_W_PRESENT] / 1e6, m->present_rt_ns / 1e6, w.cms, w.bms, w.ams, m->ft_p50_us, m->ft_p90_us};
+    for (int i = 0; i < C_COUNT && i < VKB_PERF_CAUSES; i++) pw.causes[i] = w.causes[i];
+    vkb_perf_window(p, &pw);
     if (have1) VKB_INFO("%s", l1);
     if (have2) VKB_INFO("%s", l2);
     if (have3) VKB_INFO("%s", l3);
@@ -556,10 +598,14 @@ void vkb_sv_vkbHitch(vkb_srv_call *c)
     pthread_mutex_lock(&h->lock);
     sum(h, C_COMPILE, m.t_start, m.t_end, &cms, &cn, NULL, &lost);
     sum(h, C_BC, m.t_start, m.t_end, &bms, &bn, &btex, &lost);
-    sum_gpu(h, C_BC, m.t_prev, m.t_end, &recent_ms, &rn, &rtex, &rgpu_ms, &lost);
+    uint64_t in_peak = 0;
+    sum_gpu(h, C_BC, m.t_prev, m.t_end, &recent_ms, &rn, &rtex, &rgpu_ms, &lost, &in_peak);
     sum(h, C_ALLOC, m.t_start, m.t_end, &ams, &an, &abytes, &lost);
     sum(h, C_PCACHE, m.t_start, m.t_end, &pms, NULL, NULL, &lost);
     pthread_mutex_unlock(&h->lock);
+    uint64_t in_now = __atomic_load_n(&h->bc_inflight_ns, __ATOMIC_RELAXED);
+    double in_scale = cal_scale();
+    double inflight_ms = (double)(in_now > in_peak ? in_now : in_peak) / 1e6 * (in_scale > 0 ? in_scale : 1.0);
     const vkb_hitch_wait *wa = &m.w[VKB_HITCH_W_APP], *wp = &m.w[VKB_HITCH_W_PRESENT], *wr = &m.w[VKB_HITCH_W_RT];
     double wait_ms = wa->ns / 1e6, present_ms = wp->ns / 1e6;
     double v[C_COUNT] = {cap(cms, frame_ms), cap(bms, frame_ms), cap(ams, frame_ms), cap(pms, frame_ms),
@@ -609,11 +655,11 @@ void vkb_sv_vkbHitch(vkb_srv_call *c)
     const vkb_hitch_wait *lw = wa->max_ns >= wp->max_ns ? wa : wp;
     if (lw->max_ns) snprintf(wmax, sizeof(wmax), "%s@%s", wait_name(lw->max_cmd), lw->max_thread[0] ? lw->max_thread : "?");
     VKB_INFO("hitch: frame=%llu ms=%.0f cause=%s compile_ms=%.0f compiles=%llu bc_ms=%.0f bc_mtex=%.1f bc_recent_mtex=%.1f bc_n=%llu "
-             "bc_recent_n=%llu bc_gpu_est_ms=%.0f alloc_ms=%.0f "
+             "bc_recent_n=%llu bc_gpu_est_ms=%.0f bc_inflight_est_ms=%.1f alloc_ms=%.0f "
              "allocs=%llu alloc_mb=%llu pcache_ms=%.0f wait_ms=%.0f wait_n=%llu wait_max_ms=%.0f wait_max=%s present_ms=%.0f "
              "rt_ms=%.0f rt_n=%llu pid=%d comm=%s%s%s",
              (unsigned long long)m.frame, frame_ms, cause_name[top], cms, (unsigned long long)cn, bms, btex / 1e6, rtex / 1e6,
-             (unsigned long long)bn, (unsigned long long)rn, rgpu_ms, ams,
+             (unsigned long long)bn, (unsigned long long)rn, rgpu_ms, inflight_ms, ams,
              (unsigned long long)an, (unsigned long long)(abytes >> 20), pms, wait_ms, (unsigned long long)wa->n,
              (lw->max_ns) / 1e6, wmax, present_ms, wr->ns / 1e6, (unsigned long long)wr->n, p->pid, p->comm[0] ? p->comm : "?",
              lost ? " lost=1" : "", sus);
@@ -621,6 +667,7 @@ void vkb_sv_vkbHitch(vkb_srv_call *c)
 
 void vkb_hitch_proc_gone(vkb_srv_proc *p)
 {
+    vkb_perf_proc_gone(p);
     struct vkb_hitch *h = p ? __atomic_exchange_n(&p->hitch, NULL, __ATOMIC_ACQ_REL) : NULL;
     if (!h) return;
     if (h->pend.windows) { /* the merged windows not written yet */
@@ -639,6 +686,10 @@ void vkb_hitch_proc_gone(vkb_srv_proc *p)
                  h->worst_ms, (unsigned long long)h->skipped_total);
         small_bc_text(h, l, sizeof(l));
         susp_text(h, l, sizeof(l));
+        double sc = cal_scale();
+        size_t len = strlen(l);
+        if (sc > 0 && len < sizeof(l) - 1)
+            snprintf(l + len, sizeof(l) - len, "; BC conversions' GPU time measured %.2fx the estimate (bc_inflight_est_ms scaled by it)", sc);
         VKB_INFO("%s", l);
     } else if (h->presented) {
         char l[512];

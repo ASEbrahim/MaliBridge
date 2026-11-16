@@ -5,7 +5,7 @@
  * (common/vkb_crashctx.h notes) and what those handles are, from records of the images, memory
  * allocations and graphics pipelines made last.
  *
- * Why: Mali-G615 MC6 r44p1 - the one server died in the driver's vkBindImageMemory and
+ * Why: a player log (Mali-G615 MC6 r44p1) - the one server died in the driver's vkBindImageMemory and
  * took every program with it; the line named the call and nothing else: not whose it was (binds
  * are asynchronous, any process's thread could have sent it), nor the image or the memory. a player log
  * (G615 MC2 r44p1): a near-null read in the driver's vkCmdDraw[Indexed], with no word on what
@@ -321,7 +321,8 @@ int vkb_crashctx_where(char *buf, size_t cap, const void *addr)
     name[16] = 0;
     ADD("vkbridge-server E   thread %ld \"%s\"", (long)syscall(SYS_gettid), name);
     /* What the faulting address is: a PROT_NONE part of the heap's reservation, a guard page, a
-     * mapping of the GPU's memory (/dev/mali0, a dma-buf) or nothing at all (* SEGV_ACCERR in Mali's vkBindImageMemory/vkAllocateMemory at addresses far from any pointer the
+     * mapping of the GPU's memory (/dev/mali0, a dma-buf) or nothing at all (a player log:
+     * SEGV_ACCERR in Mali's vkBindImageMemory/vkAllocateMemory at addresses far from any pointer the
      * bridge saw). /proc/self/maps read with open/read only, scanned line by line. */
     uint64_t want = (uint64_t)(uintptr_t)addr;
     int fd = want ? open("/proc/self/maps", O_RDONLY | O_CLOEXEC) : -1;
@@ -398,7 +399,7 @@ static uint32_t test_id(void)
     return t && t->id < VKB_MAX_TABLES ? t->id : 0;
 }
 
-/* VKBRIDGE_TEST_CRASH_ACCERR=1: the fault is kind (SEGV_ACCERR/5PA6): a 2-byte
+/* VKBRIDGE_TEST_CRASH_ACCERR=1: the fault is the player's kind (SEGV_ACCERR, a player log): a 2-byte
  * store at an odd offset into a mapping without access, not a near-null write. */
 /* VKBRIDGE_TEST_CRASH_LOCK=1 (with ONCE): the imitated driver call takes a lock of the driver's (one
  * for every device, as an allocator's) and the fault comes while it is held; the jump back leaves it
@@ -410,6 +411,42 @@ static uint32_t test_lock_dev;
 static void test_fault_at(uintptr_t where, int read);
 
 static void test_fault(void) { test_fault_at(0x40, 0); }
+
+/* VKBRIDGE_TEST_CRASH_THREADS=n: n threads fault at the same moment (the faulting call's and n-1 more, met at a barrier),
+ * as several driver threads do at a device loss (a player log): the crash handler's lines must stay whole (crashline_test 8) */
+static pthread_barrier_t test_crash_bar;
+
+/* peer i faults 3i calls deep right after the barrier: each thread's frames differ, their handlers run at once */
+static volatile uintptr_t test_crash_addr = 0x40; /* read at run time: no array-bounds warning for the constant */
+
+__attribute__((noinline)) static void test_crash_deep(volatile int d)
+{
+    if (d > 0) test_crash_deep(d - 1);
+    else *(volatile int *)test_crash_addr = 1;
+    __asm__ volatile("" ::: "memory"); /* not a tail call: every level stays a frame */
+}
+
+static void *test_crash_peer(void *arg)
+{
+    int i = (int)(intptr_t)arg;
+    pthread_barrier_wait(&test_crash_bar);
+    test_crash_deep(i * 3);
+    return NULL;
+}
+
+static void test_crash_together(void)
+{
+    const char *e = getenv("VKBRIDGE_TEST_CRASH_THREADS");
+    int n = e ? atoi(e) : 0;
+    if (n < 2) return;
+    if (n > 16) n = 16;
+    if (pthread_barrier_init(&test_crash_bar, NULL, (unsigned)n)) return;
+    for (int i = 1; i < n; i++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, test_crash_peer, (void *)(intptr_t)i) == 0) pthread_detach(th);
+    }
+    pthread_barrier_wait(&test_crash_bar);
+}
 
 static void test_fault_at(uintptr_t where, int read)
 {
@@ -433,6 +470,14 @@ static void test_fault_at(uintptr_t where, int read)
         char *p = mmap(NULL, 65536, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) *(volatile uint16_t *)(p + 0x7e5e) = 1;
     }
+    /* VKBRIDGE_TEST_CRASH_NULL=1: a call through a NULL entry point instead (a player log: pc 0x0 on an old driver), for the
+     * crash frames' fallback (server_crashsym.c: pc, return address) */
+    const char *nul = getenv("VKBRIDGE_TEST_CRASH_NULL");
+    if (nul && *nul == '1') {
+        void (*volatile fn)(void) = NULL;
+        fn();
+    }
+    test_crash_together();
     if (read) (void)*(volatile uint64_t *)where;
     else *(volatile int *)where = 1;
 }
@@ -457,7 +502,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL test_AllocateMemory(VkDevice d, const VkMe
 }
 
 /* "xfb_unbound": Mali's vkCmdBeginTransformFeedbackEXT with no graphics pipeline bound in the command
- * buffer (at the driver: what the layers above bound) reads through the missing pipeline (* 0xe78 on the G925: 0xe60 on the G615). The driver-level binds are noted per command buffer. */
+ * buffer (at the driver: what the layers above bound) reads through the missing pipeline (a player log:
+ * 0xe78 on the G925, a player log: 0xe60 on the G615). The driver-level binds are noted per command buffer. */
 #define XFB_CBS 1024
 static struct {
     VkCommandBuffer cb;
@@ -554,7 +600,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL test_QueueSubmit2(VkQueue q, uint32_t n, c
     return test_submit2_next[test_id()](q, n, si, f);
 }
 
-static int test_unbound; /* "unbound": only a draw with no graphics pipeline bound faults, as Mali's driver does */
+static int test_unbound; /* "unbound": only a draw with no graphics pipeline bound faults, as Mali's driver does (a player log) */
 
 static VKAPI_ATTR void VKAPI_CALL test_CmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi)
 {
@@ -566,6 +612,99 @@ static VKAPI_ATTR void VKAPI_CALL test_CmdDrawIndexed(VkCommandBuffer cb, uint32
 {
     if (vkb_srv_replay_cb && (!test_unbound || !vkb_srv_replay_gfx)) test_fault();
     test_drawi_next[test_id()](cb, ic, n, fi, vo, fin);
+}
+
+/* VKBRIDGE_TEST_CRASH_CMD=import_race (host tests, a player log): the player's driver race imitated beneath
+ * every layer. A client's vkAllocateMemory / vkFreeMemory / vkBind{Buffer,Image}Memory stays in the "driver" for
+ * VKBRIDGE_TEST_IMPORT_RACE_MS (20) ms; an allocation that imports (a dma-buf fd) while another device's such call
+ * is in there faults the way the player's did: SEGV_ACCERR, a 2-byte store into a mapping without access. */
+static PFN_vkAllocateMemory race_alloc_next[VKB_MAX_TABLES];
+static PFN_vkFreeMemory race_free_next[VKB_MAX_TABLES];
+static PFN_vkBindBufferMemory race_bindb_next[VKB_MAX_TABLES];
+static PFN_vkBindImageMemory race_bindi_next[VKB_MAX_TABLES];
+static int race_in[VKB_MAX_TABLES];
+static int race_total;
+
+static int race_others(uint32_t id)
+{
+    return __atomic_load_n(&race_total, __ATOMIC_ACQUIRE) - __atomic_load_n(&race_in[id], __ATOMIC_ACQUIRE);
+}
+
+static void race_enter(uint32_t id, int import)
+{
+    __atomic_add_fetch(&race_in[id], 1, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&race_total, 1, __ATOMIC_ACQ_REL);
+    const char *e = getenv("VKBRIDGE_TEST_IMPORT_RACE_MS");
+    long ms = e && *e ? atol(e) : 20;
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    if (!import) {
+        nanosleep(&ts, NULL);
+        return;
+    }
+    /* the import looks at the others through its time in the driver */
+    for (long i = 0; i < ms; i++) {
+        if (race_others(id) > 0) {
+            __atomic_sub_fetch(&race_in[id], 1, __ATOMIC_ACQ_REL);
+            __atomic_sub_fetch(&race_total, 1, __ATOMIC_ACQ_REL);
+            VKB_WARN("VKBRIDGE_TEST_CRASH_CMD=import_race: an import beside another device's memory call: faulting as Mali r44p1 did");
+            char *p = mmap(NULL, 65536, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p != MAP_FAILED) *(volatile uint16_t *)(p + 0xe4ba) = 1;
+            test_fault_at(0x40, 0); /* no mapping to fault in: the near-null kind */
+        }
+        struct timespec one = {0, 1000000L};
+        nanosleep(&one, NULL);
+    }
+}
+
+static void race_leave(uint32_t id)
+{
+    __atomic_sub_fetch(&race_in[id], 1, __ATOMIC_ACQ_REL);
+    __atomic_sub_fetch(&race_total, 1, __ATOMIC_ACQ_REL);
+}
+
+static int race_client(void) { return vkb_srv_current_table() != NULL; }
+
+static VKAPI_ATTR VkResult VKAPI_CALL race_AllocateMemory(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a,
+                                                          VkDeviceMemory *out)
+{
+    uint32_t id = test_id();
+    int imp = 0;
+    for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR && ((const VkImportMemoryFdInfoKHR *)b)->fd >= 0) imp = 1;
+    int on = race_client();
+    if (on) race_enter(id, imp);
+    VkResult r = race_alloc_next[id](d, ai, a, out);
+    if (on) race_leave(id);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL race_FreeMemory(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a)
+{
+    uint32_t id = test_id();
+    int on = race_client();
+    if (on) race_enter(id, 0);
+    race_free_next[id](d, m, a);
+    if (on) race_leave(id);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL race_BindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize o)
+{
+    uint32_t id = test_id();
+    int on = race_client();
+    if (on) race_enter(id, 0);
+    VkResult r = race_bindb_next[id](d, b, m, o);
+    if (on) race_leave(id);
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL race_BindImageMemory(VkDevice d, VkImage i, VkDeviceMemory m, VkDeviceSize o)
+{
+    uint32_t id = test_id();
+    int on = race_client();
+    if (on) race_enter(id, 0);
+    VkResult r = race_bindi_next[id](d, i, m, o);
+    if (on) race_leave(id);
+    return r;
 }
 
 void vkb_crashctx_test_init(vkb_srv_table *t)
@@ -585,6 +724,23 @@ void vkb_crashctx_test_init(vkb_srv_table *t)
         XFB_HOOK(vkCmdBeginTransformFeedbackEXT, xfb_CmdBeginTransformFeedbackEXT, xfb_next);
 #undef XFB_HOOK
         VKB_WARN("VKBRIDGE_TEST_CRASH_CMD=xfb_unbound: transform feedback begun with no graphics pipeline bound faults (imitated Mali)");
+        return;
+    }
+    if (!strcmp(want, "import_race")) {
+#define RACE_HOOK(field, fn, next)                                                                   \
+    do {                                                                                             \
+        if (t->real.field) {                                                                         \
+            next[t->id] = t->real.field;                                                             \
+            if (t->dt.field == t->real.field) t->dt.field = fn;                                     \
+            t->real.field = fn;                                                                      \
+        }                                                                                            \
+    } while (0)
+        RACE_HOOK(vkAllocateMemory, race_AllocateMemory, race_alloc_next);
+        RACE_HOOK(vkFreeMemory, race_FreeMemory, race_free_next);
+        RACE_HOOK(vkBindBufferMemory, race_BindBufferMemory, race_bindb_next);
+        RACE_HOOK(vkBindImageMemory, race_BindImageMemory, race_bindi_next);
+#undef RACE_HOOK
+        VKB_WARN("VKBRIDGE_TEST_CRASH_CMD=import_race: an import beside another device's memory call faults (imitated Mali r44p1)");
         return;
     }
     if (!strcmp(want, "unbound")) {

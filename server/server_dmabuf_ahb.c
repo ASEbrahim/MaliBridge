@@ -4,8 +4,8 @@
  * dma-buf external memory carried by AHardwareBuffers (VKB_EMU_DMABUF_AHB).
  *
  * gamescope enables VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf unconditionally
- * and stops without them. Kirin's Mali drivers (a player log Kirin 9000E G78 r23p0 G76 r18p0,
- * a player log G76 r19p0 G52), the Maleoon 910 and ChromeOS's Venus have neither, no
+ * and stops without them. Kirin's Mali drivers (a player log Kirin 9000E G78 r23p0, a player log G76 r18p0,
+ * a player log G76 r19p0, a player log G52), the Maleoon 910 (a player log) and ChromeOS's Venus have neither, no
  * VK_EXT_image_drm_format_modifier and no /dev/dma_heap, but they import AHardwareBuffers (the
  * ahb_share probe passed on a player log). Every exporter and importer of those dma-bufs is a client of
  * this one server (gamescope, Xwayland and Steam through Zink, the bridge's own swapchains) or
@@ -27,7 +27,7 @@
  *     (Zink and the bridge's swapchains export LINEAR images without modifiers, gamescope imports
  *     them as OPTIMAL: both then lay them out alike); an import whose image is laid out unlike the
  *     exporter's (row pitch, size, extent) is refused rather than shown as garbage;
- *   - DroidDeck's compositor asks vkb_dmabuf_ahb_lookup for the buffer and the exporter's image
+ *   - DroidDeck's compositor asks vkb_dmabuf_ahb_lookup() for the buffer and the exporter's image
  *     and makes the same image over it (vkb_dmabuf_ahb.h).
  * Images bound to BLOB AHardwareBuffer memory are outside the letter of the spec (they are not made
  * with the AHB handle type). The start's check (vkb_dab_selfcheck) runs exactly that - one buffer
@@ -663,6 +663,26 @@ static int pd_on(const vkb_dispatch *real, VkPhysicalDevice pd)
     return k && (k->info.emu & VKB_EMU_DMABUF_AHB);
 }
 
+/* VKB_EMU_DRM_MOD_LINEAR (server_emu.c): the driver has dma-buf memory and its export is emulated, but
+ * it has no VK_EXT_image_drm_format_modifier (Mali-G720 r49p1). The modifier extension's queries are
+ * answered here as on the AHardwareBuffer path, with the LINEAR modifier only, a plain LINEAR image
+ * standing for it; every other query (dma-buf images at LINEAR or OPTIMAL tiling, buffers) is the
+ * driver's, as before. */
+static int drmmod_seen;
+
+void vkb_dab_drmmod_note(void)
+{
+    __atomic_store_n(&drmmod_seen, 1, __ATOMIC_RELEASE);
+}
+
+static int pd_drmmod(const vkb_dispatch *real, VkPhysicalDevice pd)
+{
+    if (!__atomic_load_n(&drmmod_seen, __ATOMIC_ACQUIRE)) return 0;
+    const vkb_pd_knowledge *k = vkb_pd_lookup(real, pd);
+    const uint32_t both = VKB_EMU_DRM_MOD_LINEAR | VKB_EMU_DMABUF_EXPORT;
+    return k && (k->info.emu & both) == both && !(k->info.emu & VKB_EMU_DMABUF_AHB);
+}
+
 /* The tiling a dma-buf image of this description is made with: LINEAR where the check passed it
  * and the driver makes such an image, else as asked. */
 static VkImageTiling made_tiling(const vkb_dispatch *real, VkPhysicalDevice pd, VkFormat format, VkImageType type, VkImageTiling tiling,
@@ -759,7 +779,7 @@ void vkb_dab_image_created(vkb_emu_device *e, VkImage image, const VkImageCreate
     i->asked_dmabuf = n->dmabuf;
     vkb_dmabuf_ahb_info *x = &i->d;
     x->has_image = 1;
-    x->format = (uint32_t)ci->format;
+    x->format = (uint32_t)vkb_errata_pvbgra_format(t, image, ci->format); /* PV-07: R8G8B8A8 where the driver holds it so */
     x->width = ci->extent.width;
     x->height = ci->extent.height;
     x->tiling = (uint32_t)ci->tiling;
@@ -771,7 +791,8 @@ void vkb_dab_image_created(vkb_emu_device *e, VkImage image, const VkImageCreate
     for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
             const VkImageFormatListCreateInfo *fl = (const void *)b;
-            for (uint32_t k = 0; k < fl->viewFormatCount && x->view_format_count < 8; k++) x->view_formats[x->view_format_count++] = fl->pViewFormats[k];
+            for (uint32_t k = 0; k < fl->viewFormatCount && x->view_format_count < 8; k++)
+                x->view_formats[x->view_format_count++] = (uint32_t)vkb_errata_pvbgra_format(t, image, fl->pViewFormats[k]);
         }
     pthread_mutex_lock(&d->lock);
     unsigned h = img_hash(image);
@@ -823,9 +844,9 @@ int vkb_dab_linear_modifier(void)
 }
 
 /* The usages a plain LINEAR image may be made with when the driver refuses the asked one: gamescope asks for
- * its images with SAMPLED | STORAGE | TRANSFER_SRC (0xd) and Mali r18p0 (Kirin 810) refused that
+ * its images with SAMPLED | STORAGE | TRANSFER_SRC (0xd) and Mali r18p0 (Kirin 810, a player log) refused that
  * as a LINEAR image (-11) while it made LINEAR images of Zink's usages; gamescope then found no modifier
- * and stopped on "modifiers.size > 0". A LINEAR-modifier image is the bridge's own plain LINEAR one, so
+ * and stopped on "modifiers.size() > 0". A LINEAR-modifier image is the bridge's own plain LINEAR one, so
  * what the driver cannot do at LINEAR is dropped from it: first the storage bit, then the transfer-source
  * bit as well (a client's dma-buf image is sampled; the storage bit is gamescope's blanket request).
  * The asked usage comes first, so a driver that takes it is unchanged. Returns the number of usages
@@ -874,7 +895,8 @@ void vkb_dab_linear_usage(vkb_srv_table *t, VkImageCreateInfo *ci)
 static VKAPI_ATTR void VKAPI_CALL dab_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat format, VkFormatProperties2 *props)
 {
     const vkb_dispatch *real = &vkb_srv_current_table()->real;
-    if (!pd_on(real, pd)) {
+    int drmmod = 0;
+    if (!pd_on(real, pd) && !(drmmod = pd_drmmod(real, pd))) {
         real->vkGetPhysicalDeviceFormatProperties2(pd, format, props);
         return;
     }
@@ -887,7 +909,7 @@ static VKAPI_ATTR void VKAPI_CALL dab_GetPhysicalDeviceFormatProperties2(VkPhysi
     VkFormatFeatureFlags2 lin2 = lin;
     for (const VkBaseInStructure *b = props->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) lin2 = ((const VkFormatProperties3 *)b)->linearTilingFeatures;
-    uint32_t n = check_linear && lin && lin_mod_ok(format) ? 1 : 0;
+    uint32_t n = (check_linear || drmmod) && lin && lin_mod_ok(format) ? 1 : 0;
     if (l) {
         if (l->pDrmFormatModifierProperties && l->drmFormatModifierCount && n)
             l->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){0 /* DRM_FORMAT_MOD_LINEAR */, 1, lin};
@@ -914,7 +936,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL dab_GetPhysicalDeviceImageFormatProperties
         if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT) mi = (const void *)b;
     }
     int dmabuf = ei && ei->handleType == DMABUF, mod = info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-    if ((!dmabuf && !mod) || !pd_on(real, pd)) return real->vkGetPhysicalDeviceImageFormatProperties2(pd, info, props);
+    if ((!dmabuf && !mod) || (!pd_on(real, pd) && !(mod && pd_drmmod(real, pd)))) return real->vkGetPhysicalDeviceImageFormatProperties2(pd, info, props);
+    int drmmod = !pd_on(real, pd); /* the modifier extension alone (pd_drmmod): only the DRM-modifier queries come here */
     VkPhysicalDeviceImageFormatInfo2 *ii = (VkPhysicalDeviceImageFormatInfo2 *)info;
     VkBaseOutStructure *took_ei = dmabuf ? vkb_emu_chain_take(ii, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO) : NULL;
     VkBaseOutStructure *took_mi = mi ? vkb_emu_chain_take(ii, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT) : NULL;
@@ -926,11 +949,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL dab_GetPhysicalDeviceImageFormatProperties
         ii->tiling = made_tiling(real, pd, ii->format, ii->type, ii->tiling, ii->usage, ii->flags, NULL, 1, 1, VK_SAMPLE_COUNT_1_BIT);
         if (lo_refused(ii->tiling)) lo_told(" (a format query)", ii->format, NULL, 1, 1, VK_SAMPLE_COUNT_1_BIT, ii->usage);
         else r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, ii, props);
-    } else if (mi && mi->drmFormatModifier == 0 /* DRM_FORMAT_MOD_LINEAR */ && check_linear && lin_mod_ok(ii->format) &&
+    } else if (mi && mi->drmFormatModifier == 0 /* DRM_FORMAT_MOD_LINEAR */ && (check_linear || drmmod) && lin_mod_ok(ii->format) &&
                ii->type == VK_IMAGE_TYPE_2D) {
         ii->tiling = VK_IMAGE_TILING_LINEAR; /* the LINEAR modifier: a plain LINEAR image */
         VkImageUsageFlags u[3], asked_usage = ii->usage;
-        unsigned nu = linear_usages(asked_usage, u);
+        unsigned nu = drmmod ? (u[0] = asked_usage, 1) : linear_usages(asked_usage, u); /* drmmod: the image is made with the asked usage */
         for (unsigned i = 0; i < nu; i++) {
             ii->usage = u[i];
             r = real->vkGetPhysicalDeviceImageFormatProperties2(pd, ii, props);
@@ -980,10 +1003,11 @@ static VKAPI_ATTR void VKAPI_CALL dab_GetPhysicalDeviceExternalBufferProperties(
 
 void vkb_dab_instance_install(vkb_srv_table *t)
 {
-    if (!vkb_dab_on()) return;
+    if (!vkb_dab_on() && !__atomic_load_n(&drmmod_seen, __ATOMIC_ACQUIRE)) return;
     if (t->real.vkGetPhysicalDeviceImageFormatProperties2)
         t->dt.vkGetPhysicalDeviceImageFormatProperties2 = dab_GetPhysicalDeviceImageFormatProperties2;
     if (t->real.vkGetPhysicalDeviceFormatProperties2) t->dt.vkGetPhysicalDeviceFormatProperties2 = dab_GetPhysicalDeviceFormatProperties2;
+    if (!vkb_dab_on()) return; /* the modifier extension alone: buffers stay the driver's */
     if (t->real.vkGetPhysicalDeviceExternalBufferProperties)
         t->dt.vkGetPhysicalDeviceExternalBufferProperties = dab_GetPhysicalDeviceExternalBufferProperties;
 }

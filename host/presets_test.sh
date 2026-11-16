@@ -65,6 +65,12 @@ export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILEN
 unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API VKBRIDGE_FAKE_MISSING VKBRIDGE_MODE VKBRIDGE_DESC_BATCH VKBRIDGE_NO_DESC_BATCH VKBRIDGE_QUERY_MIRROR VKBRIDGE_SYNC_MIRROR
 unset SteamAppId SteamGameId VKBRIDGE_PCACHE_KEY
 fails=0 steps=0
+# The built-in presets are imitated for "this GPU": its deviceName's first word (RADV, llvmpipe, ...), read from the
+# log of a server of its own, not a name this test assumes (the test ran only where the ICD is RADV)
+start probe
+gpu1=$(sed -n 's/.*GPU: \([^ ]*\) .*(vendor 0x.*/\1/p' "$log" | head -1)
+stop
+[ -n "$gpu1" ] || { echo "FAILED: no GPU line in the server log"; exit 1; }
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
 
 # 1
@@ -104,7 +110,7 @@ r4=$?
 step $? "two app ids: ${a%% (*} and ${b%% (*}, pipeline cache off for 111 only, none without an id ($r1); at once ($r2); logged once each ($r3); in the report ($r4)"
 
 # 2
-fake="VKBRIDGE_PRESET_FAKE_BUILTIN=333@Mali-G720,RADV:VKBRIDGE_COMPILE_TIMEOUT_S=51 VKBRIDGE_NO_PCACHE=1;999@RADV:VKBRIDGE_COMPILE_TIMEOUT_S=9"
+fake="VKBRIDGE_PRESET_FAKE_BUILTIN=333@Mali-G720,$gpu1:VKBRIDGE_COMPILE_TIMEOUT_S=51 VKBRIDGE_NO_PCACHE=1;999@$gpu1:VKBRIDGE_COMPILE_TIMEOUT_S=9"
 start prec "$fake"
 device SteamAppId=333; p1=$(limit_of)
 echo "$new" | grep -q "persistent pipeline cache off"; p1pc=$?
@@ -144,7 +150,7 @@ step $? "precedence: built-in ${p1%% (*}, file ${p2%% (*} (built-in's other key 
 mkdir -p $work/mode/c/presets
 echo safe > $work/mode/c/mode
 echo "VKBRIDGE_MODE=performance" > $work/mode/c/presets/555.env
-start mode "VKBRIDGE_PRESET_FAKE_BUILTIN=556@RADV:VKBRIDGE_MODE=performance"
+start mode "VKBRIDGE_PRESET_FAKE_BUILTIN=556@$gpu1:VKBRIDGE_MODE=performance"
 device SteamAppId=555
 echo "$new" | grep -q "mode: performance (the game's preset file)" && echo "$new" | grep -q "errata: device .*performance mode" &&
   echo "$new" | grep -q "compile watchdog: interrupt after 20 s now (performance mode)"; m1l=$?
@@ -153,7 +159,7 @@ echo "$new" | grep -q "mode: safe (Setup) - changed" && echo "$new" | grep -q "e
 device SteamAppId=556
 echo "$new" | grep -q "mode: performance (the game's built-in preset)"; m3l=$?
 echo "VKBRIDGE_MODE=safe" > $work/mode/c/env
-start mode "VKBRIDGE_PRESET_FAKE_BUILTIN=556@RADV:VKBRIDGE_MODE=performance"
+start mode "VKBRIDGE_PRESET_FAKE_BUILTIN=556@$gpu1:VKBRIDGE_MODE=performance"
 device SteamAppId=555
 echo "$new" | grep -q "mode: performance (the game's preset file)"; m4l=$?
 device SteamAppId=556
@@ -198,8 +204,8 @@ mp=$(msgs SteamAppId=444); mn=$(msgs SteamAppId=445); mg=$(msgs SteamAppId=444 V
 step $? "client switch: VKBRIDGE_DESC_BATCH=0 in 444's preset $mp (guest's =0: $mb), none $mn, guest's =1 wins $mg"
 
 # 6
-start gpu "VKBRIDGE_PRESET_FAKE_BUILTIN=600@Mali-G925,RADV:VKBRIDGE_COMPILE_TIMEOUT_S=61;601@Mali-G720,Mali-G925:VKBRIDGE_COMPILE_TIMEOUT_S=62 VKBRIDGE_NO_PCACHE=1;602:VKBRIDGE_COMPILE_TIMEOUT_S=63"
-gpu=$(grep -o 'GPU: .* (vendor 0x' $log | sed 's/^GPU: //; s/ (vendor 0x$//' | paste -sd, - | sed 's/,/, /g')
+start gpu "VKBRIDGE_PRESET_FAKE_BUILTIN=600@Mali-G925,$gpu1:VKBRIDGE_COMPILE_TIMEOUT_S=61;601@Mali-G720,Mali-G925:VKBRIDGE_COMPILE_TIMEOUT_S=62 VKBRIDGE_NO_PCACHE=1;602:VKBRIDGE_COMPILE_TIMEOUT_S=63"
+gpu=$(grep -o 'GPU: .* (vendor 0x' $log | sed 's/^GPU: //; s/ (vendor 0x$//' | awk '{printf "%s%s", (NR > 1 ? ", " : ""), $0}')
 device SteamAppId=600; g1=$(limit_of)
 device SteamAppId=601; g2=$(limit_of); g2pc=$(echo "$new" | grep -c "persistent pipeline cache off")
 device SteamAppId=601
@@ -225,7 +231,7 @@ step $? "built-in on the GPUs tested: on $gpu 600 ${g1%% (*}, 601 (Mali only) an
 
 # 7
 stop
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

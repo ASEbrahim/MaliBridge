@@ -10,9 +10,11 @@
 #      (step 2 also checks that with no other program presenting the alarm is in the Summary, worded as before);
 #   6  a game process that exits soon after its device was created (VKBRIDGE_REPORT_QUICK_EXIT_S=3 here): "<exe> exited N s
 #      after its device was created (M frames); a Proton log helps: launch options PROTON_LOG=1 %command%" in the Summary
-#      (LEGO Indiana Jones gone 104 ms after vkCreateDevice, nothing in the log);
+#      (a player log: LEGO Indiana Jones gone 104 ms after vkCreateDevice, nothing in the log);
+#      (named for a Wine program only: .exe in its name or command line, a Steam app id, or DXVK / vkd3d as its engine);
 #   7  not for Steam's and Proton's own programs (steamwebhelper, explorer.exe, gamescope), nor for a game that ran past
-#      that with its frames counted (a normal quit); with 5 frames only, a game that ran longer is named.
+#      that with its frames counted (a normal quit); with 5 frames only, a game that ran longer is named;
+#   8  a Linux / KDE program (kup-daemon, the desktop's ksplashqml in a player log) keeps the line, without the Proton advice.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -87,17 +89,25 @@ step $([ "$n5" = 1 ] && [ "$s5" = 0 ]; echo $?) "5a program behind another that 
 kill $feed $prog2 2>/dev/null; wait $feed 2>/dev/null
 kill $prog 2>/dev/null; prog=
 
-# 6, 7: programs named as games and as Steam's / Proton's own, all exiting 1-2 s after their device
-for nm in mygame steamwebhelper explorer.exe gamescope-wl; do ln -sf "$out/pcache_check" "$work/$nm"; done
-for nm in mygame steamwebhelper explorer.exe gamescope-wl; do
+# 6, 7: programs named as games and as Steam's / Proton's own, all exiting 1-2 s after their device; 8: Linux and KDE
+# programs (the desktop's ksplashqml, kup-daemon: a player log) get the line without the Proton advice, a Steam game with a
+# Linux name keeps it
+for nm in mygame mygame.exe steamwebhelper explorer.exe gamescope-wl kup-daemon linuxgame; do ln -sf "$out/pcache_check" "$work/$nm"; done
+for nm in mygame.exe steamwebhelper explorer.exe gamescope-wl kup-daemon; do
   "$work/$nm" --count 2 --hold 1 >$work/x-$nm.log 2>&1 &
   wait $!
 done
+SteamAppId=4998 "$work/linuxgame" --count 2 --hold 1 >$work/x-linuxgame.log 2>&1 &
+wait $!
 rep6=$(report_after 7)
 sum6=$(sed -n '/^## Summary/,/^## Notes\|^## Device/p' <<<"$rep6")
-g6=$(grep -c "mygame: exited [0-9]* s after its device was created (0 frames); a Proton log helps: launch options PROTON_LOG=1 %command%" <<<"$sum6")
+g6=$(grep -c "mygame.exe: exited [0-9]* s after its device was created (0 frames); a Proton log helps: launch options PROTON_LOG=1 %command%" <<<"$sum6")
 h6=$(grep "exited [0-9]* s after its device was created" <<<"$rep6" | grep -c "steamwebhelper\|explorer.exe\|gamescope")
 step $([ "$g6" = 1 ] && [ "$h6" = 0 ]; echo $?) "6 a game exiting right after its device: the line in the Summary ($g6), the helpers' (steamwebhelper, explorer.exe, gamescope) none ($h6)"
+k8=$(grep -c "kup-daemon: exited [0-9]* s after its device was created (0 frames)$" <<<"$sum6")
+p8=$(grep "kup-daemon: exited" <<<"$rep6" | grep -c "Proton")
+s8=$(grep -c "linuxgame (steam4998): exited [0-9]* s after its device was created (0 frames); a Proton log helps" <<<"$sum6")
+step $([ "$k8" = 1 ] && [ "$p8" = 0 ] && [ "$s8" = 1 ]; echo $?) "8 a Linux program (kup-daemon): the line without the Proton advice ($k8, advice $p8); a Steam game with a Linux name keeps it ($s8)"
 
 # a game that ran past the limit with its frames counted (a normal quit): no line; with 5 frames only: the line
 "$work/mygame" --count 2 --hold 5 >$work/y.log 2>&1 &

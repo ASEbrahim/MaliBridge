@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * wait_check: every kind of wait the bridge forwards, each answered as the app should see it. For
  * the server's wait_retry erratum (server_wait.c) and its imitation of the Mali driver failing
  * waits with VK_ERROR_INITIALIZATION_FAILED (-3) after a signal; run against a server with the
@@ -22,12 +21,13 @@
  *      fence status reaches VK_SUCCESS and is never -3;
  * bug: each ends in -3 (the imitation, the fix off);
  * early: the late cases end in VK_TIMEOUT before the work is done (an early VK_TIMEOUT imitated,
- *      the fix off: what DXVK took as a lost device in Stray); "ok" wants VK_SUCCESS after
+ *      the fix off: what DXVK took as a lost device in Stray, a player log); "ok" wants VK_SUCCESS after
  *      the signal (300 ms);
  * nograce: as ok, but sem-slow wants VK_TIMEOUT at its 1 s deadline (VKBRIDGE_WAIT_GRACE_S=0, the
  *      old behaviour); "ok" wants VK_SUCCESS once the work is done (the grace). sem-nosubmit wants
  *      VK_TIMEOUT at 1 s either way;
- * lost: a finite wait on what is never signalled ends in VK_ERROR_DEVICE_LOST; the rest as ok;
+ * lost: a finite wait on what is never signalled ends in VK_ERROR_DEVICE_LOST (VKBRIDGE_WAIT_FAKE_LOST, the Arm
+ *      job-manager drivers' answer to a timed-out wait, with the check off); the rest as ok;
  * any: the results are printed, not judged.
  * One line per case, "OK: ..." / "FAILED: ..." last. Set VKBRIDGE_QUERY_MIRROR=0 so the query wait
  * reaches the server.

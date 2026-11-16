@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * dmabufsize_check: gamescope's import of a client's dma-buf on a driver without VK_EXT_image_drm_format_modifier
- * (Xiaomi 17T, Mali-G720 r49p1; Steam's window never showed). The exporter (Steam's Chromium) makes a
+ * (a player log: Xiaomi 17T, Mali-G720 r49p1; Steam's window never showed). The exporter (Steam's Chromium) makes a
  * LINEAR BGRA8 image with DMA_BUF and exports its memory; the importer (gamescope) names no modifier: an OPTIMAL
  * image, sampled, with DMA_BUF, bound to the imported dma-buf. Mali sizes the OPTIMAL image larger than the LINEAR
  * dma-buf (1564x720: 5193728 bytes against 4558848) and the import fails with VK_ERROR_INVALID_EXTERNAL_HANDLE.

@@ -14,19 +14,19 @@ cd "$(dirname "$0")"
 # With no names the whole suite runs. `--list` prints the names.
 # The Makefile/CMake `test` targets pass the output directory as the first argument; ignore it.
 VKB_TEST_NAMES="smoke smoke_memtypes smoke_xring memclass_xring fdprops_xring smoke_o1 memclass_o1
-bgr10 uf11 memclass_g720 smoke_push bcn_transcode bcn_zink bcn_zink_dynrend bcn_decode bcn_astc texcap bcn nulldesc opaque
+bgr10 uf11 memclass_g720 smoke_push bcn_transcode bcn_alpha bcn_zink bcn_zink_dynrend bcn_decode bcn_astc texcap bcn nulldesc opaque
 planar dmabuf_image fdprops memclass procaddr exitclean recycle desc_traffic flicker d3d11
-d3d11_flicker pcache wait_imitate compile_watchdog gsfold probe_report probe_end probe_tx errata
-bitwise shlbarrier promote shmbarrier wave32 clampzero views cmdstate vbbake cullmode_test dedimport
+d3d11_flicker pcache precachemem spinheap wait_imitate compile_watchdog stuck_retry drvthread gsfold probe_report probe_end probe_prio probe_tx errata
+bitwise shlbarrier promote shmbarrier wave32 clampzero splitvary views cmdstate vbbake cullmode_test dedimport
 stencillayout dynrend probe_mk viewport_test mode presets calts robust2 fp16 begin_encoding cached
-heapcap membudget asyncpipe fossilize viewport_check view3d viewchurn dynstate vbstride dedhint cullmode_check
+heapcap membudget asyncpipe fossilize viewport_check view3d viewchurn dynstate vbstride dedhint cullmode_check splitvary_check
 divisor polygon polygon_off vkcube_wayland_dmabuf vkcube_wayland_shm vkcube_x11 gamescope
-divisor_g925 divisor_khr report_stall report_stuck report_cpu report_gpumem present_timeout zerocopy_nested server_hup crashline unbound_draw lost memfault endcb xfb_bind reqguard capgate capgate_unit divisor_dynanyway gshide
-featclamp envfile unflagged eventstatus query querystuck gsexport dmabufsize dshape vtxlayout beginfail endfail secfail
-submitfail waitlost apicap ycbcr_swap driverid vidyn eds compilegate sparse a1zink envswitch poolfull heapleak lowmem exitheap xclipse_zink syncfd dmabufsync timeline imageless dabreg dmabufahb
-xfb xfb_nofold hotpath wire
-poll reqcache syncmirror stale_frames bcn_budget bcn_mixcopy hitch bcauto bcbudget bcupload latency lagprobe framequeue
-presentwait present_block compileburst querystuck_burst describe dmaheap"
+divisor_g925 divisor_khr report_stall report_stuck report_cpu report_gpumem present_timeout zerocopy_nested server_hup crashline unbound_draw lost losthygiene lostcause faultarm memfault faultsnap endcb xfb_bind reqguard capgate capgate_unit divisor_dynanyway gshide
+featclamp envfile adapter unflagged eventstatus query querystuck gsexport dmabufsize dshape vtxlayout beginfail endfail secfail
+submitfail waitlost hungarm hangdisp fragdepth apicap ycbcr_swap driverid vidyn eds compilegate sparse a1zink envswitch poolfull heapleak lowmem imgstat heapkind exitheap pvrdestroy pldedup pvsusp pvrhang fcmeet pvmutable pvbgra pcachewedge gpuprof xclipse_zink syncfd asyncgap dmabufsync timeline imageless dabreg dmabufahb
+xfb xfb_nofold hotpath wire pvnames importtype pvrange pagesize noflush pv3d zinkname
+poll reqcache fmtcache fastcreate cpuprof asynctimer querypoll asynclock syncmirror stale_frames bcn_budget bcn_convert bcn_mixcopy hitch bcauto bcsmall bcbudget bcupload bcfirst latency lagprobe framequeue
+presentwait present_block swapchain_churn present_path compileburst querystuck_burst describe dmaheap cores wlbind glglyph olddriver"
 if [ "${1:-}" = --list ]; then
   printf '%s\n' $VKB_TEST_NAMES
   exit 0
@@ -53,8 +53,8 @@ pf() { VKB_PROFILE_FOR="$VKB_PROFILE_FOR $1=$2"; }
 # Vulkan 1.2/1.3 in the test program itself (timeline semaphores, host query reset, extended dynamic
 # state, DXVK 2): Mali r18-r40 drivers are Vulkan 1.1 and games keep 1.1 there (version promotion is
 # off on every driver: none is on its tested list), so these fixes act from r44 on
-for t in poll reqcache d3d11 wait_imitate waitlost present_timeout hitch lagprobe presentwait apicap cullmode_test \
-         dynrend a1zink sparse timeline eventstatus syncmirror query querystuck querystuck_burst; do
+for t in poll reqcache d3d11 wait_imitate waitlost hungarm present_timeout hitch lagprobe presentwait apicap cullmode_test \
+         dynrend a1zink sparse timeline eventstatus syncmirror query querystuck querystuck_burst present_path querypoll; do
   pf $t r44 "needs Vulkan 1.2/1.3 in the client; Mali r18-r40 show games 1.1"
 done
 pf opaque r32-r34 "opaque fds over dma-bufs need the driver's VK_KHR_external_memory_fd: no r18-r26 Mali in the logs has it (nothing D3D runs there either: Vulkan 1.1)"
@@ -64,6 +64,7 @@ pf calts r32-r34 "needs a driver with VK_EXT_calibrated_timestamps (r18-r26 and 
 pf featclamp r32-r34 "needs transform feedback (r18-r26 have none); the subject is r44's missing geometry streams"
 pf cmdstate r49 "reads the driver's VK_EXT_vertex_input_dynamic_state (r49p1 has it; below r48 the errata hide it)"
 pf divisor_g925 r49 "Mali-G925's KHR-only divisor is r49p1's (older families have neither name: everything emulated)"
+pf fragdepth r44 "needs Vulkan 1.3 dynamic rendering (the colour-only pipeline it checks); the common profile (Vulkan 1.1) skips every draw step: 3 of 5 FAIL in the full run, 5 of 5 OK alone"
 pf divisor_khr r49 "a KHR-only divisor driver: needs the KHR extension (r49 on)"
 pf probe_report r54 "expects the emulation masks of a driver with divisor and push descriptors (r54 on)"
 pf mode r54 "expects the emulation masks of a driver with divisor and push descriptors (r54 on)"
@@ -71,9 +72,17 @@ pf robust2 r54 "the subject is r54p3's robustness2 without robust access; older 
 pf promote r56 "promotes a desktop driver taken as 1.1/1.2 with every 1.3 piece; no 1.1 Mali in the logs has them (they reach 1.2 at most), and its 'driver as it is' step needs the real 1.4"
 pf viewport_test r56 "draws two viewports with ViewportIndex; Mali r18-r54 have no multiViewport (the bridge's compat draws the first only)"
 pf vbbake r44 "vbstride_check binds with vkCmdBindVertexBuffers2 (Vulkan 1.3)"
-pf heapcap off "FIX NOT ON MALI: step 9 (FIXES-LEDGER rows 111/197) leans on VK_EXT_memory_budget, which no Mali in the logs has"
+pf heapcap off "FIX NOT ON MALI: step 9 (ledger rows 111/197) leans on VK_EXT_memory_budget, which no Mali in the logs has"
 pf vidyn off "FIX NOT ON MALI in part: every Mali family has clip/cull emulated; a vertex shader declaring ClipDistance/CullDistance gets a rewritten module, the vertex-input layer cannot keep that pipeline, and the BGRA 10-10-10-2 / B10G11R11 vertex fetch emulation is not fitted (r49p1+ with the driver's vidyn)"
+pf syncfd off "the subject is a driver that holds a batch until its timeline wait is met (RADV here, Samsung's Xclipse suspected): the held batch needs timeline semaphores, which the common profile hides (Vulkan 1.1: syncfd_check's late signal had no vkSignalSemaphore and crashed, steps 1, 2 and 4)"
 pf xclipse_zink off "the subject is Samsung's Xclipse driver (Vulkan 1.3, imitated with VKBRIDGE_FAKE_DRIVER=samsung:<driverVersion>), not a Mali: a Mali profile takes the imitated device down to 1.1 and Zink then never starts"
+pf importrace off "its programs need VK_KHR_external_memory_fd, which the common profile hides (r18-r26 lack it); the subject is r44p1 on a Mali-G615 MC6, set by its own server's VKBRIDGE_FAKE_DRIVER_VERSION"
+pf fcmeet off "runs importrace_test.sh (and pvrdestroy_test.sh) inside: the same need for VK_KHR_external_memory_fd, which the common profile hides"
+pf dmabufahb off "step 1's subject is the driver as it is (its own dma-bufs); the common profile hides VK_KHR_external_memory_fd/VK_EXT_external_memory_dma_buf (r18-r26 lack them), and steps 2-10 imitate the drivers without dma-buf memory themselves (VKBRIDGE_FAKE_MISSING)"
+pf pvnames off "the subject is PowerVR's driver (VKBRIDGE_FAKE_DRIVER=img-full / the pv_names imitation), not a Mali: under the common profile its probe and fix lines do not show (6 of 11 FAIL in the full run, 11 of 11 alone)"
+pf zinkname off "the subject is PowerVR's Zink profile (vertexInputDynamicState, sparse, GPL), which the common profile hides (Vulkan 1.1): 7 of 8 FAIL in the full run, 8 of 8 alone"
+pf pv3d off "the subject is PowerVR's 3D-image views (PV-04/06); under the common profile pv3d_check's chain is dropped and the test only skips"
+pf pvsusp off "the subject is PowerVR's driver (VKBRIDGE_FAKE_DRIVER=img) and vkd3d-proton 3.1's suspended dynamic renderings (Vulkan 1.3), which the common profile hides (Vulkan 1.1): 3 of 3 FAIL with empty pixel fields in the full run, 3 of 3 OK alone"
 pf fp16 r56 "a profile below the desktop driver's 1.4 installs the promotion's feature query, which drops fp16_hide's (latent bug, MALI-PROFILE-PROGRESS.md); real r54 drivers report what they are"
 mp_for() {
   local want_p=${VKB_MALI_PROFILE:-common} e
@@ -293,12 +302,36 @@ run_mode() {
     # Without the conversion budget (the default), so that every image goes through its transcoder;
     # then with the budget DS3's preset sets (32:4: some images decoded over it), the same floors
     if want bcn_transcode; then
-      VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
+      VKB_BC_TX_BUDGET=0 VKB_SERVER_ENV=VKBRIDGE_BC_SMALL_DECODE=0 . ./mali_env.sh >/dev/null
       timeout 180 ./out/bcn_check transcode >out/t-bcn.log 2>&1; result $? "bcn_check, BC transcoded ($(tail -1 out/t-bcn.log))"
+      VKB_SERVER_ENV= . ./mali_env.sh >/dev/null
+    fi
+    # Alpha-tested foliage (a player log): no texel whose BC alpha is clearly on one side of an alpha test at 0.5 comes out on
+    # the other after the transcode, at any level (bcn_check transcode alpha), with the default converters and with the
+    # palette search and one dispatch a run
+    if want bcn_alpha; then
+      VKB_BC_TX_BUDGET=0 VKB_SERVER_ENV=VKBRIDGE_BC_SMALL_DECODE=0 . ./mali_env.sh >/dev/null
+      timeout 300 ./out/bcn_check transcode alpha >out/t-bcn-alpha.log 2>&1; r=$?
+      VKB_BC_TX_BUDGET=0 VKB_SERVER_ENV="VKBRIDGE_BC_PALETTE=1 VKBRIDGE_BC_ONE_DISPATCH=1 VKBRIDGE_BC_SMALL_DECODE=0" . ./mali_env.sh >/dev/null
+      timeout 300 ./out/bcn_check transcode alpha >out/t-bcn-alpha-convert.log 2>&1 && [ $r = 0 ]
+      result $? "bcn_check transcode alpha, alpha-tested foliage keeps its alpha-test side ($(tail -1 out/t-bcn-alpha.log), $(tail -1 out/t-bcn-alpha-convert.log); $(grep -c '^PASS' out/t-bcn-alpha.log) passed)"
+      VKB_SERVER_ENV= . ./mali_env.sh >/dev/null
+    fi
+    # The same with the palette search and one dispatch a run (VKBRIDGE_BC_PALETTE=1, VKBRIDGE_BC_ONE_DISPATCH=1): the
+    # same blocks, so every PSNR figure the same as the default run's (bcn_transcode; the lines without times)
+    if want bcn_convert; then
+      VKB_BC_TX_BUDGET=0 VKB_SERVER_ENV="VKBRIDGE_BC_PALETTE=1 VKBRIDGE_BC_ONE_DISPATCH=1 VKBRIDGE_BC_SMALL_DECODE=0" . ./mali_env.sh >/dev/null
+      from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
+      timeout 180 ./out/bcn_check transcode >out/t-bcn-convert.log 2>&1 && [ -s out/t-bcn.log ] &&
+        diff <(grep -o 'PSNR [0-9.]* dB.*' out/t-bcn.log | sed 's/[0-9.]* ms//g') <(grep -o 'PSNR [0-9.]* dB.*' out/t-bcn-convert.log | sed 's/[0-9.]* ms//g') >/dev/null &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "search the blocks' palettes" && tail -n +$from "$VKB_SERVER_LOG" | grep -q "(palette search) built" &&
+        tail -n +$from "$VKB_SERVER_LOG" | grep -q "one dispatch a run of regions"
+      result $? "bcn_check transcode, palette search and one dispatch a run: every PSNR figure as without them ($(tail -1 out/t-bcn-convert.log))"
+      VKB_SERVER_ENV= . ./mali_env.sh >/dev/null
     fi
     # Zink's BC images (usage 0x17 with COLOR_ATTACHMENT, flags 0x108) are transcoded too, within the same floors
-    # (they were all decoded, 620 MB of BC held as 3.1 GB); none is logged as decoded; blocks drawn into
-    # uncompressed views of them, as Mesa uploads BC data from a pixel buffer, show in the texture (black)
+    # (a player log: they were all decoded, 620 MB of BC held as 3.1 GB); none is logged as decoded; blocks drawn into
+    # uncompressed views of them, as Mesa uploads BC data from a pixel buffer, show in the texture (a player log: black)
     if want bcn_zink; then
       VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
       from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
@@ -310,7 +343,7 @@ run_mode() {
       result $? "bcn_check transcode zink, BC images made as Zink makes them are transcoded ($(tail -1 out/t-bcn-zink.log); $(tail -n +$from "$VKB_SERVER_LOG" | grep -c 'BC emulation: image .* transcoded as') logged transcoded)"
     fi
     # The same uploads through a pixel buffer recorded with vkCmdBeginRendering on a driver without dynamic rendering
-    # (Mali-G77 r32p1): the bridge's render passes for it reach the blocks' way into the texture too
+    # (Mali-G77 r32p1, a player log): the bridge's render passes for it reach the blocks' way into the texture too
     if want bcn_zink_dynrend; then
       VKB_BC_TX_BUDGET=0 VKB_MISSING_ADD=dynrend . ./mali_env.sh >/dev/null
       from=$(($(wc -l <"$VKB_SERVER_LOG") + 1))
@@ -347,14 +380,14 @@ run_mode() {
         [ $r = 0 ] && echo "$line" | grep -q "so far: [1-9][0-9]* from a transcoded.*, [1-9][0-9]* from a decoded.*; 0 skipped"
         result $? "bcn_check $*, $name: copies between decoded and transcoded images ($(tail -1 out/t-bcn-$name.log)$([ $r = 0 ] || grep -m3 -E '^(FAIL|error)' out/t-bcn-$name.log | tr '\n' '|'); $(echo "$line" | grep -o '[0-9]* from a transcoded into a decoded image (blit), [0-9]* from a decoded into a transcoded image (re-encoded); [0-9]* skipped'))"
       }
-      VKB_SERVER_ENV=VKBRIDGE_BC_TRANSCODE_MAX=256 VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
+      VKB_SERVER_ENV="VKBRIDGE_BC_TRANSCODE_MAX=256 VKBRIDGE_BC_SMALL_DECODE=0" VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
       mixed_copies $(($(wc -l <"$VKB_SERVER_LOG") + 1)) mixcopy transcode mixcopy
       for n in 6 8; do
-        VKB_SERVER_ENV=VKBRIDGE_BC_TRANSCODE_MAX=256 VKB_BC_ASTC_BLOCK=${n}x$n VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
+        VKB_SERVER_ENV="VKBRIDGE_BC_TRANSCODE_MAX=256 VKBRIDGE_BC_SMALL_DECODE=0" VKB_BC_ASTC_BLOCK=${n}x$n VKB_BC_TX_BUDGET=0 . ./mali_env.sh >/dev/null
         mixed_copies $(($(wc -l <"$VKB_SERVER_LOG") + 1)) mixcopy-astc$n transcode astc$n mixcopy
       done
       unset VKB_SERVER_ENV
-      VKB_BC_TX_BUDGET=0.000001:0.000001 . ./mali_env.sh >/dev/null
+      VKB_SERVER_ENV=VKBRIDGE_BC_SMALL_DECODE=0 VKB_BC_TX_BUDGET=0.000001:0.000001 . ./mali_env.sh >/dev/null
       mixed_copies $(($(wc -l <"$VKB_SERVER_LOG") + 1)) mixcopy-budget transcode mixcopy
       . ./mali_env.sh >/dev/null
     fi
@@ -414,6 +447,20 @@ run_mode() {
   if want reqcache; then
     timeout 120 ./out/reqcache_check >out/t-reqcache.log 2>&1; result $? "reqcache_check ($(tail -1 out/t-reqcache.log))"
   fi
+  if want cpuprof; then timeout 60 ./out/cpuprof_unit >out/t-cpuprof.log 2>&1; result $? "cpuprof_unit ($(tail -1 out/t-cpuprof.log))"; fi
+  if want asynctimer && [ "$mode" = plain ]; then timeout 120 ./asynctimer_test.sh >out/t-asynctimer.log 2>&1; result $? "asynctimer_test ($(tail -1 out/t-asynctimer.log))"; fi
+  # Query reads without the queue flush and order wait (BL2/Tekken render-thread polls); the queue's socket writes outside its lock
+  # (dxvk-cs's lock waits in RE3/TR/BL2). Each starts its own server.
+  if want querypoll && [ "$mode" = plain ]; then timeout 300 ./querypoll_test.sh >out/t-querypoll.log 2>&1; result $? "querypoll_test ($(tail -1 out/t-querypoll.log))"; fi
+  if want asynclock && [ "$mode" = plain ]; then timeout 300 ./asynclock_test.sh >out/t-asynclock.log 2>&1; result $? "asynclock_test ($(tail -1 out/t-asynclock.log))"; fi
+  # Format properties asked while emulated formats are described: once each, then the client's cache (fmtcache_test.sh starts its own server)
+  if want fmtcache && [ "$mode" = plain ]; then
+    timeout 300 ./fmtcache_test.sh >out/t-fmtcache.log 2>&1; result $? "fmtcache_test ($(tail -1 out/t-fmtcache.log))"
+  fi
+  # Image and buffer creates ahead of queued work, the image's requirements in the create's reply (fastcreate_test.sh starts its own servers)
+  if want fastcreate && [ "$mode" = plain ]; then
+    timeout 600 ./fastcreate_test.sh >out/t-fastcreate.log 2>&1; result $? "fastcreate_test ($(tail -1 out/t-fastcreate.log))"
+  fi
   # NV12 textures as DXVK makes them (MUTABLE | EXTENDED_USAGE): on mali the refusal is imitated
   # (planarext) and the client makes them without the flag; VKBRIDGE_PLANAR_EXT_FIX=0 is the negative
   # control (the refusal reaches the app). 77: the driver has no NV12.
@@ -443,7 +490,8 @@ run_mode() {
       # Mali-G77 r32p1: the export emulation on (dmabufexport; the host's pages are
       # the driver's own dma-bufs) and the driver refusing gamescope's modifier queries (dmabufmod).
       # gamescope aborted on "modifiers.size > 0": the client answers from plain LINEAR tiling,
-      # the server makes the image plain LINEAR and reports the LINEAR modifier. gamescope's imports
+      # the server makes the image plain LINEAR and reports the LINEAR modifier (PR mutable
+      # dma-buf retry stays out of it: the export is emulated). gamescope's imports
       # of its clients' LINEAR dma-bufs (sampled, MUTABLE_FORMAT, the explicit LINEAR modifier) are
       # answered importable and made plain LINEAR at the dma-buf's layout too: answered without
       # IMPORTABLE, gamescope made them OPTIMAL, larger than the dma-buf on Mali (S10+, rc1)
@@ -456,6 +504,7 @@ run_mode() {
         [ "$(tail -n +$from "$VKB_SERVER_LOG" | grep -c "dma-buf export image with a LINEAR modifier list .* made as a plain LINEAR image")" = 4 ] &&
         [ "$(tail -n +$from "$VKB_SERVER_LOG" | grep -c "dma-buf import image at the LINEAR modifier .* made as a plain LINEAR image")" = 4 ] &&
         ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "dma-buf import: .* bytes asked for" &&
+        ! tail -n +$from "$VKB_SERVER_LOG" | grep -q "refused with a mutable format; without it" &&
         grep -q "dma-buf image query refused by the driver: format 44 type 1 tiling 1000158000 usage 0xd flags 0x8 (2 view formats) modifier 0x0: result -11, external features 0x0; answered from plain LINEAR" out/t-gsexport-r32-client.log
       result $? "gsexport_check, r32p1's refused modifier queries with the export emulated ($(tail -1 out/t-gsexport-r32.log))"
       if docker image inspect vkb-arch-gamescope >/dev/null 2>&1; then
@@ -486,7 +535,7 @@ run_mode() {
       . ./mali_env.sh >/dev/null
     fi
   fi
-  # Xiaomi 17T, Mali-G720 r49p1, no VK_EXT_image_drm_format_modifier: gamescope's import of Steam's LINEAR dma-buf
+  # a player log (Xiaomi 17T, Mali-G720 r49p1, no VK_EXT_image_drm_format_modifier): gamescope's import of Steam's LINEAR dma-buf
   # as an OPTIMAL image with an implicit layout, which Mali sizes larger than the dma-buf (optpad imitates that: +14%).
   # The importer is made LINEAR at the export's layout (server_emu_layer.c, dmabuf_shape_made); with an OPTIMAL export of
   # the shape live as well it stays OPTIMAL.
@@ -510,7 +559,8 @@ run_mode() {
     if [ "$mode" = mali ]; then
       VKB_MISSING_ADD=dmabuftypes . ./mali_env.sh >/dev/null
       timeout 60 ./out/fdprops_check >out/t-fdprops.log 2>&1 && grep -q "imitating Mali's dma-buf fd properties" "$VKB_SERVER_LOG" &&
-        grep -q "dma-buf import: type [0-9]* is not one the dma-buf takes .*; imported in type" "$VKB_SERVER_LOG"
+        grep -q "dma-buf import: type [0-9]* is not one the dma-buf takes .*; imported in type" "$VKB_SERVER_LOG" &&
+        grep -q "dma-buf import in type [0-9]* refused (-[0-9]*); imported in type [0-9]*, which its fd properties list" "$VKB_SERVER_LOG"
       result $? "fdprops_check, Mali's dma-buf fd properties ($(tail -1 out/t-fdprops.log))"
       . ./mali_env.sh >/dev/null
     else
@@ -591,6 +641,16 @@ run_mode() {
   if want pcache && [ "$mode" = plain ] && [ -x out/pcache_check ]; then
     timeout 120 ./pcache_test.sh >out/t-pcache.log 2>&1; result $? "pcache_test ($(tail -1 out/t-pcache.log))"
   fi
+  # Steam's shader pre-caching through one server (a player log): what 8 replay processes' caches hold, with a layer whose
+  # caches hold memory as Mali's do (lavapipe under it: its own hold none); and what an interrupted compile keeps
+  if want precachemem && [ "$mode" = plain ] && [ -x out/pcache_check ] && [ -f out/pcmem/libvkb_pcache_mem.so ]; then
+    VKB_HOST_ICD=/usr/share/vulkan/icd.d/lvp_icd.json timeout 600 ./precachemem_test.sh >out/t-precachemem.log 2>&1
+    result $? "precachemem_test ($(tail -1 out/t-precachemem.log))"
+  fi
+  if want spinheap && [ "$mode" = plain ] && [ -x out/pcache_check ]; then
+    VKB_HOST_ICD=/usr/share/vulkan/icd.d/lvp_icd.json timeout 300 ./spinheap_test.sh >out/t-spinheap.log 2>&1
+    result $? "spinheap_test ($(tail -1 out/t-spinheap.log))"
+  fi
   # Waits the driver fails with -3 after a signal (wait_retry, MK-01): every kind the bridge
   # forwards, the bug imitated beneath the fix, with it and without; and the server-side imitation
   # of an older Mali's feature set, both from <cache dir>/env (a server of its own; once)
@@ -602,9 +662,32 @@ run_mode() {
     if want waitlost; then
       timeout 300 ./waitlost_test.sh >out/t-waitlost.log 2>&1; result $? "waitlost_test ($(tail -1 out/t-waitlost.log))"
     fi
+    # hungarm_test.sh: a wait given up with the device not lost (a GPU job that never finished, a player log) arms the
+    # hang detector for that program's next launch
+    if want hungarm; then
+      timeout 300 ./hungarm_test.sh >out/t-hungarm.log 2>&1; result $? "hungarm_test ($(tail -1 out/t-hungarm.log))"
+    fi
+    # hangdisp_test.sh: a stuck dispatch is reported with its compute push constants and the buffer descriptors they
+    # pick (The Witcher 3's light culling on the G925: its loop count comes from a bindless CBV)
+    # fragdepth_test.sh: MK-49, a fragment shader's FragDepth output dropped where the rendering has no depth attachment
+    # (RE Village / The Witcher 3 on the G925 r49p1: vkd3d-proton's layered copy never finished)
+    if want fragdepth; then
+      timeout 300 ./fragdepth_test.sh >out/t-fragdepth.log 2>&1; result $? "fragdepth_test ($(tail -1 out/t-fragdepth.log))"
+    fi
+    if want hangdisp; then
+      timeout 300 ./hangdisp_test.sh >out/t-hangdisp.log 2>&1; result $? "hangdisp_test ($(tail -1 out/t-hangdisp.log))"
+    fi
     # A pipeline compile that never ends (the G925's compiler on Stray): interrupted, the call fails
     if want compile_watchdog; then
       timeout 400 ./compile_watchdog_test.sh >out/t-spin.log 2>&1; result $? "compile_watchdog_test ($(tail -1 out/t-spin.log))"
+    fi
+    # What the stuck-pipelines list keeps between runs: a slow compile gets the real pipeline back, a hang stays
+    if want stuck_retry; then
+      timeout 300 ./stuck_retry_test.sh >out/t-stuck.log 2>&1; result $? "stuck_retry_test ($(tail -1 out/t-stuck.log))"
+    fi
+    # A crash on the driver's own compiler thread (a player log): the compiles in flight get the stand-in at the next start
+    if want drvthread; then
+      timeout 400 ./drvthread_test.sh >out/t-drvthread.log 2>&1; result $? "drvthread_test ($(tail -1 out/t-drvthread.log))"
     fi
     # UE4's layer-only pass-through geometry stage folded into the vertex shader (Stray's stuck
     # pipelines): up front with VKBRIDGE_LAYER_GS_FOLD=1, and as the never-ending compile's fallback
@@ -619,7 +702,7 @@ run_mode() {
     if want report_stall; then
       timeout 120 ./report_stall_test.sh >out/t-stall.log 2>&1; result $? "report_stall_test ($(tail -1 out/t-stall.log))"
     fi
-    # A request the driver has not returned from, named in the report while it runs
+    # A request the driver has not returned from, named in the report while it runs (a player log)
     if want report_stuck; then
       timeout 150 ./report_stuck_test.sh >out/t-stuck.log 2>&1; result $? "report_stuck_test ($(tail -1 out/t-stuck.log))"
     fi
@@ -641,11 +724,18 @@ run_mode() {
     if want hitch; then
       timeout 300 ./hitch_test.sh >out/t-hitch.log 2>&1; result $? "hitch_test ($(tail -1 out/t-hitch.log))"
     fi
+    # Always-on perf diagnostics (server_perf.c): per-window verdicts, threads, present split, report section, cost
+    if want perfdiag; then
+      timeout 600 ./perfdiag_test.sh >out/t-perfdiag.log 2>&1; result $? "perfdiag_test ($(tail -1 out/t-perfdiag.log))"
+    fi
     # The conversion budget (VKBRIDGE_BC_TX_BUDGET): a burst of BC uploads on a GPU slowed to a
     # Mali's, without it, with 32:4 (DS3's preset), decoded and unset (off); the contents, the memory cap, query pins;
     # first auto's rate from GPU names alone (no core count never gets more than the smallest of the family)
     if want bcauto; then
       timeout 60 ./out/bcauto_unit >out/t-bcauto.log 2>&1; result $? "bcauto_unit ($(tail -1 out/t-bcauto.log))"
+    fi
+    if want bcsmall; then
+      timeout 60 ./out/bcsmall_unit >out/t-bcsmall.log 2>&1; result $? "bcsmall_unit ($(tail -1 out/t-bcsmall.log))"
     fi
     if want bcbudget; then
       timeout 900 ./bcbudget_test.sh >out/t-bcbudget.log 2>&1; result $? "bcbudget_test ($(tail -1 out/t-bcbudget.log))"
@@ -654,6 +744,11 @@ run_mode() {
     # batched (default) vs VKBRIDGE_BC_BATCH=0, the same texels read back, fewer barriers
     if want bcupload; then
       timeout 900 ./bcupload_test.sh >out/t-bcupload.log 2>&1; result $? "bcupload_test ($(tail -1 out/t-bcupload.log))"
+    fi
+    # A game's first BC burst: never one dispatch a copy where the probe has passed the new converters (a new program builds
+    # them in place of the old ones, on every GPU); with BC_FAST on, BC_FAST=0's converter while a BC_FAST one is not built
+    if want bcfirst; then
+      timeout 900 ./bcfirst_test.sh >out/t-bcfirst.log 2>&1; result $? "bcfirst_test ($(tail -1 out/t-bcfirst.log))"
     fi
     # The latency log (VKBRIDGE_LATLOG): one line a frame with every stage, from <cache dir>/env, the
     # server, the guest, a path of its own; off by default; tools/latency_report.py reads it; and
@@ -680,6 +775,26 @@ run_mode() {
     if want present_block; then
       timeout 200 ./present_block_test.sh >out/t-pblock.log 2>&1; result $? "present_block_test ($(tail -1 out/t-pblock.log))"
     fi
+    # A surface and swapchain made and destroyed every frame (a player log, KOTOR through Zink) reuse the idle image set
+    if want swapchain_churn; then
+      timeout 300 ./swapchain_churn_test.sh >out/t-swchurn.log 2>&1; result $? "swapchain_churn_test ($(tail -1 out/t-swchurn.log))"
+    fi
+    # The present path under a fake gamescope: images given back while the presenting thread waits for a frame
+    # (VKBRIDGE_PRESENT_RELEASE_THREAD), the acquire without a server round trip (VKBRIDGE_ASYNC_ACQUIRE), frame
+    # order, pixels, recreate, destroy, a lost compositor or device
+    if want present_path; then
+      timeout 600 ./present_path_test.sh >out/t-ppath.log 2>&1; result $? "present_path_test ($(tail -1 out/t-ppath.log))"
+    fi
+    # Steam's performance overlay (a client named mangoapp) draws at most VKBRIDGE_HUD_FPS frames a second; other
+    # programs and VKBRIDGE_HUD_FPS=0 untouched (server_syncfd.c hud_pace)
+    if want hudcap; then
+      timeout 200 ./hudcap_test.sh >out/t-hudcap.log 2>&1; result $? "hudcap_test ($(tail -1 out/t-hudcap.log))"
+    fi
+    # The swapchain's Wayland globals' first events (formats, modifiers) taken in whatever roundtrip they come
+    # (another thread of the program reading the connection during the registry's): the recreate flake of present_path
+    if want wlbind; then
+      timeout 300 ./wlbind_test.sh >out/t-wlbind.log 2>&1; result $? "wlbind_test ($(tail -1 out/t-wlbind.log))"
+    fi
     # Under a nested gamescope the gralloc images are offered to the app's compositor, which pairs them
     # with the same dma-bufs gamescope passes on (GitHub #44); every off case keeps ordinary dma-bufs
     if want zerocopy_nested; then
@@ -689,11 +804,12 @@ run_mode() {
     if want server_hup; then
       timeout 60 ./server_hup_test.sh >out/t-hup.log 2>&1; result $? "server_hup_test ($(tail -1 out/t-hup.log))"
     fi
-    # A driver crash's line names the client, the bind's image and memory, a draw's bound pipeline
+    # A driver crash's line names the client, the bind's image and memory, a draw's bound pipeline (a player log)
     if want crashline; then
       timeout 200 ./crashline_test.sh >out/t-crashline.log 2>&1; result $? "crashline_test ($(tail -1 out/t-crashline.log))"
+      timeout 600 ./crashstorm_test.sh >out/t-crashstorm.log 2>&1; result $? "crashstorm_test ($(tail -1 out/t-crashstorm.log))"
     fi
-    # A draw or dispatch with no pipeline bound (Mali reads through the missing pipeline) is left out
+    # A draw or dispatch with no pipeline bound (a player log: Mali reads through the missing pipeline) is left out
     if want unbound_draw; then
       timeout 400 ./unbound_draw_test.sh >out/t-unbound.log 2>&1; result $? "unbound_draw_test ($(tail -1 out/t-unbound.log))"
     fi
@@ -702,18 +818,36 @@ run_mode() {
     if want lost; then
       timeout 300 ./lost_test.sh >out/t-lost.log 2>&1; result $? "lost_test ($(tail -1 out/t-lost.log))"
     fi
+    # After a loss (a player log, Mali-G615 r44p1): the lost device's pipeline cache is never saved or merged again, and
+    # its asynchronous lost answers are counted, not logged one line each
+    if want losthygiene; then
+      timeout 300 ./losthygiene_test.sh >out/t-losthygiene.log 2>&1; result $? "losthygiene_test ($(tail -1 out/t-losthygiene.log))"
+    fi
+    if want lostcause; then
+      timeout 300 ./lostcause_test.sh >out/t-lostcause.log 2>&1; result $? "lostcause_test ($(tail -1 out/t-lostcause.log))"
+    fi
+    # A loss with a GPU fault address arms the hang detector for that game's next launch only (God of War, a player log:
+    # Mali-G615 r44p1 TRANSLATION_FAULT write, writer not named by the loss record)
+    if want faultarm; then
+      timeout 300 ./faultarm_test.sh >out/t-faultarm.log 2>&1; result $? "faultarm_test ($(tail -1 out/t-faultarm.log))"
+    fi
     # A driver fault in vkAllocateMemory or a bind is contained: the allocation fails, a bind takes its
-    # device as lost, the other programs go on (Mali-G615 r44p1)
+    # device as lost, the other programs go on (a player log: Mali-G615 r44p1)
     if want memfault; then
       timeout 300 ./memfault_test.sh >out/t-memfault.log 2>&1; result $? "memfault_test ($(tail -1 out/t-memfault.log))"
     fi
+    # The calls in the driver AT a contained fault, copied in the signal handler (ledger 297: the list made
+    # after the jump named calls that had started 22-30 ms after a player's RE8 fault, a player log)
+    if want faultsnap; then
+      timeout 120 ./faultsnap_test.sh >out/t-faultsnap.log 2>&1; result $? "faultsnap_test ($(tail -1 out/t-faultsnap.log))"
+    fi
     # A driver fault in vkEndCommandBuffer of a client's command buffer is contained: its device is stopped,
-    # its program ends, the other programs go on (Mali-G2-Ultra r56p0 beta, vkd3d-proton's query resets)
+    # its program ends, the other programs go on (a player log: Mali-G2-Ultra r56p0 beta, vkd3d-proton's query resets)
     if want endcb; then
       timeout 300 ./endcb_test.sh >out/t-endcb.log 2>&1; result $? "endcb_test ($(tail -1 out/t-endcb.log))"
     fi
     # One guard around a connection's driver calls: a fault in a replayed draw (No Man's Sky's last crash) or a
-    # submit takes its program's device down, not the server with every program on it
+    # submit (a player log) takes its program's device down, not the server with every program on it
     if want reqguard; then
       timeout 300 ./reqguard_test.sh >out/t-reqguard.log 2>&1; result $? "reqguard_test ($(tail -1 out/t-reqguard.log))"
     fi
@@ -725,7 +859,7 @@ run_mode() {
     if want capgate; then
       timeout 300 ./capgate_test.sh >out/t-capgate.log 2>&1; result $? "capgate_test ($(tail -1 out/t-capgate.log))"
     fi
-    # Transform feedback begun under a held pipeline bind (Zink, Mali read through no pipeline)
+    # Transform feedback begun under a held pipeline bind (a player log: Zink, Mali read through no pipeline)
     if want xfb_bind; then
       timeout 300 ./xfb_bind_test.sh >out/t-xfb-bind.log 2>&1; result $? "xfb_bind_test ($(tail -1 out/t-xfb-bind.log))"
     fi
@@ -733,6 +867,10 @@ run_mode() {
     # watchdog is died and decided; the default budget defers the heavy probes, both parts timed
     if want probe_end; then
       timeout 300 ./probe_end_test.sh >out/t-probe-end.log 2>&1; result $? "probe_end_test ($(tail -1 out/t-probe-end.log))"
+    fi
+    # The background probes at the lowest CPU priority: read back, starved ones run again, real hangs still hangs
+    if want probe_prio; then
+      timeout 300 ./probe_prio_test.sh >out/t-probe-prio.log 2>&1; result $? "probe_prio_test ($(tail -1 out/t-probe-prio.log))"
     fi
     # The BC transcoder builds: a slow one passes, one past their own limit leaves only its formats
     # decoded, those after a hang are not tried (a server of its own; once)
@@ -748,6 +886,36 @@ run_mode() {
     # passes; only modules with the pattern change; the corpus through the pass is spirv-val clean
     if want bitwise; then
       timeout 600 ./bitwise_test.sh >out/t-bitwise.log 2>&1; result $? "bitwise_test ($(tail -1 out/t-bitwise.log); $(grep -o 'corpus: [0-9]* modules' out/t-bitwise.log))"
+    fi
+    # PV-01 pv_names (PowerVR: an input reads zero beside an output of its OpName): the bug imitated
+    # fails pvnames_check and its probe, the probe's failure turns the fix (the names dropped) on and
+    # the picture is right; modules inline too; the corpus through the pass is spirv-val clean
+    if want pvnames; then
+      timeout 600 ./pvnames_test.sh >out/t-pvnames.log 2>&1; result $? "pvnames_test ($(tail -1 out/t-pvnames.log); $(grep -o 'corpus: TOTAL: [0-9]* modules' out/t-pvnames.log))"
+    fi
+    # PV-04 pv_view3d_base (PowerVR: a 3D image's 2D-array view from slice 1 on renders from slice 0): the bug
+    # imitated in the probe and beneath the fix; the forms of the fix go by what the probe proves
+    if want pv3d; then
+      timeout 300 ./pv3d_test.sh >out/t-pv3d.log 2>&1; result $? "pv3d_test ($(tail -1 out/t-pv3d.log))"
+    fi
+    # PowerVR version ranges (changelists; the example erratum carries ones no real driver is in)
+    if want pvrange; then
+      timeout 300 ./pvrange_test.sh >out/t-pvrange.log 2>&1; result $? "pvrange_test ($(tail -1 out/t-pvrange.log))"
+    fi
+    # 16 KB-page kernels imitated on the host (VKBRIDGE_FAKE_PAGE_SIZE): the alignments told and the server's
+    # import alignment follow the page; placed memory at a 16 KB-aligned address with an odd-sized allocation
+    if want pagesize; then
+      timeout 300 ./pagesize_test.sh >out/t-pagesize.log 2>&1; result $? "pagesize_test ($(tail -1 out/t-pagesize.log))"
+    fi
+    # The self-test's no-flush claim repeated (3 passes, 5 for a cached type, other data each time): one stale
+    # pass sends the type to flushes
+    if want noflush; then
+      timeout 300 ./noflush_test.sh >out/t-noflush.log 2>&1; result $? "noflush_test ($(tail -1 out/t-noflush.log))"
+    fi
+    # The dma-buf import's memory type fallback (server_import_type.c) over PowerVR's, Mali's and
+    # other memory tables (no driver)
+    if want importtype; then
+      timeout 60 ./out/importtype_unit >out/t-importtype.log 2>&1; result $? "importtype_unit ($(tail -1 out/t-importtype.log))"
     fi
     # shl_barrier: the no-op after constant left shifts, forced on: right values in bitwise_check and
     # vkbridge-smoke, modules named by the app's code, the corpus through the pass spirv-val clean
@@ -776,6 +944,10 @@ run_mode() {
     if want wave32; then
       timeout 600 ./wave32_test.sh >out/t-wave32.log 2>&1; result $? "wave32_test ($(tail -1 out/t-wave32.log))"
     fi
+    # built-in preset table: data checks of presets_builtin.inc (RE3 Mali-G925 narrow barriers)
+    if want presets_table; then
+      timeout 60 ./presets_table_test.sh >out/t-presets_table.log 2>&1; result $? "presets_table_test ($(tail -1 out/t-presets_table.log))"
+    fi
     # The YCbCr sampler swap in compute layouts (Mali, Samsung's Xclipse;): the
     # driver's refusal imitated, pipelines refused with the swap off and built with it on, the
     # first failure logged with its layout's YCbCr samplers; gamescope's composite pipelines too
@@ -788,10 +960,19 @@ run_mode() {
     if want driverid; then
       timeout 300 ./driverid_test.sh >out/t-driverid.log 2>&1; result $? "driverid_test ($(tail -1 out/t-driverid.log))"
     fi
+    # a player log: a Vulkan 1.0 driver under a 1.1 loader (imitated) ends with a clear 'too old' line, not SIGSEGV
+    if want olddriver; then
+      timeout 300 ./olddriver_test.sh >out/t-olddriver.log 2>&1; result $? "olddriver_test ($(tail -1 out/t-olddriver.log))"
+    fi
     # MK-32 clamp_zero: the zero limit dropped (imitated) fails clampzero_check, the opaque zero over it
     # passes, narrow from the version gate and wide when forced; the corpus through both is spirv-val clean
     if want clampzero; then
       timeout 600 ./clampzero_test.sh >out/t-clampzero.log 2>&1; result $? "clampzero_test ($(tail -1 out/t-clampzero.log); $(grep -o 'corpus, narrow: [0-9]* modules' out/t-clampzero.log))"
+    fi
+    # MK-47 split_varying: a vec4 output read in Component pieces (Zink's fixed-function texturing),
+    # the Mali read of component 3 imitated: wrong without the fix, exact with the merged input over it
+    if want splitvary; then
+      timeout 300 ./splitvary_test.sh >out/t-splitvary.log 2>&1; result $? "splitvary_test ($(tail -1 out/t-splitvary.log))"
     fi
     # The image-view errata: MK-07's REMAINING counts and MK-06's view quarantine, each failing with
     # its bug imitated and the fix off and passing with the fix; the quarantine's caps and the
@@ -827,6 +1008,12 @@ run_mode() {
     if want dedimport; then
       timeout 300 ./dedimport_test.sh >out/t-dedimport.log 2>&1; result $? "dedimport_test ($(tail -1 out/t-dedimport.log))"
     fi
+    # MK-48 import_serial (a player log: a dma-buf import beside another device's memory call faults in
+    # Mali r44p1's driver): the race imitated beneath (VKBRIDGE_TEST_CRASH_CMD=import_race) faults with the fix off,
+    # not with it; the version gate (r44 only)
+    if want importrace; then
+      timeout 300 ./importrace_test.sh >out/t-importrace.log 2>&1; result $? "importrace_test ($(tail -1 out/t-importrace.log))"
+    fi
     # MK-11 stencil_layout (a separate stencil layout ignored, Arm 4021056): failing with its bug
     # imitated and the fix off, passing with the fix; the version gate (r41p0-r54p0)
     if want stencillayout; then
@@ -840,6 +1027,11 @@ run_mode() {
     # a1zink_test.sh: extended dynamic state hidden and dynamic rendering as render passes, and its switch
     if want a1zink; then
       timeout 300 ./a1zink_test.sh >out/t-a1zink.log 2>&1; result $? "a1zink_test ($(tail -1 out/t-a1zink.log))"
+    fi
+    # glglyph_test.sh: GoldSrc's text through Zink (Half-Life menu, a player log), Mali imitated;
+    # split_varying (MK-47): its bug imitated with the fix off shows WRONG, with the fix the reference picture
+    if want glglyph; then
+      timeout 600 ./glglyph_test.sh >out/t-glglyph.log 2>&1; result $? "glglyph_test ($(tail -1 out/t-glglyph.log))"
     fi
     # server switches from <cache dir>/env
     if want envswitch; then
@@ -895,6 +1087,12 @@ run_mode() {
     if want gshide; then
       timeout 900 ./gshide_test.sh >out/t-gshide.log 2>&1; result $? "gshide_test ($(tail -1 out/t-gshide.log))"
     fi
+    # pv_zink_name (PV-07): PowerVR's driver hides features from the engine name "mesa zink" (imitated:
+    # VKBRIDGE_FAKE_DRIVER=powervr); the probe sees it and Zink's name is passed as a neutral one
+    # (a server of its own per step; once)
+    if want zinkname; then
+      timeout 300 ./zinkname_test.sh >out/t-zinkname.log 2>&1; result $? "zinkname_test ($(tail -1 out/t-zinkname.log))"
+    fi
     # DXVK 1.x turns on transform feedback's geometryStreams whatever the query said; a driver without
     # it (Mali-G720 r44p1, imitated) refused every D3D10/11 device (Hollow Knight on DXVK 1.10.3, Tab
     # S10+): the bit taken off before the driver, the device made; DXVK 1.10.3's d3d11_check with
@@ -911,7 +1109,7 @@ run_mode() {
     if want poolfull; then
       timeout 120 ./poolfull_test.sh >out/t-poolfull.log 2>&1; result $? "poolfull_test ($(tail -1 out/t-poolfull.log))"
     fi
-    # The server heap with Detroit: Become Human's pattern: no overflow pools for sets bigger
+    # The server heap with Detroit: Become Human's pattern (a player log): no overflow pools for sets bigger
     # than the pool, no copies of the app's pipeline caches past the limit, flat over 10000 frames
     if want heapleak; then
       timeout 600 ./heapleak_test.sh >out/t-heapleak.log 2>&1; result $? "heapleak_test ($(tail -1 out/t-heapleak.log))"
@@ -921,13 +1119,63 @@ run_mode() {
     if want lowmem; then
       timeout 120 ./lowmem_test.sh >out/t-lowmem.log 2>&1; result $? "lowmem_test ($(tail -1 out/t-lowmem.log))"
     fi
-    # What a process gone without destroying its device leaves in the server: destroyed, the heap flat
+    # Uncompressed images by format in the memory line (ledger 357): counts, mips, over 1024, targets
+    if want imgstat; then
+      timeout 120 ./imgstat_test.sh >out/t-imgstat.log 2>&1; result $? "imgstat_test ($(tail -1 out/t-imgstat.log))"
+    fi
+    # Memory by kind of object (server_heapkind.c): memkind line counts, memtop owners at memory low, off switch
+    if want heapkind; then
+      timeout 180 ./heapkind_test.sh >out/t-heapkind.log 2>&1; result $? "heapkind_test ($(tail -1 out/t-heapkind.log))"
+    fi
+    # What a process gone without destroying its device leaves in the server (a player log): destroyed, the heap flat
     if want exitheap; then
       timeout 300 ./exitheap_test.sh >out/t-exitheap.log 2>&1; result $? "exitheap_test ($(tail -1 out/t-exitheap.log))"
+    fi
+    # A device ended with render objects alive on a PowerVR-like driver that blocks on it (a player log): the next device still made
+    if want pvrdestroy; then
+      timeout 300 ./pvrdestroy_test.sh >out/t-pvrdestroy.log 2>&1; result $? "pvrdestroy_test ($(tail -1 out/t-pvrdestroy.log))"
+    fi
+    # PowerVR: pipeline layouts made the same way share one driver layout (its per-buffer-descriptor tables)
+    if want pldedup; then
+      timeout 120 ./pldedup_test.sh >out/t-pldedup.log 2>&1; result $? "pldedup_test ($(tail -1 out/t-pldedup.log))"
+    fi
+    # PowerVR: suspended/resumed dynamic renderings reach the driver as whole passes (its submit faults on the chains)
+    if want pvsusp; then
+      timeout 180 ./pvsusp_test.sh >out/t-pvsusp.log 2>&1; result $? "pvsusp_test ($(tail -1 out/t-pvsusp.log))"
+    fi
+    # Where PowerVR's leftover destroy meets the GPU hang detector (fault-armed launches): no double destroy, next device made
+    if want pvrhang; then
+      timeout 300 ./pvrhang_test.sh >out/t-pvrhang.log 2>&1; result $? "pvrhang_test ($(tail -1 out/t-pvrhang.log))"
+    fi
+    # Where fast create meets PowerVR's sweep, the hang detector and import_serial: each with VKBRIDGE_FAST_CREATE=1 and =0
+    if want fcmeet; then
+      timeout 1500 ./fastcreate_meet_test.sh >out/t-fcmeet.log 2>&1; result $? "fastcreate_meet_test ($(tail -1 out/t-fcmeet.log))"
+    fi
+    # PV-02 pv_mutable_linear (PowerVR: the query for a mutable-format LINEAR dma-buf image refused though the
+    # image works; a player log gamescope "modifiers.size > 0"): imitated beneath every layer, gamescope's own query
+    # keeps no modifier without the fix and LINEAR with it; the probe turns it on; a driver that says yes is untouched
+    if want pvmutable; then
+      timeout 300 ./pvmutable_test.sh >out/t-pvmutable.log 2>&1; result $? "pvmutable_test ($(tail -1 out/t-pvmutable.log))"
+    fi
+    # pv_bgra_store (PV-07 PowerVR: storage writes to a B8G8R8A8 image land in R8G8B8A8 order; gamescope's composite
+    # reached the screen with R and B exchanged): imitated beneath every layer; the probe turns the fix on; Mali untouched
+    if want pvbgra; then
+      timeout 300 ./pvbgra_test.sh >out/t-pvbgra.log 2>&1; result $? "pvbgra_test ($(tail -1 out/t-pvbgra.log))"
+    fi
+    if want pcachewedge; then
+      timeout 600 ./pcache_wedge_test.sh >out/t-pcache-wedge.log 2>&1; result $? "pcache_wedge_test ($(tail -1 out/t-pcache-wedge.log))"
+    fi
+    # The GPU profiler's dispatch spans (server_gpuprof.c): under =2 a span per compute pipeline, within the 512 stamps
+    if want gpuprof; then
+      timeout 240 ./gpuprof_test.sh >out/t-gpuprof.log 2>&1; result $? "gpuprof_test ($(tail -1 out/t-gpuprof.log))"
     fi
     # the compile gate on its own (server_compile_gate.c): its limit, one at a time while memory is low
     if want compilegate; then
       timeout 120 ./out/compilegate_unit >out/t-compilegate.log 2>&1; result $? "compilegate_unit ($(tail -1 out/t-compilegate.log))"
+    fi
+    # the fast cores for the threads a game waits on (server_cores.c): the fast set per SoC, affinity, background threads back on every core
+    if want cores; then
+      timeout 60 ./out/cores_unit >out/t-cores.log 2>&1; result $? "cores_unit ($(tail -1 out/t-cores.log))"
     fi
     # DX12 reserved buffers (server_emu_sparse.c): an address for vkd3d-proton's sparse buffers on a driver without sparse binding
     if want sparse; then
@@ -938,6 +1186,12 @@ run_mode() {
     # read back right through DMA_BUF_IOCTL_SYNC (dma-buf strategy; a server of its own; once)
     if want cached; then
       timeout 300 ./cached_test.sh >out/t-cached.log 2>&1; result $? "cached_test ($(tail -1 out/t-cached.log))"
+    fi
+    # Flushes and invalidates of coherent shared memory answered in the client (VKBRIDGE_FLUSH_ELIDE; Wine's WoW64
+    # OpenGL flushes every glFlushMappedBufferRange): 0 round trips with the switch on, bytes right; types that need
+    # flushes and cached readback still go to the server (servers of its own; once)
+    if want flushelide; then
+      timeout 300 ./flushelide_test.sh >out/t-flushelide.log 2>&1; result $? "flushelide_test ($(tail -1 out/t-flushelide.log))"
     fi
     # What the app is shown: VKBRIDGE_HEAP_MAX_MB (device-local heaps and their budget capped) and
     # VKBRIDGE_SPOOF_GPU (vendor, device, name; driverID and the server's own view real), from the
@@ -956,6 +1210,10 @@ run_mode() {
     # server of its own; once)
     if want envfile; then
       timeout 300 ./envfile_test.sh >out/t-envfile.log 2>&1; result $? "envfile_test ($(tail -1 out/t-envfile.log))"
+    fi
+    # The adapter line (client physdev.c): the GPU and heaps the app is shown, spoofed or capped by the guest or the server
+    if want adapter; then
+      timeout 300 ./adapter_test.sh >out/t-adapter.log 2>&1; result $? "adapter_test ($(tail -1 out/t-adapter.log))"
     fi
     # The Xclipse 530 (Galaxy A55): no host pointers and external buffers in no host-visible type
     # (VKBRIDGE_FAKE_MISSING=hostptr,extbufhv): smoke 6 of 13 with the fallback off, 13 of 13 with
@@ -979,6 +1237,10 @@ run_mode() {
     # syncfd_test.sh: sync-fd exports answered within a deadline; a held async submit named in the log
     if want syncfd; then
       timeout 300 ./syncfd_test.sh >out/t-syncfd.log 2>&1; result $? "syncfd_test ($(tail -1 out/t-syncfd.log))"
+    fi
+    # asyncgap_test.sh: a request still running is never taken as missing; a real gap loses only its program's device (a player log)
+    if want asyncgap; then
+      timeout 300 ./asyncgap_test.sh >out/t-asyncgap.log 2>&1; result $? "asyncgap_test ($(tail -1 out/t-asyncgap.log))"
     fi
     # dmabufsync_test.sh: a frame handed to another process is finished first on kernels without dma-buf sync files
     if want dmabufsync; then
@@ -1093,6 +1355,10 @@ run_mode() {
   if want cullmode_check; then
     timeout 60 ./out/cullmode_check >out/t-cullmode.log 2>&1; result $? "cullmode_check ($(tail -1 out/t-cullmode.log))"
   fi
+  # A vec4 vertex output read in Component pieces (MK-47's pairs): exact through the bridge as it is
+  if want splitvary_check; then
+    timeout 60 ./out/splitvary_check >out/t-splitvary-check.log 2>&1; result $? "splitvary_check ($(tail -1 out/t-splitvary-check.log))"
+  fi
   # The vertex attribute divisor as vkd3d-proton wants it (EXT name, zero divisor), drawn at
   # divisors 0/2/1: native on plain, emulated on mali
   if want divisor; then
@@ -1163,9 +1429,14 @@ run_mode() {
   fi
   if want querystuck; then
     # stale, batman: a reused slot's new value reaching the host late must be answered late, never as the slot's old value
-    for c in multiview lost drg stale batman late; do
+    for c in multiview lost drg stale batman late behind; do
       timeout 60 ./out/querystuck_check $c >out/t-qstuck-$c.log 2>&1
-      result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (multiview|lost|Deep|a reused|UE3|late)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
+      result $? "querystuck_check $c ($(grep -m1 -E '^(PASS|FAIL) (multiview|lost|Deep|a reused|UE3|late|behind)' out/t-qstuck-$c.log | cut -d: -f2- | cut -c2-140))"
+    done
+    # the late probe off (VKBRIDGE_QUERY_LATE_PROBE_MS=0): the 200 ms rule alone, as before 2026-11-10
+    for c in late drg; do
+      VKBRIDGE_QUERY_LATE_PROBE_MS=0 timeout 60 ./out/querystuck_check $c >out/t-qstuck-$c-p0.log 2>&1
+      result $? "querystuck_check $c, late probe off ($(grep -m1 -E '^(PASS|FAIL) (late|Deep)' out/t-qstuck-$c-p0.log | cut -d: -f2- | cut -c2-140))"
     done
   fi
   if want querystuck_burst; then
@@ -1181,6 +1452,9 @@ run_mode() {
     # timeline waits (VKBRIDGE_QUERY_NOTREADY_WIRE=1 + VKBRIDGE_SEM_WAIT_LOCAL=1; query_check's round-trip
     # counts are not for that arm, so only the stuck cases run there)
     VKBRIDGE_QUERY_EARLY=1 timeout 120 ./out/query_check >out/t-query-early.log 2>&1; result $? "query_check, VKBRIDGE_QUERY_EARLY=1 ($(tail -1 out/t-query-early.log))"
+    # the late probe off: no round trip at all while the mirror is on (the strict form of query_check's spin case)
+    VKBRIDGE_QUERY_LATE_PROBE_MS=0 timeout 120 ./out/query_check >out/t-query-p0.log 2>&1; result $? "query_check, late probe off ($(tail -1 out/t-query-p0.log))"
+    VKBRIDGE_QUERY_LATE_PROBE_MS=0 VKBRIDGE_QUERY_EARLY=1 timeout 120 ./out/query_check >out/t-query-early-p0.log 2>&1; result $? "query_check, VKBRIDGE_QUERY_EARLY=1, late probe off ($(tail -1 out/t-query-early-p0.log))"
     for c in multiview lost drg burst; do
       VKBRIDGE_QUERY_EARLY=1 timeout 60 ./out/querystuck_check $c >out/t-qstuck-early-$c.log 2>&1
       result $? "querystuck_check $c, VKBRIDGE_QUERY_EARLY=1 ($(tail -1 out/t-qstuck-early-$c.log))"
@@ -1298,5 +1572,15 @@ server_errors; result $? "no protocol errors in the server log (mali)"
 vkb_server_start VKBRIDGE_WG_INIT=1
 timeout 60 ./out/wginit_check >out/t-wginit.log 2>&1 && { grep -q "^SKIP" out/t-wginit.log || grep -q "wg_init: workgroup memory zeroed" "$VKB_SERVER_LOG"; }
 result $? "wginit_check, wg_init forced on ($(tail -1 out/t-wginit.log))"
+# wg_zero (PR #36, K11MCH1): invocation 0 stores the initializers, then a barrier. Alone it gives the same zeros;
+# with wg_init also on, wg_init takes the module (it spreads the stores) and wg_zero only what wg_init declines
+: > "$VKB_SERVER_LOG"
+vkb_server_start VKBRIDGE_WG_INIT=0 VKBRIDGE_WG_ZERO=1
+timeout 60 ./out/wginit_check >out/t-wgzero.log 2>&1 && { grep -q "^SKIP" out/t-wgzero.log || grep -q "wg_zero: workgroup variable initializers done by one invocation" "$VKB_SERVER_LOG"; }
+result $? "wginit_check, wg_zero alone ($(tail -1 out/t-wgzero.log))"
+: > "$VKB_SERVER_LOG"
+vkb_server_start VKBRIDGE_WG_INIT=1 VKBRIDGE_WG_ZERO=1
+timeout 60 ./out/wginit_check >out/t-wgboth.log 2>&1 && { grep -q "^SKIP" out/t-wgboth.log || { grep -q "wg_init: workgroup memory zeroed" "$VKB_SERVER_LOG" && ! grep -q "wg_zero: workgroup variable initializers done" "$VKB_SERVER_LOG"; }; }
+result $? "wginit_check, wg_init and wg_zero on: wg_init takes the module ($(tail -1 out/t-wgboth.log))"
 echo "== $pass passed, $fail failed (Mali profile ${VKB_MALI_PROFILE:-common})"
 [ "$fail" = 0 ]

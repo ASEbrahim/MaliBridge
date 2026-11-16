@@ -1,7 +1,7 @@
 #!/bin/bash
 # The capability check before the driver (server_guard.c): a pipeline whose stage reaches the driver
 # with a clip or cull distance built-in, on a driver without shaderClipDistance / shaderCullDistance.
-# ULTRAKILL (Mali r44p1: 0x40) and No Man's Sky (a player log G925 r49p1: 0x18 x3 G615 r44p1: 0x40 x3,
+# ULTRAKILL (Mali r44p1: 0x40) and No Man's Sky (a player log G925 r49p1: 0x18 x3, a player log G615 r44p1: 0x40 x3,
 # device poisoned, then the server died in a draw) both died in Mali's compiler that way, each time
 # after the bridge's clip rewrite had not taken the built-in out. The driver is now never handed one:
 # the pipeline is refused (VK_ERROR_INITIALIZATION_FAILED, a failed pipeline as DXVK/vkd3d know it).

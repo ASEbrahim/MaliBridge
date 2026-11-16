@@ -42,8 +42,13 @@ static int reserved(void *p, size_t len)
     return ok;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* --page N: the alignment told must be N (VKBRIDGE_FAKE_PAGE_SIZE=N stands in for an N-byte-page kernel on
+     * this host), the range is reserved aligned to it, and the allocation's size is not a multiple of it */
+    unsigned long want_page = 0;
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--page")) want_page = strtoul(argv[i + 1], NULL, 0);
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
         printf("FAIL loader: %s\n", dlerror());
@@ -93,6 +98,12 @@ int main(void)
     snprintf(d, sizeof(d), "placed %u, unmap reserve %u, alignment %llu", pf.memoryMapPlaced, pf.memoryUnmapReserve,
              (unsigned long long)pp.minPlacedMemoryMapAlignment);
     check(pf.memoryMapPlaced && pf.memoryUnmapReserve && pp.minPlacedMemoryMapAlignment, "features", d);
+    const unsigned long page_told = (unsigned long)pp.minPlacedMemoryMapAlignment;
+    check(page_told >= (unsigned long)sysconf(_SC_PAGESIZE) && (page_told & (page_told - 1)) == 0, "alignment: a power of two, the kernel's page or more", d);
+    if (want_page) {
+        snprintf(d, sizeof(d), "told %lu, want %lu", page_told, want_page);
+        check(page_told == want_page, "alignment told is the page asked for (--page)", d);
+    }
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &prio};
@@ -124,7 +135,8 @@ int main(void)
 
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-    const VkDeviceSize size = 1 << 20;
+    /* an allocation whose size is not a multiple of the page told (--page): the tail is the odd part */
+    const VkDeviceSize size = (1 << 20) + (want_page ? 4096 : 0);
     VkBuffer bufs[2];
     VkDeviceMemory mems[2];
     void *plain = NULL;
@@ -148,7 +160,9 @@ int main(void)
 
     /* The app's range, as Wine reserves it (low addresses for 32-bit programs, any here). */
     size_t len = (size_t)size;
-    void *where = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    void *where = mmap(NULL, len + 2 * page_told, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (where != MAP_FAILED) /* aligned up to the page told, as Wine places it (the rest stays reserved beyond it) */
+        where = (void *)(((uintptr_t)where + page_told - 1) & ~(uintptr_t)(page_told - 1));
     VkMemoryMapPlacedInfoEXT pl = {VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, NULL, where};
     VkMemoryMapInfoKHR mi = {VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, &pl, VK_MEMORY_MAP_PLACED_BIT_EXT, mems[0], 0, VK_WHOLE_SIZE};
     void *got = NULL;

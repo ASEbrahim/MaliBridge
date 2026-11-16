@@ -11,7 +11,7 @@
  * Those two ioctls came with Linux 6.0. On a 5.x kernel the import fails (ENOTTY, unchecked in a
  * release build), the dma-buf carries no fence, and the reader takes the buffer while the GPU is
  * still drawing it: parts of the frame missing at random, a whole frame near-black at times
- * (Galaxy Tab S9 FE+, kernel 5.15; the Kirin 9000's 5.10).
+ * (a player's Galaxy Tab S9 FE+, kernel 5.15, a player log; the Kirin 9000's 5.10, a player log).
  * Mali's own driver attaches nothing to an imported dma-buf either.
  *
  * Here: when a dma-buf export follows a sync-file export on the same thread (Zink's pattern) and the

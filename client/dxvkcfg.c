@@ -66,6 +66,34 @@ int vkb_dxvkcfg_own_latency(void)
     return 0;
 }
 
+/* An option's value in DXVK_CONFIG ("key = value; ..."), any prefix (dxgi., d3d9., dxvk.): 1 and the value when set. */
+static int cfg_value(const char *cfg, const char *key, char *val, size_t cap)
+{
+    size_t kl = strlen(key);
+    for (const char *p = cfg; (p = strcasestr(p, key)); p += kl) {
+        const char *v = p + kl;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v != '=') continue;
+        v++;
+        while (*v == ' ' || *v == '\t') v++;
+        size_t i = 0;
+        while (v[i] && v[i] != ';' && v[i] != ' ' && v[i] != '\t' && i + 1 < cap) val[i] = v[i], i++;
+        val[i] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+const char *vkb_dxvkcfg_pacer_conflict(void)
+{
+    const char *cfg = getenv("DXVK_CONFIG");
+    char v[32];
+    if (!cfg) return NULL;
+    if (cfg_value(cfg, "latencySleep", v, sizeof(v)) && (!strcasecmp(v, "True") || !strcmp(v, "1"))) return "dxvk.latencySleep";
+    if (cfg_value(cfg, "maxFrameRate", v, sizeof(v)) && atoi(v) != 0) return "a maxFrameRate";
+    return NULL;
+}
+
 typedef struct opt {
     char key[64], val[96];
     int confirmed; /* found in DXVK's effective configuration with this value */

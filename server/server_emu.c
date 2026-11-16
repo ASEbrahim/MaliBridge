@@ -69,6 +69,7 @@ static const struct {
     {"timeline", {"VK_KHR_timeline_semaphore", NULL}},
     {"imageless", {"VK_KHR_imageless_framebuffer", NULL}},
     {"membudget", {"VK_EXT_memory_budget", NULL}},
+    {"drmmod", {"VK_EXT_image_drm_format_modifier", NULL}},
 };
 
 /* A driver extension the clients are not shown: named in VKBRIDGE_FAKE_MISSING (as itself or
@@ -455,7 +456,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL dmabufmod_GetPhysicalDeviceImageFormatProp
     return dmabufmod_next2(pd, info, props);
 }
 
-/* VKBRIDGE_FAKE_MISSING=linearstorage (host tests): Arm's r18p0 (Mali-G52, HUAWEI AQM-AL10) most
+/* VKBRIDGE_FAKE_MISSING=linearstorage (host tests): Arm's r18p0 (Mali-G52, HUAWEI AQM-AL10, a player log) most
  * likely refuses a LINEAR-tiling image with storage usage: gamescope's LINEAR-modifier query (BGRA8,
  * SAMPLED | STORAGE | TRANSFER_SRC, MUTABLE_FORMAT) was answered VK_ERROR_FORMAT_NOT_SUPPORTED by the
  * driver while LINEAR images of Zink's usage (0x6, 0x97) were made. Imitated at the driver boundary
@@ -508,6 +509,61 @@ void vkb_emu_linearstorage_instance_init(vkb_srv_table *t)
     VKB_ONCE(VKB_LOG_INFO, "imitating r18p0's refusal of LINEAR images with storage usage (VKBRIDGE_FAKE_MISSING=linearstorage)");
 }
 
+/* VKBRIDGE_FAKE_MISSING=pvmutable (host tests): PowerVR's answer on a Pixel 10 Pro XL (DXT-48-1536, driver
+ * 25.1@6794074, a player log session.log): gamescope's query for its flippable image, B8G8R8A8_UNORM, 2D,
+ * DRM-format-modifier tiling, usage 0x6, MUTABLE_FORMAT with a 2-format view list, DMA_BUF, came back
+ * VK_ERROR_FORMAT_NOT_SUPPORTED for the LINEAR modifier and for 0x00ffffffffffffff alike, so gamescope had no
+ * modifier left and aborted ("modifiers.size > 0", rendervulkan.cpp:2272). Imitated at the driver boundary
+ * (beneath every layer, as linearstorage): a 2D RGBA8 / BGRA8 (UNORM or sRGB) MUTABLE_FORMAT query with DMA_BUF
+ * and LINEAR tiling or any DRM format modifier is refused; the images themselves are made as the driver makes
+ * them (PowerVR makes, exports and imports that image: the refusal is the query's alone). */
+int vkb_emu_pvmutable_refused(const VkPhysicalDeviceImageFormatInfo2 *info)
+{
+    static int fake = -1;
+    if (fake < 0) fake = vkb_emu_faked("pvmutable");
+    if (!fake || !info || info->type != VK_IMAGE_TYPE_2D || !(info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) return 0;
+    switch (info->format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+        break;
+    default:
+        return 0;
+    }
+    int dmabuf = 0, mod = 0;
+    for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
+            dmabuf |= ((const VkPhysicalDeviceExternalImageFormatInfo *)b)->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+            mod = 1;
+    }
+    return dmabuf && (info->tiling == VK_IMAGE_TILING_LINEAR || (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && mod));
+}
+
+static PFN_vkGetPhysicalDeviceImageFormatProperties2 pvmut_next2;
+
+static VKAPI_ATTR VkResult VKAPI_CALL pvmut_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *info,
+                                                                                   VkImageFormatProperties2 *props)
+{
+    if (vkb_emu_pvmutable_refused(info)) {
+        memset(&props->imageFormatProperties, 0, sizeof(props->imageFormatProperties));
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return pvmut_next2(pd, info, props);
+}
+
+/* at instance creation, before the dispatch tables are copied: wraps the driver's own query */
+void vkb_emu_pvmutable_instance_init(vkb_srv_table *t)
+{
+    if (!vkb_emu_faked("pvmutable")) return;
+    if (t->real.vkGetPhysicalDeviceImageFormatProperties2 && t->real.vkGetPhysicalDeviceImageFormatProperties2 != pvmut_GetPhysicalDeviceImageFormatProperties2) {
+        pvmut_next2 = t->real.vkGetPhysicalDeviceImageFormatProperties2;
+        t->real.vkGetPhysicalDeviceImageFormatProperties2 = pvmut_GetPhysicalDeviceImageFormatProperties2;
+    }
+    VKB_ONCE(VKB_LOG_INFO, "imitating PowerVR's refusal of mutable-format LINEAR / DRM-modifier dma-buf RGBA8 / BGRA8 image queries (VKBRIDGE_FAKE_MISSING=pvmutable)");
+}
+
 /* depthClamp (VKB_EMU_DEPTH_CLAMP) is reported here as well as by the client (client/emu.c), so a
  * guest whose client library predates the flag sees it too. */
 static PFN_vkGetPhysicalDeviceFeatures clamp_next1;
@@ -547,14 +603,6 @@ void vkb_emu_instance_install(vkb_srv_table *t)
         t->dt.vkGetPhysicalDeviceImageFormatProperties2 = dmabufmod_GetPhysicalDeviceImageFormatProperties2;
         VKB_ONCE(VKB_LOG_INFO, "imitating r32p1's refusal of DRM-modifier dma-buf storage / mutable images (VKBRIDGE_FAKE_MISSING=dmabufmod)");
     }
-    if (t->dt.vkGetPhysicalDeviceFeatures) {
-        clamp_next1 = t->dt.vkGetPhysicalDeviceFeatures;
-        t->dt.vkGetPhysicalDeviceFeatures = clamp_GetPhysicalDeviceFeatures;
-    }
-    if (t->dt.vkGetPhysicalDeviceFeatures2) {
-        clamp_next2 = t->dt.vkGetPhysicalDeviceFeatures2;
-        t->dt.vkGetPhysicalDeviceFeatures2 = clamp_GetPhysicalDeviceFeatures2;
-    }
     if (vkb_emu_faked("planarext")) {
         if (t->dt.vkGetPhysicalDeviceImageFormatProperties) {
             planar_next1 = t->dt.vkGetPhysicalDeviceImageFormatProperties;
@@ -568,6 +616,15 @@ void vkb_emu_instance_install(vkb_srv_table *t)
     }
     /* always: fp16_hide (MK-20) decides per query whether 16-bit floats are offered */
     vkb_errata_fp16_instance_install(t);
+    /* depthClamp (PR #31) over fp16_hide: fp16_hide installs only on the driver's own query (dt == real) */
+    if (t->dt.vkGetPhysicalDeviceFeatures) {
+        clamp_next1 = t->dt.vkGetPhysicalDeviceFeatures;
+        t->dt.vkGetPhysicalDeviceFeatures = clamp_GetPhysicalDeviceFeatures;
+    }
+    if (t->dt.vkGetPhysicalDeviceFeatures2) {
+        clamp_next2 = t->dt.vkGetPhysicalDeviceFeatures2;
+        t->dt.vkGetPhysicalDeviceFeatures2 = clamp_GetPhysicalDeviceFeatures2;
+    }
     if (!t->real.vkEnumerateDeviceExtensionProperties) return;
     /* always: the driver errata hide by GPU and driver version (vkb_errata_hidden_ext) */
     t->dt.vkEnumerateDeviceExtensionProperties = hide_EnumerateDeviceExtensionProperties;
@@ -786,7 +843,7 @@ int vkb_emu_bgr10_for(const vkb_srv_table *inst, VkPhysicalDevice pd)
  * round trip); a process that started with enough memory, and every process on a device without the
  * default cap (more than 12800 MB of RAM, performance mode, an explicit VKBRIDGE_HEAP_MAX_MB), is not
  * offered it and runs exactly as before. The processes the system killed or that died short of memory
- * (a player log 2850 MB free at the start, QUWD 3507, 8SUS 3045, EMS5 3270 under a 4096 MB cap) started so;
+ * (player logs with 2850, 3507, 3045 and 3270 MB free at the start, under a 4096 MB cap) started so;
  * the owner's tablets: no cap on the 16 GB Ultra, 3 of 4 S10+ starts with 4096 MB free or more.
  * VKBRIDGE_EMU_MEMBUDGET=1: offered to every DXVK/vkd3d process (A/B), =0: to none. */
 int vkb_emu_membudget_for(const vkb_srv_table *t)
@@ -807,8 +864,10 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
     VkExtensionProperties *e = calloc(n ? n : 1, sizeof(*e));
     idt->vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
-    int divisor = 0, depth_clip = 0, maint5 = 0, robust2 = 0, maint6 = 0, lson_khr = 0, lson_ext = 0, push = 0, dynrend = 0, rp2 = 0, imageless = 0, membudget = 0;
+    int divisor = 0, depth_clip = 0, maint5 = 0, robust2 = 0, maint6 = 0, lson_khr = 0, lson_ext = 0, push = 0, dynrend = 0, rp2 = 0, imageless = 0, membudget = 0,
+        drmmod = 0;
     for (uint32_t i = 0; i < n; i++) {
+        if (!strcmp(e[i].extensionName, "VK_EXT_image_drm_format_modifier")) drmmod = 1;
         if (!strcmp(e[i].extensionName, "VK_EXT_memory_budget")) membudget = 1;
         if (!strcmp(e[i].extensionName, "VK_EXT_vertex_attribute_divisor") ||
             !strcmp(e[i].extensionName, "VK_KHR_vertex_attribute_divisor"))
@@ -926,10 +985,41 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
      * stops without it; server_dmabuf_ahb.c), or where VKBRIDGE_DMABUF_VIA_AHB=1 asks: the driver's
      * dma-buf paths are then not used for clients. */
     if (vkb_dab_wanted(idt, pd)) emu = (emu | VKB_EMU_DMABUF_AHB) & ~(VKB_EMU_DMABUF_EXPORT | VKB_EMU_OPAQUE_FD);
+    /* VK_EXT_image_drm_format_modifier where the driver has dma-buf memory but not the extension
+     * (Mali-G720 MC8 r49p1, Xiaomi 17T: a player log) and the export is emulated. Zink
+     * exports an image it did not make exportable (every window pixmap Xwayland hands to gamescope,
+     * the buffers Steam's browser makes through GBM) only by making it again with the LINEAR
+     * modifier (zink_resource_get_handle); without the extension it gives no fd ("Incorrect rendering
+     * will happen because the Vulkan device doesn't support the 'EXT_image_drm_format_modifier'
+     * feature" in both Xwayland processes and the web helper's GPU process, "Failed to get fd for
+     * plane" 24 times there), and Steam's window never reached the screen. Offered with the LINEAR
+     * modifier only: such an image is a plain LINEAR one (server_emu_layer.c), its memory the
+     * emulation's pages, as the export emulation already makes gamescope's (linear_mod_plain). A
+     * driver with the extension is not touched; VKBRIDGE_EMU_DRMMOD=0 turns it off;
+     * VKBRIDGE_FAKE_MISSING=drmmod (or the extension in VKBRIDGE_SERVER_HIDE_EXTS: the host's Mali
+     * profiles) imitates a driver without it on the host. */
+    if (vkb_emu_ext_hidden_by_env("VK_EXT_image_drm_format_modifier")) drmmod = 0; /* imitated missing counts as lacking */
+    if (!drmmod && (emu & VKB_EMU_DMABUF_EXPORT) && !(emu & VKB_EMU_DMABUF_AHB) && !env_off("VKBRIDGE_EMU_DRMMOD")) {
+        emu |= VKB_EMU_DRM_MOD_LINEAR;
+        vkb_dab_drmmod_note();
+        VKB_ONCE(VKB_LOG_INFO, "VK_EXT_image_drm_format_modifier: the driver has none; offered with the LINEAR modifier only "
+                               "(a LINEAR-modifier image is a plain LINEAR one over the emulated export; VKBRIDGE_EMU_DRMMOD=0 turns it off)");
+    }
     /* What DXVK 3 requires and the GPU lacks (server_emu_compat.c). Vulkan 1.4 has maintenance6. */
     if (!f.dualSrcBlend && !env_off("VKBRIDGE_EMU_DUALSRC")) emu |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid && !env_off("VKBRIDGE_EMU_FILLMODE")) emu |= VKB_EMU_FILL_MODE;
-    if (!f.depthClamp && !env_off("VKBRIDGE_EMU_DEPTHCLAMP")) emu |= VKB_EMU_DEPTH_CLAMP;
+    /* depthClamp (PR #31): by default only on a driver below Vulkan 1.3, where DroidDeck runs D3D11 on DXVK
+     * 1.10.3, which asks for it at every feature level (Mali-G76 r26p0 and r38p1 lack it). A Vulkan 1.3 driver
+     * without it (a Mali-G52 on 1.3.283 runs Steam mode on Zink, whose GL would change with it) keeps it
+     * absent. VKBRIDGE_EMU_DEPTHCLAMP=1 has it there too, =0 off; VKBRIDGE_FAKE_API counts as the driver's. */
+    if (!f.depthClamp) {
+        const char *dc = vkb_srv_env("VKBRIDGE_EMU_DEPTHCLAMP");
+        uint32_t fake_api = vkb_promote_fake_api(), api = fake_api && fake_api < props.apiVersion ? fake_api : props.apiVersion;
+        if (dc && *dc ? strcmp(dc, "0") != 0 : api < VK_API_VERSION_1_3) emu |= VKB_EMU_DEPTH_CLAMP;
+        else if (!dc || strcmp(dc, "0"))
+            VKB_ONCE(VKB_LOG_INFO, "depthClamp: the driver has none; not reported on a Vulkan 1.%u driver (VKBRIDGE_EMU_DEPTHCLAMP=1 reports it)",
+                     VK_API_VERSION_MINOR(api));
+    }
     if (!f.multiViewport && !env_off("VKBRIDGE_EMU_MULTIVIEWPORT")) emu |= VKB_EMU_MULTI_VIEWPORT;
     /* DXVK refuses a device without multiDrawIndirect; Mali-G57 on r32p1/r38p1 has none (Lee Gao's
      * compat_layer README). Indirect draws are split into single ones (server_emu_compat.c). */
@@ -1004,6 +1094,13 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
         for (int i = 0; i < 3; i++) desc_short |= dl[1][i] && dl[1][i] < 1000000;
     }
     if (desc_short && !env_off("VKBRIDGE_EMU_DESCLIMITS")) emu |= VKB_EMU_DESC_LIMITS;
+    /* PowerVR reports no descriptor limit at all, but its update-after-bind pools cost host memory per
+     * descriptor (RE3's vkd3d heap: 6 GB of the server's heap, Pixel 10 Pro XL 2026-11-10): the same
+     * wrappers measure that and cut vkd3d's sets to a budget (server_emu_desc.c). Nothing is raised for
+     * the app (its limits are already the highest), so nothing is said missing either. */
+    if (props.apiVersion >= VK_API_VERSION_1_2 && !env_off("VKBRIDGE_EMU_DESCLIMITS") &&
+        vkb_driver_id(idt, pd, props.apiVersion) == VK_DRIVER_ID_IMAGINATION_PROPRIETARY)
+        emu |= VKB_EMU_DESC_LIMITS;
     /* PointSize in geometry/tessellation stages: stripped when the feature is missing. */
     if (!f.shaderTessellationAndGeometryPointSize && (f.geometryShader || f.tessellationShader)) emu |= VKB_EMU_POINT_SIZE;
     /* gamescope (Vulkan 1.2) and Zink need timeline semaphores; Mali r18/r19 (Vulkan 1.1) have none
@@ -1011,7 +1108,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     int timeline_missing = vkb_timeline_missing(idt, pd);
     if (timeline_missing) emu |= VKB_EMU_TIMELINE;
     /* Zink requires VK_KHR_imageless_framebuffer (Mesa 26.0.8, DroidDeck's Ubuntu runtime: "failed to load
-     * driver: zink" and Steam's UI gone); Mali r18-r26 (Vulkan 1.1) lack it. A real framebuffer is
+     * driver: zink" and Steam's UI gone, a player log); Mali r18-r26 (Vulkan 1.1) lack it. A real framebuffer is
      * made per set of views at the render pass (server_emu_imageless.c). Hidden from the clients
      * (VKBRIDGE_FAKE_MISSING=imageless, VKBRIDGE_SERVER_HIDE_EXTS: the host's Mali profiles) counts as lacking. */
     int imageless_missing = (!imageless && props.apiVersion < VK_API_VERSION_1_2) || vkb_emu_ext_hidden_by_env("VK_KHR_imageless_framebuffer");
@@ -1044,6 +1141,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (uf11_missing) miss |= VKB_EMU_UF11_VTX;
     if (!texel_single) miss |= VKB_EMU_TEXEL_ALIGN;
     if (desc_short) miss |= VKB_EMU_DESC_LIMITS;
+    if (emu & VKB_EMU_DRM_MOD_LINEAR) miss |= VKB_EMU_DRM_MOD_LINEAR;
     *missing = miss;
     return emu & VKB_EMU_IMPLEMENTED;
 }

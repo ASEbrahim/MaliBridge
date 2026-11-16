@@ -4,12 +4,12 @@
  * A lost device stays one program's problem. The one server serves every program; one program's
  * device loss must not reach into the others.
  *
- * Why: Pixel 9, Mali-G715, driver r54p3, WoW Classic through vkd3d-proton: the game's
+ * Why: a player log (Pixel 9, Mali-G715, driver r54p3, WoW Classic through vkd3d-proton): the game's
  * device was lost (vkWaitForFences -4), the game submitted four more times (each -4), and 19 ms
  * after the fourth the driver's own thread (mali-event-hand: basep_event_thread ->
  * basep_cpu_queue_process -> signal_fence_cb -> device_faults_handler_internal::record_internal)
- * read address 0x101; the server died with Steam, the compositor and everything. G715
- * Immortalis, r38p1, which has no device-fault recording took 25 submits after its loss and lived.
+ * read address 0x101; the server died with Steam, the compositor and everything. a player log (G715
+ * Immortalis, r38p1, which has no device-fault recording) took 25 submits after its loss and lived.
  *
  * Two parts, both off the path of a device that works:
  *   1. The latch. A device is taken as lost when a submission (vkQueueSubmit, vkQueueSubmit2,
@@ -28,7 +28,7 @@
  *      as without the latch, until the latch is set. From then on, submissions,
  *      waits and fence/semaphore polls on it return VK_ERROR_DEVICE_LOST without reaching the
  *      driver: a lost device runs nothing more, and every new submission is one more fence the
- *      driver's thread signals with an error (the path E6ZA's driver died on). Vulkan allows
+ *      driver's thread signals with an error (the path a player log's driver died on). Vulkan allows
  *      exactly this: once a device is lost, these calls may return VK_ERROR_DEVICE_LOST. Installed
  *      beneath every layer, so the layers' own submissions stop too. A device that works pays one
  *      load of its flag per call. VKBRIDGE_LOST_LATCH=0 turns it off (the A/B).
@@ -52,7 +52,7 @@
  * submission of a device of the program VKBRIDGE_TEST_LOST_COMM names (default lost_check) and every call the latch covers after it return VK_ERROR_DEVICE_LOST
  * (an imitated loss). ":after": every submission that reaches the imitated lost device after the
  * loss starts a thread named "mali-event-hand" that faults inside the real driver (a driver
- * query writing through address 0x101), as E6ZA's driver did on the submissions after its loss.
+ * query writing through address 0x101), as a player log's driver did on the submissions after its loss.
  * ":loss": that thread starts at the loss itself, where the latch cannot help.
  * ":blip": the n-th FENCE WAIT answers -4 and so does the poll right after it, then the driver
  * answers as it is (the device is fine): a slow job-manager driver's transient; ":blip:again": the
@@ -62,11 +62,12 @@
  * VKBRIDGE_TEST_PARK_STALL_S shortens the release's STALL_S. ":wait": the device
  * is lost from the n-th fence wait on (waits, polls and submissions answer -4). ":wait:evt": as
  * ":wait", and every submission that reaches the lost device starts the faulting "mali-event-hand"
- * thread, as ":after" does: E6ZA's own order (the loss first answered by vkWaitForFences, then the
+ * thread, as ":after" does: a player log's own order (the loss first answered by vkWaitForFences, then the
  * game's submissions answered -4, then the driver's event thread faulted).
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
+#include "vkb_lostlog.h"
 
 #include <pthread.h>
 #include <signal.h>
@@ -82,6 +83,7 @@
 #define STALL_S 30
 #define CONFIRM_MS 100 /* a wait's lost answer is confirmed by another this much later (not the same burst of polls) */
 #define SUSPECT_MS 2000 /* ... and no later than this: an older suspicion nothing confirmed is dropped, the next lost answer is a new one */
+#define ASYNC_SAY_S 10  /* a lost device's asynchronous lost answers: one count line at most this often */
 
 typedef struct lost_dev {
     vkb_srv_table *t;
@@ -111,6 +113,11 @@ typedef struct lost_dev {
     volatile int imi_lost;
     volatile int imi_blip; /* VKBRIDGE_TEST_LOST=<n>:blip: lost answers left before the driver's own again */
     const char *why;
+    /* asynchronous calls answered VK_ERROR_DEVICE_LOST after the latch (vkb_lost_async): counted, not logged each */
+    unsigned long async_n, async_cmd[4]; /* in all; by kind: vkQueueSubmit, vkQueueSubmit2, vkEndCommandBuffer, other */
+    unsigned long async_said;            /* async_n at the last line */
+    uint64_t async_said_ns;              /* when that line was written (0: none yet) */
+    vkb_ll *ll;                          /* what it was given: the loss record (server_lostlog.c; NULL: off) */
 } lost_dev;
 
 static lost_dev *devs[VKB_MAX_TABLES];
@@ -172,6 +179,7 @@ static lost_dev *dev_of(VkDevice d)
 
 static void *watch_main(void *arg);
 static void imi_fault(lost_dev *l);
+static void async_counts(const lost_dev *l, char *out, size_t cap);
 
 /* The watchdog of a stopped driver thread (vkb_lost_fault): started with the first lost device, by the
  * latch or by a stop (vkb_lost_stop), so that a thread parked after either can be released; never from
@@ -184,7 +192,9 @@ static void watch_start(void)
         pthread_detach(th);
 }
 
-static void latch(lost_dev *l, const char *why)
+/* driver_said: the driver's own answer said lost (a submission's, a confirmed wait's): the loss record asks it for its
+ * fault report; 0: the bridge took the device as lost (a contained fault), the driver is not asked */
+static void latch(lost_dev *l, const char *why, int driver_said)
 {
     if (!l || latch_off || __atomic_exchange_n(&l->lost, 1, __ATOMIC_ACQ_REL)) return;
     l->why = why;
@@ -192,12 +202,13 @@ static void latch(lost_dev *l, const char *why)
     watch_start();
     VKB_ERR("device %u (pid %d) is lost (%s): its submissions and waits now answer VK_ERROR_DEVICE_LOST without reaching the "
             "driver; the other programs go on", l->t->id, l->t->proc ? l->t->proc->pid : 0, why);
+    vkb_ll_lost(l->ll, why, driver_said); /* on a thread of its own */
 }
 
 void vkb_lost_mark(vkb_srv_table *t, const char *why)
 {
     env_once();
-    latch(dev_of_table(t), why);
+    latch(dev_of_table(t), why, 0);
 }
 
 /* server_conn.c vkb_srv_end_proc (the memory-fault stall watchdog, server_guard.c): the device is
@@ -211,6 +222,7 @@ void vkb_lost_stop(vkb_srv_table *t, const char *why)
     if (!__atomic_exchange_n(&l->lost, 1, __ATOMIC_ACQ_REL)) {
         l->why = why;
         __atomic_add_fetch(&lost_count, 1, __ATOMIC_RELAXED);
+        vkb_ll_lost(l->ll, why, 0); /* stopped: what it was given, the driver not asked */
     }
     /* a lost device now counts (vkb_lost_fault parks a driver thread's fault): its release must be able to come
      * (test11 audit P2: an A2 stop alone never started it, and a parked thread the driver needed froze every program) */
@@ -221,7 +233,8 @@ void vkb_lost_stop(vkb_srv_table *t, const char *why)
 
 int vkb_lost_is(const vkb_srv_table *t)
 {
-    lost_dev *l = t && t->id < VKB_MAX_TABLES ? devs[t->id] : NULL;
+    /* also from the pipeline cache's saver thread (server_pcache.c); relaxed: the same plain load as before on the hot path */
+    lost_dev *l = t && t->id < VKB_MAX_TABLES ? __atomic_load_n(&devs[t->id], __ATOMIC_RELAXED) : NULL;
     return l && __atomic_load_n(&l->lost, __ATOMIC_RELAXED);
 }
 
@@ -232,12 +245,12 @@ int vkb_lost_stopped(const vkb_srv_table *t)
         /* an instance with a stopped device: left as it is too */
         for (uint32_t i = 1; i < __atomic_load_n(&devs_top, __ATOMIC_ACQUIRE); i++) {
             lost_dev *x = __atomic_load_n(&devs[i], __ATOMIC_ACQUIRE);
-            if (x && x->stopped && x->t->parent == t) return 1;
+            if (x && __atomic_load_n(&x->stopped, __ATOMIC_RELAXED) && x->t->parent == t) return 1;
         }
         return 0;
     }
     lost_dev *l = t->id < VKB_MAX_TABLES ? devs[t->id] : NULL;
-    return l && l->stopped;
+    return l && __atomic_load_n(&l->stopped, __ATOMIC_RELAXED);
 }
 
 /* After a stop, the watchdog's view of the driver: calls in it and calls coming back. */
@@ -267,7 +280,7 @@ static void suspect(lost_dev *l, const char *what)
     if (latch_off) return;
     uint64_t now = mono_ns(), was = __atomic_load_n(&l->suspect_ns, __ATOMIC_ACQUIRE);
     if (!was) {
-        if (__atomic_compare_exchange_n(&l->suspect_ns, &was, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        if (__atomic_compare_exchange_n(&l->suspect_ns, &was, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && (vkb_ll_said(l->ll, what), 1))
             VKB_WARN("device %u (pid %d): %s answered VK_ERROR_DEVICE_LOST, and so did a poll right after: not taken as lost "
                      "until the driver says so again (a job-manager driver's timed-out wait can work again after it)",
                      l->t->id, l->t->proc ? l->t->proc->pid : 0, what);
@@ -291,7 +304,7 @@ static void suspect(lost_dev *l, const char *what)
     if (!is_lost(l)) {
         snprintf(l->why_buf, sizeof(l->why_buf), "%s answered VK_ERROR_DEVICE_LOST again %.0f ms after the first lost answer", what,
                  (now - was) / 1e6);
-        latch(l, l->why_buf);
+        latch(l, l->why_buf, 1);
     }
     __atomic_store_n(&l->confirming, 0, __ATOMIC_RELEASE);
 }
@@ -301,6 +314,7 @@ static inline void fine(lost_dev *l)
 {
     if (__builtin_expect(!__atomic_load_n(&l->suspect_ns, __ATOMIC_RELAXED), 1)) return;
     if (!__atomic_exchange_n(&l->suspect_ns, 0, __ATOMIC_ACQ_REL)) return;
+    vkb_ll_unsaid(l->ll);
     unsigned long n = __atomic_add_fetch(&l->blips, 1, __ATOMIC_RELAXED);
     if (n <= 3 || n % 100 == 0)
         VKB_INFO("device %u (pid %d): said lost, then finished work: not lost (%lu time(s))", l->t->id,
@@ -314,10 +328,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL lo_QueueSubmit(VkQueue q, uint32_t n, cons
     lost_dev *l = dev_of_table(vkb_srv_current_table());
     if (!l) return VK_ERROR_DEVICE_LOST;
     if (is_lost(l)) return VK_ERROR_DEVICE_LOST;
+    vkb_ll_sub *rec = l->ll ? vkb_ll_submit(l->ll, 0, q, n, si, f) : NULL; /* the loss record's ring: stores only */
     ENTER();
     VkResult r = l->submit(q, n, si, f);
     LEAVE();
-    if (r == VK_ERROR_DEVICE_LOST) latch(l, "vkQueueSubmit returned VK_ERROR_DEVICE_LOST");
+    vkb_ll_answer(rec, r);
+    if (r == VK_ERROR_DEVICE_LOST) latch(l, "vkQueueSubmit returned VK_ERROR_DEVICE_LOST", 1);
     return r;
 }
 
@@ -326,10 +342,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL lo_QueueSubmit2(VkQueue q, uint32_t n, con
     lost_dev *l = dev_of_table(vkb_srv_current_table());
     if (!l) return VK_ERROR_DEVICE_LOST;
     if (is_lost(l)) return VK_ERROR_DEVICE_LOST;
+    vkb_ll_sub *rec = l->ll ? vkb_ll_submit(l->ll, 1, q, n, si, f) : NULL; /* the loss record's ring: stores only */
     ENTER();
     VkResult r = l->submit2(q, n, si, f);
     LEAVE();
-    if (r == VK_ERROR_DEVICE_LOST) latch(l, "vkQueueSubmit2 returned VK_ERROR_DEVICE_LOST");
+    vkb_ll_answer(rec, r);
+    if (r == VK_ERROR_DEVICE_LOST) latch(l, "vkQueueSubmit2 returned VK_ERROR_DEVICE_LOST", 1);
     return r;
 }
 
@@ -338,10 +356,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL lo_QueueBindSparse(VkQueue q, uint32_t n, 
     lost_dev *l = dev_of_table(vkb_srv_current_table());
     if (!l) return VK_ERROR_DEVICE_LOST;
     if (is_lost(l)) return VK_ERROR_DEVICE_LOST;
+    vkb_ll_sub *rec = l->ll ? vkb_ll_submit(l->ll, 2, q, n, bi, f) : NULL; /* the loss record's ring: stores only */
     ENTER();
     VkResult r = l->sparse(q, n, bi, f);
     LEAVE();
-    if (r == VK_ERROR_DEVICE_LOST) latch(l, "vkQueueBindSparse returned VK_ERROR_DEVICE_LOST");
+    vkb_ll_answer(rec, r);
+    if (r == VK_ERROR_DEVICE_LOST) latch(l, "vkQueueBindSparse returned VK_ERROR_DEVICE_LOST", 1);
     return r;
 }
 
@@ -354,7 +374,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL lo_WaitForFences(VkDevice d, uint32_t n, c
     VkResult r = l->wait_fences(d, n, f, all, timeout);
     LEAVE();
     /* lost for real when the fence's status says so too */
-    if (r == VK_SUCCESS) fine(l);
+    if (r == VK_SUCCESS) {
+        fine(l);
+        if (l->ll) vkb_ll_fences_done(l->ll, n, f, all);
+    }
     else if (r == VK_ERROR_DEVICE_LOST && n && f && l->fence_status && l->fence_status(d, f[0]) == VK_ERROR_DEVICE_LOST)
         suspect(l, "vkWaitForFences");
     return r;
@@ -369,8 +392,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL lo_WaitSemaphores(VkDevice d, const VkSema
     VkResult r = l->wait_sems(d, wi, timeout);
     LEAVE();
     /* Arm's job-manager drivers end a timed-out wait with -4 that a poll takes back (server_wait.c) */
-    if (r == VK_SUCCESS) fine(l);
-    else if (r == VK_ERROR_DEVICE_LOST && wi && l->wait_sems(d, wi, 0) == VK_ERROR_DEVICE_LOST)
+    if (r == VK_SUCCESS) {
+        fine(l);
+        if (l->ll) vkb_ll_sems_done(l->ll, wi);
+    } else if (r == VK_ERROR_DEVICE_LOST && wi && l->wait_sems(d, wi, 0) == VK_ERROR_DEVICE_LOST)
         suspect(l, "vkWaitSemaphores");
     return r;
 }
@@ -381,7 +406,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL lo_GetFenceStatus(VkDevice d, VkFence f)
     if (!l) return VK_ERROR_DEVICE_LOST;
     if (is_lost(l)) return VK_ERROR_DEVICE_LOST;
     VkResult r = l->fence_status(d, f);
-    if (r == VK_SUCCESS) fine(l);
+    if (r == VK_SUCCESS) {
+        fine(l);
+        if (l->ll) vkb_ll_fences_done(l->ll, 1, &f, VK_TRUE);
+    }
     /* a fence status's -4 only confirms a wait's: a poll loop alone never latches on its first answer */
     else if (r == VK_ERROR_DEVICE_LOST && __atomic_load_n(&l->suspect_ns, __ATOMIC_RELAXED)) suspect(l, "vkGetFenceStatus");
     return r;
@@ -429,7 +457,7 @@ static void *imi_fault_main(void *arg)
     imi_fault_arg a = *(imi_fault_arg *)arg;
     free(arg);
     prctl(PR_SET_NAME, "mali-event-hand", 0, 0, 0);
-    struct timespec ts = {0, 50000000}; /* E6ZA's came 111 ms after the loss, 19 ms after the last submission */
+    struct timespec ts = {0, 50000000}; /* a player log's came 111 ms after the loss, 19 ms after the last submission */
     nanosleep(&ts, NULL);
     VKB_WARN("VKBRIDGE_TEST_LOST: the imitated driver's event thread faults inside the driver");
     /* a driver query writing its count through address 0x101: the fault is inside the driver */
@@ -581,6 +609,7 @@ void vkb_lost_device_init(vkb_srv_table *t)
         LO_HOOK(vkDeviceWaitIdle, lo_DeviceWaitIdle, device_idle);
         LO_HOOK(vkQueueWaitIdle, lo_QueueWaitIdle, queue_idle);
     }
+    if (!latch_off) l->ll = vkb_ll_device_init(t); /* recorded in the latch's wrappers */
     __atomic_store_n(&devs[t->id], l, __ATOMIC_RELEASE);
     for (uint32_t top = __atomic_load_n(&devs_top, __ATOMIC_RELAXED); top <= t->id;)
         if (__atomic_compare_exchange_n(&devs_top, &top, t->id + 1, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) break;
@@ -590,11 +619,30 @@ void vkb_lost_device_destroy(vkb_srv_table *t)
 {
     if (!t || t->id >= VKB_MAX_TABLES) return;
     lost_dev *l = devs[t->id];
-    if (!l || l->t != t || l->stopped) return; /* a stopped device keeps its record: it is never destroyed */
+    if (!l || l->t != t || __atomic_load_n(&l->stopped, __ATOMIC_RELAXED)) return; /* a stopped device keeps its record: it is never destroyed */
     __atomic_store_n(&devs[t->id], NULL, __ATOMIC_RELEASE);
     if (l->lost) __atomic_sub_fetch(&lost_count, 1, __ATOMIC_RELAXED);
+    unsigned long an = __atomic_load_n(&l->async_n, __ATOMIC_RELAXED);
+    if (an) {
+        char kinds[160];
+        async_counts(l, kinds, sizeof(kinds));
+        VKB_INFO("device %u: %lu asynchronous call(s) answered VK_ERROR_DEVICE_LOST after its loss (%s)", t->id, an, kinds);
+    }
+    vkb_ll_device_destroy(l->ll); /* a lost answer never confirmed: its record now */
     /* its wrappers stay in t->real until the table goes, which is right after */
     free(l);
+}
+
+/* Before a device goes (vkDestroyDevice, its program's end): its loss record's driver query, if one runs, is waited for
+ * (bounded: it has its own time limit of 2 s); one that does not come back leaves the device stopped, never destroyed
+ * under the query. */
+int vkb_lost_settle(vkb_srv_table *t)
+{
+    lost_dev *l = t && t->is_device && t->id < VKB_MAX_TABLES ? __atomic_load_n(&devs[t->id], __ATOMIC_ACQUIRE) : NULL;
+    if (!l || !l->ll || !vkb_ll_busy(l->ll, 5.0)) return vkb_lost_stopped(t);
+    VKB_ERR("device %u: its loss record's driver query is still running: the device is left as it is", t->id);
+    vkb_lost_stop(t, "its loss record's driver query did not end");
+    return 1;
 }
 
 /* ------------------------------------------------------------------ a driver thread's fault after a loss */
@@ -649,8 +697,8 @@ void vkb_lost_fault(int sig, const void *addr, uintptr_t pc, const char *lib, co
     ids[0] = 0;
     for (uint32_t i = 1; i < __atomic_load_n(&devs_top, __ATOMIC_ACQUIRE); i++) {
         lost_dev *x = __atomic_load_n(&devs[i], __ATOMIC_ACQUIRE);
-        if (!x || !x->lost || x->stopped) continue;
-        x->stopped = 1;
+        /* atomic (lock-free, safe in the handler): run_request reads it on other threads (TSan, lost_test) */
+        if (!x || !x->lost || __atomic_exchange_n(&x->stopped, 1, __ATOMIC_RELAXED)) continue;
         __atomic_add_fetch(&stopped_count, 1, __ATOMIC_RELAXED);
         if (n < (int)sizeof(ids) - 24) n += snprintf(ids + n, sizeof(ids) - (size_t)n, "%s%u (pid %d)", n ? ", " : "", x->t->id,
                                                      x->t->proc ? x->t->proc->pid : 0);
@@ -678,4 +726,49 @@ void vkb_lost_fault(int sig, const void *addr, uintptr_t pc, const char *lib, co
 int vkb_lost_refuse(const vkb_srv_table *t)
 {
     return __atomic_load_n(&stopped_count, __ATOMIC_RELAXED) && t && t->is_device && vkb_lost_stopped(t);
+}
+
+/* ------------------------------------------------------------------ asynchronous lost answers */
+
+static const char *const async_kind[4] = {"vkQueueSubmit", "vkQueueSubmit2", "vkEndCommandBuffer", "other"};
+
+static void async_counts(const lost_dev *l, char *out, size_t cap)
+{
+    int n = 0;
+    out[0] = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned long k = __atomic_load_n(&l->async_cmd[i], __ATOMIC_RELAXED);
+        if (k && n >= 0 && (size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "%s%s %lu", n ? ", " : "", async_kind[i], k);
+    }
+}
+
+/* server_conn.c async_report: an asynchronous call (the client has told the app VK_SUCCESS already) that answered
+ * VK_ERROR_DEVICE_LOST, or was refused, on a device taken as lost. a player log (RE Village after its loss): 42867 such
+ * lines, one per call, 65% of the server log. Counted instead: the first is said, then one count line at most every
+ * ASYNC_SAY_S while they go on, and the total when the device goes (vkb_lost_device_destroy). Returns 0 when the
+ * device is not latched lost (the caller logs the call as before). */
+int vkb_lost_async(const vkb_srv_table *t, const char *cmd)
+{
+    lost_dev *l = t && t->id < VKB_MAX_TABLES ? __atomic_load_n(&devs[t->id], __ATOMIC_RELAXED) : NULL;
+    if (!l || !is_lost(l)) return 0;
+    int kind = !strcmp(cmd, "vkQueueSubmit") ? 0 : !strcmp(cmd, "vkQueueSubmit2") ? 1 : !strcmp(cmd, "vkEndCommandBuffer") ? 2 : 3;
+    __atomic_add_fetch(&l->async_cmd[kind], 1, __ATOMIC_RELAXED);
+    unsigned long n = __atomic_add_fetch(&l->async_n, 1, __ATOMIC_RELAXED);
+    uint64_t now = mono_ns(), was = __atomic_load_n(&l->async_said_ns, __ATOMIC_RELAXED);
+    if (n == 1) {
+        __atomic_store_n(&l->async_said_ns, now, __ATOMIC_RELAXED);
+        __atomic_store_n(&l->async_said, 1, __ATOMIC_RELAXED);
+        VKB_ERR("asynchronous %s returned -4 on device %u (pid %d), which is lost: its further asynchronous lost answers are "
+                "counted, a line at most every %d s, the total when the device goes", cmd, l->t->id, l->t->proc ? l->t->proc->pid : 0,
+                ASYNC_SAY_S);
+        return 1;
+    }
+    if (!was || now - was < (uint64_t)ASYNC_SAY_S * 1000000000ull) return 1;
+    if (!__atomic_compare_exchange_n(&l->async_said_ns, &was, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 1;
+    unsigned long said = __atomic_exchange_n(&l->async_said, n, __ATOMIC_RELAXED);
+    char kinds[160];
+    async_counts(l, kinds, sizeof(kinds));
+    VKB_WARN("device %u (pid %d) is lost: %lu more asynchronous call(s) answered VK_ERROR_DEVICE_LOST in the last %.0f s (%lu since "
+             "the loss: %s)", l->t->id, l->t->proc ? l->t->proc->pid : 0, n - said, (now - was) / 1e9, n, kinds);
+    return 1;
 }

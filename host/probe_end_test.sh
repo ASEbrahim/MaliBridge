@@ -19,6 +19,10 @@
 #      as the app ends a short session (gamescope gone after 800 ms, the server
 #      killed right after, three times in a row inside bc_transcoders, which was then recorded as
 #      died): 3 times in a row, never counted, the probe runs again and passes.
+#   8  the device rebooted inside a background probe (the server killed, then started under another
+#      boot id, VKBRIDGE_BOOT_ID; the heartbeat records the boot it began in): died at once, not run
+#      again (a probe that reboots the phone would do it at every start), its decision applied;
+#   9  the same kill, the same boot id: as step 3, 1 of 3, run again.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -88,7 +92,7 @@ for sig in TERM KILL; do
   waitfor "compile_aces takes 3 s longer on purpose" $log 300 && sleep 0.5
   inside=0; grep -q '"running": "compile_aces"' "$(prof $c)" && inside=1
   killsrv $sig 2>/dev/null
-  mark=$(tail -c +65 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | tr -d '\0\n' | cut -c1-20)
+  mark=$(tail -c +65 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | head -c 32 | tr -d '\0\n' | cut -c1-20)
   start $c $work/s-$sig-2 $slow
   log2=$work/s-$sig-2/vkbridge-server.log
   waitdone $log2 300
@@ -167,7 +171,7 @@ for k in 1 2 3; do
   killsrv KILL
   [ $inside = 1 ] || break
 done
-mark=$(tail -c +65 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | tr -d '\0\n' | cut -c1-20)
+mark=$(tail -c +65 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | head -c 32 | tr -d '\0\n' | cut -c1-20)
 start $c $work/s-gone4 $slow
 log=$work/s-gone4/vkbridge-server.log
 waitdone $log 300
@@ -178,4 +182,32 @@ p=$(prof $c)
   grep -q '"complete": true' "$p" && ! grep -q '"status": "died"' "$p"
 step $? "SIGKILL after the last client left, 3 starts in a row: the session's end, never died (mark: ${mark:-none}; $(grep -m1 -o 'compile_aces" probe ([^;]*' $log | cut -c22-120))"
 
-if [ $fails = 0 ]; then echo "OK: 8 steps"; else echo "FAILED: $fails of 8 steps"; exit 1; fi
+# 8, 9  killed inside a background probe; then started on another boot (8) and on the same one (9)
+for same in 0 1; do
+  c=$work/c-boot$same
+  start $c $work/s-boot$same-1 $slow VKBRIDGE_BOOT_ID=boot-aaaaaaaa-0000
+  log=$work/s-boot$same-1/vkbridge-server.log
+  waitfor "compile_aces takes 3 s longer on purpose" $log 300 && sleep 0.5
+  inside=0; grep -q '"running": "compile_aces"' "$(prof $c)" && inside=1
+  killsrv KILL
+  bootmark=$(tail -c +97 $(ls $c/probe-*.json.beat | head -1) 2>/dev/null | tr -d '\0\n' | cut -c1-40)
+  [ $same = 1 ] && now=boot-aaaaaaaa-0000 || now=boot-bbbbbbbb-1111
+  start $c $work/s-boot$same-2 $slow VKBRIDGE_BOOT_ID=$now
+  log2=$work/s-boot$same-2/vkbridge-server.log
+  waitfor "background probes done" $log2 300
+  p=$(prof $c)
+  if [ $same = 0 ]; then
+    [ $inside = 1 ] && [ "$bootmark" = "boot boot-aaaaaaaa-0000" ] &&
+      grep -q 'an earlier start died inside the "compile_aces" probe (the device rebooted while it ran (boot boot-aaa, now boot-bbb), after [0-9]* ms on an earlier start); recorded as died, not run again' $log2 &&
+      grep -q "probe: compile_aces died (.*UE4 LUT pipelines get their stand-in at once" $log2 &&
+      grep -q '"name": "compile_aces", "status": "died"' "$p" && grep -q '"complete": true' "$p"
+    step $? "killed inside a probe, started on another boot: died at once, decided (${bootmark:-no boot line})"
+  else
+    [ $inside = 1 ] && [ "$bootmark" = "boot boot-aaaaaaaa-0000" ] &&
+      grep -q 'ended inside the "compile_aces" probe (ended after [0-9]* ms without a word.*: 1 of 3 in a row before it counts as died); running it again' $log2 &&
+      ! grep -q "rebooted" $log2 && grep -q '"name": "compile_aces", "status": "pass"' "$p" && ! grep -q '"status": "died"' "$p"
+    step $? "killed inside a probe, the same boot: 1 of 3, run again ($(grep -m1 -o 'compile_aces" probe ([^;]*' $log2 | cut -c22-90))"
+  fi
+done
+
+if [ $fails = 0 ]; then echo "OK: 10 steps"; else echo "FAILED: $fails of 10 steps"; exit 1; fi

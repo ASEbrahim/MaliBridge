@@ -302,4 +302,5 @@ void vkb_sv_vkbUpdateDescSets(vkb_srv_call *c);
 void vkb_sv_vkbBatch(vkb_srv_call *c);
 void vkb_sv_vkbHitch(vkb_srv_call *c);
 void vkb_sv_vkbLatency(vkb_srv_call *c);
+void vkb_sv_vkbAcquireSignal(vkb_srv_call *c);
 #endif

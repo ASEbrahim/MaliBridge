@@ -9,7 +9,7 @@
 #   5  the fix alone, from the version gate (VKBRIDGE_FAKE_DRIVER_VERSION=r44p1, safe mode): right
 #      values; modules without the pattern (vkbridge-smoke's) are not touched;
 #   6  layers beneath name the module by the app's code: the hang detector's dump-spirv/h-<hash>
-#      is the app's hash, holding the code the driver got;
+#      is the app's hash, holding the code the driver got; 6b VKBRIDGE_SKIP_SHADERS=h-<hash> drops its dispatch;
 #   7  the pass over the corpus (tests/corpus, the check's own shader, and every *.spv under the
 #      directories in BITWISE_CORPUS_DIRS, colon-separated): each rewritten module spirv-val clean
 #      (when its input is), deterministic, with nothing left for the pass or the imitation; the
@@ -30,7 +30,7 @@ start() {
   [ -n "$srv" ] && kill $srv 2>/dev/null && wait $srv 2>/dev/null
   rm -f "$sock"
   env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_ERRATA -u VKBRIDGE_ERRATA_IMITATE -u VKBRIDGE_MODE \
-      -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_ERRATA_PROBE -u VKBRIDGE_BITWISE_ALL -u VKBRIDGE_HANG_DETECT \
+      -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_ERRATA_PROBE -u VKBRIDGE_BITWISE_ALL -u VKBRIDGE_HANG_DETECT -u VKBRIDGE_SKIP_SHADERS \
       VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
       "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$cache" >/dev/null 2>&1 &
   srv=$!
@@ -108,6 +108,13 @@ inc_bytes=$(( $(grep -o '0x[0-9a-fA-F]*' ../tests/bitwise_comp.inc | wc -l) * 4 
   [ "$(ls "$cache/dump-spirv" | grep -c '^h-')" = 1 ]
 step $? "the hang detector names the module h-$app_hash (the app's), its dump the driver's code ($(stat -c %s "$dumped" 2>/dev/null) bytes, the app's $inc_bytes)"
 rm -rf "$cache/dump-spirv"
+# 6b the hang bisect switch drops dispatches too (VKBRIDGE_SKIP_SHADERS=h-<hash>, server_hang.c): the job that hangs a D3D12
+#    game on the G925 may be compute (RE Village / The Witcher 3, player logs); the check's dispatch is dropped, so its
+#    results are wrong and the server says so
+run "$out/bitwise_check" -- VKBRIDGE_HANG_DETECT=1 VKBRIDGE_SKIP_SHADERS=h-$app_hash
+[ $rc != 0 ] && echo "$new" | grep -q "HANG bisect: dispatch with h-$app_hash dropped" &&
+  echo "$new" | grep -q "hang bisect drops draws and dispatches using 1 listed shader"
+step $? "the hang bisect drops the module's dispatch (check rc $rc: $res)"
 
 # 7 the corpus
 if command -v spirv-val >/dev/null; then
@@ -147,7 +154,7 @@ grep "^TOTAL" "$work/corpus.log" | sed 's/^/    /'
 step $? "corpus: $(grep -o '[0-9]* modules, .* rewritten ([0-9.]*%)' "$work/corpus.log" | head -1); spirv-val: ${vok:-?} clean, ${vbad:-?} invalid, ${vskip:-?} with an invalid input"
 
 # 8
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

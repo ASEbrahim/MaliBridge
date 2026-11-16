@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * crash_contain_check: a driver crash inside pipeline compilation fails that call, not the
  * session (server_guard.c; ULTRAKILL's SIGSEGV 0x40 in vkCreateGraphicsPipelines took it down).
  * Needs a server started with VKBRIDGE_TEST_CRASH_PIPELINE=1, which faults on purpose (a write to
@@ -8,7 +7,7 @@
  *   device A: marked graphics + compute pipelines fail with VK_ERROR_INITIALIZATION_FAILED and
  *             null handles; the connection lives; a normal pipeline still draws (two strikes);
  *             the third crash poisons A: a normal pipeline then gets VK_ERROR_DEVICE_LOST;
- *             --unbound (the server's replay): a draw with no pipeline bound, a bind of
+ *             --unbound (the server's replay, a player log): a draw with no pipeline bound, a bind of
  *             VK_NULL_HANDLE and its draw, a dispatch with no pipeline: left out, nothing drawn
  *   device B: (new) compute dispatch and draw correct
  * Three contained crashes per run: the server's process ceiling (64) allows twenty-one runs per server.
@@ -143,6 +142,9 @@ static VkShaderModule shader(const uint32_t *code, size_t size)
 static const VkSpecializationMapEntry marker_entry = {TEST_CRASH_SPEC_ID, 0, 4};
 static const uint32_t marker_value = 1;
 static const VkSpecializationInfo marker = {1, &marker_entry, 4, &marker_value};
+/* The same marker with another value: to the server's stuck list, another pipeline (--standin2) */
+static const uint32_t marker_value2 = 2;
+static const VkSpecializationInfo marker2 = {1, &marker_entry, 4, &marker_value2};
 
 /* ------------------------------------------------------------------ compute */
 
@@ -228,8 +230,8 @@ static VkResult graphics_pipeline(int marked, VkPipeline *pipe)
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, shader(spv_smoke_vert, sizeof(spv_smoke_vert)),
          "main", marked ? &marker : NULL},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, shader(spv_smoke_frag, sizeof(spv_smoke_frag)),
-         "main", marked == 2 ? &marker : NULL}};
-    if (marked == 2) st[0].pSpecializationInfo = NULL; /* 2: the fragment stage carries the marker */
+         "main", marked == 2 ? &marker : marked == 3 ? &marker2 : NULL}};
+    if (marked >= 2) st[0].pSpecializationInfo = NULL; /* 2, 3: the fragment stage carries the marker */
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
@@ -249,7 +251,7 @@ static VkResult graphics_pipeline(int marked, VkPipeline *pipe)
     return vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe);
 }
 
-/* how: 0 binds pipe; 1 binds nothing (No Man's Sky after its pipelines failed); 2 binds VK_NULL_HANDLE.
+/* how: 0 binds pipe; 1 binds nothing (No Man's Sky after its pipelines failed, a player log); 2 binds VK_NULL_HANDLE.
  * Returns 1 when the left half is magenta and the right half black; 2 when the whole image is the
  * clear's black (the draw left out); 0 otherwise. */
 static int draw_as(VkPipeline pipe, int how);
@@ -427,6 +429,26 @@ static int again_mode(void)
     return 0;
 }
 
+/* --standin: the pipeline whose fragment stage is marked, asked for twice, each outcome on a "RESULT"
+ * line: real (the program's own fragment shader drew), standin (the bridge's constant colour drew) or
+ * failed (stuck_retry_test.sh judges them run by run: a compile the watchdog cut off that would have
+ * finished gets the real pipeline back in a later run). --standin2: a second such pipeline too. */
+static int standin_mode(int second)
+{
+    for (int i = 0; i < 2; i++) {
+        for (int k = 2; k <= 2 + second; k++) {
+            VkPipeline pipe = VK_NULL_HANDLE;
+            double t0 = secs();
+            VkResult r = graphics_pipeline(k, &pipe);
+            double el = secs() - t0;
+            printf("RESULT %d %s %.1f s\n", i, r != VK_SUCCESS || !pipe ? "failed" : draw_ok(pipe) ? "real" : "standin", el);
+        }
+    }
+    vkDestroyDevice(dev, NULL);
+    vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int spin = argc > 1 && !strcmp(argv[1], "--spin"), spinfc2 = argc > 1 && !strcmp(argv[1], "--spinfc2");
@@ -474,6 +496,8 @@ int main(int argc, char **argv)
     if (spin || spinfc2) return spin_mode(spinfc2);
     if (argc > 1 && !strcmp(argv[1], "--slow")) return slow_mode();
     if (argc > 1 && !strcmp(argv[1], "--again")) return again_mode();
+    if (argc > 1 && !strcmp(argv[1], "--standin")) return standin_mode(0);
+    if (argc > 1 && !strcmp(argv[1], "--standin2")) return standin_mode(1);
     VkPipeline pipe;
     VkResult r = graphics_pipeline(1, &pipe);
     expect_contained(r, pipe, "A: faulting graphics pipeline fails, not the connection");
@@ -489,7 +513,7 @@ int main(int argc, char **argv)
     snprintf(d, sizeof(d), "result %d (want %d)", r, VK_ERROR_DEVICE_LOST);
     check(r == VK_ERROR_DEVICE_LOST && pipe == VK_NULL_HANDLE, "A: poisoned after three: pipeline creation reports device lost", d);
     check(alive(), "A: other calls still work on the poisoned device (teardown possible)", "");
-    /* No Man's Sky went on after its pipelines failed, skipped the bind and drew; Mali's
+    /* a player log: No Man's Sky went on after its pipelines failed, skipped the bind and drew; Mali's
      * vkCmdDrawIndexed read through the missing pipeline (0x7a0) and the server died with every
      * program. A draw or dispatch with no pipeline bound in its command buffer is left out by the
      * server's replay (--unbound: host/unbound_draw_test.sh; the layer has no replay to leave it out). */

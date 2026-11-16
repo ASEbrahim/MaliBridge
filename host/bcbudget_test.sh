@@ -2,7 +2,7 @@
 # The BC conversion budget (VKBRIDGE_BC_TX_BUDGET, server/server_emu_bcn.c) on a burst of BC uploads
 # (tests/bcburst_check.c: 32 textures of 1024x1024 with every level, half BC7, half BC1, in one
 # frame, then 20 frames of 2), each run with a server of its own that transcodes BC with its GPU
-# slowed to a Mali-G720's (VKBRIDGE_TEST_BC_SLOW=8: the burst's transcodes take about what the
+# slowed to a Mali-G720's (VKBRIDGE_TEST_BC_SLOW=<n>,1, n calibrated to the host GPU below, 8 on the first host: the burst's transcodes take about what the
 # G720's warm BC7 2048x2048 level does a texel) and the per-hitch line at 100 ms:
 #   1  no budget (0): the burst frame is one long frame, its hitch line says cause=bc;
 #   2  the budget DS3's preset sets (32:4; off by default): the burst frame has no hitch line and is
@@ -22,7 +22,8 @@
 #      encoded fast, the same floors and cap;
 #   9  the same as a Mali-G1-Ultra MC12: 32:4, never encoded fast in place (its fast search showed the
 #      D9500's green squares), only decoded.
-# 2, 4 and 5 run with VKBRIDGE_BC_TX_BUDGET=32:4.
+# 2, 4 and 5 run with VKBRIDGE_BC_TX_BUDGET=32:4. All with VKBRIDGE_BC_SMALL_DECODE=0 (the budget alone; the small-image rule
+# is host/bcupload_test.sh step 6).
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -31,6 +32,7 @@ work=$(mktemp -d)
 sock=${XDG_RUNTIME_DIR:-/tmp}/vkbridge-bcbudget-$$.sock
 srv=
 fails=0
+slow=8 # the transcoders' repeat count (VKBRIDGE_TEST_BC_SLOW); calibrated below to this GPU
 bud=32:4 # what Dark Souls III's built-in preset sets (server/presets_builtin.inc)
 stop() { [ -n "$srv" ] && kill $srv 2>/dev/null && wait $srv 2>/dev/null; srv=; }
 trap 'stop; rm -rf "$work" "$sock"' EXIT
@@ -45,9 +47,9 @@ run() {
   rm -rf "$work/c"; mkdir -p "$work/c"
   slog=$work/$name.server.log; o=$work/$name.out
   env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_ERRATA -u VKBRIDGE_MODE -u VKBRIDGE_BC_TX_BUDGET -u VKBRIDGE_BC_TX_FALLBACK_MB \
-      -u VKBRIDGE_BC1_ASTC -u VKBRIDGE_BC_TRANSCODE_MAX -u VKBRIDGE_BC_DECODE -u VKBRIDGE_TEST_HITCH_DELAY_MS \
+      -u VKBRIDGE_BC1_ASTC -u VKBRIDGE_BC_TRANSCODE_MAX -u VKBRIDGE_BC_DECODE -u VKBRIDGE_TEST_HITCH_DELAY_MS -u VKBRIDGE_BC_SMALL_DECODE \
       VKBRIDGE_PROBE_BUDGET_S=0 VKBRIDGE_FAKE_MISSING=bc vk_require_etc2=true vk_require_astc=true VKBRIDGE_BC_TRANSCODE=1 \
-      VKBRIDGE_HITCH_MS=100 VKBRIDGE_TEST_BC_SLOW=8 "${e[@]}" \
+      VKBRIDGE_HITCH_MS=100 VKBRIDGE_TEST_BC_SLOW=$slow,1 VKBRIDGE_BC_SMALL_DECODE=0 "${e[@]}" \
       VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
       "$out/vkbridge-server" --socket "$sock" --log "$slog" --cache-dir "$work/c" >/dev/null 2>&1 &
   srv=$!
@@ -64,6 +66,22 @@ lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'; } # lt a b: a 
 cause_of() { grep -o "hitch: frame=$2 ms=[0-9]* cause=[a-z]*" "$1" | sed 's/.*cause=//'; }
 totals() { grep -o "BC budget: so far .*" "$slog" | tail -1; }
 dump() { tail -4 "$o" | sed 's/^/     /'; grep -h "BC budget\|hitch:" "$slog" | tail -6 | sed 's/^/     /'; }
+
+# Calibrate the slow factor. The test was written on a GPU where 8 repeats made step 1's burst
+# take ~314 ms (the G720's pace: its transcodes are 20-30x slower than a desktop GPU's; only the
+# transcoders are repeated, the decoder dispatches run once: the comment above is about transcodes); a faster
+# host GPU (RX 7900 XTX: ~76 ms at 8) never reaches the hitch line and step 1 cannot show what it
+# checks. So: time the no-budget burst at 1 and at 8 repeats, take the per-repeat cost from the
+# two, and pick the count that puts the burst at ~$target_ms (VKB_BC_SLOW=<n> sets it by hand).
+target_ms=300
+if [ -n "$VKB_BC_SLOW" ]; then slow=$VKB_BC_SLOW; calnote="set by VKB_BC_SLOW"
+else
+  run cal1 VKBRIDGE_BC_TX_BUDGET=0 VKBRIDGE_TEST_BC_SLOW=1,1 --; t1=$(val burst_ms)
+  run cal8 VKBRIDGE_BC_TX_BUDGET=0 VKBRIDGE_TEST_BC_SLOW=8,1 --; t8=$(val burst_ms)
+  slow=$(awk -v a="${t1:-0}" -v b="${t8:-0}" -v t="$target_ms" 'BEGIN { per = (b - a) / 7; if (per < 0.5) per = 0.5; n = int((t - a) / per + 0.999); if (n < 8) n = 8; if (n > 400) n = 400; print n }')
+  calnote="pilot: 1 repeat ${t1:-?} ms, 8 repeats ${t8:-?} ms"
+fi
+echo "     slow factor $slow ($calnote; target burst ~${target_ms} ms)"
 
 # 1 no budget
 run off VKBRIDGE_BC_TX_BUDGET=0 --

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * The driver-errata layer's insides, shared by server_errata.c (the decisions) and the files that
  * hold its fixes (server_errata_*.c).
  */
@@ -8,6 +7,7 @@
 #define VKB_SERVER_ERRATA_H
 
 #include "vkb_server.h"
+#include "pv3d_copy.h"
 
 typedef struct vkb_errata_dev {
     uint32_t on;           /* 1 << VKB_ERRATUM_*: decided on */
@@ -15,6 +15,8 @@ typedef struct vkb_errata_dev {
     uint32_t forced;       /* on by VKBRIDGE_ERRATA=+name */
     uint32_t targeted;     /* on for a reason other than "always" alone: a probe, the range, an
                               unknown version, VKBRIDGE_ERRATA=+name (a fix may do more then) */
+    uint32_t scope[VKB_ERRATA_COUNT]; /* 0: the whole fix; else the part of it the driver's ranges
+                              name (on by range alone, every matching range naming one): VKB_*_SCOPE_* */
     vkb_dispatch next_fix; /* what each fix calls: the driver's functions, or the imitation's */
     vkb_dispatch next_imi; /* what each imitation calls: the driver's */
     uint64_t example_calls, example_imitated;
@@ -22,13 +24,20 @@ typedef struct vkb_errata_dev {
     struct vkb_errata_views *views; /* server_errata_views.c (MK-06, MK-07) */
     struct vkb_errata_bitwise *bitwise; /* server_errata_bitwise.c (MK-03) */
     struct vkb_errata_cmd *cmd;     /* server_errata_cmd.c (MK-04, MK-05) */
+    struct vkb_errata_pvnames *pvnames; /* server_errata_pvnames.c (PV-01) */
     struct vkb_errata_flip *flip;       /* server_errata_flip.c (MK-02) */
     struct vkb_errata_clampzero *clampzero; /* server_errata_clampzero.c (MK-32) */
+    struct vkb_errata_splitvary *splitvary; /* server_errata_splitvary.c (MK-47) */
+    struct vkb_errata_fragdepth *fragdepth; /* server_errata_fragdepth.c (MK-49) */
     struct vkb_errata_mem *mem;     /* server_errata_mem.c (MK-39) */
     PFN_vkCreateShaderModule fp16_imi_next; /* server_errata_fp16.c (MK-20): beneath its imitation */
     struct vkb_errata_ds *ds;       /* server_errata_ds.c (MK-11) */
+    struct vkb_errata_pv3d *pv3d;      /* server_errata_view3d.c (PV-04) */
     struct vkb_errata_vbbake *vbbake;  /* server_errata_vbbake.c (MK-05 option B) */
     struct vkb_vbbake_imi *vbbake_imi;
+    struct vkb_errata_pvbgra_imi *pvbgra_imi; /* server_errata_pvbgra.c (PV-07): the imitation's records */
+    struct vkb_errata_pvbgra *pvbgra;         /* server_errata_pvbgra.c (PV-07): the fix's */
+    int pvr;   /* PowerVR's driver (driverID IMAGINATION_PROPRIETARY, or vendor 0x1010): pv_view3d_base's static multiview rule */
     int probe; /* the startup probe's: an imitation only, for one probe (vkb_errata_probe_begin);
                   it publishes nothing a server thread without a table would fall back to, and logs
                   no totals */
@@ -71,6 +80,26 @@ void vkb_wait_retry_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_views_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_views_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* before the driver's vkDestroyDevice */
 
+/* server_errata_view3d.c: pv_view3d_base (PV-04, PowerVR): attachments that are 2D-array views of a 3D image from
+ * slice 1 on are redirected (a 2D view of the slice, or a 2D-array image of the bridge's own copied in before and
+ * out after each pass); the imitation (host) starts such views at slice 0. The copies are also the startup
+ * probe's own sub-cases (view3d_layers), so the probe proves the fix's form on the driver it turns on for. */
+void vkb_errata_pv3d_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pv3d_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pv3d_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* before the driver's vkDestroyDevice, and before views' */
+/* pv_fbloop_split (PV-06, PowerVR): the same file's second erratum. Passes with an attachment in a feedback-loop layout
+ * are ended and begun again (loadOp LOAD, no copy) at their in-pass barriers; the imitation (host) makes feedback loops
+ * read what the image held before the pass, in plain 2D / 2D-array images (VKBRIDGE_ERRATA_IMITATE=pv_fbloop_split):
+ * the hidden 2D-array image of the copy form beneath a plain attachment, copied into the image only where a pass ends. */
+void vkb_errata_pvfbl_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pvfbl_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+/* (vkb_pv3d_pair: pv3d_copy.h) */
+/* Before the pass: the shadow ready in ls_start, with the area of the slices copied into it when copy_in. The 3D
+ * image is left in l3_start. After the pass: the area copied back into the slices when copy_out; the 3D image ends
+ * in l3_end either way. Both only record commands on cb, through d. */
+void vkb_pv3d_begin(const vkb_dispatch *d, VkCommandBuffer cb, const vkb_pv3d_pair *p, int copy_in);
+void vkb_pv3d_end(const vkb_dispatch *d, VkCommandBuffer cb, const vkb_pv3d_pair *p, int copy_out);
+
 /* server_errata_bitwise.c: bitwise_scalar (MK-03), the SPIR-V rewrite on module and pipeline
  * creation; the imitation is the same hooks beneath it */
 void vkb_errata_bitwise_install(vkb_srv_table *t, vkb_errata_dev *e);
@@ -78,6 +107,11 @@ void vkb_errata_bitwise_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_bitwise_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 /* server_errata_cmd.c: command-buffer state - dyn_reemit (MK-04) and vb_split (MK-05); their
  * wrappers chain, the command-buffer and pipeline records are installed once beneath them */
+/* dyn_reemit's scope VKB_DYN_SCOPE_EDS3: the driver is affected by Arm 3893903/3893905 alone
+ * (r48p0-r53p0), whose states are the EDS3 conservative mode, line mode and sample mask: only those
+ * are sent again; depth, stencil, cull and strides (3809538, fixed in r44p1) are left to the driver.
+ * VKBRIDGE_ERRATA_IMITATE_DYN=eds3 imitates that shape (host). */
+#define VKB_DYN_SCOPE_EDS3 1u
 void vkb_errata_dyn_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_dyn_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_vb_install(vkb_srv_table *t, vkb_errata_dev *e);
@@ -92,6 +126,9 @@ void vkb_errata_cmd_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_dedicated_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_dedicated_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_mem_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+/* server_errata_import.c: import_serial (MK-48), the driver calls on imported memory run alone in the process */
+void vkb_errata_import_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_import_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
 /* server_errata_fp16.c: fp16_hide (MK-20). The fix is in the feature queries and vkCreateDevice
  * (vkb_errata_fp16_hidden and the functions after it, vkb_server.h); its install logs what the
@@ -126,10 +163,43 @@ void vkb_errata_clampzero_install(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_clampzero_imitate(vkb_srv_table *t, vkb_errata_dev *e);
 void vkb_errata_clampzero_destroy(vkb_srv_table *t, vkb_errata_dev *e);
 
+/* server_errata_pvmutable.c: pv_mutable_linear (PV-02, PowerVR); the fix is in the instance's image-format
+ * query (vkb_errata_pvmutable_instance_install, vkb_server.h), the device installs only say so */
+void vkb_errata_pvmutable_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pvmutable_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+
+/* server_errata_pvbgra.c: pv_bgra_store (PV-07, PowerVR): storage writes to a B8G8R8A8 image land in R8G8B8A8 byte order */
+void vkb_errata_pvbgra_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pvbgra_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pvbgra_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+/* server_errata_pvnames.c: pv_names (PV-01, PowerVR), the OpName/OpMemberName instructions dropped
+ * from modules on creation (module and pipeline calls); the imitation (host) zeroes the stores to
+ * an output that shares an OpName with an input, beneath the fix */
+void vkb_errata_pvnames_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pvnames_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_pvnames_destroy(vkb_srv_table *t, vkb_errata_dev *e);
+
 /* server_errata_gs.c: gs_hide. The fix is in the instance's queries and vkCreateDevice
  * (vkb_errata_gs_hidden and the functions after it, vkb_server.h); its install says whether this
  * device's process is one it hides geometry shaders from. No imitation: the crash is imitated by
  * VKBRIDGE_TEST_CRASH_PIPELINE=gs (server_guard.c), on any build. */
 void vkb_errata_gs_install(vkb_srv_table *t, vkb_errata_dev *e);
+
+/* server_errata_splitvary.c: split_varying (MK-47), fragment inputs split by Component at a Location
+ * the stage before writes whole merged into one input at pipeline creation; the imitation reads 0
+ * for such a piece at a Component above 0, beneath the fix */
+void vkb_errata_splitvary_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_splitvary_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_splitvary_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* totals logged, tables freed */
+
+/* server_errata_fragdepth.c: fragdepth_nodepth (MK-49), a fragment shader's FragDepth output dropped at pipeline creation where
+ * the (dynamic) rendering has no depth attachment; the imitation refuses such pipelines, beneath the fix */
+void vkb_errata_fragdepth_install(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_fragdepth_imitate(vkb_srv_table *t, vkb_errata_dev *e);
+void vkb_errata_fragdepth_destroy(vkb_srv_table *t, vkb_errata_dev *e); /* totals logged, tables freed */
+
+/* server_errata_zink.c: pv_zink_name (PV-08), the engine name passed at vkCreateInstance; the
+ * device's install only logs */
+void vkb_errata_zink_install(vkb_srv_table *t, vkb_errata_dev *e);
 
 #endif

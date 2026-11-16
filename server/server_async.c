@@ -67,6 +67,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "spirv_effects.h"
+#include "server_cores.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -529,6 +530,7 @@ static void compile_job(apipe *x, vkb_arena *arena)
 static void *worker(void *arg)
 {
     (void)arg;
+    vkb_cores_plain_thread(); /* started from a connection thread: compiles never take a fast core from the game */
     vkb_arena arena = {0};
     pthread_mutex_lock(&lk);
     for (;;) {

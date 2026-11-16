@@ -19,6 +19,20 @@
  *
  * libwayland-client is opened at run time, so the driver loads in programs that never touch
  * Wayland. Our objects live on a private event queue, like Mesa's WSI.
+ *
+ * Images given back (VKBRIDGE_PRESENT_RELEASE_THREAD; on unless 0, in the guest's environment or from
+ * the server: a game's preset, <cache dir>/env). The presenting thread waits for each frame's GPU work
+ * before it shows it, and took the compositor's events only between frames. A wl_buffer.release that
+ * came while it waited for frame N therefore made the image the game's again only once frame N was
+ * rendered: a game waiting in vkAcquireNextImageKHR (3 images under gamescope's FIFO: one on screen,
+ * one queued in gamescope, one just presented) waited for its newest frame's GPU work, so the CPU and
+ * the GPU took turns instead of overlapping (a player log, StS2 on the G925: vkb-present waited 10.7 ms a
+ * frame, the GPU at 338-494 MHz; host: 4 ms of CPU, 1 of it after the acquire, and 8 ms of GPU made
+ * 109 fps at 120 Hz). The dma-buf wl_buffers now live on a second queue, which a small thread of the
+ * swapchain's reads and dispatches (libwayland's prepare_read/read_events, made for several readers):
+ * an image comes back the moment the compositor releases it. The presenting thread shows the same
+ * frames in the same order at the same time as before; nothing waits more, and the thread sleeps in
+ * poll() between events.
  */
 #define _GNU_SOURCE
 #include "wsi.h"
@@ -275,6 +289,16 @@ typedef struct wl_state {
     uint64_t fq_calls, fq_waits, fq_ns, fq_max_ns; /* the frame queue's waits, for the line at the end */
     uint32_t ring_lat[64];         /* ... each with its latency log number (latency.c), 0 */
     uint64_t ring_id[64];          /* ... and its present id (VK_KHR_present_id, wsi.c), 0 */
+    uint64_t ring_pq[64];          /* ... and when the app presented it, for the frame pacer (pacer.c), 0 */
+    /* Images given back (VKBRIDGE_PRESENT_RELEASE_THREAD): the dma-buf wl_buffers on rel_queue, dispatched by rel_thread */
+    struct wl_event_queue *rel_queue;
+    pthread_t rel_thread;
+    int rel_on;                    /* the thread runs (with sc->lock): buffer_release wakes acquires itself */
+    int rel_efd, rel_quit;         /* wakes it to quit */
+    int pt_waiting;                /* the presenting thread waits for a frame's GPU work (with sc->lock) */
+    uint64_t rel_early;            /* releases taken while it waited: each an image back up to a frame sooner (sc->lock) */
+    uint64_t pt_frames;            /* frames the presenting thread took (its own; read by others only after it ended) */
+    uint64_t log_presents, log_acq_waits, log_acq_ns, log_early; /* the last "present path" line's counts */
     uint32_t lat_cur;              /* the presenting thread's frame being shown: its latency log number */
     uint64_t id_cur;               /* ... its present id */
     int fb_for_id;                 /* wl_present asked when that frame is shown, for its present id */
@@ -351,37 +375,6 @@ static void fb_discarded(void *data, struct wl_proxy *fb)
 
 static const void *fb_listener[] = {(void *)fb_sync_output, (void *)fb_presented, (void *)fb_discarded};
 
-static void registry_global(void *data, struct wl_proxy *reg, uint32_t name, const char *iface, uint32_t version)
-{
-    wl_state *s = data;
-    if (!strcmp(iface, "wl_shm") && !s->shm) {
-        s->shm = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, wl.shm_iface, 1, name, wl.shm_iface->name, 1, NULL);
-    } else if (!strcmp(iface, "zwp_linux_dmabuf_v1") && !s->dmabuf && version >= 2) {
-        uint32_t v = version < 3 ? version : 3;
-        s->dmabuf = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &dmabuf_iface, v, name, dmabuf_iface.name, v, NULL);
-        s->dmabuf_version = v;
-    } else if (!strcmp(iface, "wp_presentation") && !s->presentation && (vkb_lat_on() || (s->sc && s->sc->dev->present_ids && !vkb_wsi_present_wait_commit(s->sc->dev->pd)))) {
-        static const void *pres_listener[] = {(void *)pres_clock};
-        s->presentation = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &pres_iface, 1, name, pres_iface.name, 1, NULL);
-        if (s->presentation) wl.proxy_add_listener(s->presentation, (void (**)(void))pres_listener, s);
-    } else if (!strcmp(iface, "banner_ahb_v1") && !s->ahb && !vkb_wsi_ahb_disabled()) {
-        static const void *ahb_listener[] = {(void *)ahb_mode};
-        uint32_t v = version < 2 ? version : 2; /* attach and mode: version 3 adds nothing for this path */
-        s->ahb = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &ahb_iface, v, name, ahb_iface.name, v, NULL);
-        s->ahb_version = v;
-        if (s->ahb) wl.proxy_add_listener(s->ahb, (void (**)(void))ahb_listener, s);
-    }
-}
-
-static void registry_global_remove(void *data, struct wl_proxy *reg, uint32_t name)
-{
-    (void)data;
-    (void)reg;
-    (void)name;
-}
-
-static const void *registry_listener[] = {(void *)registry_global, (void *)registry_global_remove};
-
 static void shm_format(void *data, struct wl_proxy *shm, uint32_t format)
 {
     (void)shm;
@@ -411,13 +404,58 @@ static void dmabuf_modifier(void *data, struct wl_proxy *d, uint32_t format, uin
 
 static const void *dmabuf_listener[] = {(void *)dmabuf_format, (void *)dmabuf_modifier};
 
+/* Each global's listener goes on as it is bound, in this callback: its first events (wl_shm's and the dma-buf
+ * formats and modifiers) can be dispatched in this same pass of the registry's roundtrip, before that returns,
+ * when another thread of the program reads the connection meanwhile (the old swapchain's presenting thread
+ * during a recreate); a proxy without a listener drops them (row 228: "takes no XR24 dma-buf", no swapchain). */
+static void registry_global(void *data, struct wl_proxy *reg, uint32_t name, const char *iface, uint32_t version)
+{
+    wl_state *s = data;
+    if (!strcmp(iface, "wl_shm") && !s->shm) {
+        s->shm = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, wl.shm_iface, 1, name, wl.shm_iface->name, 1, NULL);
+        if (s->shm) wl.proxy_add_listener(s->shm, (void (**)(void))shm_listener, s);
+    } else if (!strcmp(iface, "zwp_linux_dmabuf_v1") && !s->dmabuf && version >= 2) {
+        uint32_t v = version < 3 ? version : 3;
+        s->dmabuf = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &dmabuf_iface, v, name, dmabuf_iface.name, v, NULL);
+        s->dmabuf_version = v;
+        if (s->dmabuf) wl.proxy_add_listener(s->dmabuf, (void (**)(void))dmabuf_listener, s);
+    } else if (!strcmp(iface, "wp_presentation") && !s->presentation && (vkb_lat_on() || (s->sc && s->sc->dev->present_ids && !vkb_wsi_present_wait_commit(s->sc->dev->pd)))) {
+        static const void *pres_listener[] = {(void *)pres_clock};
+        s->presentation = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &pres_iface, 1, name, pres_iface.name, 1, NULL);
+        if (s->presentation) wl.proxy_add_listener(s->presentation, (void (**)(void))pres_listener, s);
+    } else if (!strcmp(iface, "banner_ahb_v1") && !s->ahb && !vkb_wsi_ahb_disabled()) {
+        static const void *ahb_listener[] = {(void *)ahb_mode};
+        uint32_t v = version < 2 ? version : 2; /* attach and mode: version 3 adds nothing for this path */
+        s->ahb = wl.proxy_marshal_constructor_versioned(reg, WL_REGISTRY_BIND, &ahb_iface, v, name, ahb_iface.name, v, NULL);
+        s->ahb_version = v;
+        if (s->ahb) wl.proxy_add_listener(s->ahb, (void (**)(void))ahb_listener, s);
+    }
+}
+
+static void registry_global_remove(void *data, struct wl_proxy *reg, uint32_t name)
+{
+    (void)data;
+    (void)reg;
+    (void)name;
+}
+
+static const void *registry_listener[] = {(void *)registry_global, (void *)registry_global_remove};
+
 static void buffer_release(void *data, struct wl_proxy *buffer)
 {
     (void)buffer;
     vkb_swap_image *img = data;
-    pthread_mutex_lock(&img->chain->lock);
+    vkb_swapchain *sc = img->chain;
+    wl_state *s = sc->bdata;
+    pthread_mutex_lock(&sc->lock);
     img->busy = 0;
-    pthread_mutex_unlock(&img->chain->lock);
+    if (s && s->rel_on) {
+        /* the release thread's: an acquire waiting for an image goes on now (the presenting thread may be
+         * waiting for a frame, and broadcasts only after its own dispatch) */
+        if (s->pt_waiting) s->rel_early++;
+        pthread_cond_broadcast(&s->changed);
+    }
+    pthread_mutex_unlock(&sc->lock);
 }
 
 static const void *buffer_listener[] = {(void *)buffer_release};
@@ -440,10 +478,15 @@ static void frame_done(void *data, struct wl_proxy *cb, uint32_t t)
 
 static const void *frame_listener[] = {(void *)frame_done};
 
-/* Dispatch our queue, waiting up to timeout_ns for events. -1 on a dead connection. */
+/* Dispatch our queue, waiting up to timeout_ns for events when none is queued yet. -1 on a dead connection. */
 static int dispatch_timeout(wl_state *s, uint64_t timeout_ns)
 {
-    if (wl.display_dispatch_queue_pending(s->display, s->queue) < 0) return -1;
+    /* Events another reader already queued for us (the release thread, the presenting thread's idle loop) are
+     * what the caller waits for: dispatched, it returns at once instead of polling the socket for more. A FIFO
+     * present found its frame callback queued and still waited up to 20 ms for the next event (pacer_test). */
+    int n = wl.display_dispatch_queue_pending(s->display, s->queue);
+    if (n < 0) return -1;
+    if (n > 0) return 1;
     while (wl.display_prepare_read_queue(s->display, s->queue) != 0) {
         if (wl.display_dispatch_queue_pending(s->display, s->queue) < 0) return -1;
     }
@@ -462,12 +505,12 @@ static int dispatch_timeout(wl_state *s, uint64_t timeout_ns)
     return wl.display_dispatch_queue_pending(s->display, s->queue) < 0 ? -1 : 1;
 }
 
-/* dispatch_timeout, also returning (0) when efd is written. */
-static int dispatch_or_wake(wl_state *s, int efd)
+/* Dispatch queue q, waiting for events without a limit; also returns (0) when efd is written. */
+static int dispatch_queue_or_wake(wl_state *s, struct wl_event_queue *q, int efd)
 {
-    if (wl.display_dispatch_queue_pending(s->display, s->queue) < 0) return -1;
-    while (wl.display_prepare_read_queue(s->display, s->queue) != 0) {
-        if (wl.display_dispatch_queue_pending(s->display, s->queue) < 0) return -1;
+    if (wl.display_dispatch_queue_pending(s->display, q) < 0) return -1;
+    while (wl.display_prepare_read_queue(s->display, q) != 0) {
+        if (wl.display_dispatch_queue_pending(s->display, q) < 0) return -1;
     }
     if (wl.display_flush(s->display) < 0 && errno != EAGAIN) {
         wl.display_cancel_read(s->display);
@@ -484,7 +527,109 @@ static int dispatch_or_wake(wl_state *s, int efd)
         return r < 0 && errno != EINTR ? -1 : 0;
     }
     if (wl.display_read_events(s->display) < 0) return -1;
-    return wl.display_dispatch_queue_pending(s->display, s->queue) < 0 ? -1 : 1;
+    return wl.display_dispatch_queue_pending(s->display, q) < 0 ? -1 : 1;
+}
+
+/* dispatch_timeout, also returning (0) when efd is written. */
+static int dispatch_or_wake(wl_state *s, int efd) { return dispatch_queue_or_wake(s, s->queue, efd); }
+
+/* VKBRIDGE_PRESENT_RELEASE_THREAD: the guest's environment, else the server's switch, else on */
+static int release_thread_wanted(void)
+{
+    const char *e = getenv("VKBRIDGE_PRESENT_RELEASE_THREAD");
+    int known;
+    int on = e && *e ? strcmp(e, "0") != 0 : vkb_client_knob(VKB_KNOB_PRESENT_RELEASE_SHIFT, &known) == 1; /* v0.5.5.4: off unless asked for */
+    if (!on) VKB_ONCE(VKB_LOG_INFO, "Wayland: images given back only between frames (VKBRIDGE_PRESENT_RELEASE_THREAD unset or 0)");
+    return on;
+}
+
+/* Reads the compositor's events for the dma-buf wl_buffers and dispatches them (buffer_release). A
+ * dead connection ends it, and the swapchain with it (an acquire waiting for an image returns). */
+static void *release_thread(void *arg)
+{
+    vkb_swapchain *sc = arg;
+    wl_state *s = sc->bdata;
+    pthread_setname_np(pthread_self(), "vkb-release");
+    while (!__atomic_load_n(&s->rel_quit, __ATOMIC_ACQUIRE)) {
+        if (dispatch_queue_or_wake(s, s->rel_queue, s->rel_efd) >= 0) continue;
+        pthread_mutex_lock(&sc->lock);
+        if (sc->status >= 0) sc->status = VK_ERROR_SURFACE_LOST_KHR;
+        pthread_cond_broadcast(&s->changed);
+        pthread_mutex_unlock(&sc->lock);
+        break;
+    }
+    return NULL;
+}
+
+/* Once, before the presenting thread starts (nothing dispatches the swapchain's queue yet): the
+ * wl_buffers to a queue and a thread of their own. Nothing started (switched off, no thread): as before. */
+static void release_start(vkb_swapchain *sc)
+{
+    wl_state *s = sc->bdata;
+    if (!s->buffers || !release_thread_wanted()) return;
+    s->rel_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (s->rel_efd < 0) return;
+    s->rel_queue = wl.display_create_queue(s->display);
+    if (!s->rel_queue) {
+        close(s->rel_efd);
+        return;
+    }
+    for (uint32_t i = 0; i < sc->count; i++)
+        if (s->buffers[i]) wl.proxy_set_queue(s->buffers[i], s->rel_queue);
+    pthread_mutex_lock(&sc->lock);
+    s->rel_on = 1;
+    pthread_mutex_unlock(&sc->lock);
+    if (pthread_create(&s->rel_thread, NULL, release_thread, sc) != 0) {
+        /* no thread: back on the swapchain's queue (the queue is destroyed with the swapchain) */
+        for (uint32_t i = 0; i < sc->count; i++)
+            if (s->buffers[i]) wl.proxy_set_queue(s->buffers[i], s->queue);
+        pthread_mutex_lock(&sc->lock);
+        s->rel_on = 0;
+        pthread_mutex_unlock(&sc->lock);
+        close(s->rel_efd);
+        return;
+    }
+    VKB_ONCE(VKB_LOG_INFO, "Wayland: images given back as the compositor releases them, also while a frame renders "
+                           "(VKBRIDGE_PRESENT_RELEASE_THREAD=0: only between frames)");
+}
+
+/* After the presenting thread ended, before the wl_buffers and the cond go. Events still on rel_queue
+ * stay there until wl_teardown destroys it (after the buffers). */
+static void release_stop(vkb_swapchain *sc)
+{
+    wl_state *s = sc->bdata;
+    pthread_mutex_lock(&sc->lock);
+    int on = s->rel_on;
+    pthread_mutex_unlock(&sc->lock);
+    if (!on) return;
+    __atomic_store_n(&s->rel_quit, 1, __ATOMIC_RELEASE);
+    uint64_t one = 1;
+    if (write(s->rel_efd, &one, sizeof(one)) < 0) { /* the counter is already set */ }
+    pthread_join(s->rel_thread, NULL);
+    pthread_mutex_lock(&sc->lock);
+    s->rel_on = 0;
+    pthread_mutex_unlock(&sc->lock);
+    close(s->rel_efd);
+}
+
+/* Every 1200 frames (~10 s at 120 fps) and at the end: how long acquires waited for an image, and how
+ * many images came back while the presenting thread waited for a frame (the line a device A/B reads). */
+static void present_path_line(vkb_swapchain *sc, wl_state *s, int last)
+{
+    uint64_t n = s->pt_frames - s->log_presents;
+    if (!n || (!last && n < 1200)) return;
+    uint64_t aw = __atomic_load_n(&sc->acq_waits, __ATOMIC_RELAXED), ans = __atomic_load_n(&sc->acq_wait_ns, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&sc->lock);
+    uint64_t early = s->rel_early;
+    int on = s->rel_on;
+    pthread_mutex_unlock(&sc->lock);
+    VKB_INFO("present path: %llu frames; acquires waited for an image %llu times, %.2f ms per frame; %llu images given back while a "
+             "frame rendered%s", (unsigned long long)n, (unsigned long long)(aw - s->log_acq_waits),
+             (ans - s->log_acq_ns) / 1e6 / (double)n, (unsigned long long)(early - s->log_early), on ? "" : " (release thread off)");
+    s->log_presents = s->pt_frames;
+    s->log_acq_waits = aw;
+    s->log_acq_ns = ans;
+    s->log_early = early;
 }
 
 static VkResult wl_present(vkb_swapchain *sc, uint32_t index, const VkPresentRegionKHR *region);
@@ -504,6 +649,7 @@ static void *present_thread(void *arg)
         uint32_t index = have ? s->ring[s->head] : 0;
         uint32_t lat = have ? s->ring_lat[s->head] : 0;
         uint64_t pid = have ? s->ring_id[s->head] : 0;
+        uint64_t pq = have ? s->ring_pq[s->head] : 0;
         if (have) {
             s->head = (s->head + 1) % 64;
             s->len--;
@@ -512,9 +658,20 @@ static void *present_thread(void *arg)
         if (have) {
             /* A slow frame (a game loading) is waited for; only a real loss or a frame past the limit
              * (VKBRIDGE_PRESENT_TIMEOUT_S) ends the swapchain (wsi.c) */
+            pthread_mutex_lock(&sc->lock);
+            s->pt_waiting = 1;
+            pthread_mutex_unlock(&sc->lock);
+            uint64_t w0 = sc->pacer ? vkb_lat_now() : 0;
             VkResult r = vkb_wsi_wait_frame(sc, s->fences[index]);
             if (r >= 0) vkb_lat_stamp(lat, VKB_LAT_DONE, 0);
+            if (r >= 0 && sc->pacer) {
+                /* the frame pacer (pacer.c): when its GPU work was seen done, and whether this thread waited for it */
+                uint64_t t = vkb_lat_now();
+                vkb_wsi_pw_gpu_done(sc, pid, t);
+                vkb_pacer_frame(sc->pacer, pq, t, t - w0, __atomic_load_n(&sc->acq_waits, __ATOMIC_RELAXED));
+            }
             pthread_mutex_lock(&sc->lock);
+            s->pt_waiting = 0;
             s->rendering--; /* a present waiting for the frame queue (wl_wait_queue) may go on */
             pthread_cond_broadcast(&s->changed);
             pthread_mutex_unlock(&sc->lock);
@@ -539,6 +696,8 @@ static void *present_thread(void *arg)
             }
             pthread_cond_broadcast(&s->changed);
             pthread_mutex_unlock(&sc->lock);
+            s->pt_frames++;
+            present_path_line(sc, s, 0);
             continue;
         }
         if (quit) break;
@@ -574,6 +733,7 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
         for (uint32_t i = 0; i < sc->count; i++)
             if (vkb_ep_vkCreateFence(device, &fci, NULL, &s->fences[i]) != VK_SUCCESS) return VK_ERROR_OUT_OF_HOST_MEMORY;
         pthread_cond_init(&s->changed, NULL);
+        release_start(sc); /* before the presenting thread: the buffers change queues while nothing dispatches them */
         if (pthread_create(&s->thread, NULL, present_thread, sc) != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
         s->thread_on = 1;
     }
@@ -590,6 +750,7 @@ static VkResult wl_present_async(vkb_swapchain *sc, VkQueue queue, uint32_t inde
     s->ring[(s->head + s->len) % 64] = index;
     s->ring_lat[(s->head + s->len) % 64] = sc->lat_n;
     s->ring_id[(s->head + s->len) % 64] = sc->pw_cur;
+    s->ring_pq[(s->head + s->len) % 64] = sc->pq_cur;
     s->len++;
     s->rendering++;
     r = sc->status;
@@ -809,8 +970,7 @@ static VkResult wl_connect(vkb_swapchain *sc)
     s->registry = wl.proxy_marshal_constructor(s->display_wrapper, WL_DISPLAY_GET_REGISTRY, wl.registry_iface, NULL);
     wl.proxy_add_listener(s->registry, (void (**)(void))registry_listener, s);
     if (wl.display_roundtrip_queue(s->display, s->queue) < 0) return VK_ERROR_SURFACE_LOST_KHR;
-    if (s->shm) wl.proxy_add_listener(s->shm, (void (**)(void))shm_listener, s);
-    if (s->dmabuf) wl.proxy_add_listener(s->dmabuf, (void (**)(void))dmabuf_listener, s);
+    /* the bound globals' first events (their listeners went on at the bind, registry_global) */
     if (wl.display_roundtrip_queue(s->display, s->queue) < 0) return VK_ERROR_SURFACE_LOST_KHR;
     s->connected = 1;
     return VK_SUCCESS;
@@ -1140,6 +1300,7 @@ static void wl_teardown(wl_state *s)
     if (s->display_wrapper) wl.proxy_wrapper_destroy(s->display_wrapper);
     if (s->display) wl.display_flush(s->display);
     if (s->queue) wl.event_queue_destroy(s->queue);
+    if (s->rel_queue) wl.event_queue_destroy(s->rel_queue);
     free(s);
 }
 
@@ -1158,6 +1319,8 @@ static void wl_destroy(vkb_swapchain *sc)
         uint64_t one = 1;
         if (write(s->efd, &one, sizeof(one)) < 0) { /* the counter is already set */ }
         pthread_join(s->thread, NULL);
+        present_path_line(sc, s, 1);
+        release_stop(sc); /* the drain above still had its releases; before the cond it signals and the buffers go */
         pthread_cond_destroy(&s->changed);
         s->thread_on = 0;
     }

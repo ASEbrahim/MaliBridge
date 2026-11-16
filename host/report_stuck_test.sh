@@ -1,7 +1,7 @@
 #!/bin/bash
 # The session report's line for a request the driver has not returned from (server_report.c,
 # VKBRIDGE_REPORT_STUCK_S), and its "stuck_call" in malibridge-report.json, which the app's
-# loading screen reads to say which stage stalled (Xwayland in vkGetSemaphoreFdKHR for
+# loading screen reads to say which stage stalled (a player log: Xwayland in vkGetSemaphoreFdKHR for
 # 400 s, the screen said only "Waiting for Steam's first frame"). A server of its own holds one
 # request of syncfd_check's "stall" step (VKBRIDGE_TEST_DELAY_CMD) for 14 s; the report is read
 # while it is held and after:
@@ -91,7 +91,7 @@ j4=$(stuck_json)
 step $? "4 VKBRIDGE_REPORT_STUCK_S=0: never named (json: $j4)"
 wait $prog 2>/dev/null; prog=
 
-# 5: X5: the End of a command buffer held inside one replayed command: the report says which
+# 5: X5 (a player log): the End of a command buffer held inside one replayed command: the report says which
 start endrep VKBRIDGE_REPORT_STUCK_S=3 VKBRIDGE_TEST_DELAY_CMD=vkCmdSetViewport VKBRIDGE_TEST_DELAY_MS=14000
 timeout 60 "$out/syncfd_check" endstall >"$sess/check.log" 2>&1 & prog=$!
 sleep 10

@@ -51,6 +51,13 @@
 #include "astc_tables.glsl"
 
 uint g_apart; /* texels (bit t) in partition 1 */
+#if defined(ENC_ASTC) && (defined(FMT_BC7) || defined(SRC_RAW))
+/* BC7 (and raw blocks, which may be BC7's): the largest alpha error of a texel in the last astc_weights (g_am) and in
+ * the best candidate astc_try kept (g_tam), to tell alpha that does not follow the colour (only these variants: the
+ * others' SPIR-V and pipeline caches stay as they were) */
+#define ASTC_ALPHA_SPLIT
+float g_am, g_tam;
+#endif
 
 bool astc_in(uint p, uint part) { return ((g_apart >> p) & 1u) == part; }
 
@@ -237,6 +244,9 @@ float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, out uvec2
     float a1 = 0.0;
     wi = uvec2(0u);
     uint pos = 0u;
+#ifdef ASTC_ALPHA_SPLIT
+    g_am = 0.0;
+#endif
     for (uint p = 0u; p < 16u; p++) {
         uint part = (g_apart >> p) & 1u;
         vec4 v = vec4(g_px[p]), a = d0[part], b = d1[part];
@@ -244,6 +254,9 @@ float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, out uvec2
         float x = astc_w(wb, k) / 64.0, y = 1.0 - x;
         vec4 d = (v - mix(a, b, x)) * m + (v - a) * rest;
         e += dot(d, d);
+#ifdef ASTC_ALPHA_SPLIT
+        g_am = max(g_am, abs(d.a));
+#endif
         sa[part] += y * y;
         sb[part] += y * x;
         sc[part] += x * x;
@@ -321,6 +334,9 @@ float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec
         float e = astc_weights(d0, d1, m, dual, wb, wi, e0, e1);
         if (e < best) {
             best = e;
+#ifdef ASTC_ALPHA_SPLIT
+            g_tam = g_am;
+#endif
             /* block mode: 4x4 weights (A = 2, B = 0), range R/H, D for the second plane */
             uint r = wb == 2u ? 4u : (wb == 3u ? 7u : 4u), h = wb == 4u ? 1u : 0u;
             uint bm = ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5) | (h << 9) | ((dual ? 1u : 0u) << 10);
@@ -362,7 +378,8 @@ float astc_good() { return BC_QUALITY == 0u ? 64.0 : (BC_QUALITY == 1u ? ASTC_GO
  * and QUANT_192; BC7 3-bit and 8-bit, then 4-bit and QUANT_192, or for a BC7 block of 2 or 3 subsets
  * its 2 partitions first and 4-bit weights only after. With alpha: 3-bit weights and QUANT_192, then
  * for BC2 / BC3 a second plane for alpha (2-bit, QUANT_48: their alpha seldom follows the colour),
- * for BC7 4-bit weights and QUANT_48 (high: then a second plane as well). */
+ * for BC7 4-bit weights and QUANT_48 (high: then a second plane as well), or where the first leaves a
+ * texel's alpha 48 or more off (alpha that does not follow the colour) the second plane in their place. */
 uvec4 astc_encode(uint part, bool fine)
 {
     bool alpha = false, same = true;
@@ -385,7 +402,15 @@ uvec4 astc_encode(uint part, bool fine)
     if (alpha) {
         e = astc_try(true, false, 3u, 192u, ~0u, s0, s1, 1e30, blk);
         if (e <= astc_good()) return blk;
+#ifdef ASTC_ALPHA_SPLIT
+        /* Alpha that does not follow the colour (leaves on transparent texels, BC7 modes 4 / 5) on one line puts a
+         * transparent texel's alpha past an alpha test (a player log: up to 255 off). Where the first candidate leaves a texel's
+         * alpha 48 or more off, the second plane is the next candidate instead of 4-bit weights (still two at most; a
+         * share-of-the-error rule instead also took soft alpha's blocks and cost it up to 3.5 dB of alpha). */
+        if (fine && (BC_QUALITY == 2u || g_tam < 48.0)) {
+#else
         if (fine) {
+#endif
             e = astc_try(true, false, 4u, 48u, ~0u, s0, s1, e, blk);
             if (BC_QUALITY < 2u) return blk;
         }

@@ -7,6 +7,7 @@
 #include "server_emu.h"
 #include "vkb_caps.h"
 #include "vkb_ext_alias.h"
+#include "server_cores.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -190,6 +191,8 @@ static void log_device(const vkb_dispatch *dt, VkPhysicalDevice pd, const VkPhys
         VKB_INFO("memory type %u: heap %u flags 0x%x", i, mp.memoryTypes[i].heapIndex, mp.memoryTypes[i].propertyFlags);
 }
 
+int vkb_selftest_too_old; /* GPUs the self-test left unserved: their driver is older than Vulkan 1.1 */
+
 void vkb_selftest_all(void)
 {
     uint32_t api = VK_API_VERSION_1_0;
@@ -212,6 +215,19 @@ void vkb_selftest_all(void)
     dt.vkEnumeratePhysicalDevices(inst, &n, pds);
     VKB_INFO("self-test: loader Vulkan %u.%u, %u physical device(s)", VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api), n);
     for (uint32_t i = 0; i < n; i++) {
+        /* a player log (Note 8 Mali-G71, Android 9): a Vulkan 1.0 driver under a 1.1 loader has no 1.1 core
+         * physical-device entry points, and every one below needs them: said plainly, the GPU not served */
+        if (!dt.vkGetPhysicalDeviceProperties2) {
+            VkPhysicalDeviceProperties p1 = {0};
+            if (dt.vkGetPhysicalDeviceProperties) dt.vkGetPhysicalDeviceProperties(pds[i], &p1);
+            const char *miss = "vkGetPhysicalDeviceProperties2";
+            VKB_ERR("self-test: this phone's GPU driver is too old: %s, Vulkan %u.%u.%u, driver 0x%08x, has no %s (MaliBridge needs "
+                    "Vulkan 1.1); this GPU is not served",
+                    p1.deviceName[0] ? p1.deviceName : "the GPU", VK_API_VERSION_MAJOR(p1.apiVersion), VK_API_VERSION_MINOR(p1.apiVersion),
+                    VK_API_VERSION_PATCH(p1.apiVersion), p1.driverVersion, miss);
+            vkb_selftest_too_old++;
+            continue;
+        }
         VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
         VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
         dt.vkGetPhysicalDeviceProperties2(pds[i], &p2);
@@ -222,6 +238,7 @@ void vkb_selftest_all(void)
         snprintf(k->name, sizeof(k->name), "%s", p2.properties.deviceName);
         k->info.real_api_version = p2.properties.apiVersion;
         k->info.driver_id = vkb_driver_id(&dt, pds[i], api);
+        vkb_zink_profile_probe(id.deviceUUID, p2.properties.vendorID, k->info.driver_id, api); /* pv_zink_name (PV-08) */
         vkb_promote_decide(&dt, pds[i]);
         vkb_mem_selftest(k, inst, &dt, pds[i]);
         k->info.emu_available = vkb_emu_detect(&dt, pds[i], &k->info.missing);
@@ -254,7 +271,18 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         return;
     }
     VkInstance inst = VK_NULL_HANDLE;
+    /* pv_zink_name (PV-08): PowerVR's driver profiles the engine name "mesa zink"; the driver is
+     * asked under a neutral one where the startup probe saw it, the app's name stays everywhere else */
+    const char *app_engine = ci->pApplicationInfo ? ci->pApplicationInfo->pEngineName : NULL, *engine_why_name = NULL;
+    char engine_why[320];
+    if ((engine_why_name = vkb_errata_zink_engine(app_engine, engine_why, sizeof(engine_why))))
+        ((VkApplicationInfo *)ci->pApplicationInfo)->pEngineName = engine_why_name;
     VkResult r = vkb_global_dt.vkCreateInstance(ci, NULL, &inst);
+    if (engine_why_name) {
+        ((VkApplicationInfo *)ci->pApplicationInfo)->pEngineName = app_engine;
+        VKB_INFO("errata: pv_zink_name: instance made under engine name \"%s\" instead of \"%s\" (%s) - PV-08", engine_why_name, app_engine,
+                 engine_why);
+    }
     uint32_t id = 0;
     if (r == VK_SUCCESS) {
         vkb_srv_table *t = calloc(1, sizeof(*t));
@@ -269,15 +297,20 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
                         !strcmp(ci->pApplicationInfo->pApplicationName, "gamescope");
         vkb_dispatch_load_instance(&t->real, vkb_gipa, inst);
         vkb_emu_linearstorage_instance_init(t); /* host: a driver refusing LINEAR storage images, beneath every layer */
+        vkb_emu_pvmutable_instance_init(t);     /* host: PowerVR refusing the mutable LINEAR dma-buf image query, beneath every layer */
         t->dt = t->real;
         vkb_opaque_instance_install(t);
         vkb_dab_instance_install(t); /* dma-bufs over AHardwareBuffers: their queries */
         vkb_mem_instance_install(t);
         vkb_emu_instance_install(t);
         vkb_sparse_instance_install(t);
+        vkb_errata_pvmutable_instance_install(t); /* PV-02: the image-format query, over the emulations' */
+        vkb_mem_mutable_instance_install(t);      /* PR mutable dma-buf retry, over PV-02's answer */
         vkb_promote_instance_install(t);
         vkb_vidyn_instance_install(t); /* over the promotion's feature query */
         vkb_errata_gs_instance_install(t); /* over all of them, its processes only */
+        t->zink_renamed = engine_why_name != NULL;
+        vkb_errata_zink_instance_install(t); /* PV-08: over everything, renamed Zink instances only */
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);
@@ -340,6 +373,8 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
     else VKB_WARN("query for a physical device the self-test did not see");
     info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: the game's preset file, <cache dir>/env, ... */
     info.client_knobs |= vkb_syncfd_client_knobs(info.driver_id); /* server_syncfd.c */
+    info.perf_src = vkb_preset_perf_src(); /* where those switches came from: the client's 'perf-switches:' line */
+    vkb_srv_fast_create_set(c->conn->proc, VKB_KNOB_GET(info.client_knobs, VKB_KNOB_FAST_CREATE_SHIFT) == VKB_KNOB_ON ? 2 : 1);
     /* The bridge's own timeline semaphores (server_timeline.c, Mali r18p0/r19p0): the sync mirror's
      * fence slot waits on a timeline of its own in a second batch, which the bridge's timelines turn
      * into a CPU wait for the GPU inside every submit with a fence (gamescope's every frame). The
@@ -464,17 +499,31 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     if ((emu & VKB_EMU_BCN) && vkb_emu_bcn_astc_hdr(&inst->real, pd, inst->api_version) == 2 &&
         !list_has(exts, n, "VK_EXT_texture_compression_astc_hdr"))
         exts[n++] = "VK_EXT_texture_compression_astc_hdr";
-    /* The hang detector asks the driver what faulted once the device is lost. */
-    if (vkb_hang_wanted() && has_ext(avail, avail_n, "VK_EXT_device_fault") && !list_has(exts, n, "VK_EXT_device_fault")) {
-        VkPhysicalDeviceFaultFeaturesEXT *ff = vkb_dec_alloc(&c->d, sizeof(*ff));
-        if (ff) {
+    /* VK_EXT_device_fault: the driver's own report of what faulted, asked for once at a loss (the loss record,
+     * server_lostlog.c; and the hang detector). Only where the driver lists it AND its deviceFault feature says yes;
+     * a vkCreateDevice that fails with it is made again without it (below). The app never sees it (codegen). */
+    int fault_state = 0, ll_test = vkb_ll_test_mode();
+    VkPhysicalDeviceFaultFeaturesEXT *fault_ff = NULL;
+    if ((vkb_hang_wanted() || vkb_ll_wanted()) && has_ext(avail, avail_n, "VK_EXT_device_fault") && !list_has(exts, n, "VK_EXT_device_fault")) {
+        VkPhysicalDeviceFaultFeaturesEXT have = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have};
+        if (inst->real.vkGetPhysicalDeviceFeatures2) inst->real.vkGetPhysicalDeviceFeatures2(pd, &f2);
+        VkPhysicalDeviceFaultFeaturesEXT *ff = have.deviceFault ? vkb_dec_alloc(&c->d, sizeof(*ff)) : NULL;
+        if (!have.deviceFault) {
+            fault_state = -2;
+            VKB_INFO("vkCreateDevice: the driver lists VK_EXT_device_fault without its deviceFault feature: not asked for");
+        } else if (ff) {
             memset(ff, 0, sizeof(*ff));
             ff->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
             ff->deviceFault = VK_TRUE;
             ff->pNext = (void *)ci->pNext;
             ci->pNext = ff;
             exts[n++] = "VK_EXT_device_fault";
+            fault_state = 1;
+            fault_ff = ff;
         }
+    } else if (ll_test) {
+        fault_state = 2; /* host tests: the driver offers it (imitated; lavapipe is not given it) */
     }
     /* robustness2 reported without the driver having it (VKB_EMU_ROBUSTNESS2): robustBufferAccess
      * is turned on for robustBufferAccess2 (server_emu.c), and image robustness, where the driver
@@ -606,7 +655,27 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         VKB_INFO("vkCreateDevice: pEnabledFeatures %s, chain:%s", ci->pEnabledFeatures ? "set" : "null", chain);
     }
     VkDevice dev = VK_NULL_HANDLE;
-    VkResult r = inst->real.vkCreateDevice(pd, ci, NULL, &dev);
+    VkResult r = fault_state == 2 && ll_test == 4 ? VK_ERROR_EXTENSION_NOT_PRESENT /* host tests: refused once */
+                                                  : inst->real.vkCreateDevice(pd, ci, NULL, &dev);
+    if (r != VK_SUCCESS && (fault_state == 1 || (fault_state == 2 && ll_test == 4))) {
+        /* a driver that lists VK_EXT_device_fault and refuses it: the device without it, as before it was asked for */
+        VKB_WARN("vkCreateDevice refused VK_EXT_device_fault (%d): the device is made without it (no driver fault report at a loss)", r);
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci; fault_ff && b; b = b->pNext)
+            if (b->pNext == (VkBaseOutStructure *)fault_ff) {
+                b->pNext = (VkBaseOutStructure *)fault_ff->pNext;
+                break;
+            }
+        for (uint32_t i = 0; fault_state == 1 && i < n; i++)
+            if (exts[i] && !strcmp(exts[i], "VK_EXT_device_fault")) {
+                for (uint32_t k = i + 1; k < n; k++) exts[k - 1] = exts[k];
+                n--;
+                break;
+            }
+        ci->enabledExtensionCount = n;
+        fault_state = -1;
+        dev = VK_NULL_HANDLE;
+        r = inst->real.vkCreateDevice(pd, ci, NULL, &dev);
+    }
     uint32_t id = 0;
     if (r == VK_SUCCESS) {
         vkb_srv_table *t = calloc(1, sizeof(*t));
@@ -619,9 +688,11 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         t->parent = inst;
         t->pd = k;
         t->api_version = inst->api_version;
+        t->device_fault = fault_state;
         t->real = inst->real;
         PFN_vkGetDeviceProcAddr gdpa = vkb_promote_gdpa((PFN_vkGetDeviceProcAddr)vkb_gipa(inst->instance, "vkGetDeviceProcAddr"));
         vkb_dispatch_load_device(&t->real, gdpa, dev);
+        vkb_children_fake_init(t); /* host: a PowerVR driver whose vkDestroyDevice never returns with live render objects */
         vkb_children_device_init(t); /* the very bottom: the driver's objects as it makes them (server_children.c) */
         vkb_promote_device_init(t); /* beneath every layer: what reaches the driver is SPIR-V it takes */
         t->dt = t->real;
@@ -635,9 +706,11 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
         } else {
             vkb_crashctx_test_init(t); /* host tests: a client's call faults at the driver, beneath everything */
             vkb_lost_device_init(t); /* beneath every layer: a lost device runs nothing more (server_lost.c) */
+            vkb_pvsusp_device_init(t); /* PowerVR: suspended/resumed renderings reach the driver as whole passes (server_pvsusp.c) */
             vkb_qlock_device_init(t); /* beneath everything: every submit, the layers' own too, takes its queue's lock */
             vkb_mem_device_install(t); /* host: another driver's image requirements, beneath every layer */
             vkb_spvfix_fake_init(t); /* host: a driver refusing compute pipelines with YCbCr samplers */
+            vkb_cores_device_made(); /* this connection thread and the driver's event threads on the fast cores (server_cores.c) */
             vkb_guard_device_init(t); /* first: every layer's compiles reach the driver through it */
             vkb_nocomp_device_init(t, nocomp);
             vkb_hang_device_init(t);  /* next: sees the driver-level calls of every layer above it */
@@ -662,7 +735,9 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_syncfd_device_init(t); /* sync-fd exports answered within a deadline (server_syncfd.c) */
             vkb_syncfb_device_init(t); /* a fence the client's mirror saw done is signalled before it is reset (server_syncfb.c) */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
+            vkb_pldedup_device_init(t); /* over everything: one driver layout for pipeline layouts made the same way (PowerVR) */
             vkb_mem_export_install(t);
+            vkb_errata_pvbgra_export_install(t); /* PV-07: over everything, where the fix is on: converted images' dma-bufs registered */
             VKB_INFO("device %u created on %s (pid %d, %u extensions, memory sharing %s)", id, k ? k->name : "?",
                      t->proc ? t->proc->pid : 0, n, vkb_mem_strategy_name(strategy));
             vkb_mem_log_types(t, id);
@@ -689,10 +764,14 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
         vkb_srv_bad_message(c);
         return;
     }
+    /* its loss record's driver query (server_lostlog.c) ends first; one that does not leaves the device stopped */
+    if (vkb_lost_settle(t)) return;
     /* A sync-fd export still blocked in the driver on this device: the device and its table are
      * left as they are (the table stays registered, so its id is not reused under that call). */
     if (vkb_syncfd_device_destroy(t)) return;
     vkb_table_unregister(t);
+    vkb_pldedup_device_destroy(t);
+    vkb_timeline_device_quiesce(t); /* its queues' workers stop before anything of the device goes */
     vkb_async_device_destroy(t);
     vkb_vidyn_device_destroy(t);
     vkb_emu_device_quiesce(t);
@@ -720,6 +799,7 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_children_device_destroy(t, 0); /* the app's own destroy: nothing more destroyed than before */
     t->real.vkDestroyDevice(dev, NULL);
     vkb_qlock_device_destroy(t); /* server_qlock.c: the device's queue locks */
+    vkb_pvsusp_device_destroy(t); /* server_pvsusp.c: its totals */
     VKB_INFO("device %u destroyed", t->id);
     pthread_mutex_destroy(&t->lock);
     free(t);

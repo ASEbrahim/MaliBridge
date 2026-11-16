@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Driver errata: known Mali driver bugs, each with a fix that sits just above the driver. The
  * errata layer replaces t->real.* right after server_quirks.c (vkb_sv_vkCreateDevice), so every
  * layer installed later reaches the driver through it - the bridge's own emulation calls (the
@@ -28,14 +27,17 @@
  *                                     on is the regression test of it on an unaffected driver
  *   VKBRIDGE_ERRATA_IMITATE=name,...  host builds only: a shim beneath the fix introduces the bug,
  *                                     so a test shows the bug without the fix and none with it
- *   VKBRIDGE_FAKE_DRIVER_VERSION=r49p1[:jm|:csf]   the version gates believe another driver (also
- *                                     a driverInfo string, "v1.r49p1-03bet0"); the GPU counts as Arm
+ *   VKBRIDGE_FAKE_DRIVER_VERSION=r49p1[:jm|:csf][@<deviceName>]   the version gates believe another driver
+ *                                     (also a driverInfo string, "v1.r49p1-03bet0"); the GPU counts as Arm;
+ *                                     after '@' the GPU name the gates match ("r44p1@Mali-G615 MC6")
+ *                                     pvr25.3@6908880 (or pvr6908880): a PowerVR driver of that changelist
+ *                                     instead; its ranges (VEND_PVR, in changelists) read it, Arm's never
  *   VKBRIDGE_ERRATA_PROBE=probe:pass|fail,...      host builds only: probe results as if the
  *                                     probe had recorded them (tests of the decisions; on a device
  *                                     VKBRIDGE_PROBE_FAKE=<probe>:fail fails the real probe)
  *   VKBRIDGE_WAIT_FIX=0               v0.4's name for -wait_retry; VKBRIDGE_WAIT_FAKE_ERROR (how the
  *                                     wait imitation fails, server_wait.c) imitates on any build, as does
- *                                     VKBRIDGE_WAIT_FAKE_LOST
+ *                                     VKBRIDGE_WAIT_FAKE_LOST (timed-out waits answered VK_ERROR_DEVICE_LOST)
  *   VKBRIDGE_NO_FP16=1 / =0           +fp16_hide / -fp16_hide (also a per-game preset key); it wins
  *                                     over VKBRIDGE_ERRATA for that one erratum
  *
@@ -49,7 +51,8 @@
  * Names (not VKBRIDGE_QUIRKS: server_quirks.c means shader discard): wait_retry (MK-01),
  * viewport_flip (MK-02), bitwise_scalar (MK-03), dyn_reemit (MK-04), vb_split (MK-05),
  * view_quarantine (MK-06), view_counts (MK-07), clamp_zero (MK-32), cull_nontri (MK-16),
- * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), gs_hide, and example: a no-op on
+ * pv_names (PV-01, PowerVR), pv_view3d_base (PV-04, PowerVR), pv_fbloop_split (PV-06, PowerVR), pv_zink_name (PV-08, PowerVR),
+ * dedicated_import (MK-39), fp16_hide (MK-20), stencil_layout (MK-11), gs_hide, split_varying (MK-47), import_serial (MK-48), and example: a no-op on
  * vkCreateImageView that counts the calls reaching it (and its imitation the calls beneath it),
  * the pattern a fix follows.
  */
@@ -67,16 +70,21 @@
 #define V(r, p) (((uint32_t)(r) << 10) | (uint32_t)(p)) /* comparable: r major, p minor */
 #define V_MAX 0xffffffffu
 
-enum { G_ALWAYS = 1, G_PROBE_FAIL = 2, G_IN_RANGE = 4, G_VERSION_UNKNOWN = 8 };
+/* G_PROBE_UNVERIFIED: its probe has not passed (failed, not run, skipped, crashed or still to run) */
+enum { G_ALWAYS = 1, G_PROBE_FAIL = 2, G_IN_RANGE = 4, G_VERSION_UNKNOWN = 8, G_PROBE_UNVERIFIED = 16, G_POWERVR = 32 }; /* G_POWERVR: PowerVR's driver, whatever the probe says */
 enum { FAM_ANY, FAM_JM, FAM_CSF };
 enum { R_BETA = 1, R_SAFE = 2 }; /* a range for beta builds only / in safe mode only */
+enum { VEND_ARM, VEND_PVR }; /* whose driver a range is of: Arm's r<major>p<minor> (V), or PowerVR's changelist number (CL) */
 
 typedef struct {
-    uint32_t from, fixed; /* affected: from <= v < fixed (V_MAX: not fixed yet) */
+    uint32_t from, fixed; /* affected: from <= v < fixed (V_MAX: not fixed yet); v: V(r, p) for Arm's driver, the changelist
+                           * (the 6908880 of "25.3@6908880") for PowerVR's - it only grows, across releases too */
     int family;           /* FAM_*: the GPUs it was seen on */
     const char *gpu;      /* a deviceName substring, or NULL */
     const char *note;
     int flags;            /* R_* */
+    unsigned scope;       /* 0: the whole fix; else the part this range needs (VKB_*_SCOPE_*) */
+    int vendor;           /* VEND_*: left out, Arm's */
 } erratum_range;
 
 typedef struct {
@@ -88,6 +96,8 @@ typedef struct {
     void (*install)(vkb_srv_table *t, vkb_errata_dev *e); /* NULL: no fix in this build yet */
     void (*imitate)(vkb_srv_table *t, vkb_errata_dev *e); /* the bug beneath the fix (host) */
     const char *elsewhere; /* fixed outside this layer (its own switch) */
+    uint64_t pattern;      /* VKB_PROBE_FLAG_* (any of them): with a failed probe it counts as the bug's own only when the probe set one
+                            * (pv_view3d_base shares view3d_layers with view_counts, whose failure is another pattern) */
 } erratum;
 
 static void example_install(vkb_srv_table *t, vkb_errata_dev *e);
@@ -102,9 +112,21 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
         {{V(54, 2), V(54, 3), FAM_ANY, "G715", "a single report"}}, vkb_errata_flip_install, vkb_errata_flip_imitate},
     [VKB_ERRATUM_BITWISE_SCALAR] = {"bitwise_scalar", "MK-03", "bitwise_vec", 1, G_PROBE_FAIL | G_IN_RANGE, G_PROBE_FAIL,
         {{V(18, 0), V(54, 0), FAM_ANY, NULL, NULL}}, vkb_errata_bitwise_install, vkb_errata_bitwise_imitate},
-    [VKB_ERRATUM_DYN_REEMIT] = {"dyn_reemit", "MK-04", "dyn_state", 1, G_ALWAYS, G_PROBE_FAIL | G_IN_RANGE,
-        {{V(0, 0), V(44, 1), FAM_ANY, NULL, "depth/stencil/cull/stride; ANGLE: below r44p1"},
-         {V(48, 0), V(54, 0), FAM_ANY, NULL, "EDS3 conservative raster, line mode, sample mask"},
+    /* Arm SDEN-3735689 v5.0: 3809538 (r38p0-r44p0, fixed r44p1: depth test/write/compare, stencil
+     * test/op/write mask, cull mode, vertex stride lost at a pipeline change after a draw that used
+     * them), 3809774 (r37p0-r44p0: depth/stencil write off ignored when the shader reads them),
+     * 3893905 (r48p0-r53p0, fixed r54p0: conservative and line mode only) and 3893903 (r48p0-r53p0:
+     * a static sample mask/line/conservative mode taking the dynamic value). ANGLE turns extended
+     * dynamic state off below r44p1 and on job manager GPUs r46-r51 (no Arm erratum names which
+     * states there, so the whole fix). Safe mode: on wherever a range or an unknown Arm version says
+     * so, and on any driver whose probe dyn_state has not passed; off only on a driver outside every
+     * range whose probe passed (r44p1-r47 CSF, r52+ JM, r54 and later, other vendors' drivers). On
+     * r48-r53 CSF only the EDS3 states are sent again (VKB_DYN_SCOPE_EDS3). Before 2026-11-06 safe
+     * mode sent every state again after every bind on every driver ("always"). */
+    [VKB_ERRATUM_DYN_REEMIT] = {"dyn_reemit", "MK-04", "dyn_state", 1, G_PROBE_UNVERIFIED | G_IN_RANGE | G_VERSION_UNKNOWN,
+        G_PROBE_FAIL | G_IN_RANGE,
+        {{V(0, 0), V(44, 1), FAM_ANY, NULL, "depth/stencil/cull/stride, Arm 3809538; ANGLE: below r44p1"},
+         {V(48, 0), V(54, 0), FAM_ANY, NULL, "EDS3 conservative raster, line mode, sample mask, Arm 3893903/3893905", 0, VKB_DYN_SCOPE_EDS3},
          {V(46, 0), V(51, 0), FAM_JM, NULL, "job manager GPUs"}},
         vkb_errata_dyn_install, vkb_errata_dyn_imitate},
     [VKB_ERRATUM_VB_SPLIT] = {"vb_split", "MK-05", "vb_strides", 0, G_ALWAYS, G_ALWAYS,
@@ -174,19 +196,99 @@ static const erratum errata[VKB_ERRATA_COUNT] = {
     [VKB_ERRATUM_GS_HIDE] = {"gs_hide", "#11", NULL, 0, G_IN_RANGE, G_IN_RANGE,
         {{V(38, 1), V(38, 2), FAM_ANY, NULL, "a beta build: Zink's geometry shaders crash its compiler", R_BETA}},
         vkb_errata_gs_install, NULL},
-    [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, 0, 0, {{0}}, example_install, example_imitate},
+    /* a player log (Mali-G68 r38p1 JM) and a player log (Mali-G925 r49p1 CSF): Half-Life's menu text in
+     * fragments. Zink's fixed-function fragment shader reads the texture coordinate's q at
+     * Location 1 Component 3 while its vertex shader writes one vec4 there; the G68 r38p1 reads 0
+     * (tests/splitvary_check.c on a Galaxy A35; a merged input reads right). Two GPU families,
+     * drivers two years apart, no Arm erratum to bound it: every Arm driver, both modes. The merged
+     * interface is exact on any driver. */
+    [VKB_ERRATUM_SPLIT_VARYING] = {"split_varying", "MK-47", NULL, 0, G_IN_RANGE | G_VERSION_UNKNOWN, G_IN_RANGE | G_VERSION_UNKNOWN,
+        {{V(0, 0), V_MAX, FAM_ANY, NULL, "every Arm driver (a player log r38p1, a player log r49p1)"}},
+        vkb_errata_splitvary_install, vkb_errata_splitvary_imitate},
+    /* a player log (POCO X6 Pro, Mali-G615 MC6 r44p1): the server faulted at one
+     * driver pc (libGLES_mali.so+0xa177bc, SEGV_ACCERR, a wild pointer) four times, each in a dma-buf import or its
+     * bind while another program's device was in its memory calls. The fix (server_errata_import.c) keeps such a
+     * call apart from other devices' memory calls. Keyed to the driver of those logs, r44p1 on a G615 MC6, both
+     * modes: the S10+'s G720 runs the same "v1.r44p1-01eac0" release and never faulted (~690k imports in a stress
+     * run), nor did the G615 MC2/MC5 phones' logs (other SoCs' builds); the build hash after "01eac0." would be
+     * narrower but player logs carry it redacted. VKBRIDGE_ERRATA=+/-import_serial forces it. */
+    /* player logs of RE Village and The Witcher 3, Mali-G925 r49p1: vkd3d-proton's layered image copy - a fragment
+     * shader writing gl_FragDepth (DepthReplacing) into a rendering with only a colour attachment - never finishes; the kernel
+     * ends the queue group every ~7 s (status 0x72) until Android kills the game. Shown on the Ultra: the same shader without its
+     * depth store runs the scene at 60 fps. Without a depth attachment the depth goes nowhere, so the fix is exact on any driver;
+     * keyed to the driver it was seen on, both modes. VKBRIDGE_ERRATA=+/-fragdepth_nodepth forces it. */
+    [VKB_ERRATUM_FRAGDEPTH_NODEPTH] = {"fragdepth_nodepth", "MK-49", NULL, 0, G_IN_RANGE, G_IN_RANGE,
+        {{V(49, 1), V(49, 2), FAM_ANY, "G925", "player logs: RE Village, The Witcher 3 (vkd3d-proton's layered copy)"}},
+        vkb_errata_fragdepth_install, vkb_errata_fragdepth_imitate},
+    [VKB_ERRATUM_IMPORT_SERIAL] = {"import_serial", "MK-48", NULL, 0, G_IN_RANGE, G_IN_RANGE,
+        {{V(44, 1), V(44, 2), FAM_ANY, "G615 MC6", "a player log"}}, vkb_errata_import_install, NULL},
+    /* PowerVR: the image-format query for a LINEAR, dma-buf shareable, mutable-format RGBA8 / BGRA8
+     * image says NOT_SUPPORTED though the image is exported, imported and bound fine (gamescope's
+     * flippable images). Answered with the base format's result. Probe-gated: the probe asks the
+     * query and then makes, exports, imports and views the same image. */
+    [VKB_ERRATUM_PV_MUTABLE_LINEAR] = {"pv_mutable_linear", "PV-02", "pv_mutable_linear", 1, G_PROBE_FAIL, G_PROBE_FAIL, {{0}},
+        vkb_errata_pvmutable_install, vkb_errata_pvmutable_imitate},
+    /* PowerVR: storage writes to a B8G8R8A8 image land in R8G8B8A8 byte order (reads right); gamescope composites
+     * into B8G8R8A8 storage images whose dma-bufs reach the screen: red and blue exchanged. Probe-gated. */
+    [VKB_ERRATUM_PV_BGRA_STORE] = {"pv_bgra_store", "PV-07", "pv_bgra_store", 1, G_PROBE_FAIL, G_PROBE_FAIL, {{0}},
+        vkb_errata_pvbgra_install, vkb_errata_pvbgra_imitate},
+    /* PowerVR DXT 25.3 (Android 17): an input reads zero beside an output of the same OpName (DXVK's
+     * "TEXCOORD" pairs); names are debug information, so dropping them is exact on any driver.
+     * Probe-gated: a driver without the bug keeps its names. The probe runs the shared-name shader
+     * and its stripped twin, so the fix is known to work on the driver it turns on for. */
+    [VKB_ERRATUM_PV_NAMES] = {"pv_names", "PV-01", "pv_names", 1, G_PROBE_FAIL, G_PROBE_FAIL, {{0}},
+        vkb_errata_pvnames_install, vkb_errata_pvnames_imitate},
+    /* PowerVR DXT 25.1 (Pixel 10): a 2D-array view of a 3D image from slice 1 on, used as a framebuffer attachment, renders
+     * into slices 0..n-1, explicit counts too (so view_counts, MK-07, cannot fix it). Probe-gated on view3d_layers where
+     * its sub-cases 0 and 1 are both wrong (the pattern flag); the forms the fix uses (a one-slice view as it is or through
+     * a 2D view, or a 2D-array image of the bridge's own copied in and out) are what the same probe run proved. A second
+     * pattern of the probe (VKB_PROBE_FLAG_PV_V3D_FB; CXTP 25.3, Pixel 11: a feedback loop in a 3D image's multi-slice
+     * 2D-array view reads wrong, the same loop in a plain 2D-array image and in the copy form is right) turns it on for
+     * those passes only. And on PowerVR's driver always (G_POWERVR): multiview into such a view faults in it (SIGSEGV,
+     * CXTP 25.3 and DXT 24.3/25.1), which no probe can tell - a fault ends the server - so passes with a view mask that
+     * render into a 2D-array view of a 3D image take the copy form on every PowerVR driver, the probe passing or not.
+     * Nothing else changes there. */
+    [VKB_ERRATUM_PV_VIEW3D_BASE] = {"pv_view3d_base", "PV-04", "view3d_layers", 1, G_PROBE_FAIL | G_POWERVR, G_PROBE_FAIL | G_POWERVR, {{0}},
+        vkb_errata_pv3d_install, vkb_errata_pv3d_imitate, NULL, VKB_PROBE_FLAG_PV_VIEW3D | VKB_PROBE_FLAG_PV_V3D_FB},
+    /* PowerVR CXTP 25.3 (Pixel 11): a feedback loop (a colour attachment in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL, a barrier with
+     * the feedback-loop / by-region dependency inside the pass, then draws sampling the attachment at their own texel) reads
+     * wrong values, in a plain 2D-array image as much as in a 3D image's view, while the pass ended at the barrier and begun
+     * again with loadOp LOAD (no copy) is right. Probe-gated on view3d_layers where its plain loop (sub-case 7) is wrong and the
+     * split form (sub-case 8) right (the pattern flag VKB_PROBE_FLAG_PV_FBLOOP); every pass with an attachment in such a layout is
+     * then split at those barriers (server_errata_view3d.c, the split pv_view3d_base's copy form uses, with nothing to copy).
+     * Nothing else changes. */
+    [VKB_ERRATUM_PV_FBLOOP_SPLIT] = {"pv_fbloop_split", "PV-06", "view3d_layers", 1, G_PROBE_FAIL, G_PROBE_FAIL, {{0}},
+        vkb_errata_pvfbl_install, vkb_errata_pvfbl_imitate, NULL, VKB_PROBE_FLAG_PV_FBLOOP},
+    /* PowerVR's driver keeps an application profile for the exact engine name "mesa zink" that
+     * hides vertexInputDynamicState, sparse resources and more: Zink's text vanishes (wallentx,
+     * DroidDeck PR #570). The fix passes Zink clients' engine name to the driver as a neutral one
+     * at vkCreateInstance (server_errata_zink.c), only where the startup probe saw the two names
+     * show different features (it runs on PowerVR drivers only). Same in both modes. */
+    [VKB_ERRATUM_PV_ZINK_NAME] = {"pv_zink_name", "PV-08", "zink_profile", 1, G_PROBE_FAIL, G_PROBE_FAIL, {{0}},
+        vkb_errata_zink_install, NULL},
+    /* The pattern of a fix, and of the ranges of both vendors. Its ranges are ones no real driver is in (CL 1,
+     * r999p0): VKBRIDGE_FAKE_DRIVER_VERSION=pvr25.3@1 or r999p0 puts a driver in them (host/pvrange_test.sh).
+     * The first range of a PowerVR erratum will look like the first. */
+    [VKB_ERRATUM_EXAMPLE] = {"example", NULL, NULL, 0, G_IN_RANGE, G_IN_RANGE,
+        {{1, 2, FAM_ANY, NULL, "a test range no real PowerVR driver is in", 0, 0, VEND_PVR},
+         {V(999, 0), V(1000, 0), FAM_ANY, NULL, "a test range no real Arm driver is in"}},
+        example_install, example_imitate},
 };
 
 /* The driver, as the version gates see it */
 typedef struct {
     int arm;           /* Arm's driver (driverID ARM_PROPRIETARY, else vendor 0x13B5), or a faked version */
     int arm_vendor;    /* vendor 0x13B5, whichever driver (Mesa PanVK too) */
+    int pvr;           /* Imagination's PowerVR driver (a faked one too: VKBRIDGE_FAKE_DRIVER_VERSION=pvr...) */
+    uint32_t pvr_cl;   /* its changelist, from driverInfo "25.3@6908880" else driverVersion; the number its ranges are in; 0: unknown */
+    char pvr_rel[16];  /* "25.3" */
     int known;         /* r and p decoded */
     uint32_t r, p;
     int beta;
     int family;        /* FAM_JM / FAM_CSF */
     const char *from;  /* where the version came from */
     char build[VK_MAX_DRIVER_INFO_SIZE];
+    char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]; /* VKBRIDGE_FAKE_DRIVER_VERSION's "@<deviceName>": the GPU name the gates match */
 } drv_version;
 
 static int (*probe_source)(const char *probe);
@@ -267,10 +369,44 @@ static void version_from(const VkPhysicalDeviceProperties *pr, const char *info,
     d->family = pr->limits.maxDrawIndirectCount <= 1 ? FAM_JM : FAM_CSF;
     d->arm = vkb_driver_is_arm(pr, driver_id);
     d->arm_vendor = pr->vendorID == ARM_VENDOR;
+    d->pvr = !d->arm && vkb_driver_is_powervr(pr, driver_id);
+    if (d->pvr) {
+        d->pvr_cl = pr->driverVersion;
+        unsigned maj, min, cl;
+        if (info && sscanf(info, "%u.%u@%u", &maj, &min, &cl) == 3) {
+            snprintf(d->pvr_rel, sizeof(d->pvr_rel), "%u.%u", maj, min);
+            d->pvr_cl = cl;
+        }
+    }
     snprintf(d->build, sizeof(d->build), "%s", info ? info : "");
 
-    const char *fake = vkb_srv_env("VKBRIDGE_FAKE_DRIVER_VERSION");
-    if (fake && *fake) {
+    const char *fake_env = vkb_srv_env("VKBRIDGE_FAKE_DRIVER_VERSION");
+    if (fake_env && (fake_env[0] | 32) == 'p' && (fake_env[1] | 32) == 'v' && (fake_env[2] | 32) == 'r') {
+        /* pvr<release>@<changelist> ("pvr25.3@6908880") or pvr<changelist>: a PowerVR driver of that version */
+        unsigned maj, min, cl;
+        d->arm = 0;
+        d->pvr = 1;
+        d->pvr_cl = 0;
+        d->pvr_rel[0] = 0;
+        if (sscanf(fake_env + 3, "%u.%u@%u", &maj, &min, &cl) == 3) {
+            snprintf(d->pvr_rel, sizeof(d->pvr_rel), "%u.%u", maj, min);
+            d->pvr_cl = cl;
+        } else if (sscanf(fake_env + 3, "%u", &cl) == 1)
+            d->pvr_cl = cl;
+        else
+            VKB_WARN("errata: VKBRIDGE_FAKE_DRIVER_VERSION=%s is not pvr<release>@<changelist> or pvr<changelist>; the version counts as unknown", fake_env);
+        snprintf(d->build, sizeof(d->build), "%s", fake_env);
+        d->from = "VKBRIDGE_FAKE_DRIVER_VERSION";
+        return;
+    }
+    if (fake_env && *fake_env) {
+        char fake[VK_MAX_DRIVER_INFO_SIZE];
+        snprintf(fake, sizeof(fake), "%s", fake_env);
+        char *at = strchr(fake, '@');
+        if (at) {
+            *at = 0;
+            snprintf(d->gpu, sizeof(d->gpu), "%s", at + 1);
+        }
         d->arm = 1;
         d->known = vkb_errata_parse_version(fake, &d->r, &d->p, &d->beta);
         if (!d->known) VKB_WARN("errata: VKBRIDGE_FAKE_DRIVER_VERSION=%s is not r<major>p<minor>; the version counts as unknown", fake);
@@ -306,11 +442,12 @@ static void driver_version(const vkb_srv_table *t, VkPhysicalDevice pd, drv_vers
         p2.pNext = NULL;
         t->real.vkGetPhysicalDeviceProperties(pd, &p2.properties);
     }
-    snprintf(name, name_cap, "%s", p2.properties.deviceName);
     version_from(&p2.properties, dp.driverInfo, dp.driverID ? dp.driverID : vkb_driver_id(&t->real, pd, t->api_version), d);
+    snprintf(name, name_cap, "%s", d->gpu[0] ? d->gpu : p2.properties.deviceName);
 }
 
-/* The Arm driver's release (38 for r38p1), -1 when not Arm's or not decoded; *arm: Arm's own driver, *jm: a job manager GPU. */
+/* The Arm driver's release (38 for r38p1), -1 when it is not Arm's or not decoded; *arm: Arm's own driver,
+ * *jm: a job manager GPU (server_apicap.c's gate). t: any table of the GPU's instance. */
 int vkb_errata_arm_release_pd(const vkb_srv_table *t, VkPhysicalDevice pd, int *arm, int *jm)
 {
     if (arm) *arm = 0;
@@ -326,11 +463,17 @@ int vkb_errata_arm_release_pd(const vkb_srv_table *t, VkPhysicalDevice pd, int *
 
 static const erratum_range *in_range(const erratum *e, const drv_version *d, const char *gpu, int perf)
 {
-    if (!d->arm || !d->known) return NULL;
-    uint32_t v = V(d->r, d->p);
     for (int i = 0; i < 4; i++) {
         const erratum_range *g = &e->ranges[i];
         if (!g->from && !g->fixed) break;
+        uint32_t v;
+        if (g->vendor == VEND_PVR) {
+            if (!d->pvr || !d->pvr_cl) continue;
+            v = d->pvr_cl;
+        } else {
+            if (!d->arm || !d->known) continue;
+            v = V(d->r, d->p);
+        }
         if (v < g->from || v >= g->fixed) continue;
         if (g->family != FAM_ANY && g->family != d->family) continue;
         if (g->gpu && !strstr(gpu, g->gpu)) continue;
@@ -340,9 +483,39 @@ static const erratum_range *in_range(const erratum *e, const drv_version *d, con
     return NULL;
 }
 
+/* The part of the fix the driver's matching ranges need: 0 when one of them needs all of it (or none
+ * matches), else the union of their scopes */
+static unsigned range_scope(const erratum *e, const drv_version *d, const char *gpu, int perf)
+{
+    if (!d->arm || !d->known) return 0;
+    uint32_t v = V(d->r, d->p);
+    unsigned sc = 0;
+    for (int i = 0; i < 4; i++) {
+        const erratum_range *g = &e->ranges[i];
+        if (!g->from && !g->fixed) break;
+        if (v < g->from || v >= g->fixed) continue;
+        if (g->family != FAM_ANY && g->family != d->family) continue;
+        if (g->gpu && !strstr(gpu, g->gpu)) continue;
+        if (((g->flags & R_BETA) && !d->beta) || ((g->flags & R_SAFE) && perf)) continue;
+        if (!g->scope) return 0;
+        sc |= g->scope;
+    }
+    return sc;
+}
+
 static void range_str(const erratum_range *g, char *out, size_t cap)
 {
     char last[24];
+    if (g->vendor == VEND_PVR) {
+        if (g->fixed == V_MAX) snprintf(last, sizeof(last), "on");
+        else snprintf(last, sizeof(last), "%u", g->fixed - 1);
+        snprintf(out, cap, "CL %u-%s%s%s", g->from, last, g->gpu && *g->gpu ? ", " : "", g->gpu && *g->gpu ? g->gpu : "");
+        if (g->note) {
+            size_t n = strlen(out);
+            snprintf(out + n, cap - n, " (%s)", g->note);
+        }
+        return;
+    }
     if (g->fixed == V_MAX)
         snprintf(last, sizeof(last), "on");
     else if (g->fixed & 0x3ff)
@@ -360,7 +533,7 @@ static void range_str(const erratum_range *g, char *out, size_t cap)
 
 /* VKBRIDGE_ERRATA_PROBE=name:pass|fail,... (host builds: tests of the decisions), else the probe's
  * record */
-static int probe_result(const char *probe)
+static int probe_result_raw(const char *probe)
 {
 #ifdef __ANDROID__
     const char *v = NULL;
@@ -374,10 +547,26 @@ static int probe_result(const char *probe)
         if (len > pl + 1 && !strncmp(c, probe, pl) && c[pl] == ':') {
             if (!strncmp(c + pl + 1, "fail", 4)) return VKB_ERRATA_PROBE_FAIL;
             if (!strncmp(c + pl + 1, "pass", 4)) return VKB_ERRATA_PROBE_PASS;
+            if (!strncmp(c + pl + 1, "none", 4)) return VKB_ERRATA_PROBE_NOT_RUN;
         }
         c += len;
     }
+    if (!strcmp(probe, "zink_profile")) return vkb_zink_profile_result(); /* pv_zink_name: the self-test's own probe */
     return probe_source ? probe_source(probe) : VKB_ERRATA_PROBE_NOT_RUN;
+}
+
+/* the result for erratum x: its probe's, a failure only where the probe saw the pattern x is about */
+static int probe_result_x(const erratum *x)
+{
+    int pr = probe_result_raw(x->probe);
+    if (pr == VKB_ERRATA_PROBE_FAIL && x->pattern && !vkb_probe_flag(x->pattern)) {
+        const char *v = NULL;
+#ifndef __ANDROID__
+        v = vkb_srv_env("VKBRIDGE_ERRATA_PROBE"); /* a host test that sets the result by hand means it */
+#endif
+        if (!v || !strstr(v, x->probe)) pr = VKB_ERRATA_PROBE_PASS;
+    }
+    return pr;
 }
 
 static int performance_mode(void)
@@ -447,25 +636,36 @@ static const char *forced_by(const switches *w, int i, int plus, char *out, size
  * (the one logged and shown in the report); *forced_off: VKBRIDGE_ERRATA (or VKBRIDGE_WAIT_FIX=0)
  * turned it off where it would be on for why */
 static int decide_erratum(int i, const drv_version *d, const char *gpu, int perf, const switches *w, int *targeted, char *why, size_t cap,
-                          int *forced_off)
+                          int *forced_off, unsigned *scope)
 {
+    if (scope) *scope = 0;
     const erratum *x = &errata[i];
     unsigned gates = perf ? x->perf : x->safe;
     const char *mode = perf ? "performance mode" : "safe mode";
     size_t o = 0;
     why[0] = 0;
-    int pr = x->probe ? probe_result(x->probe) : VKB_ERRATA_PROBE_NOT_RUN;
+    int pr = x->probe ? probe_result_x(x) : VKB_ERRATA_PROBE_NOT_RUN;
     const erratum_range *g = in_range(x, d, gpu, perf);
     int want = 0;
     if (gates & G_ALWAYS) want = 1, CAT("always");
     int by_probe = (gates & G_PROBE_FAIL) && x->probe_gates && pr == VKB_ERRATA_PROBE_FAIL;
     if (by_probe) want = 1, CAT("%sprobe %s failed", o ? "; " : "", x->probe);
+    int by_pvr = (gates & G_POWERVR) && d->pvr;
+    if (by_pvr && !by_probe) want = 1, CAT("%sPowerVR driver", o ? "; " : "");
     if ((gates & G_IN_RANGE) && g) {
         char rs[128];
         range_str(g, rs, sizeof(rs));
-        want = 1, CAT("%sr%up%u in %s", o ? "; " : "", d->r, d->p, rs);
+        if (g->vendor == VEND_PVR) want = 1, CAT("%sCL %u in %s", o ? "; " : "", d->pvr_cl, rs);
+        else want = 1, CAT("%sr%up%u in %s", o ? "; " : "", d->r, d->p, rs);
     }
-    if ((gates & G_VERSION_UNKNOWN) && d->arm && !d->known) want = 1, CAT("%sdriver version unknown", o ? "; " : "");
+    int unverified = (gates & G_PROBE_UNVERIFIED) && x->probe && pr != VKB_ERRATA_PROBE_PASS && !by_probe;
+    if (unverified) want = 1, CAT("%sprobe %s %s", o ? "; " : "", x->probe, pr == VKB_ERRATA_PROBE_FAIL ? "failed" : "not passed");
+    int unknown = (gates & G_VERSION_UNKNOWN) && d->arm && !d->known;
+    if (unknown) want = 1, CAT("%sdriver version unknown", o ? "; " : "");
+    /* the range's part of the fix, when the range alone turned it on */
+    unsigned sc = want && !(gates & G_ALWAYS) && !by_probe && !unverified && !unknown && !(w->plus >> i & 1) ? range_scope(x, d, gpu, perf) : 0;
+    if (sc && i == VKB_ERRATUM_DYN_REEMIT) CAT("; the EDS3 states only");
+    if (scope) *scope = sc;
     if (want) CAT("; %s", mode);
     int on = want;
     *forced_off = 0;
@@ -479,10 +679,25 @@ static int decide_erratum(int i, const drv_version *d, const char *gpu, int perf
         *forced_off = want ? 1 : 0;
         on = 0;
     }
-    if (x->probe && pr != VKB_ERRATA_PROBE_NOT_RUN && on && !(by_probe && !(w->plus >> i & 1)))
+    if (x->probe && pr != VKB_ERRATA_PROBE_NOT_RUN && on && !(by_probe && !(w->plus >> i & 1)) && !(unverified && !(w->plus >> i & 1)))
         CAT("; probe %s %s%s", x->probe, pr == VKB_ERRATA_PROBE_FAIL ? "failed" : "passed", x->probe_gates ? "" : ", recorded only");
     /* the driver is affected as far as is known, not only "always" */
-    *targeted = on && (g || pr == VKB_ERRATA_PROBE_FAIL || (d->arm && !d->known) || (w->plus >> i & 1));
+    *targeted = on && (g || by_pvr || pr == VKB_ERRATA_PROBE_FAIL || (d->arm && !d->known) || (w->plus >> i & 1));
+    return on;
+}
+
+/* pv_zink_name at vkCreateInstance, before any device: the decision without a driver version */
+int vkb_errata_zink_name_on(char *why, size_t cap)
+{
+    drv_version d;
+    memset(&d, 0, sizeof(d));
+    switches w;
+    read_switches(&w);
+    int targeted, forced_off;
+    unsigned scope = 0;
+    char buf[320];
+    int on = decide_erratum(VKB_ERRATUM_PV_ZINK_NAME, &d, "", performance_mode(), &w, &targeted, buf, sizeof(buf), &forced_off, &scope);
+    if (why && cap) snprintf(why, cap, "%s", buf);
     return on;
 }
 
@@ -503,11 +718,11 @@ int vkb_errata_explain(const VkPhysicalDeviceProperties *props, const char *driv
         r->mk = x->mk;
         r->probe = x->probe;
         r->probe_gates = x->probe_gates;
-        r->probe_result = x->probe ? probe_result(x->probe) : VKB_ERRATA_PROBE_NOT_RUN;
+        r->probe_result = x->probe ? probe_result_x(x) : VKB_ERRATA_PROBE_NOT_RUN;
         r->has_fix = x->install != NULL;
         for (int m = 0; m < 2; m++) {
             int targeted, forced_off;
-            r->on[m] = decide_erratum(i, &d, props->deviceName, m, &w, &targeted, r->why[m], sizeof(r->why[m]), &forced_off);
+            r->on[m] = decide_erratum(i, &d, d.gpu[0] ? d.gpu : props->deviceName, m, &w, &targeted, r->why[m], sizeof(r->why[m]), &forced_off, NULL);
             if (forced_off) {
                 char was[sizeof(r->why[m])];
                 snprintf(was, sizeof(was), "%s", r->why[m]);
@@ -593,6 +808,7 @@ void vkb_errata_device_init(vkb_srv_table *t)
     char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     drv_version d;
     driver_version(t, t->physical, &d, gpu, sizeof(gpu));
+    e->pvr = d.pvr;
     int perf = performance_mode();
     const char *mode = perf ? "performance mode" : "safe mode";
 
@@ -603,6 +819,10 @@ void vkb_errata_device_init(vkb_srv_table *t)
     char drv[400];
     if (!d.arm && d.arm_vendor)
         snprintf(drv, sizeof(drv), "not Arm's driver (driverID %s)", vkb_driver_id_name(vkb_driver_id(&t->real, t->physical, t->api_version)));
+    else if (d.pvr && *d.pvr_rel)
+        snprintf(drv, sizeof(drv), "PowerVR driver %s (CL %u), not Arm's: its own CL ranges only", d.pvr_rel, d.pvr_cl);
+    else if (d.pvr)
+        snprintf(drv, sizeof(drv), "PowerVR driver (CL %u), not Arm's: its own CL ranges only", d.pvr_cl);
     else if (!d.arm)
         snprintf(drv, sizeof(drv), "not an Arm GPU");
     else if (!d.known)
@@ -617,7 +837,8 @@ void vkb_errata_device_init(vkb_srv_table *t)
         const erratum *x = &errata[i];
         char why[320];
         int targeted, forced_off;
-        int on = decide_erratum(i, &d, gpu, perf, &w, &targeted, why, sizeof(why), &forced_off);
+        unsigned scope;
+        int on = decide_erratum(i, &d, gpu, perf, &w, &targeted, why, sizeof(why), &forced_off, &scope);
         if (forced_off) {
             char sw[64];
             block_add(block, sizeof(block), "errata: %s OFF (%s; it would be on: %s)", x->name, forced_by(&w, i, 0, sw, sizeof(sw)), why);
@@ -628,6 +849,7 @@ void vkb_errata_device_init(vkb_srv_table *t)
         if (on) {
             e->on |= 1u << i;
             if (targeted) e->targeted |= 1u << i;
+            e->scope[i] = scope;
             if (w.plus >> i & 1) e->forced |= 1u << i;
             if (x->install)
                 block_add(block, sizeof(block), "errata: %s ON (%s)%s%s", x->name, why, x->mk ? " - " : "", x->mk ? x->mk : "");
@@ -690,14 +912,20 @@ void vkb_errata_device_destroy(vkb_srv_table *t)
 {
     vkb_errata_dev *e = t->errata;
     if (!e) return;
+    vkb_errata_pv3d_destroy(t, e);
     vkb_errata_views_destroy(t, e);
     vkb_errata_bitwise_destroy(t, e);
     vkb_errata_cmd_destroy(t, e);
     vkb_errata_flip_destroy(t, e);
     vkb_errata_clampzero_destroy(t, e);
+    vkb_errata_pvnames_destroy(t, e);
     vkb_errata_mem_destroy(t, e);
+    vkb_errata_import_destroy(t, e);
     vkb_errata_ds_destroy(t, e);
     vkb_errata_vbbake_destroy(e);
+    vkb_errata_splitvary_destroy(t, e);
+    vkb_errata_fragdepth_destroy(t, e);
+    vkb_errata_pvbgra_destroy(t, e);
     if ((e->on | e->imitated) >> VKB_ERRATUM_EXAMPLE & 1)
         VKB_INFO("errata: example: %llu vkCreateImageView call(s) through the fix, %llu through the imitation beneath it",
                  (unsigned long long)e->example_calls, (unsigned long long)e->example_imitated);
@@ -757,7 +985,7 @@ int vkb_errata_fp16_hidden(const vkb_srv_table *t, VkPhysicalDevice pd, char *wh
     switches w;
     read_switches(&w);
     int targeted, forced_off;
-    return decide_erratum(VKB_ERRATUM_FP16_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off);
+    return decide_erratum(VKB_ERRATUM_FP16_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off, NULL);
 }
 
 /* gs_hide's driver half: the erratum's decision for this physical device (the range, or
@@ -774,7 +1002,28 @@ int vkb_errata_gs_driver(const vkb_srv_table *t, VkPhysicalDevice pd, char *why,
     switches w;
     read_switches(&w);
     int targeted, forced_off;
-    return decide_erratum(VKB_ERRATUM_GS_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off);
+    return decide_erratum(VKB_ERRATUM_GS_HIDE, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off, NULL);
+}
+
+/* pv_mutable_linear's decision for this physical device (the instance's image-format query asks it) */
+int vkb_errata_pvmutable_driver(const vkb_srv_table *t, VkPhysicalDevice pd, char *why, size_t cap)
+{
+    char buf[320];
+    if (!why) why = buf, cap = sizeof(buf);
+    why[0] = 0;
+    if (!t || !t->real.vkGetPhysicalDeviceProperties) return 0;
+    char gpu[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    drv_version d;
+    driver_version(t, pd, &d, gpu, sizeof(gpu));
+    switches w;
+    read_switches(&w);
+    int targeted, forced_off;
+    return decide_erratum(VKB_ERRATUM_PV_MUTABLE_LINEAR, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off, NULL);
+}
+
+int vkb_errata_imitating(int id)
+{
+    return id >= 0 && id < VKB_ERRATA_COUNT && (imitated_set(0) >> id & 1);
 }
 
 /* example: what a fix looks like. Its wrapper calls the function it replaced (example_next), so it
@@ -848,13 +1097,18 @@ void vkb_errata_probe_end(void *handle)
     probe_imi *h = handle;
     if (!h) return;
     probe_cur = NULL;
+    vkb_errata_pv3d_destroy(&h->t, h->e);
     vkb_errata_views_destroy(&h->t, h->e);
     vkb_errata_bitwise_destroy(&h->t, h->e);
     vkb_errata_cmd_destroy(&h->t, h->e);
     vkb_errata_flip_destroy(&h->t, h->e);
     vkb_errata_clampzero_destroy(&h->t, h->e);
+    vkb_errata_pvnames_destroy(&h->t, h->e);
     vkb_errata_mem_destroy(&h->t, h->e);
     vkb_errata_ds_destroy(&h->t, h->e);
+    vkb_errata_splitvary_destroy(&h->t, h->e);
+    vkb_errata_fragdepth_destroy(&h->t, h->e);
+    vkb_errata_pvbgra_destroy(&h->t, h->e);
     free(h->e);
     free(h);
 }

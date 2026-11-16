@@ -41,6 +41,34 @@ variant spv_bc4_eac -DFMT_BC4 -DENC_EAC
 variant spv_bc5_eac -DFMT_BC5 -DENC_EAC
 variant spv_bc7_astc -DFMT_BC7 -DENC_ASTC
 variant spv_bc6h_astc -DFMT_BC6H -DENC_ASTC_HDR
+# one dispatch a run of regions (REGION_TABLE, VKBRIDGE_BC_ONE_DISPATCH): the 4x4 decoders and transcoders again
+for f in BC1 BC2 BC3 BC4 BC5 BC6H BC7; do
+  variant spv_$(echo $f | tr A-Z a-z)_t -DFMT_$f -DREGION_TABLE
+done
+variant spv_bc1_16_t -DFMT_BC1 -DPACK16 -DREGION_TABLE
+variant spv_bc1_etc2_t -DFMT_BC1 -DENC_ETC2 -DREGION_TABLE
+variant spv_bc1_astc_t -DFMT_BC1 -DENC_ASTC -DREGION_TABLE
+variant spv_bc2_astc_t -DFMT_BC2 -DENC_ASTC -DREGION_TABLE
+variant spv_bc3_astc_t -DFMT_BC3 -DENC_ASTC -DREGION_TABLE
+variant spv_bc4_eac_t -DFMT_BC4 -DENC_EAC -DREGION_TABLE
+variant spv_bc5_eac_t -DFMT_BC5 -DENC_EAC -DREGION_TABLE
+variant spv_bc7_astc_t -DFMT_BC7 -DENC_ASTC -DREGION_TABLE
+variant spv_bc6h_astc_t -DFMT_BC6H -DENC_ASTC_HDR -DREGION_TABLE
+# the block's palette searched instead of its 16 texels (BC_PALETTE, VKBRIDGE_BC_PALETTE): BC1 -> ETC2, BC4 / BC5 -> EAC,
+# the same blocks; with one dispatch a run too (_tp)
+variant spv_bc1_etc2_p -DFMT_BC1 -DENC_ETC2 -DBC_PALETTE
+variant spv_bc4_eac_p -DFMT_BC4 -DENC_EAC -DBC_PALETTE
+variant spv_bc5_eac_p -DFMT_BC5 -DENC_EAC -DBC_PALETTE
+variant spv_bc1_etc2_tp -DFMT_BC1 -DENC_ETC2 -DBC_PALETTE -DREGION_TABLE
+variant spv_bc4_eac_tp -DFMT_BC4 -DENC_EAC -DBC_PALETTE -DREGION_TABLE
+variant spv_bc5_eac_tp -DFMT_BC5 -DENC_EAC -DBC_PALETTE -DREGION_TABLE
+# BC1 -> ETC2 by palette with less state a thread (BC_FAST, VKBRIDGE_BC_FAST; etc2_fast.glsl): the same blocks; _tpf with
+# one dispatch a run
+variant spv_bc1_etc2_pf -DFMT_BC1 -DENC_ETC2 -DBC_PALETTE -DBC_FAST
+variant spv_bc1_etc2_tpf -DFMT_BC1 -DENC_ETC2 -DBC_PALETTE -DBC_FAST -DREGION_TABLE
+# BC7 -> ASTC with less state a thread (BC_FAST, VKBRIDGE_BC_FAST; astc_fast.glsl): the same blocks; _tf with one dispatch a run
+variant spv_bc7_astc_f -DFMT_BC7 -DENC_ASTC -DBC_FAST
+variant spv_bc7_astc_tf -DFMT_BC7 -DENC_ASTC -DBC_FAST -DREGION_TABLE
 # ASTC 6x6 / 8x8 (VKBRIDGE_BC_ASTC_BLOCK): BC2, BC3, BC7
 for n in 6 8; do
   for f in BC2 BC3 BC7; do

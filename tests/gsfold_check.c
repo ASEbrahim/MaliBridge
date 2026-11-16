@@ -69,11 +69,19 @@ static uint32_t find_type(uint32_t bits, VkMemoryPropertyFlags f)
 static const VkSpecializationMapEntry marker_entry = {0x7E57C0DEu, 0, 4}; /* server_guard.c */
 static const uint32_t marker_value = 1;
 static const VkSpecializationInfo marker = {1, &marker_entry, 4, &marker_value};
+/* GSFOLD_VARIANT=<n>: the vertex stage carries an unused specialization constant of that value, so
+ * the pipeline is another variant of the same LUT shape (another stuck-pipelines key), as UE4's
+ * CombineLUTs variants differ (host/gsfold_test.sh step 6) */
+static const VkSpecializationMapEntry variant_entry = {0x7E57C0DFu, 0, 4};
+static uint32_t variant_value;
+static const VkSpecializationInfo variant = {1, &variant_entry, 4, &variant_value};
 
 int main(int argc, char **argv)
 {
     int mark = argc > 1 && !strcmp(argv[1], "--mark"), lutslow = argc > 1 && !strcmp(argv[1], "--lutslow"),
         lut = lutslow || (argc > 1 && !strcmp(argv[1], "--lut"));
+    const char *var = getenv("GSFOLD_VARIANT");
+    variant_value = var ? (uint32_t)strtoul(var, NULL, 10) : 0;
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) return printf("FAIL loader\n"), 2;
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
@@ -165,7 +173,7 @@ int main(int argc, char **argv)
     VkPipelineLayout pl;
     vkCreatePipelineLayout(dev, &plci, NULL, &pl);
     VkPipelineShaderStageCreateInfo st[3] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, mods[0], "main", NULL},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, mods[0], "main", variant_value ? &variant : NULL},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, mods[1], "main", mark ? &marker : NULL},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, mods[2], "main", lut ? &marker : NULL}};
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};

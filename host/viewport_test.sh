@@ -203,7 +203,7 @@ cases=$?
 step $? "$(tail -1 "$work/corpus.log"); spirv-val: ${vok:-?} clean, ${vbad:-?} invalid"
 grep '^flipped' "$work/corpus.log" | sed 's/^/       /'
 
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

@@ -7,7 +7,8 @@
 #   1  ... on the tested list (VKBRIDGE_PROMOTE_TESTED): offered as 1.3; promote_check 1.3 (core
 #      structures, core names, no extensions enabled, SPIR-V 1.6 lowered to 1.4, dynamic
 #      rendering/sync2/copy2); the steps below turn it on with VKBRIDGE_PROMOTE_API=1;
-#   1b ... without subgroup shuffles (VKBRIDGE_FAKE_MISSING=shuffle): 1.3, broadcasts as chains;
+#   1b ... without subgroup shuffles (VKBRIDGE_FAKE_MISSING=shuffle, as Mali r18-r26): still 1.3,
+#      the dynamic-id broadcast lowered to a chain over the lanes, promote_check's values right;
 #   2  ... without VK_KHR_dynamic_rendering: offered as 1.2, and the log says what 1.3 lacks;
 #      <cache dir>/apps-vulkan says 1.2 on a 1.1 driver, promotion=on (the launcher's DXVK choice);
 #   3  ... VKBRIDGE_PROMOTE_API=1.2: 1.2;  4  ... VKBRIDGE_PROMOTE_API=0: 1.1, nothing installed;
@@ -133,7 +134,7 @@ run "$out/vkbridge-smoke"
 [ $r8 = 0 ] && [ $rc = 0 ] && grep -q "PASS timeline semaphore" $work/run.log
 step $? "the 1.1 driver with Mali's gaps: $res8; vkbridge-smoke $res"
 unset VKBRIDGE_HIDE_EXTS
-# 10 Mali r18p0 / r19p0 (a player log Mali-G52 Mali-G76: Vulkan 1.1, gpuinfo 52871's extensions):
+# 10 Mali r18p0 / r19p0 (a player log Mali-G52, a player log Mali-G76: Vulkan 1.1, gpuinfo 52871's extensions):
 #    no timeline semaphores (the bridge's), and 1.2 short of pieces gamescope does not use: gamescope
 #    alone gets 1.2 (timeline_check gamescope: its device and every timeline step through the core
 #    names); another app keeps 1.1; VKBRIDGE_PROMOTE_UI_GAPS=0: gamescope keeps 1.1 too
@@ -180,7 +181,7 @@ mkdir -p "$work/in" "$work/rw4" "$work/rw5" "$work/rw16"
 $run_t bash -c "for s in $PWD/../tests/downgrade/*.spvasm; do b=\$(basename \$s .spvasm); spirv-as --target-env spv1.\${b##*_1} -o $work/in/\$b.spv \$s || echo \"cannot assemble \$b\"; done" >"$work/as.log" 2>&1
 "$out/downgrade_corpus" 1.4 "$work/rw4" "$work"/in/*.spv >"$work/c4.log"; rc4=$?
 "$out/downgrade_corpus" 1.5 "$work/rw5" "$work"/in/*_16.spv >"$work/c5.log"; rc5=$?
-# without shuffles (subgroups of 16): the broadcasts as chains
+# a driver without shuffles (Mali r18-r26, subgroups of 16): the broadcasts as chains
 "$out/downgrade_corpus" 1.4:16 "$work/rw16" "$work"/in/bcast*_15.spv >"$work/c16.log" || rc4=1
 val=$($run_t bash -c "ok=0 bad=0; for f in $work/rw4/*.spv; do if spirv-val --target-env vulkan1.1spv1.4 \$f >/dev/null 2>$work/v.err; then ok=\$((ok+1)); else bad=\$((bad+1)); echo \"invalid: \${f##*/}: \$(head -1 $work/v.err)\" >&2; fi; done;
   for f in $work/rw16/*.spv; do if spirv-val --target-env vulkan1.1spv1.4 \$f >/dev/null 2>$work/v.err; then ok=\$((ok+1)); else bad=\$((bad+1)); echo \"invalid (chains): \${f##*/}: \$(head -1 $work/v.err)\" >&2; fi; done;

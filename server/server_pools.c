@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Elastic descriptor pools. Desktop drivers commonly allocate past a pool's maxSets and sizes, and
  * games developed on them rely on it; Mali (r44) refuses with VK_ERROR_OUT_OF_POOL_MEMORY, which
  * the game never expects (Hades' Vulkan renderer: 8192 sets a frame from a pool made for 8192, the
@@ -20,7 +19,7 @@
  * the app's pool alone (until a layout is destroyed: handles come back). The size is part of
  * it: a layout with a variable descriptor count (bindless heaps: vkd3d-proton, native engines)
  * refused at 8000 descriptors still gets overflow pools at 16, as without the memo. Before, each such request made overflow pools up to the cap of
- * 64: Detroit: Become Human (a player log, G925) got 384 for six pools of 45056 sets, 8 MB each in
+ * 64: Detroit: Become Human (a player log) got 384 for six pools of 45056 sets, 8 MB each in
  * Mali's heap, 3 GB at the game's start.
  */
 #define _GNU_SOURCE
@@ -261,7 +260,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL ep_AllocateDescriptorSets(VkDevice device,
         if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) break;
         /* An overflow pool nothing was allocated from since the last reset is empty, and it is
          * made like the app's: a set it refuses no pool like it can hold (more of a type than the
-         * pool has), so another one cannot help. Detroit: Become Human (a player log, G925) asked a
+         * pool has), so another one cannot help. Detroit: Become Human (a player log) asked a
          * FREE_DESCRIPTOR_SET pool of 45056 sets, still empty, for a set of 8426 image samplers
          * and 12800 storage buffers; each refusal made overflow pools until the 64 cap, 384 of
          * them for 6 pools, 8 MB each in Mali's heap: 3 GB at the game's start for nothing. */

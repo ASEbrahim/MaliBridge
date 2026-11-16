@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * What a server thread's current driver call was given, for the crash line (server_crashctx.c,
  * server_main.c). The generated handlers of a few commands note their arguments right before the
  * driver's call: plain stores into thread-local memory, nothing waits, nothing is looked up. Only
@@ -46,7 +45,7 @@ static inline void vkb_srv_note_bind_image2(uint32_t n, const VkBindImageMemoryI
 
 /* vkAllocateMemory (server_memory.c), before the driver's calls: size, memory type, the dedicated
  * image, how it is made (a string literal) and the dma-buf's inode (an import's fd, or the export
- * emulation's pages once it has them; 0 none). the one server died in Mali's
+ * emulation's pages once it has them; 0 none). a player log: the one server died in Mali's
  * vkAllocateMemory with two dma-buf allocations in flight and the line could not say which. */
 static inline void vkb_srv_note_alloc(uint64_t size, uint32_t type, uint64_t dedicated_image, const char *path, uint64_t ino)
 {

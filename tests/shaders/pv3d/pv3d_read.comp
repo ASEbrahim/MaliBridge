@@ -1,0 +1,11 @@
+#version 450
+// pv3d_check: every texel of the 3D image's mip, sampled (texelFetch through a 3D view), after the pass
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler3D tex;
+layout(std430, set = 0, binding = 1) buffer B { uint o[]; } buf;
+void main()
+{
+    ivec3 s = textureSize(tex, 0), p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, s))) return;
+    buf.o[(p.z * s.y + p.y) * s.x + p.x] = packUnorm4x8(texelFetch(tex, p, 0));
+}

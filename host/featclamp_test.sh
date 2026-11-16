@@ -19,6 +19,17 @@
 #   7. drawparams asked in VkPhysicalDeviceVulkan11Features: taken off (only it; multiview kept), and
 #      refused + named with the clamp off
 #   8. the desktop driver as it is, shaderDrawParameters asked: nothing taken off, the device made
+# PR #31 (K11MCH1): DXVK 1.10 asks for depthClamp at every D3D11 feature level; the Mali-G76 r26p0
+# lacks it (VKBRIDGE_FAKE_MISSING=depthclamp imitates it in the self-test). The emulation (bit 28)
+# reports it and draws a clamping pipeline with clipping, by default on drivers below Vulkan 1.3
+# (VKBRIDGE_FAKE_API=1.1 takes the desktop driver as a 1.1 one).
+#   9. imitated on a 1.1 driver: the emulation is on (self-test mask and the device's), the client sees
+#      depthClamp 1, a device asking for it is made
+#  10. imitated on a 1.1 driver, VKBRIDGE_EMU_DEPTHCLAMP=0: the emulation stays off
+#  11. the desktop driver as it is: the emulation stays off (nothing changes on a GPU with depthClamp)
+#  12. imitated on the 1.3 driver as it is (a Mali-G52 on Vulkan 1.3.283 lacks depthClamp and runs Steam
+#      mode on Zink): the emulation stays off, said once (the imitation is the self-test's: the client still
+#      reads the desktop driver's own depthClamp); VKBRIDGE_EMU_DEPTHCLAMP=1 turns it on there
 # A server of its own (VKB_RUN_DIR); needs out/ built.
 cd "$(dirname "$0")"
 VKB_RUN_DIR=${VKB_RUN_DIR:-$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/vkbridge-fc-$$.XXXX")}
@@ -143,6 +154,43 @@ timeout 60 ./out/featclamp_check drawparams >out/t-fc-dp-plain.log 2>&1
 check "the device is made, nothing taken off ($(grep -m1 '^features: shader' out/t-fc-dp-plain.log); $(grep -m1 '^device' out/t-fc-dp-plain.log))" \
   "grep -q '^features: shaderDrawParameters=1' out/t-fc-dp-plain.log && grep -q '^device: 0' out/t-fc-dp-plain.log && \
    ! grep -q 'which the driver lacks; taken off' $VKB_SERVER_LOG"
+
+DCBIT=$((1 << 28))
+# the emulation masks the server logged: the self-test's ("emulating 0x...") and each device's ("emulation 0x... installed")
+dc_masks() { grep -oE 'emulating 0x[0-9a-f]+|emulation 0x[0-9a-f]+ installed' "$VKB_SERVER_LOG" | grep -oE '0x[0-9a-f]+'; }
+dc_on() { local m n=0; for m in $(dc_masks); do n=$((n+1)); [ $((m & DCBIT)) = 0 ] && return 1; done; [ "$n" -gt 0 ]; }
+dc_off() { local m n=0; for m in $(dc_masks); do n=$((n+1)); [ $((m & DCBIT)) != 0 ] && return 1; done; [ "$n" -gt 0 ]; }
+echo "== 9. depthClamp imitated (PR #31)"
+: >"$VKB_SERVER_LOG"
+vkb_server_start VKBRIDGE_FAKE_MISSING=depthclamp VKBRIDGE_FAKE_API=1.1
+timeout 60 ./out/featclamp_check depthclamp >out/t-fc-dc-on.log 2>&1
+check "the client sees depthClamp 1, the device asking for it is made ($(grep -m1 '^features' out/t-fc-dc-on.log); $(grep -m1 '^device' out/t-fc-dc-on.log))" \
+  "grep -q '^features: depthClamp=1' out/t-fc-dc-on.log && grep -q '^device: 0' out/t-fc-dc-on.log"
+check "the emulation is on in the self-test and the device ($(dc_masks | tr '\n' ' '))" "dc_on"
+echo "== 10. depthClamp imitated, VKBRIDGE_EMU_DEPTHCLAMP=0"
+: >"$VKB_SERVER_LOG"
+vkb_server_start VKBRIDGE_FAKE_MISSING=depthclamp VKBRIDGE_FAKE_API=1.1 VKBRIDGE_EMU_DEPTHCLAMP=0
+timeout 60 ./out/featclamp_check depthclamp >out/t-fc-dc-off.log 2>&1
+check "the emulation stays off ($(dc_masks | tr '\n' ' '))" "dc_off && grep -q '^device: 0' out/t-fc-dc-off.log"
+echo "== 11. the desktop driver as it is, depthClamp asked"
+: >"$VKB_SERVER_LOG"
+vkb_server_start
+timeout 60 ./out/featclamp_check depthclamp >out/t-fc-dc-plain.log 2>&1
+check "the driver's own depthClamp, the emulation off, the device made ($(grep -m1 '^features' out/t-fc-dc-plain.log); $(dc_masks | tr '\n' ' '))" \
+  "grep -q '^features: depthClamp=1' out/t-fc-dc-plain.log && grep -q '^device: 0' out/t-fc-dc-plain.log && dc_off"
+echo "== 12. depthClamp imitated on the 1.3 driver as it is"
+# VKBRIDGE_FAKE_API=0: the driver's own version, also under the suite's Mali profile (whose shim gives the
+# server VKB_PROFILE_FAKE_API, 1.1, wherever the test sets none)
+: >"$VKB_SERVER_LOG"
+vkb_server_start VKBRIDGE_FAKE_MISSING=depthclamp VKBRIDGE_FAKE_API=0
+timeout 60 ./out/featclamp_check depthclamp >out/t-fc-dc-13.log 2>&1
+check "not reported on a 1.3+ driver, said once ($(dc_masks | tr '\n' ' '))" \
+  "dc_off && grep -q '^device: 0' out/t-fc-dc-13.log && [ \$(grep -c 'depthClamp: the driver has none; not reported on a Vulkan 1\.[3-9] driver' $VKB_SERVER_LOG) = 1 ]"
+: >"$VKB_SERVER_LOG"
+vkb_server_start VKBRIDGE_FAKE_MISSING=depthclamp VKBRIDGE_FAKE_API=0 VKBRIDGE_EMU_DEPTHCLAMP=1
+timeout 60 ./out/featclamp_check depthclamp >out/t-fc-dc-13on.log 2>&1
+check "VKBRIDGE_EMU_DEPTHCLAMP=1 reports it on the 1.3 driver ($(grep -m1 '^features' out/t-fc-dc-13on.log); $(dc_masks | tr '\n' ' '))" \
+  "grep -q '^features: depthClamp=1' out/t-fc-dc-13on.log && grep -q '^device: 0' out/t-fc-dc-13on.log && dc_on"
 
 echo "featclamp_test: $pass passed, $fail failed"
 [ "$fail" = 0 ]

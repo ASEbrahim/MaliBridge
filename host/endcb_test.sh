@@ -1,5 +1,5 @@
 #!/bin/bash
-# Xiaomi, XRing O3, Mali-G2-Ultra r56p0 beta, Animal Well through vkd3d-proton: the one
+# a player log (Xiaomi, XRing O3, Mali-G2-Ultra r56p0 beta, Animal Well through vkd3d-proton): the one
 # server died twice, same driver pc, with a read of address 0x18 inside the driver's
 # vkEndCommandBuffer of a client's command buffer ("command 4 of its stream; the last ones:
 # vkBeginCommandBuffer vkCmdResetQueryPool vkCmdPipelineBarrier vkCmdFillBuffer"), and took Steam
@@ -9,12 +9,12 @@
 # VKBRIDGE_TEST_CRASH_CMD=vkEndCommandBuffer VKBRIDGE_TEST_CRASH_ONCE=1: a client's first replayed
 # end reads 0x18 at the driver boundary (server_crashctx.c).
 #   1  the server lives and says it contained the fault in vkEndCommandBuffer, naming the stream:
-#      the app's begin + reset, then the query mirror's barrier + fill (client/query.c) - QQBX's 4;
+#      the app's begin + reset, then the query mirror's barrier + fill (client/query.c) - a player log's 4;
 #   2  the program sees its device lost and ends (no hang);
 #   3  a second program works on the same server;
 #   4  the first program's exit leaves the stopped device as it is (no driver call on it);
 #   5  with VKBRIDGE_QUERY_MIRROR=0 (guest) the same command buffer holds the app's 2 commands only;
-#   6  A/B: with VKBRIDGE_NO_CRASH_GUARD=1 the same fault kills the server (QQBX's crash line).
+#   6  A/B: with VKBRIDGE_NO_CRASH_GUARD=1 the same fault kills the server (a player log's crash line).
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}

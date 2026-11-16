@@ -12,7 +12,7 @@
 #include <stdint.h>
 typedef struct vkb_enc vkb_enc;
 typedef struct vkb_dec vkb_dec;
-#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL
+#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL
 enum vkb_cmd_id {
     VKB_CMD_vkbHello = 0,
     VKB_CMD_vkbQueryServer = 1,
@@ -310,7 +310,8 @@ enum vkb_cmd_id {
     VKB_CMD_vkUpdateDescriptorSets = 293,
     VKB_CMD_vkWaitForFences = 294,
     VKB_CMD_vkWaitSemaphores = 295,
-    VKB_CMD_COUNT = 296
+    VKB_CMD_vkbAcquireSignal = 296,
+    VKB_CMD_COUNT = 297
 };
 extern const char *const vkb_cmd_names[VKB_CMD_COUNT];
 extern const unsigned char vkb_cmd_result[VKB_CMD_COUNT]; /* returns VkResult (first in the reply) */

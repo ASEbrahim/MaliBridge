@@ -21,6 +21,13 @@
  * Host imitation (server): VKBRIDGE_ERRATA_IMITATE=dyn_reemit puts the states back to the
  * pipeline's own values at each bind, and gives a static sample mask the last dynamic one.
  *
+ * dynstate_check bench [binds] [rounds]: no checks; the cost of a DXVK-like bind instead. Two
+ * pipelines with DXVK's extended dynamic state list (depth test/write/compare, stencil test/op/
+ * masks/reference, cull mode, vertex stride), every state set once, then binds alternating between
+ * them with one draw each, one command buffer per round; prints the wall time per bind (begin to
+ * the queue idle). host/errata_bench.sh runs it with dyn_reemit on and off and reads the server's
+ * CPU time around it.
+ *
  * Shaders: tests/shaders/dynstate/ (glslc -O --target-env=vulkan1.1 -mfmt=num -> dynstate_*.inc).
  */
 #define VK_NO_PROTOTYPES
@@ -30,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static const uint32_t spv_vert[] = {
 #include "dynstate_vert.inc"
@@ -59,7 +67,7 @@ I(vkCreatePipelineLayout); I(vkCreateGraphicsPipelines); I(vkCmdBeginRenderPass)
 I(vkCmdPushConstants); I(vkCmdBindVertexBuffers); I(vkCmdBindVertexBuffers2); I(vkCmdDraw); I(vkCmdCopyImageToBuffer);
 I(vkCmdPipelineBarrier); I(vkDeviceWaitIdle); I(vkCmdSetDepthWriteEnable); I(vkCmdSetDepthTestEnable); I(vkCmdSetDepthCompareOp);
 I(vkCmdSetCullMode); I(vkCmdSetStencilWriteMask); I(vkCmdSetStencilOp); I(vkCmdSetStencilReference); I(vkCmdSetStencilCompareMask);
-I(vkCmdSetSampleMaskEXT);
+I(vkCmdSetSampleMaskEXT); I(vkCmdSetStencilTestEnable);
 #undef I
 
 static void check(int ok, const char *what, const char *detail)
@@ -223,8 +231,59 @@ static void end_case(VkCommandBuffer cb, const char *what, const uint8_t want[4]
 
 static const uint8_t RED[4] = {255, 0, 0, 255}, GREEN[4] = {0, 255, 0, 255}, BLUE[4] = {0, 0, 255, 255}, NONE[4] = {0, 0, 0, 0};
 
-int main(void)
+static double now_s(void)
 {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* bench mode (see the top) */
+static void bench(int binds, int rounds)
+{
+    const VkDynamicState d[] = {VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+                                VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE,
+                                VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+    const VkStencilOpState s = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 0};
+    pdesc p = {d, sizeof(d) / sizeof(d[0]), VK_TRUE, VK_TRUE, VK_FALSE, VK_COMPARE_OP_LESS, s, VK_CULL_MODE_BACK_BIT, 16, NULL};
+    VkPipeline pl[2] = {pipeline(&p), pipeline(&p)};
+    if (!pl[0] || !pl[1]) { check(0, "bench", "pipelines"); return; }
+    double best = 1e9, sum = 0;
+    for (int r = 0; r < rounds; r++) {
+        double t0 = now_s();
+        VkCommandBuffer cb = begin_case();
+        VkDeviceSize off = 0, stride = 16;
+        vkCmdBindVertexBuffers2(cb, 0, 1, &vbuf, &off, NULL, &stride);
+        vkCmdSetDepthTestEnable(cb, VK_TRUE);
+        vkCmdSetDepthWriteEnable(cb, VK_TRUE);
+        vkCmdSetDepthCompareOp(cb, VK_COMPARE_OP_LESS_OR_EQUAL);
+        vkCmdSetStencilTestEnable(cb, VK_FALSE);
+        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+        vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0xff);
+        vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0xff);
+        vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        vkCmdSetCullMode(cb, VK_CULL_MODE_NONE);
+        for (int i = 0; i < binds; i++) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl[i & 1]);
+            vkCmdDraw(cb, 3, 1, 0, 0);
+        }
+        vkCmdEndRenderPass(cb);
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+        if (vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) || vkQueueWaitIdle(queue)) { check(0, "bench", "submit"); return; }
+        vkFreeCommandBuffers(dev, cpool, 1, &cb);
+        double t = (now_s() - t0) / binds * 1e9;
+        sum += t;
+        if (t < best) best = t;
+    }
+    printf("bench: %d binds x %d rounds: %.0f ns per bind (best round %.0f)\n", binds, rounds, sum / rounds, best);
+}
+
+int main(int argc, char **argv)
+{
+    int bench_binds = argc > 1 && !strcmp(argv[1], "bench") ? (argc > 2 ? atoi(argv[2]) : 20000) : 0;
+    int bench_rounds = argc > 3 ? atoi(argv[3]) : 10;
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) { printf("FAIL no libvulkan\n"); return 1; }
     gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
@@ -291,7 +350,7 @@ int main(void)
     D(vkCmdBindPipeline); D(vkCmdPushConstants); D(vkCmdBindVertexBuffers); D(vkCmdBindVertexBuffers2); D(vkCmdDraw);
     D(vkCmdCopyImageToBuffer); D(vkCmdPipelineBarrier); D(vkDeviceWaitIdle); D(vkCmdSetDepthWriteEnable); D(vkCmdSetDepthTestEnable);
     D(vkCmdSetDepthCompareOp); D(vkCmdSetCullMode); D(vkCmdSetStencilWriteMask); D(vkCmdSetStencilOp); D(vkCmdSetStencilReference);
-    D(vkCmdSetStencilCompareMask); D(vkCmdSetSampleMaskEXT);
+    D(vkCmdSetStencilCompareMask); D(vkCmdSetSampleMaskEXT); D(vkCmdSetStencilTestEnable);
 #undef D
     vkGetDeviceQueue(dev, qfam, 0, &queue);
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
@@ -344,6 +403,10 @@ int main(void)
     VkCommandPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, qfam};
     vkCreateCommandPool(dev, &cpci, NULL, &cpool);
 
+    if (bench_binds > 0) {
+        bench(bench_binds, bench_rounds > 0 ? bench_rounds : 10);
+        goto done;
+    }
     const VkStencilOpState s_never = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_NEVER, 0, 0, 0};
     const VkStencilOpState s_replace1 = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 1};
     const VkStencilOpState s_eq0 = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xff, 0, 0};
@@ -472,6 +535,7 @@ int main(void)
     } else
         printf("SKIP sample mask: no extendedDynamicState3SampleMask\n");
     (void)RED;
+done:
     vkDeviceWaitIdle(dev);
     vkDestroyDevice(dev, NULL);
 out:

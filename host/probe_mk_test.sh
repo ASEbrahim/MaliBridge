@@ -2,13 +2,13 @@
 # The MK probes (server_probe.c: one per Mali driver erratum a probe can tell) and the errata
 # decisions they feed (server_errata.c), on the desktop driver with a server of its own per step
 # (socket, cache directory, session folder):
-#   1  every MK probe passes natively; the profile is PROBE_VERSION 3 with the sub-cases recorded;
+#   1  every MK probe passes natively; the profile is PROBE_VERSION 4 with the sub-cases recorded;
 #      safe mode: the always-on errata on, each with its probe's pass in the reason; the report
 #      lists every erratum with its probe result and both modes' decisions (Markdown and JSON);
 #   2  performance mode from the same profile (no re-probe): the probe-gated errata stay off;
 #   3  each erratum's bug imitated (VKBRIDGE_ERRATA_IMITATE): its probe fails with the bug's own
 #      pattern, the other MK probes pass, and the decision follows - viewport_flip, bitwise_scalar,
-#      dyn_reemit and fp16_hide turn on in performance mode, the record-only ones say the probe failed; the
+#      dyn_reemit, fp16_hide, pv_mutable_linear (PV-02, PowerVR), pv_bgra_store (PV-07), pv_names (PV-01), pv_view3d_base (PV-04) and pv_fbloop_split (PV-06) turn on in performance mode, the record-only ones say the probe failed; the
 #      report diff tool shows the probe, its sub-cases and the decision it changed;
 #   4  vb_strides tells the two stride shapes apart (VKBRIDGE_ERRATA_IMITATE_VB=single: option B);
 #   5  viewport_flip on a probe failure in safe mode too; a crashed probe decides nothing;
@@ -34,7 +34,7 @@ start() { # start <name> [env...]: a server of its own, cache $work/<name>/c, lo
   log=$d/s/vkbridge-server.log
   : > "$log"
   env -u VKBRIDGE_FAKE_MISSING -u VKBRIDGE_HIDE_EXTS -u VKBRIDGE_ERRATA -u VKBRIDGE_ERRATA_IMITATE -u VKBRIDGE_ERRATA_IMITATE_VB \
-      -u VKBRIDGE_MODE -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_ERRATA_PROBE -u VKBRIDGE_PROBE_FAKE -u VKBRIDGE_WAIT_FAKE_ERROR \
+      -u VKBRIDGE_MODE -u VKBRIDGE_FAKE_DRIVER_VERSION -u VKBRIDGE_ERRATA_PROBE -u VKBRIDGE_PROBE_FAKE -u VKBRIDGE_WAIT_FAKE_ERROR -u VKBRIDGE_PV3D_IMITATE \
       VKBRIDGE_PROBE_BUDGET_S=0 "$@" VK_DRIVER_FILES=${VKB_HOST_ICD:-/usr/share/vulkan/icd.d/radeon_icd.json} VK_ICD_FILENAMES= \
       "$out/vkbridge-server" --socket "$sock" --log "$log" --cache-dir "$d/c" >/dev/null 2>&1 &
   srv=$!
@@ -55,7 +55,7 @@ export VKBRIDGE_SOCKET=$sock VK_DRIVER_FILES=$out/vkbridge_icd.json VK_ICD_FILEN
 unset VKBRIDGE_HIDE_EXTS VKBRIDGE_MAX_API VKBRIDGE_FAKE_MISSING
 fails=0 steps=0
 step() { steps=$((steps+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fails=$((fails+1)); fi; }
-mk="viewport_flip bitwise_vec dyn_state vb_strides view3d_layers wait_eintr rendering_churn fp16_math"
+mk="viewport_flip bitwise_vec dyn_state vb_strides view3d_layers wait_eintr rendering_churn fp16_math pv_mutable_linear pv_bgra_store pv_names"
 
 # 1
 start plain
@@ -63,15 +63,15 @@ device
 ok=1; res=
 for p in $mk; do st=$(status_of plain $p); res="$res $p=$st"; [ "$st" = pass ] || [ "$st" = skip ] || ok=0; done
 p1=$(prof plain)
-[ $ok = 1 ] && grep -q '"probe_version": 3' "$p1" && grep -q '"name": "dyn_state", "status": "pass", .*"cases": "0x[1-9a-f]*", "failed": "0x0"' "$p1"
+[ $ok = 1 ] && grep -q '"probe_version": 7' "$p1" && grep -q '"name": "dyn_state", "status": "pass", .*"cases": "0x[1-9a-f]*", "failed": "0x0"' "$p1"
 step $? "every MK probe passes:$res"
 got=$(on_set)
-[ "$got" = wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri ] && echo "$new" | grep -q "errata: dyn_reemit ON (always; safe mode; probe dyn_state passed) - MK-04" &&
+[ "$got" = wait_retry,vb_split,view_quarantine,view_counts,cull_nontri ] && ! echo "$new" | grep -q "errata: dyn_reemit ON" &&
   echo "$new" | grep -q "errata: view_quarantine ON (always; safe mode; probe rendering_churn passed, recorded only)" &&
   echo "$new" | grep -q "errata: wait_retry ON (always; safe mode; probe wait_eintr passed, recorded only)" &&
   echo "$new" | grep -q "errata: vb_split ON (always; safe mode; probe vb_strides passed, recorded only)" &&
   echo "$new" | grep -q "errata: view_counts ON (always; safe mode; probe view3d_layers passed, recorded only)"
-step $? "safe mode: on $got, each with its probe's pass"
+step $? "safe mode: on $got, each with its probe's pass (dyn_reemit off: its probe passed on a driver no range names)"
 rep=$work/plain/s/malibridge-report
 for _ in $(seq 100); do grep -q "^Driver errata, GPU 0" $rep.md 2>/dev/null && break; sleep 0.1; done
 rows=$(grep -c '^| [a-z_]* | MK-0[1-7] |' $rep.md)
@@ -79,17 +79,20 @@ python3 - "$rep.json" <<'PY' 2>$work/1j.log
 import json, sys
 r = json.load(open(sys.argv[1]))
 e = {x["name"]: x for x in r["probe"][0]["errata"]}
-assert len(e) == 14, e.keys()
+assert len(e) == 23, e.keys()
+assert e["pv_bgra_store"]["probe"] == "pv_bgra_store" and not e["pv_bgra_store"]["safe"]["on"] and not e["pv_bgra_store"]["performance"]["on"], e["pv_bgra_store"]
+assert e["pv_mutable_linear"]["probe"] == "pv_mutable_linear" and not e["pv_mutable_linear"]["safe"]["on"] and not e["pv_mutable_linear"]["performance"]["on"], e["pv_mutable_linear"]
+assert not e["split_varying"]["probe"] and not e["split_varying"]["safe"]["on"] and not e["split_varying"]["performance"]["on"], e["split_varying"]
 assert not e["gs_hide"]["probe"] and not e["gs_hide"]["safe"]["on"] and not e["gs_hide"]["performance"]["on"], e["gs_hide"]
 assert e["vb_bake"]["probe"] == "vb_strides" and e["vb_bake"]["probe_gates"], e["vb_bake"]
 assert not e["clamp_zero"]["probe"] and not e["clamp_zero"]["safe"]["on"], e["clamp_zero"]
-assert e["dyn_reemit"]["safe"]["on"] and not e["dyn_reemit"]["performance"]["on"], e["dyn_reemit"]
+assert not e["dyn_reemit"]["safe"]["on"] and not e["dyn_reemit"]["performance"]["on"], e["dyn_reemit"]
 assert e["viewport_flip"]["probe_status"] == "pass" and not e["viewport_flip"]["safe"]["on"]
 assert e["view_quarantine"]["probe"] == "rendering_churn" and not e["view_quarantine"]["probe_gates"]
 assert r["probe"][0]["mode"] == "safe"
 PY
 j=$?
-[ $j = 0 ] && [ "$rows" -ge 7 ] && grep -q "| dyn_reemit | MK-04 | dyn_state | pass | \*\*ON\*\* (always; safe mode; probe dyn_state passed) - in force | off (not needed here) |" $rep.md
+[ $j = 0 ] && [ "$rows" -ge 7 ] && grep -q "| dyn_reemit | MK-04 | dyn_state | pass | off (not needed here) - in force | off (not needed here) |" $rep.md
 step $? "the report: $rows errata rows with the probe result and both modes ($(grep -m1 '| viewport_flip |' $rep.md | cut -c1-120)...)$([ $j = 0 ] || head -3 $work/1j.log)"
 
 # 2
@@ -110,6 +113,10 @@ imitate() { # erratum probe flag expected-line
     st=$(status_of "$1" $p); [ "$st" = pass ] || [ "$st" = skip ] || { others=0; res="$res $p=$st"; }
   done
   st=$(status_of "$1" "$2")
+  if [ "$st" = skip ] && [ "$(status_of plain "$2")" = skip ]; then # no driver feature for it here (pv_mutable_linear on lavapipe: no DRM modifiers)
+    step 0 "$1 imitated: $2 skips on this driver as without the imitation (host/pvmutable_test.sh covers it on a driver with DRM modifiers)"
+    return
+  fi
   local pf; pf=$(prof "$1")
   [ "$st" = fail ] && [ $others = 1 ] && grep -q "\"name\": \"$2\", \"status\": \"fail\", .*\"want\": \"$3\"" "$pf" &&
     grep -q "probe: $2 .*the bug imitated beneath: VKBRIDGE_ERRATA_IMITATE" $log && { [ -z "$4" ] || echo "$new" | grep -q "$4"; }
@@ -122,6 +129,26 @@ imitate dyn_reemit dyn_state 0x400 "errata: dyn_reemit ON (probe dyn_state faile
 imitate vb_split vb_strides 0x800 "errata: vb_split ON (always; performance mode; probe vb_strides failed, recorded only)"
 imitate view_counts view3d_layers 0x4000 "errata: view_counts ON (always; performance mode; probe view3d_layers failed, recorded only)"
 imitate fp16_hide fp16_math 0x8000 "errata: fp16_hide ON (probe fp16_math failed; performance mode) - MK-20"
+imitate pv_mutable_linear pv_mutable_linear 0x200000 "errata: pv_mutable_linear ON (probe pv_mutable_linear failed; performance mode) - PV-02"
+imitate pv_bgra_store pv_bgra_store 0x800000 "errata: pv_bgra_store ON (probe pv_bgra_store failed; performance mode) - PV-07"
+imitate pv_names pv_names 0x40000000 "errata: pv_names ON (probe pv_names failed; performance mode) - PV-01"
+imitate pv_view3d_base view3d_layers 0x10e004000 "errata: pv_view3d_base ON (probe view3d_layers failed; performance mode) - PV-04"
+imitate pv_fbloop_split view3d_layers 0x80000000 "errata: pv_fbloop_split ON (probe view3d_layers failed; performance mode) - PV-06"
+# PowerVR CXTP 25.3's form of PV-04 (VKBRIDGE_PV3D_IMITATE=fb): the base layer is right, a feedback loop into a 3D image's 2D-array view
+# reads stale slices: sub-case 5 (fb_loop) fails, the copy form (6) and the plain 2D-array control (7) are right, the flags are the
+# loop pattern alone (0x30000000), the other probes pass, and the fix turns on in performance mode
+start pv3dfb VKBRIDGE_MODE=performance VKBRIDGE_ERRATA_IMITATE=pv_view3d_base VKBRIDGE_PV3D_IMITATE=fb
+device
+others=1
+for p in $mk; do
+  [ "$p" = view3d_layers ] && continue
+  st=$(status_of pv3dfb $p); [ "$st" = pass ] || [ "$st" = skip ] || others=0
+done
+[ "$(status_of pv3dfb view3d_layers)" = fail ] && [ $others = 1 ] &&
+  grep -q '"name": "view3d_layers", "status": "fail", .*"want": "0x30000000", "cases": "0x1ff", "failed": "0x20"' "$(prof pv3dfb)" &&
+  grep -q "probe: view3d_layers .*feedback loop: 3D view -???, copied -bbb, 2D array bbb, 2D array split bbb" $log &&
+  echo "$new" | grep -q "errata: pv_view3d_base ON (probe view3d_layers failed; performance mode) - PV-04"
+step $? "pv_view3d_base's loop form imitated: view3d_layers fails sub-case fb_loop only (flags 0x30000000), the others pass; on $(on_set)"
 imitate view_quarantine rendering_churn 0x2000 ""
 for _ in $(seq 100); do grep -q "^| view_quarantine" $work/view_quarantine/s/malibridge-report.md 2>/dev/null && break; sleep 0.1; done
 ! echo "$new" | grep -q "errata: view_quarantine ON" &&
@@ -179,7 +206,7 @@ for p in viewport_flip bitwise_vec dyn_state vb_strides view3d_layers fp16_math;
 step $? "default budget: start ${starts}ms, background ${bgs}(wait_eintr and rendering_churn there); ${cost%, }"
 
 # 8
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

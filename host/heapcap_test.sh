@@ -26,7 +26,7 @@
 #      driver's (reserve 0, the old behaviour); 6000 MB free: 6000 - 1536 reserve; 3000 MB free with a
 #      512 MB reserve: 2488; 2000 MB free: the 1024 MB floor, never below; usage never under the budget's
 #      reading and the budget never above the driver's.
-#  10  the default cap follows the memory free when the process starts (VKBRIDGE_FAKE_MEMAVAIL_MB/QUWD):
+#  10  the default cap follows the memory free when the process starts (VKBRIDGE_FAKE_MEMAVAIL_MB, a player log):
 #      11350 MB of RAM with 2850 MB free -> 2560, 3507 -> 3072, 1500 -> 2048 (the floor), 4096 and 1 TB -> 4096 (no
 #      change, nothing logged); 7322 MB with 2185 free -> 2048; VKBRIDGE_HEAP_FOLLOW_FREE=0, an explicit
 #      VKBRIDGE_HEAP_MAX_MB=4096 in <cache dir>/env and the guest's =0 win; 15000 MB of RAM and performance mode: no
@@ -183,7 +183,7 @@ step $? "safe-mode default for 8 and 12 GB devices:$d7 MB, logged once; 12801 MB
 
 # 8
 stop
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 # 9

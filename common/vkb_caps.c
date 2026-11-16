@@ -2,6 +2,7 @@
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  */
 #define _GNU_SOURCE
+#include "vkb_page.h"
 #include "vkb_caps.h"
 #include "vkb_emu_formats.h"
 #include "vkb_ext_alias.h"
@@ -104,6 +105,9 @@ const VkExtensionProperties *vkb_caps_emu_extensions(const vkb_pd_caps *caps, ui
         /* the LINEAR modifier only (server_dmabuf_ahb.c): Zink exports Xwayland's pixmaps only through it */
         list[c++] = (VkExtensionProperties){"VK_EXT_image_drm_format_modifier", 1};
     }
+    /* the LINEAR modifier only, on a driver with dma-buf memory but without the extension (server_emu_layer.c) */
+    if (CAP_EMU(caps, VKB_EMU_DRM_MOD_LINEAR) && CAP_EMU(caps, VKB_EMU_DMABUF_EXPORT) && !CAP_EMU(caps, VKB_EMU_DMABUF_AHB))
+        list[c++] = (VkExtensionProperties){"VK_EXT_image_drm_format_modifier", 1};
     *n = c;
     return list;
 }
@@ -263,7 +267,7 @@ void vkb_caps_patch_properties_chain(const vkb_pd_caps *caps, VkPhysicalDevice p
 {
     if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT)
         ((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT *)b)->minPlacedMemoryMapAlignment =
-            (VkDeviceSize)sysconf(_SC_PAGESIZE);
+            (VkDeviceSize)vkb_report_page_size();
 
     /* the bridge's timelines are 64-bit counters with no limit on how far a signal runs ahead */
     if (CAP_EMU(caps, VKB_EMU_TIMELINE)) {

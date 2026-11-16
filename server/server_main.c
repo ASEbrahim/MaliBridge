@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * vkbridge server entry point.
  *
  *   libvkbridge_server.so --socket <path> [--log <file>] [--vulkan <libvulkan>] [--cache-dir <dir>] [--selftest]
@@ -25,6 +24,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <time.h>
 #include <ucontext.h>
@@ -99,7 +99,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
 #elif defined(__x86_64__) && defined(REG_RIP)
     if (uc) pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
 #endif
-    if (sig != SIGABRT) vkb_guard_fault(sig, si ? si->si_addr : NULL, si ? si->si_code : 0, pc);
+    if (sig != SIGABRT) vkb_guard_fault(sig, si ? si->si_addr : NULL, si ? si->si_code : 0, pc, uc);
     vkb_probe_mark_end(sig, 1); /* a startup probe in flight died of it (server_probe.c) */
     char buf[2048];
     const char *cmd = vkb_srv_current_cmd ? vkb_srv_current_cmd : "(no Vulkan call)";
@@ -111,12 +111,15 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
     memset(&di, 0, sizeof(di));
     int found = pc && dladdr((void *)pc, &di) && di.dli_fname;
     const char *lib = found ? strrchr(di.dli_fname, '/') : NULL;
-    /* The driver's own thread faulting after a device was lost: stopped, the server goes
+    /* The driver's own thread faulting after a device was lost (a player log): stopped, the server goes
      * on (server_lost.c). Returns when that does not apply, or when its watchdog lets it die. */
     vkb_lost_fault(sig, si ? si->si_addr : NULL, pc, found ? di.dli_fname : NULL, found ? (lib ? lib + 1 : di.dli_fname) : NULL,
                    found ? (unsigned long)(pc - (uintptr_t)di.dli_fbase) : 0ul);
+    /* Dying: the pipeline compiles in flight are written down as suspects first, so the next start gives them
+     * the stand-in (server_guard.c; a player log: the driver's "mali-compiler" thread, which no arm covers). */
+    vkb_guard_crash_suspects(sig, found ? di.dli_fname : NULL, vkb_srv_current_cmd != NULL);
     /* Whose call it was: the one server serves every program, and asynchronous calls (binds,
-     * submits) carry no reply that would tie the death to a program. */
+     * submits) carry no reply that would tie the death to a program (a player log). */
     const vkb_srv_proc *client = vkb_srv_crash_client();
     char who[64] = "";
     if (client) snprintf(who, sizeof(who), " from %s (pid %d)", client->comm[0] ? client->comm : "?", client->pid);
@@ -160,6 +163,36 @@ static void on_crash(int sig, siginfo_t *si, void *uc)
             memcpy(buf + n, oth, (size_t)k);
             n += k;
             buf[n] = 0;
+        }
+    }
+    /* Then every frame as module + offset + build id, in the tombstone's form (server_crashsym.c; a player log). Logcat gets
+     * them in their own message: the account above already fills most of logcat's 4 KB line. The buffer is static (6 KB
+     * is too much for a signal stack) and so one thread's: when several crash at once (a device loss's driver threads,
+     * a player log) the first writes its frames and the others say in one line that theirs are skipped, then give it up to
+     * 1 s to finish before they go on to die (the first of them to die takes the process, frames unwritten), so a fault
+     * inside this cannot hang them (before, they all wrote into it at once: NUL bytes in the log). */
+    {
+        static char fr[6144];
+        static int fr_owner, fr_done; /* the thread id writing fr (0 while free); 1 once its frames are out */
+        int me = (int)syscall(SYS_gettid), was = 0;
+        if (__atomic_compare_exchange_n(&fr_owner, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            int k = vkb_crash_frames(fr, sizeof(fr), uc);
+            if (k > 0) {
+                if (log_file && write(fileno(log_file), fr, (size_t)k) < 0) {}
+                if (write(2, fr, (size_t)k) < 0) {}
+#ifdef __ANDROID__
+                __android_log_write(ANDROID_LOG_FATAL, "vkbridge", fr);
+#endif
+            }
+            __atomic_store_n(&fr_done, 1, __ATOMIC_RELEASE);
+        } else {
+            char sk[160];
+            int k = snprintf(sk, sizeof(sk), "vkbridge-server E crash-frame: thread %d also crashed (frames skipped: thread %d writes its own)\n", me,
+                             was);
+            if (k > (int)sizeof(sk) - 1) k = (int)sizeof(sk) - 1;
+            if (k > 0) vkb_crash_log_raw(sk, (size_t)k);
+            struct timespec ts = {0, 10000000};
+            for (int i = 0; i < 100 && !__atomic_load_n(&fr_done, __ATOMIC_ACQUIRE); i++) nanosleep(&ts, NULL);
         }
     }
 #ifdef __ANDROID__
@@ -262,9 +295,20 @@ static void open_log(const char *path)
 }
 
 /* Loads the Vulkan loader and runs the self-test; 0 when there is nothing to serve. */
+#ifndef VKB_GIT
+#define VKB_GIT "unknown"
+#endif
 static int server_init(const char *vk_lib, const char *cache_dir)
 {
-    VKB_INFO("starting (pid %d, protocol %016llx)", getpid(), (unsigned long long)VKB_PROTOCOL_HASH);
+    /* the build and which of the two servers (libvkbridge_jni.so in the app's process, or the executable): a device run whose
+     * override did not load shows it here (G925: the jni override without files/vkbridge/inapp ran the APK's own
+     * executable, and nothing in the log said which build that was) */
+#ifdef VKB_JNI
+    const char *kind = "in the app's process";
+#else
+    const char *kind = "its own process";
+#endif
+    VKB_INFO("starting (pid %d, protocol %016llx, build %s, %s)", getpid(), (unsigned long long)VKB_PROTOCOL_HASH, VKB_GIT, kind);
     void *lib = load_vulkan(vk_lib);
     if (!lib) {
         VKB_ERR("no Vulkan loader; nothing to serve");
@@ -283,6 +327,10 @@ static int server_init(const char *vk_lib, const char *cache_dir)
     vkb_gipa = vkb_driverid_imitate_gipa(vkb_gipa); /* host tests: PanVK or Arm's driver by driverID (server_driverid.c) */
     vkb_mode_refresh();   /* logged with its source; the probe decides for both modes */
     vkb_selftest_all();
+    if (vkb_npds == 0 && vkb_selftest_too_old) { /* a player log: nothing to serve; ends here, not at a NULL call later */
+        VKB_ERR("the GPU driver is too old for MaliBridge (Vulkan 1.0); nothing to serve");
+        return 0;
+    }
     return 1;
 }
 

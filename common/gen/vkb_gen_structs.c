@@ -15978,6 +15978,7 @@ const char *const vkb_cmd_names[VKB_CMD_COUNT] = {
         "vkUpdateDescriptorSets",
         "vkWaitForFences",
         "vkWaitSemaphores",
+        "vkbAcquireSignal",
 };
 const unsigned char vkb_cmd_result[VKB_CMD_COUNT] = {
         0,
@@ -16276,6 +16277,7 @@ const unsigned char vkb_cmd_result[VKB_CMD_COUNT] = {
         0,
         1,
         1,
+        0,
 };
 const vkb_ext_desc vkb_exts[VKB_EXT_COUNT] = {
         {"VK_KHR_surface", 0, 1},

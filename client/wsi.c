@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Surfaces and swapchains (backend-independent part).
  */
 #define _GNU_SOURCE
 #include "wsi.h"
+#include "emu.h"
 #include "gen/vkb_client_gen.h"
 
 #include <errno.h>
@@ -178,7 +178,7 @@ static VkImageUsageFlags supported_usage(VkPhysicalDevice pd)
     VkImageUsageFlags u = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
     VkFormatProperties fp;
-    vkb_wire_vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_B8G8R8A8_UNORM, &fp);
+    vkb_pd_raw_format_properties(pd, VK_FORMAT_B8G8R8A8_UNORM, &fp); /* kept per device: no round trip per surface query */
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     return u;
 }
@@ -425,15 +425,18 @@ static VkResult create_image(vkb_swapchain *sc, vkb_swap_image *img, int dmabuf)
         chain = &fl;
     }
     int use_mods = 0;
+    /* The driver's modifier extension: the server's own (LINEAR only, VKB_EMU_DRM_MOD_LINEAR, on a driver
+     * without one) leaves the swapchain's images as they were made without it */
+    int drv_mods = pd_has_ext(dev->pd, "VK_EXT_image_drm_format_modifier") && !(dev->pd->caps.emu & VKB_EMU_DRM_MOD_LINEAR);
     if (dmabuf) {
         ext.pNext = chain;
         chain = &ext;
-        if (pd_has_ext(dev->pd, "VK_EXT_image_drm_format_modifier") && ahb) {
+        if (drv_mods && ahb) {
             expl.pNext = chain;
             chain = &expl;
             ici.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
             use_mods = 1;
-        } else if (pd_has_ext(dev->pd, "VK_EXT_image_drm_format_modifier")) {
+        } else if (drv_mods) {
             mods.pNext = chain;
             chain = &mods;
             ici.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
@@ -512,14 +515,16 @@ static VkResult create_image(vkb_swapchain *sc, vkb_swap_image *img, int dmabuf)
     return VK_SUCCESS;
 }
 
-static void destroy_image(vkb_swapchain *sc, vkb_swap_image *img)
+static void destroy_image_dev(vkb_device *dev, vkb_swap_image *img)
 {
-    VkDevice device = (VkDevice)sc->dev;
+    VkDevice device = (VkDevice)dev;
     if (img->dmabuf_fd >= 0) close(img->dmabuf_fd);
     if (img->ahb_sock >= 0) close(img->ahb_sock);
     if (img->image) vkb_ep_vkDestroyImage(device, img->image, NULL);
     if (img->memory) vkb_ep_vkFreeMemory(device, img->memory, NULL);
 }
+
+static void destroy_image(vkb_swapchain *sc, vkb_swap_image *img) { destroy_image_dev(sc->dev, img); }
 
 static VkResult create_staging(vkb_swapchain *sc)
 {
@@ -603,7 +608,7 @@ static VkResult ensure_copy_cbs(vkb_swapchain *sc, uint32_t family)
 /*
  * How long one frame may take to render before the swapchain calls the device lost. A frame that
  * is slow is not a lost device: while a game loads, the GPU can be busy for many seconds with the
- * frame queued behind it (Watch_Dogs on a Dimensity 8300: about 2,500 BC textures
+ * frame queued behind it (a player log, Watch_Dogs on a Dimensity 8300: about 2,500 BC textures
  * converted on the GPU in 50 s with the CPU held at 1.4 GHz; the frame passed 10 s, the server
  * lost nothing, and the 10 s limit this replaced told DXVK the device was lost). A real loss still
  * ends the wait at once: the server's wait returns VK_ERROR_DEVICE_LOST.
@@ -862,11 +867,223 @@ VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index
 
 /* ------------------------------------------------------------------ swapchain */
 
-static void swapchain_free(vkb_swapchain *sc)
+/*
+ * Idle image sets of destroyed swapchains (a player log: KOTOR through Zink makes a new VkSurface and swapchain of 8 images for
+ * every frame, ~6 a second: each image a vkCreateImage, vkAllocateMemory, vkGetMemoryFdKHR and more, ~950 round trips a
+ * second, half of a 150 ms frame). A destroyed swapchain's images are kept for POOL_TTL_NS (at most POOL_MAX_BYTES, 4 sets)
+ * and handed to the next swapchain of the same device with the same extent, format, usage, flags, layers, count, view formats
+ * and image kind (dma-buf or plain). A swapchain's images start UNDEFINED for the app whatever they held, so a reused image
+ * is the same as a new one to it; the images are idle (the destroy waited for the device). Not for gralloc images (their
+ * AHardwareBuffer socket belongs to the compositor's attach), nor a broken swapchain's. The sets are freed after the
+ * time-to-live (checked at every swapchain create/destroy and present), when memory runs out, and at vkDestroyDevice.
+ * VKBRIDGE_SWAPCHAIN_RECYCLE=0: off.
+ */
+#define POOL_TTL_NS (3ull * 1000 * 1000 * 1000)
+#define POOL_MAX_BYTES (64ull << 20)
+#define POOL_MAX_SETS 4
+
+typedef struct pool_set {
+    struct pool_set *next;
+    vkb_device *dev;
+    VkSwapchainCreateInfoKHR key; /* extent, format, usage, flags, layers */
+    uint32_t count, nview;
+    VkFormat *views;
+    int dmabuf, copy_present;
+    uint64_t bytes, when;
+    vkb_swap_image *images;
+} pool_set;
+
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pool_set *pool_head;
+static int pool_n; /* sets in the pool: read without the lock by the present path */
+static uint64_t pool_reused;
+
+static int recycle_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_SWAPCHAIN_RECYCLE");
+        v = !(e && !strcmp(e, "0"));
+    }
+    return v;
+}
+
+static void pool_free_list(pool_set *l)
+{
+    while (l) {
+        pool_set *n = l->next;
+        for (uint32_t i = 0; i < l->count; i++) destroy_image_dev(l->dev, &l->images[i]);
+        free(l->images);
+        free(l->views);
+        free(l);
+        l = n;
+    }
+}
+
+/* pool_lock held: the sets older than the time-to-live (dev NULL), or all of dev's, unlinked onto *out */
+static void pool_collect(uint64_t now, vkb_device *dev, pool_set **out)
+{
+    pool_set **pp = &pool_head;
+    while (*pp) {
+        pool_set *p = *pp;
+        if (dev ? p->dev == dev : now - p->when >= POOL_TTL_NS) {
+            *pp = p->next;
+            p->next = *out;
+            *out = p;
+            __atomic_fetch_sub(&pool_n, 1, __ATOMIC_RELAXED);
+        } else
+            pp = &p->next;
+    }
+}
+
+/* Sets past their time-to-live freed. */
+static void pool_expire(void)
+{
+    if (!__atomic_load_n(&pool_n, __ATOMIC_RELAXED)) return;
+    pool_set *dead = NULL;
+    pthread_mutex_lock(&pool_lock);
+    pool_collect(wsi_now_ns(), NULL, &dead);
+    pthread_mutex_unlock(&pool_lock);
+    pool_free_list(dead);
+}
+
+void vkb_wsi_pool_drop_device(vkb_device *dev)
+{
+    if (!__atomic_load_n(&pool_n, __ATOMIC_RELAXED)) return;
+    pool_set *dead = NULL;
+    pthread_mutex_lock(&pool_lock);
+    pool_collect(0, dev, &dead);
+    pthread_mutex_unlock(&pool_lock);
+    pool_free_list(dead);
+}
+
+static int pool_match(const pool_set *p, const vkb_swapchain *sc, int dmabuf)
+{
+    const VkSwapchainCreateInfoKHR *a = &p->key, *b = &sc->info;
+    if (p->dev != sc->dev || p->dmabuf != dmabuf || p->copy_present != sc->copy_present || p->count != sc->count) return 0;
+    if (a->imageExtent.width != b->imageExtent.width || a->imageExtent.height != b->imageExtent.height) return 0;
+    if (a->imageFormat != b->imageFormat || a->imageUsage != b->imageUsage || a->flags != b->flags ||
+        a->imageArrayLayers != b->imageArrayLayers)
+        return 0;
+    if (p->nview != sc->view_format_count || (p->nview && memcmp(p->views, sc->view_formats, p->nview * sizeof(VkFormat)))) return 0;
+    return 1;
+}
+
+/* The images of a kept set matching sc moved into sc->images. 1 if so. */
+static int pool_take(vkb_swapchain *sc, int dmabuf)
+{
+    if (!recycle_on() || sc->ahb || !__atomic_load_n(&pool_n, __ATOMIC_RELAXED)) return 0;
+    pool_set *dead = NULL, *hit = NULL;
+    pthread_mutex_lock(&pool_lock);
+    pool_collect(wsi_now_ns(), NULL, &dead);
+    for (pool_set **pp = &pool_head; *pp; pp = &(*pp)->next) {
+        if (pool_match(*pp, sc, dmabuf)) {
+            hit = *pp;
+            *pp = hit->next;
+            __atomic_fetch_sub(&pool_n, 1, __ATOMIC_RELAXED);
+            break;
+        }
+    }
+    uint64_t n = hit ? ++pool_reused : 0;
+    pthread_mutex_unlock(&pool_lock);
+    pool_free_list(dead);
+    if (!hit) return 0;
+    for (uint32_t i = 0; i < sc->count; i++) {
+        sc->images[i] = hit->images[i];
+        sc->images[i].chain = sc;
+    }
+    if (n == 1 || n == 100 || n == 10000)
+        VKB_INFO("swapchain: image set reused from a destroyed swapchain (%ux%u x %u images, reuse %llu): no new images, no round trips "
+                 "for them", sc->info.imageExtent.width, sc->info.imageExtent.height, sc->count, (unsigned long long)n);
+    free(hit->images);
+    free(hit->views);
+    free(hit);
+    return 1;
+}
+
+/* The idle images of a swapchain being freed kept in the pool (sc->images emptied). 1 if kept. */
+static int pool_put(vkb_swapchain *sc)
+{
+    if (!recycle_on() || sc->ahb || sc->status < 0 || !sc->count || sc->count > 64) return 0;
+    uint64_t bytes = (uint64_t)sc->info.imageExtent.width * sc->info.imageExtent.height * 4 * sc->count;
+    if (bytes > POOL_MAX_BYTES) return 0;
+    for (uint32_t i = 0; i < sc->count; i++)
+        if (!sc->images[i].image || !sc->images[i].memory) return 0;
+    pool_set *p = calloc(1, sizeof(*p));
+    if (!p) return 0;
+    p->images = calloc(sc->count, sizeof(vkb_swap_image));
+    p->views = calloc(sc->view_format_count + 1, sizeof(VkFormat));
+    if (!p->images || !p->views) {
+        free(p->images);
+        free(p->views);
+        free(p);
+        return 0;
+    }
+    p->dev = sc->dev;
+    p->key = sc->info;
+    p->count = sc->count;
+    p->nview = sc->view_format_count;
+    if (p->nview) memcpy(p->views, sc->view_formats, p->nview * sizeof(VkFormat));
+    p->dmabuf = sc->dmabuf;
+    p->copy_present = sc->copy_present;
+    p->bytes = bytes;
+    p->when = wsi_now_ns();
+    /* The images the compositor still holds (the one on screen) go last: the next swapchain acquires
+     * from the front, so it renders into them only after several frames of its own have replaced
+     * them on screen, as with new images; never into the buffer being shown. */
+    uint32_t order[64], no = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (uint32_t i = 0; i < sc->count; i++)
+            if ((sc->images[i].busy || sc->images[i].acquired ? 1 : 0) == pass) order[no++] = i;
+    for (uint32_t k = 0; k < sc->count; k++) {
+        vkb_swap_image *src = &sc->images[order[k]], *d = &p->images[k];
+        d->image = src->image;
+        d->memory = src->memory;
+        d->dmabuf_fd = src->dmabuf_fd;
+        d->ahb_sock = -1;
+        d->stride = src->stride;
+        d->offset = src->offset;
+        d->modifier = src->modifier;
+    }
+    pool_set *dead = NULL;
+    pthread_mutex_lock(&pool_lock);
+    pool_collect(p->when, NULL, &dead);
+    /* over the caps: the oldest sets go (the list is newest first) */
+    pool_set **pp = &pool_head;
+    uint64_t kept = bytes;
+    int kn = 1;
+    while (*pp) {
+        pool_set *q = *pp;
+        if (kept + q->bytes > POOL_MAX_BYTES || kn >= POOL_MAX_SETS) {
+            *pp = q->next;
+            q->next = dead;
+            dead = q;
+            __atomic_fetch_sub(&pool_n, 1, __ATOMIC_RELAXED);
+        } else {
+            kept += q->bytes;
+            kn++;
+            pp = &q->next;
+        }
+    }
+    p->next = pool_head;
+    pool_head = p;
+    __atomic_fetch_add(&pool_n, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&pool_lock);
+    pool_free_list(dead);
+    for (uint32_t i = 0; i < sc->count; i++) {
+        memset(&sc->images[i], 0, sizeof(sc->images[i]));
+        sc->images[i].dmabuf_fd = sc->images[i].ahb_sock = -1;
+    }
+    return 1;
+}
+
+static void swapchain_free(vkb_swapchain *sc, int recycle)
 {
     VkDevice device = (VkDevice)sc->dev;
     if (sc->backend && sc->backend->destroy) sc->backend->destroy(sc);
-    for (uint32_t i = 0; i < sc->count; i++) destroy_image(sc, &sc->images[i]);
+    vkb_pacer_destroy(sc->pacer); /* after the presenting thread is gone */
+    if (!recycle || !pool_put(sc))
+        for (uint32_t i = 0; i < sc->count; i++) destroy_image(sc, &sc->images[i]);
     if (sc->pool) vkb_ep_vkDestroyCommandPool(device, sc->pool, NULL);
     if (sc->fence) vkb_ep_vkDestroyFence(device, sc->fence, NULL);
     if (sc->staging) vkb_ep_vkDestroyBuffer(device, sc->staging, NULL);
@@ -884,8 +1101,18 @@ static VkResult swapchain_build(vkb_swapchain *sc, int dmabuf)
 {
     VkDevice device = (VkDevice)sc->dev;
     sc->dmabuf = dmabuf;
-    for (uint32_t i = 0; i < sc->count; i++) {
+    int reused = pool_take(sc, dmabuf);
+    for (uint32_t i = 0; i < sc->count && !reused; i++) {
         VkResult r = create_image(sc, &sc->images[i], dmabuf);
+        if ((r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_TOO_MANY_OBJECTS) &&
+            __atomic_load_n(&pool_n, __ATOMIC_RELAXED)) {
+            /* the kept image sets give their memory back first */
+            vkb_wsi_pool_drop_device(sc->dev);
+            destroy_image(sc, &sc->images[i]);
+            memset(&sc->images[i], 0, sizeof(sc->images[i]));
+            sc->images[i].dmabuf_fd = sc->images[i].ahb_sock = -1;
+            r = create_image(sc, &sc->images[i], dmabuf);
+        }
         if (r != VK_SUCCESS) return r;
         sc->images[i].chain = sc;
     }
@@ -997,9 +1224,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateSwapchainKHR(VkDevice device, cons
     }
     if (r != VK_SUCCESS) {
         VKB_ERR("swapchain creation failed: %d", r);
-        swapchain_free(sc);
+        swapchain_free(sc, 0);
         return r;
     }
+    sc->pacer = vkb_pacer_create(sc); /* VKBRIDGE_PACER=1 (pacer.c) */
     VKB_INFO("swapchain %ux%u format %d, %u images, %s", sc->info.imageExtent.width, sc->info.imageExtent.height, sc->info.imageFormat,
              sc->count, sc->copy_present ? "presented by copy" : sc->ahb ? "presented as gralloc dma-bufs (zero-copy layer)"
                         : sc->dmabuf ? "presented as dma-bufs" : "headless");
@@ -1025,7 +1253,8 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroySwapchainKHR(VkDevice device, VkSwapc
     late_stop(sc); /* a late copy present is shown first (it waits for its frame, up to the present timeout) */
     /* Images may still be in use by the GPU (present waits are CPU-side, so not by us). */
     vkb_wire_vkDeviceWaitIdle(device);
-    swapchain_free(sc);
+    swapchain_free(sc, 1);
+    pool_expire();
     vkb_lat_flush(); /* the latency log's last records (latency.c) */
 }
 
@@ -1043,11 +1272,56 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSwapchainImagesKHR(VkDevice device, V
     return n < sc->count ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+/*
+ * VKBRIDGE_ASYNC_ACQUIRE (on unless 0; the guest's environment, else the server's switch: a game's preset,
+ * <cache dir>/env). An acquired image's semaphore and fence were signalled by a synchronous import of a
+ * signalled sync fd: a round trip on the game's thread per acquire, and one that waited for everything
+ * queued before it to run on the server first (the previous frame's submits and command buffer replays):
+ * 0.23-0.63 ms a frame on the G925 (a player log, StS2's FEX thread: vkImportSemaphoreFdKHR 278 ms in 438 round
+ * trips per 10 s), 6.2 ms on the host with a server 3 ms per submit. On, one request with no reply does it
+ * (vkbAcquireSignal, server_syncfd.c: the same import, and the same empty-submit fallback on the same queue
+ * where the driver refuses it), queued in order with the app's requests: its submit that waits on the
+ * semaphore runs after it on the server, and a wait for the fence carries the queue's barrier. The image
+ * is still handed out only once the compositor gave it back (and, for gralloc images, once the display let
+ * go of it): only the signal may come a little later, which the spec allows.
+ */
+static int async_acquire_on(void)
+{
+    static int v = -1;
+    int c = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (c >= 0) return c;
+    const char *e = getenv("VKBRIDGE_ASYNC_ACQUIRE");
+    int known = 1, on;
+    if (e && *e) on = strcmp(e, "0") != 0;
+    else {
+        int k = vkb_client_knob(VKB_KNOB_ASYNC_ACQUIRE_SHIFT, &known);
+        on = k == 1; /* v0.5.5.4: off unless asked for (VKBRIDGE_ASYNC_ACQUIRE=1 here, or the server's switch) */
+    }
+    if (known) {
+        __atomic_store_n(&v, on, __ATOMIC_RELAXED);
+        VKB_INFO("acquire: %s (VKBRIDGE_ASYNC_ACQUIRE=%d)", on ? "the image's semaphore and fence signalled without a round trip"
+                                                              : "the image's semaphore and fence signalled with a round trip each", on);
+    }
+    return on;
+}
+
 /* Signals the app's semaphore/fence for an acquired image (no GPU work is involved). */
 static VkResult signal_acquire(vkb_device *dev, VkSemaphore sem, VkFence fence)
 {
     VkDevice device = (VkDevice)dev;
     if (fence) vkb_sm_fence_unknown(dev, fence); /* imported or signalled by an empty submit: asked of the server */
+    if ((sem || fence) && dev->queues && async_acquire_on()) {
+        vkb_call c;
+        vkb_call_begin(&c, VKB_CMD_vkbAcquireSignal, vkb_table_of((const void *)device));
+        vkb_enc_u64(&c.e, vkb_remote((const void *)device));
+        vkb_enc_u64(&c.e, vkb_remote((const void *)dev->queues));
+        vkb_enc_u64(&c.e, (uint64_t)sem);
+        vkb_enc_u64(&c.e, (uint64_t)fence);
+        if (!vkb_call_exec_async(&c)) return vkb_device_lost("vkAcquireNextImageKHR");
+        /* a status poll of the fence (no barrier, icd.c) does not overtake its signal */
+        if (fence) vkb_hostop_note((uint64_t)(uintptr_t)fence * 2);
+        return VK_SUCCESS;
+    }
     if (sem) {
         VkImportSemaphoreFdInfoKHR si = {VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, NULL, sem, VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
                                          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, -1};
@@ -1124,9 +1398,11 @@ static VkResult acquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t time
         if (now >= deadline) return VK_TIMEOUT;
         /* a late copy present holds an image until shown: wait for it, not for the window system */
         if (late_wait(sc, deadline)) continue;
-        uint64_t ht0 = vkb_hitch_active ? now_ns() : 0;
         VkResult r = sc->backend->wait_free(sc, deadline == UINT64_MAX ? UINT64_MAX : deadline - now);
-        if (ht0) vkb_hitch_waited(VKB_HITCH_W_PRESENT, VKB_CMD_COUNT, now_ns() - ht0);
+        uint64_t waited = now_ns() - now;
+        __atomic_fetch_add(&sc->acq_waits, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&sc->acq_wait_ns, waited, __ATOMIC_RELAXED);
+        if (vkb_hitch_active) vkb_hitch_waited(VKB_HITCH_W_PRESENT, VKB_CMD_COUNT, waited);
         if (r < 0) {
             sc->status = r;
             return r;
@@ -1242,6 +1518,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
     uint32_t nids = 0;
     vkb_frames_present(); /* for the server's session report (frames.c) */
     vkb_hitch_present();  /* the per-hitch line (hitch.c) */
+    pool_expire();        /* kept swapchain image sets past their time-to-live */
     vkb_dxvkcfg_check();  /* once: what DXVK was given (dxvkcfg.c) */
     uint32_t lat = vkb_lat_present(); /* the latency log (latency.c): before any of this present reaches the server */
     for (const VkBaseInStructure *b = pPresentInfo->pNext; b; b = b->pNext)
@@ -1263,6 +1540,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
         if (pid && r >= 0) {
             pthread_mutex_lock(&sc->lock);
             if (pid > sc->pw_queued) sc->pw_queued = pid;
+            if (sc->pacer) pthread_cond_broadcast(&sc->pw_cond); /* not engaged, a presented id counts as done (pacer.c) */
             pthread_mutex_unlock(&sc->lock);
         }
         if (r >= 0 && sc->backend->present_async && sc->dmabuf && !sc->copy_present && !dump_on()) {
@@ -1276,11 +1554,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
             /* the presenting thread stamps it from here on; one swapchain's (the first) per present */
             sc->lat_n = i == 0 ? lat : 0;
             sc->pw_cur = pid; /* the presenting thread says when it is shown */
+            sc->pq_cur = sc->pacer && i == 0 ? now_ns() : 0; /* the pacer's P(k): this call (pacer.c) */
             vkb_lat_flag(sc->lat_n, VKB_LAT_F_ASYNC);
             r = sc->backend->present_async(sc, queue, index, nwait, pPresentInfo->pWaitSemaphores);
             if (r < 0) vkb_lat_presented(sc->lat_n, 0);
             sc->lat_n = 0;
             sc->pw_cur = 0;
+            sc->pq_cur = 0;
             sc->presents++;
             uint32_t fq = r >= 0 && sc->backend->wait_queue ? frame_queue() : 0;
             if (fq) {
@@ -1368,20 +1648,28 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkQueuePresentKHR(VkQueue queue, const VkP
 #define PW_GRACE_COMMITS 4
 #define PW_SLICE_NS (50ull * 1000 * 1000)
 
-int vkb_wsi_present_wait_on(const vkb_physdev *pd)
+int vkb_wsi_present_wait_setting(const vkb_physdev *pd, int *from)
 {
     const char *e = getenv("VKBRIDGE_PRESENT_WAIT");
     uint32_t srv = pd ? pd->info.present_wait : 0;
-    int on;
-    if (e && *e) on = strcmp(e, "0") != 0;
-    else if (srv) on = srv != VKB_PRESENT_WAIT_OFF;
-    else if (pd && pd->instance && pd->instance->dxvk) {
-        /* DXVK keeps its frame latency without them; with them it measured the same Present() ->
-         * shown and about 1.4% fewer frames on the host (gamescope, GPU-bound). */
+    int dxvk = pd && pd->instance && pd->instance->dxvk;
+    if (e && *e) return *from = VKB_PWF_GUEST, strcmp(e, "0") != 0;
+    if (srv) return *from = VKB_PWF_SERVER, srv != VKB_PRESENT_WAIT_OFF;
+    if (dxvk && vkb_pacer_wanted()) return *from = VKB_PWF_PACER, 1; /* the pacer's lever (pacer.c) */
+    /* DXVK keeps its frame latency without them; with them it measured the same Present() ->
+     * shown and about 1.4% fewer frames on the host (gamescope, GPU-bound). */
+    if (dxvk) return *from = VKB_PWF_DEFAULT_DXVK, 0;
+    return *from = VKB_PWF_DEFAULT, 1;
+}
+
+int vkb_wsi_present_wait_on(const vkb_physdev *pd)
+{
+    int from, on = vkb_wsi_present_wait_setting(pd, &from);
+    if (from == VKB_PWF_DEFAULT_DXVK) {
         VKB_ONCE(VKB_LOG_INFO, "present wait: not offered to DXVK (it limits its frame latency without; VKBRIDGE_PRESENT_WAIT=1 "
                                "offers it)");
         return 0;
-    } else on = 1;
+    }
     if (!on)
         VKB_ONCE(VKB_LOG_INFO, "present wait: off (VKBRIDGE_PRESENT_WAIT=0): VK_KHR_present_id, present_wait, present_id2 and "
                                "present_wait2 not offered");
@@ -1467,6 +1755,37 @@ void vkb_wsi_pw_shown(vkb_swapchain *sc, uint64_t id)
     pthread_mutex_unlock(&sc->lock);
 }
 
+/* lock held. A paced swapchain's present wait (pacer.c): 1 when it may return; else *wake is when it may
+ * (0: once something changes). Not engaged (no hold): done once presented. Engaged: at the frame's GPU done
+ * (as the presenting thread saw it) + the hold; a frame the thread never stamped (failed, shown without it)
+ * once shown. */
+static int paced_ready_locked(vkb_swapchain *sc, uint64_t id, uint64_t now, uint64_t *wake)
+{
+    *wake = 0;
+    uint64_t hold = sc->retired ? 0 : vkb_pacer_hold_ns(sc->pacer);
+    if (!hold) return sc->pw_queued >= id || sc->pw_done >= id;
+    if (sc->pw_gdone < id) return sc->pw_done >= id;
+    for (uint32_t i = 0; i < sizeof(sc->pw_gd) / sizeof(sc->pw_gd[0]); i++)
+        if (sc->pw_gd[i].id == id) {
+            uint64_t at = sc->pw_gd[i].done + hold;
+            if (now >= at) return 1;
+            *wake = at;
+            return 0;
+        }
+    return 1; /* older than the ring: long done */
+}
+
+void vkb_wsi_pw_gpu_done(vkb_swapchain *sc, uint64_t id, uint64_t t)
+{
+    if (!id) return;
+    pthread_mutex_lock(&sc->lock);
+    sc->pw_gd[id % (sizeof(sc->pw_gd) / sizeof(sc->pw_gd[0]))].id = id;
+    sc->pw_gd[id % (sizeof(sc->pw_gd) / sizeof(sc->pw_gd[0]))].done = t;
+    if (id > sc->pw_gdone) sc->pw_gdone = id;
+    pthread_cond_broadcast(&sc->pw_cond);
+    pthread_mutex_unlock(&sc->lock);
+}
+
 static VkResult wait_for_present(VkDevice device, VkSwapchainKHR swapchain, uint64_t id, uint64_t timeout)
 {
     (void)device;
@@ -1476,16 +1795,18 @@ static VkResult wait_for_present(VkDevice device, VkSwapchainKHR swapchain, uint
     uint64_t deadline = timeout >= UINT64_MAX - t0 ? UINT64_MAX : t0 + timeout;
     VkResult r;
     int waited = 0;
+    vkb_pacer_pw_call(sc->pacer);
     pthread_mutex_lock(&sc->lock);
     sc->pw_waiters++;
     for (;;) {
-        uint64_t now = now_ns();
+        uint64_t now = now_ns(), wake = 0;
         pw_unanswered_locked(sc, now);
         if (sc->pw_closing) {
             r = VK_ERROR_OUT_OF_DATE_KHR;
             break;
         }
-        if (sc->pw_done >= id) {
+        /* a held frame is done: at the app's own deadline it returns as done, never VK_TIMEOUT */
+        if (sc->pacer ? paced_ready_locked(sc, id, now, &wake) || (wake && now >= deadline) : sc->pw_done >= id) {
             r = sc->status == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
             break;
         }
@@ -1503,6 +1824,7 @@ static VkResult wait_for_present(VkDevice device, VkSwapchainKHR swapchain, uint
         }
         /* in slices: a status set elsewhere, a compositor's silence are seen without a signal */
         uint64_t until = deadline - now > PW_SLICE_NS ? now + PW_SLICE_NS : deadline;
+        if (wake && wake < until) until = wake; /* the pacer lets it go then */
         struct timespec ts = {(time_t)(until / 1000000000ull), (long)(until % 1000000000ull)};
         waited = 1;
         pthread_cond_timedwait(&sc->pw_cond, &sc->lock, &ts);

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Zink over the bridge on a driver without VK_KHR_imageless_framebuffer (Mali r18-r26, Vulkan 1.1:
 # Mesa 26.0.8's Zink refuses such a device, "ZINK: VK_KHR_imageless_framebuffer required!", and
-# Steam's UI died with "failed to load driver: zink" on a HUAWEI P40 Pro). The bridge makes
+# Steam's UI died with "failed to load driver: zink" on a HUAWEI P40 Pro, a player log). The bridge makes
 # imageless framebuffers itself (server_emu_imageless.c). Two framebuffer objects drawn in turn,
 # several rounds: each cleared to its
 # colour with a white triangle over its lower-left half, read back. (Zink 26.x renders with dynamic
@@ -11,12 +11,23 @@
 # those drivers (no transform feedback there, so no OpenGL 3.0).
 import ctypes, ctypes.util, sys
 
-egl = ctypes.CDLL(ctypes.util.find_library("EGL") or "libEGL.so.1")
-gl = ctypes.CDLL(ctypes.util.find_library("GL") or "libGL.so.1")
+try:
+    egl = ctypes.CDLL(ctypes.util.find_library("EGL") or "libEGL.so.1")
+    gl = ctypes.CDLL(ctypes.util.find_library("GL") or "libGL.so.1")
+except OSError as e:
+    # Not a skip: this machine cannot run the check. The CI installs these (tests.yml: libegl1 libegl-mesa0 libgl1
+    # libgl1-mesa-dri); GitHub's runner image has none of them (run 42257307116 died here on every Zink step).
+    print("RESULT WRONG no OpenGL libraries (%s): Zink needs libEGL.so.1, libGL.so.1 and Mesa's GL drivers "
+          "(Debian/Ubuntu: libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri)" % e)
+    sys.exit(1)
 P = ctypes.c_void_p
 egl.eglGetProcAddress.restype = P
 egl.eglGetProcAddress.argtypes = [ctypes.c_char_p]
-gpd = ctypes.CFUNCTYPE(P, ctypes.c_int, P, P)(egl.eglGetProcAddress(b"eglGetPlatformDisplayEXT"))
+gpd_addr = egl.eglGetProcAddress(b"eglGetPlatformDisplayEXT")
+if not gpd_addr:  # libglvnd's libEGL without Mesa's EGL behind it
+    print("RESULT WRONG no eglGetPlatformDisplayEXT: no Mesa EGL (Debian/Ubuntu: libegl-mesa0)")
+    sys.exit(1)
+gpd = ctypes.CFUNCTYPE(P, ctypes.c_int, P, P)(gpd_addr)
 for f, a in (("eglInitialize", [P, P, P]), ("eglChooseConfig", [P, P, P, ctypes.c_int, P]), ("eglCreateContext", [P, P, P, P]),
              ("eglMakeCurrent", [P, P, P, P])):
     getattr(egl, f).argtypes = a

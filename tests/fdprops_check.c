@@ -253,6 +253,37 @@ int main(void)
             check(bad == -1, "dma-buf imported into the buffer in that type, read back", msg);
         }
     }
+    /* 3: the same buffer imported with no dedicated struct (gamescope's and Zink's import of a
+     * dma-buf the resource was not asked for): the type is the one both masks allow; where the driver
+     * takes dma-bufs only in the types its fd properties list and the server was handed another, the
+     * server moves the import to the nearest listed type when the first try is refused */
+    {
+        VkBuffer b = buffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1);
+        vkGetBufferMemoryRequirements(dev, b, &mr);
+        uint32_t t = dmabuf_type(mr.memoryTypeBits, fp.memoryTypeBits);
+        if (t != UINT32_MAX) {
+            VkImportMemoryFdInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, NULL, DMABUF, dup(fd)};
+            ai = (VkMemoryAllocateInfo){VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, mr.size, t};
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            r = vkAllocateMemory(dev, &ai, NULL, &m);
+            if (r) close(imp.fd);
+            if (!r) r = vkBindBufferMemory(dev, b, m, 0);
+            int bad = -2;
+            if (!r) {
+                memset(rmap, 0, N * 4);
+                bad = gpu_copy(b, rbuf) ? -1 : -3;
+                for (uint32_t i = 0; i < N && bad == -1; i++)
+                    if (rmap[i] != PATTERN) bad = (int)i;
+            }
+            if (bad == -1)
+                snprintf(msg, sizeof(msg), "type %u (flags 0x%x): %u words as exported", t, mp.memoryTypes[t].propertyFlags, N);
+            else if (bad >= 0)
+                snprintf(msg, sizeof(msg), "type %u: word %d is 0x%08x", t, bad, rmap[bad]);
+            else
+                snprintf(msg, sizeof(msg), "type %u: %s %d", t, bad == -3 ? "copy failed" : "VkResult", r);
+            check(bad == -1, "dma-buf imported into the buffer without a dedicated struct, read back", msg);
+        }
+    }
     close(fd);
 out:
     if (failures)

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Per-game presets, by Steam app id. A client says its app id in its hello (client/conn.c
  * pcache_key: "steam<appid>", with ".dl"/".run" for Steam's shader pre-caching of that game); at
  * that hello the process gets its preset, for its own devices only:
@@ -95,7 +94,7 @@ static const char *const keys[] = {
     "VKBRIDGE_HANG_DETECT", "VKBRIDGE_HANG_AFTER_MS", "VKBRIDGE_SKIP_SHADERS",
     /* the client's (vkb_preset_client_knobs) */
     "VKBRIDGE_DESC_BATCH", "VKBRIDGE_NO_DESC_BATCH", "VKBRIDGE_QUERY_MIRROR", "VKBRIDGE_SYNC_MIRROR",
-    "VKBRIDGE_DMABUF_SYNC_MS", "VKBRIDGE_DMABUF_SYNC_FAKE_OLD",
+    "VKBRIDGE_DMABUF_SYNC_MS", "VKBRIDGE_DMABUF_SYNC_FAKE_OLD", "VKBRIDGE_PRESENT_RELEASE_THREAD", "VKBRIDGE_ASYNC_ACQUIRE",
     /* what the app is shown (vkb_preset_client_values) */
     "VKBRIDGE_HEAP_MAX_MB", "VKBRIDGE_SPOOF_GPU",
     /* the client's frame wait (vkb_preset_client_values) */
@@ -106,6 +105,8 @@ static const char *const keys[] = {
     "VKBRIDGE_LATLOG",
     /* present ids and waits offered by the client (server_latency.c, the same way) */
     "VKBRIDGE_PRESENT_WAIT",
+    /* the client's frame pacer (vkb_preset_client_knobs) */
+    "VKBRIDGE_PACER",
 };
 
 static int allowed(const char *k)
@@ -397,7 +398,40 @@ uint32_t vkb_preset_client_knobs(void)
     if (ds && *ds) w |= (strtol(ds, NULL, 10) > 0 ? VKB_KNOB_ON : VKB_KNOB_OFF) << VKB_KNOB_DMABUF_SYNC_SHIFT;
     const char *fo = vkb_srv_env("VKBRIDGE_DMABUF_SYNC_FAKE_OLD");
     if (fo && *fo) w |= knob(fo) << VKB_KNOB_DMABUF_SYNC_FAKE_SHIFT;
+    const char *rt = vkb_srv_env("VKBRIDGE_PRESENT_RELEASE_THREAD");
+    if (rt && *rt) w |= knob(rt) << VKB_KNOB_PRESENT_RELEASE_SHIFT;
+    const char *aa = vkb_srv_env("VKBRIDGE_ASYNC_ACQUIRE");
+    if (aa && *aa) w |= knob(aa) << VKB_KNOB_ASYNC_ACQUIRE_SHIFT;
+    /* image and buffer creates ahead of queued work (server_conn.c): said either way, so the client knows this server takes them */
+    const char *fc = vkb_srv_env("VKBRIDGE_FAST_CREATE");
+    w |= (fc && *fc ? knob(fc) : VKB_KNOB_OFF) << VKB_KNOB_FAST_CREATE_SHIFT; /* v0.5.5.4: off unless asked for (=1) */
+    w |= (vkb_emu_bcn_rules_wanted() ? VKB_KNOB_OFF : VKB_KNOB_ON) << VKB_KNOB_FAST_CREATE_BC_SHIFT;
+    /* the frame pacer (client/pacer.c): read only by the client's getenv before, so a line in <cache dir>/env (what the
+     * app's Performance setting writes) never reached the game; the guest's VKBRIDGE_PACER still wins */
+    const char *pc = vkb_srv_env("VKBRIDGE_PACER");
+    if (pc && *pc) w |= knob(pc) << VKB_KNOB_PACER_SHIFT;
     return w;
+}
+
+/* vkb_server_pd_info.perf_src: where each performance switch the client logs came from (vkb_srv_env_src) */
+static uint32_t psrc(const char *key)
+{
+    int s = VKB_ENV_SRC_NONE;
+    const char *v = vkb_srv_env_src(key, &s);
+    if (!v || !*v) return VKB_PSRC_NONE;
+    switch (s) {
+    case VKB_ENV_SRC_CACHE_ENV: return VKB_PSRC_CACHE_ENV;
+    case VKB_ENV_SRC_ENV: return VKB_PSRC_ENV;
+    case VKB_ENV_SRC_PRESET_FILE: return VKB_PSRC_PRESET_FILE;
+    case VKB_ENV_SRC_PRESET_BUILTIN: return VKB_PSRC_PRESET_BUILTIN;
+    default: return VKB_PSRC_NONE;
+    }
+}
+
+uint32_t vkb_preset_perf_src(void)
+{
+    return psrc("VKBRIDGE_PACER") << VKB_PSRC_PACER_SHIFT | psrc("VKBRIDGE_PRESENT_WAIT") << VKB_PSRC_PRESENT_WAIT_SHIFT |
+           psrc("VKBRIDGE_FAST_CREATE") << VKB_PSRC_FAST_CREATE_SHIFT;
 }
 
 /* VKBRIDGE_HEAP_MAX_MB=<n> (n MB; 0: off; empty: nothing said, so the default below) and
@@ -470,7 +504,7 @@ uint32_t vkb_heap_default_cap_mb(int mode, uint64_t ram_mb)
  * size is all DXVK and vkd3d-proton go by: DXGI's DedicatedVideoMemory is the largest device-local heap
  * (4064 MB under the 4096 cap) and games size their texture pools from it; on Mali (an integrated GPU)
  * DXVK enforces no budget, so a smaller heap refuses nothing, it only changes what the game is told.
- * vivo X300, 11350 MB, 2.9-3.5 GB free at the game's start: Gas Station Simulator
+ * a player log (vivo X300, 11350 MB, 2.9-3.5 GB free at the game's start): Gas Station Simulator
  * (UE5) took 3.0-3.3 GB of GPU memory under the 4096 cap and the system killed the bridge (exit 137)
  * both times. With as much free as the cap or more nothing changes. Fixed per process at its first query,
  * so its later instances and devices see the same heaps. Only the default cap: an explicit

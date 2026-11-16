@@ -143,6 +143,16 @@ void vkb_first_error(const char *call, VkResult r)
 
 /* ------------------------------------------------------------------ connection */
 
+/* The async-send timer's counts of one thread (see vkb_call_exec): kept in the thread's own connection, so that counting a call
+ * touches no thread-local of its own (in the ICD library each costs a __tls_get_addr call). */
+typedef struct async_timer {
+    uint64_t n;                  /* async requests sent */
+    uint64_t tn, tns;            /* the sampled ones and their time, the lock and flush time inside them taken out (the plain append) */
+    uint64_t lock_ns, lock_n;    /* waits for the queue's lock (another thread, the flusher, held it): every one timed */
+    uint64_t flush_ns, flush_n;  /* flushes this thread did (queue full): every one timed */
+    uint64_t max_ns, start;      /* the longest lock wait or flush; the window's start */
+} async_timer;
+
 typedef struct vkb_conn {
     int sock;
     int dead;
@@ -152,6 +162,7 @@ typedef struct vkb_conn {
     size_t incap;
     vkb_arena arena;
     int busy;
+    async_timer at;
 } vkb_conn;
 
 static uint64_t process_token;
@@ -184,8 +195,11 @@ static void conn_free(vkb_conn *c)
     free(c);
 }
 
+static void async_note_flush(vkb_conn *c);
+
 static void conn_thread_exit(void *p)
 {
+    async_note_flush(p); /* the thread's last async-send line */
     conn_free(p);
 }
 
@@ -204,6 +218,35 @@ static pthread_mutex_t aq_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *aq_buf;
 static size_t aq_len, aq_cap;
 #define AQ_FLUSH (256u << 10)
+/* The queue's socket writes happen OUTSIDE aq_lock (2026-11-10, RE3 / Tomb Raider / BL2: dxvk-cs waited 1.1-1.4 s of every 10 s
+ * on this lock, ~91 us a wait, max 3.8-7.2 ms, while its holder - mostly the flusher, else a synchronous caller - was inside
+ * send(), which blocks when the server's thread is behind and keeps the lock while its thread is preempted). Under the lock a
+ * writer only takes what is queued (aq_take_locked: the buffer swapped for a spare) and reads the sequence numbers; it writes
+ * after unlocking. Two batches can then reach the server on two connections in either order: the server runs requests by
+ * sequence number whatever connection carries them (server_conn.c order_wait), as it does for any two threads' messages.
+ * At AQ_FLUSH the appending thread hands the write to the flusher instead of doing it itself; only at AQ_HARD (the flusher
+ * behind too) does it write itself: the old backpressure, without holding the lock. VKBRIDGE_AQ_LOCKED_WRITES=1: every write
+ * under the lock as before (the A/B arm). */
+#define AQ_HARD (4u * AQ_FLUSH)
+#define AQ_SPARES 2
+static uint8_t *aq_spare[AQ_SPARES];
+static size_t aq_spare_cap[AQ_SPARES];
+static int aq_inflight; /* batches taken out of the queue and not yet written (under aq_lock) */
+static pthread_cond_t aq_idle = PTHREAD_COND_INITIALIZER;
+typedef struct aq_taken {
+    uint8_t *buf;
+    size_t len, cap;
+} aq_taken;
+
+static int aq_locked_writes(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_AQ_LOCKED_WRITES");
+        v = !(e && *e) || strcmp(e, "0") != 0; /* v0.5.5.4: the locked writes by default; VKBRIDGE_AQ_LOCKED_WRITES=0 */
+    }
+    return v;
+}
 
 static int write_all(int sock, const void *p, size_t n)
 {
@@ -233,6 +276,57 @@ static int aq_flush_locked(vkb_conn *conn)
     return r;
 }
 
+/* Under aq_lock: what is queued leaves the queue (a spare buffer, or none, takes its place); the caller writes it with
+ * aq_write_taken after unlocking, then gives the buffer back with aq_give_back. Nothing queued: t->len 0, nothing to do. */
+static void aq_take_locked(aq_taken *t)
+{
+    t->buf = aq_buf;
+    t->len = aq_len;
+    t->cap = aq_cap;
+    if (!aq_len) return;
+    aq_buf = NULL;
+    aq_cap = 0;
+    aq_len = 0;
+    for (int i = 0; i < AQ_SPARES; i++)
+        if (aq_spare[i]) {
+            aq_buf = aq_spare[i];
+            aq_cap = aq_spare_cap[i];
+            aq_spare[i] = NULL;
+            break;
+        }
+    aq_inflight++;
+}
+
+/* Not under aq_lock. */
+static int aq_write_taken(vkb_conn *conn, const aq_taken *t)
+{
+    return t->len ? write_all(conn->sock, t->buf, t->len) : 0;
+}
+
+/* Under aq_lock: the written buffer back to the spares (one above 4 MB, or with the spares full, is freed). */
+static void aq_give_back_locked(aq_taken *t)
+{
+    if (!t->len) return;
+    int kept = 0;
+    for (int i = 0; i < AQ_SPARES && !kept && t->cap <= (4u << 20); i++)
+        if (!aq_spare[i]) {
+            aq_spare[i] = t->buf;
+            aq_spare_cap[i] = t->cap;
+            kept = 1;
+        }
+    if (!kept) free(t->buf);
+    t->buf = NULL;
+    t->len = 0;
+    if (--aq_inflight == 0) pthread_cond_broadcast(&aq_idle);
+}
+
+/* The flusher's own counts ("async flusher" line, every WAIT_STATS period when its writes took >= 1 % of it): the time it spent
+ * writing the queue to the socket - before 2026-11-10 with aq_lock held, i.e. what the other threads' "lock wait" waited for. */
+static struct {
+    uint64_t start, n, bytes, ns, max_ns;
+} aq_fstat;
+static void aq_flusher_note(uint64_t t0, uint64_t t1, size_t bytes);
+
 /* The flusher: asynchronous requests do not wait for the next synchronous one forever - another
  * thread may be blocked in the server on work they would start (a submit that signals what it is
  * waiting for). It sends what is queued ~100 us after it was queued, batching what follows. */
@@ -253,6 +347,7 @@ static vkb_conn *get_conn(void);
 static void *aq_flusher(void *arg)
 {
     (void)arg;
+    prctl(PR_SET_NAME, "vkb-flush", 0, 0, 0); /* else it carries the name of the thread that started it (often dxvk-cs) */
     vkb_conn *conn = get_conn();
     pthread_mutex_lock(&aq_lock);
     if (!conn) {
@@ -270,7 +365,21 @@ static void *aq_flusher(void *arg)
             pthread_mutex_lock(&aq_lock);
             continue;
         }
-        if (aq_flush_locked(conn) < 0) {
+        size_t bytes = aq_len;
+        uint64_t t0 = now_ns();
+        int r;
+        if (aq_locked_writes()) {
+            r = aq_flush_locked(conn);
+        } else {
+            aq_taken t;
+            aq_take_locked(&t);
+            pthread_mutex_unlock(&aq_lock);
+            r = aq_write_taken(conn, &t);
+            pthread_mutex_lock(&aq_lock);
+            aq_give_back_locked(&t);
+        }
+        aq_flusher_note(t0, now_ns(), bytes);
+        if (r < 0) {
             conn->dead = 1;
             aq_flusher_gone = 1;
             break;
@@ -311,6 +420,12 @@ static void aq_exit_flush(void)
     if (!c || c->dead) return;
     pthread_mutex_lock(&aq_lock);
     aq_flush_locked(c);
+    /* batches other threads took out of the queue and are still writing (at most 200 ms): exit must not cut one */
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 200000000L;
+    if (until.tv_nsec >= 1000000000L) until.tv_sec++, until.tv_nsec -= 1000000000L;
+    while (aq_inflight > 0 && pthread_cond_timedwait(&aq_idle, &aq_lock, &until) == 0) {}
     pthread_mutex_unlock(&aq_lock);
 }
 
@@ -319,7 +434,11 @@ static void atfork_child(void)
     aq_len = 0;
     aq_flusher_started = 0;
     aq_flusher_gone = 0;
+    aq_inflight = 0; /* the parent's writers are not in the child; their buffers stay with the parent */
+    for (int i = 0; i < AQ_SPARES; i++) aq_spare[i] = NULL;
+    memset(&aq_fstat, 0, sizeof(aq_fstat));
     pthread_cond_init(&aq_cond, NULL);
+    pthread_cond_init(&aq_idle, NULL);
     pthread_mutex_init(&aq_lock, NULL);
     /* The child must not talk on the parent's sockets: new token, new connections. */
     fork_epoch++;
@@ -525,6 +644,17 @@ static __thread uint64_t last_async_seq;
 static uint64_t synced_seq;
 
 void vkb_call_poll_next(void) { poll_next = 1; }
+
+/* VKB_F_FAST_CREATE / VKB_F_CREATE_REQS on this thread's next call (vkb_call_fast_next), and the requirements its vkCreateImage
+ * reply carried */
+static __thread uint32_t fast_next;
+static __thread vkb_fast_reqs fast_got;
+void vkb_call_fast_next(uint32_t flags) { fast_next = flags; }
+void vkb_fast_reqs_take(vkb_fast_reqs *q)
+{
+    *q = fast_got;
+    fast_got.have = 0;
+}
 uint64_t vkb_async_seq_last(void) { return last_async_seq; }
 int vkb_async_ran(uint64_t seq) { return __atomic_load_n(&synced_seq, __ATOMIC_ACQUIRE) >= seq; }
 
@@ -538,6 +668,7 @@ void vkb_call_begin(vkb_call *c, uint32_t cmd, uint32_t table)
     c->table = table;
     c->flags = 0;
     if (poll_next) c->flags |= VKB_CALL_POLL, poll_next = 0;
+    if (fast_next) c->flags |= fast_next, fast_next = 0;
     c->conn = get_conn();
     if (c->conn && !c->conn->busy) {
         c->conn->busy = 1;
@@ -666,6 +797,81 @@ static void wait_note(uint32_t cmd, uint64_t ns, uint64_t now)
     tw->start = now;
 }
 
+/* VKBRIDGE_ASYNC_TIMER: the time each thread spends queuing asynchronous requests (the NOREPLY path of exec(): the wait for the queue's
+ * lock, the copy into the batch, a flush when the queue is full) - not covered by "waits over" (those are the round trips), so a
+ * thread's idle time could not be told from time spent in the bridge's queue. Every call is counted; one in ASYNC_SAMPLE is timed (two
+ * clock reads) and scaled (the plain append), while every wait for the lock and every flush this thread does is timed exactly (rare,
+ * and what stalls a thread: a sampled call could miss them). Cost to a game thread: a counter, ~1 ns a call. VKBRIDGE_ASYNC_TIMER=1
+ * times every call, 0 turns it off, any other number: sampled, and every thread says its line. A line a WAIT_STATS period for a
+ * thread with >= ASYNC_MIN_CALLS calls whose queuing took >= 1 % of the period (no line: less), and one when the thread ends (a
+ * window of a second or more):
+ *   async sends over 10.0s, thread NAME (tid): N calls, queuing ~X ms (append ~A ms sampled, lock wait L ms in LN, flush F ms in FN, max_us=M)
+ * X = A + L + F; max_us is the longest single lock wait or flush, i.e. a stall in the queue shows there. */
+#define ASYNC_SAMPLE 64
+#define ASYNC_MIN_CALLS 100
+#define ASYNC_LINES 1000
+static int async_explicit; /* VKBRIDGE_ASYNC_TIMER set (not 0): every thread with calls gets its line */
+static int async_mask = -1; /* -1 off; else a call is timed when (count & mask) == 0 (63: one in 64) */
+static uint32_t async_lines;
+static void async_note_line(async_timer *ta, uint64_t now)
+{
+    if (!ta->n) return;
+    /* what queuing cost: the plain appends (sampled, scaled to all calls) + every lock wait + every flush */
+    double append_ms = ta->tn ? ta->tns / 1e6 * (double)ta->n / (double)ta->tn : 0;
+    double est_ms = append_ms + (ta->lock_ns + ta->flush_ns) / 1e6;
+    /* a thread says something only when queuing took >= 1 % of a window of at least a second (as the waits-over lines do), unless asked for all */
+    uint64_t win = ta->start && now > ta->start ? now - ta->start : 0;
+    int quiet = !async_explicit && (win < 1000000000ull || est_ms * 1e6 * 100 < (double)win);
+    if (!quiet && ta->n >= ASYNC_MIN_CALLS && __atomic_fetch_add(&async_lines, 1, __ATOMIC_RELAXED) < ASYNC_LINES) {
+        char name[17] = "";
+        prctl(PR_GET_NAME, name, 0, 0, 0);
+        vkb_log_info_always("async sends over %.1fs, thread %s (%ld): %llu calls, queuing ~%.1f ms (append ~%.1f ms sampled, lock wait %.1f ms in %llu, "
+                            "flush %.1f ms in %llu, max_us=%llu)",
+                            win / 1e9, name, (long)syscall(SYS_gettid), (unsigned long long)ta->n, est_ms, append_ms, ta->lock_ns / 1e6,
+                            (unsigned long long)ta->lock_n, ta->flush_ns / 1e6, (unsigned long long)ta->flush_n, (unsigned long long)(ta->max_ns / 1000));
+    }
+    memset(ta, 0, sizeof(*ta));
+    ta->start = now;
+}
+
+static void async_note_flush(vkb_conn *c)
+{
+    if (async_mask >= 0 && c) async_note_line(&c->at, now_ns());
+}
+
+/* Under aq_lock (the flusher's loop holds it here). */
+static void aq_flusher_note(uint64_t t0, uint64_t t1, size_t bytes)
+{
+    if (async_mask < 0) return;
+    if (!aq_fstat.start) aq_fstat.start = t0;
+    uint64_t d = t1 - t0;
+    aq_fstat.n++, aq_fstat.bytes += bytes, aq_fstat.ns += d;
+    if (d > aq_fstat.max_ns) aq_fstat.max_ns = d;
+    uint64_t win = t1 - aq_fstat.start;
+    if (wait_period <= 0 || win < (uint64_t)wait_period * 1000000000ull) return;
+    if ((async_explicit || aq_fstat.ns * 100 >= win) && __atomic_fetch_add(&async_lines, 1, __ATOMIC_RELAXED) < ASYNC_LINES)
+        vkb_log_info_always("async flusher over %.1fs, thread vkb-flush (%ld): %llu writes, %.1f KB, writing %.1f ms (max_us=%llu), %s",
+                            win / 1e9, (long)syscall(SYS_gettid), (unsigned long long)aq_fstat.n, aq_fstat.bytes / 1024.0, aq_fstat.ns / 1e6,
+                            (unsigned long long)(aq_fstat.max_ns / 1000),
+                            aq_locked_writes() ? "the queue's lock held while writing (VKBRIDGE_AQ_LOCKED_WRITES=1)" : "the queue's lock not held while writing");
+    memset(&aq_fstat, 0, sizeof(aq_fstat));
+    aq_fstat.start = t1;
+}
+
+/* an async request through exec(), timed when it is the thread's turn; wait_period (the WAIT_STATS period) paces the lines */
+static int async_exec(vkb_call *c)
+{
+    async_timer *ta = &c->conn->at;
+    if ((++ta->n & (uint64_t)async_mask) != 0) return exec(c);
+    uint64_t t0 = now_ns(), stall0 = ta->lock_ns + ta->flush_ns;
+    if (!ta->start) ta->start = t0;
+    int r = exec(c);
+    uint64_t t1 = now_ns(), d = t1 - t0, stall = ta->lock_ns + ta->flush_ns - stall0;
+    ta->tn++, ta->tns += d > stall ? d - stall : 0;
+    if (wait_period > 0 && t1 - ta->start >= (uint64_t)wait_period * 1000000000ull) async_note_line(ta, t1);
+    return r;
+}
+
 int vkb_call_exec(vkb_call *c)
 {
     if (slow_ms < 0) {
@@ -674,9 +880,14 @@ int vkb_call_exec(vkb_call *c)
         v = getenv("VKBRIDGE_WAIT_STATS");
         wait_explicit = v && *v;
         wait_period = wait_explicit ? atoi(v) : WAIT_STATS_DEFAULT;
+        v = getenv("VKBRIDGE_ASYNC_TIMER");
+        async_mask = v && *v ? (atoi(v) == 0 ? -1 : atoi(v) == 1 ? 0 : ASYNC_SAMPLE - 1) : ASYNC_SAMPLE - 1;
+        async_explicit = v && *v && atoi(v) != 0;
     }
     int hitch = __atomic_load_n(&vkb_hitch_active, __ATOMIC_RELAXED);
-    if ((!slow_ms && wait_period <= 0 && !hitch) || (c->flags & VKB_F_NOREPLY)) return exec(c);
+    if (c->flags & VKB_F_NOREPLY) return async_mask >= 0 && c->conn ? async_exec(c) : exec(c);
+    if (!slow_ms && wait_period <= 0 && !hitch) return exec(c);
+    if (hitch && vkb_hitch_in_present) c->flags |= VKB_F_PRESENT_WAIT; /* the server times it for the present wait split */
     uint64_t t0 = now_ns();
     int r = exec(c);
     uint64_t t1 = now_ns(), ns = t1 - t0, us = ns / 1000;
@@ -691,9 +902,77 @@ int vkb_call_exec(vkb_call *c)
     return r;
 }
 
+/* VKBRIDGE_TEST_DROP_ASYNC=<command> (host tests only, asyncgap_test.sh): the first asynchronous request of that
+ * command takes its sequence number and is never sent, as one a thread took with it when it ended would be: the
+ * server's order wait then has a request that never arrives. */
+static int test_drop(uint32_t cmd)
+{
+    static int want = -2;
+    if (want == -2) {
+        const char *n = getenv("VKBRIDGE_TEST_DROP_ASYNC");
+        int w = -1;
+        for (uint32_t i = 0; n && *n && i < VKB_CMD_COUNT; i++)
+            if (vkb_cmd_names[i] && !strcmp(vkb_cmd_names[i], n)) w = (int)i;
+        want = w;
+    }
+    if (want < 0 || cmd != (uint32_t)want) return 0;
+    want = -1; /* once (under aq_lock) */
+    return 1;
+}
+
+/* The queue's lock for an async request: a wait is timed (the try costs what the lock does), and a flush this thread does under
+ * it (the queue is full, or the socket is) - the parts of queuing that stall a thread; the append itself is sampled (async_exec). */
+static void aq_lock_timed(async_timer *at)
+{
+    if (!pthread_mutex_trylock(&aq_lock)) return;
+    uint64_t t0 = now_ns();
+    pthread_mutex_lock(&aq_lock);
+    uint64_t d = now_ns() - t0;
+    at->lock_ns += d, at->lock_n++;
+    if (d > at->max_ns) at->max_ns = d;
+}
+
+/* Called with aq_lock held, returns with it held: the full queue written by this thread (outside the lock unless
+ * VKBRIDGE_AQ_LOCKED_WRITES=1), timed for the async-send line. */
+static int aq_flush_timed(vkb_conn *conn, async_timer *at)
+{
+    uint64_t t0 = at ? now_ns() : 0;
+    int r;
+    if (aq_locked_writes()) {
+        r = aq_flush_locked(conn);
+    } else {
+        aq_taken t;
+        aq_take_locked(&t);
+        pthread_mutex_unlock(&aq_lock);
+        r = aq_write_taken(conn, &t);
+        pthread_mutex_lock(&aq_lock);
+        aq_give_back_locked(&t);
+    }
+    if (at) {
+        uint64_t d = now_ns() - t0;
+        at->flush_ns += d, at->flush_n++;
+        if (d > at->max_ns) at->max_ns = d;
+    }
+    return r;
+}
+
+/* Under aq_lock, after an append: a queue at AQ_FLUSH goes to the flusher (due now); this thread writes it itself only at
+ * AQ_HARD, or when there is no flusher, or with VKBRIDGE_AQ_LOCKED_WRITES=1 (then at AQ_FLUSH, as before). */
+static int aq_full(vkb_conn *conn, async_timer *at)
+{
+    if (aq_len < AQ_FLUSH) return 0;
+    if (!aq_locked_writes() && aq_len < AQ_HARD && aq_flusher_started && !aq_flusher_gone) {
+        aq_first_ns = 0; /* due now */
+        pthread_cond_signal(&aq_cond);
+        return 0;
+    }
+    return aq_flush_timed(conn, at);
+}
+
 static int exec(vkb_call *c)
 {
     vkb_conn *conn = c->conn;
+    async_timer *at = (c->flags & VKB_F_NOREPLY) && async_mask >= 0 && conn ? &conn->at : NULL;
     if (trace_on()) {
         /* VkResult-returning calls put it first in the reply; peeked after the round trip. */
         vkb_log(VKB_LOG_ERROR, "trace: %s", vkb_cmd_names[c->cmd]);
@@ -709,9 +988,21 @@ static int exec(vkb_call *c)
         c->conn = NULL;
         return 0;
     }
-    vkb_msg_hdr h = {VKB_MAGIC, (uint32_t)c->e.len, c->cmd, c->table, (uint32_t)c->e.nfds, c->flags & VKB_F_NOREPLY, 0, 0};
+    vkb_msg_hdr h = {VKB_MAGIC, (uint32_t)c->e.len, c->cmd, c->table, (uint32_t)c->e.nfds,
+                     c->flags & (VKB_F_NOREPLY | VKB_F_PRESENT_WAIT | VKB_F_FAST_CREATE | VKB_F_CREATE_REQS), 0, 0};
     vkb_stats_count(c->cmd, (c->flags & VKB_F_NOREPLY) != 0, c->e.len);
-    pthread_mutex_lock(&aq_lock);
+    if (at) aq_lock_timed(at);
+    else pthread_mutex_lock(&aq_lock);
+    if ((c->flags & VKB_F_NOREPLY) && test_drop(c->cmd)) {
+        /* what is queued goes out first, so that the dropped one's number is a gap of its own */
+        int r = aq_flush_locked(conn);
+        last_async_seq = ++async_seq;
+        pthread_mutex_unlock(&aq_lock);
+        VKB_WARN("VKBRIDGE_TEST_DROP_ASYNC: %s (request %llu) not sent", vkb_cmd_names[c->cmd], (unsigned long long)last_async_seq);
+        release_enc(c);
+        c->conn = NULL;
+        return r < 0 ? 0 : 1;
+    }
     if ((c->flags & VKB_F_NOREPLY) && !c->e.nfds && vkb_async_framed()) {
         /* Appended to the open vkbBatch (or opening it) under the lock that orders the seqs. Requests
          * queued as messages of their own before the server's switches came in (the first
@@ -751,7 +1042,7 @@ static int exec(vkb_call *c)
         ((vkb_msg_hdr *)aq_buf)->size = (uint32_t)(aq_len - sizeof(h));
         aq_start_flusher();
         if (opened) pthread_cond_signal(&aq_cond); /* the flusher waits only on an empty queue */
-        int r = aq_len >= AQ_FLUSH ? aq_flush_locked(conn) : 0;
+        int r = aq_full(conn, at);
         pthread_mutex_unlock(&aq_lock);
         release_enc(c);
         c->conn = NULL;
@@ -780,7 +1071,7 @@ static int exec(vkb_call *c)
         aq_len = need;
         aq_start_flusher();
         pthread_cond_signal(&aq_cond);
-        int r = aq_len >= AQ_FLUSH ? aq_flush_locked(conn) : 0;
+        int r = aq_full(conn, at);
         pthread_mutex_unlock(&aq_lock);
         release_enc(c);
         c->conn = NULL;
@@ -794,17 +1085,25 @@ static int exec(vkb_call *c)
     /* Everything queued goes first, on this connection; a poll leaves it to the flusher and
      * overtakes it (its answer may be one the GPU had a little earlier). Ahead of a sync-fd export
      * with the server's order deadline on (Samsung's driver), on the flusher's instead: there a
-     * submit the driver holds does not keep the export unread behind it, and the server's
+     * submit the driver holds does not keep the export unread behind it (a player log), and the server's
      * deadline applies. (A round trip is timed around this, in vkb_call_exec.) */
     int qr = 0;
+    aq_taken taken = {0};
     if (c->flags & VKB_CALL_POLL) {
         /* the poll overtakes the queue */
+    } else if ((c->flags & VKB_F_FAST_CREATE) && aq_len && aq_flusher_started && !aq_flusher_gone) {
+        /* a create the server may run ahead of the queue (vkb_fast_create): the queue still goes out now, as it would have, but
+         * on the flusher's connection - this thread does not write it out under the queue's lock first */
+        aq_first_ns = 0; /* due now */
+        pthread_cond_signal(&aq_cond);
     } else if (aq_len && aq_flusher_started && !aq_flusher_gone &&
                (c->cmd == VKB_CMD_vkGetSemaphoreFdKHR || c->cmd == VKB_CMD_vkGetFenceFdKHR) && syncfd_side()) {
         aq_first_ns = 0; /* due now */
         pthread_cond_signal(&aq_cond);
-    } else {
+    } else if (aq_locked_writes()) {
         qr = aq_flush_locked(conn);
+    } else {
+        aq_take_locked(&taken); /* written below, after the unlock, ahead of this request on this connection */
     }
     stat_wire_add(1, sizeof(h) + c->e.len);
     if (c->flags & VKB_F_NOREPLY) {
@@ -814,6 +1113,12 @@ static int exec(vkb_call *c)
         h.barrier = c->flags & VKB_CALL_POLL ? 0 : async_seq;
     }
     pthread_mutex_unlock(&aq_lock);
+    if (taken.len) {
+        qr = aq_write_taken(conn, &taken);
+        pthread_mutex_lock(&aq_lock);
+        aq_give_back_locked(&taken);
+        pthread_mutex_unlock(&aq_lock);
+    }
     if (qr < 0 || vkb_send_msg(conn->sock, &h, c->e.buf, c->e.fds, c->e.nfds) < 0) {
         VKB_ERR("%s: lost the bridge server (%s)", vkb_cmd_names[c->cmd], strerror(errno));
         conn->dead = 1;
@@ -834,8 +1139,9 @@ static int exec(vkb_call *c)
         c->conn = NULL;
         return 0;
     }
+    /* (a fast create's barrier proves nothing: the server may have run it ahead of the queue) */
     for (uint64_t o = __atomic_load_n(&synced_seq, __ATOMIC_RELAXED);
-         o < h.barrier && !__atomic_compare_exchange_n(&synced_seq, &o, h.barrier, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);) {}
+         !(c->flags & VKB_F_FAST_CREATE) && o < h.barrier && !__atomic_compare_exchange_n(&synced_seq, &o, h.barrier, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);) {}
     if (rh.cmd != VKB_ST_OK) {
         static const char *const why[] = {"ok", "malformed request", "the driver lacks this command", "unknown object"};
         VKB_ERR("%s: the server refused the call (%s)", vkb_cmd_names[c->cmd], rh.cmd < 4 ? why[rh.cmd] : "?");
@@ -853,6 +1159,16 @@ static int exec(vkb_call *c)
 void vkb_call_end(vkb_call *c)
 {
     if (!c->conn) return;
+    if ((c->flags & VKB_F_CREATE_REQS) && c->cmd == VKB_CMD_vkCreateImage) {
+        /* the reply's tail after the generated outputs (server_conn.c vkb_srv_fast_create_reply) */
+        fast_got.have = 0;
+        if (vkb_dec_u8(&c->d)) {
+            vkb_dec_bytes(&c->d, &fast_got.req, sizeof(fast_got.req));
+            fast_got.prefers = vkb_dec_u32(&c->d);
+            fast_got.requires = vkb_dec_u32(&c->d);
+            fast_got.have = !c->d.err;
+        }
+    }
     if (c->d.err) VKB_ERR("%s: malformed reply", vkb_cmd_names[c->cmd]);
     vkb_dec_close_untaken(&c->d);
     vkb_arena_reset(&c->conn->arena);
@@ -910,6 +1226,43 @@ static int knob(int shift, int *known)
 int vkb_client_knob(int shift, int *known)
 {
     return knob(shift, known);
+}
+
+/* VKBRIDGE_FAST_CREATE: image and buffer creates sent with VKB_F_FAST_CREATE (the server runs them ahead of the process's queued
+ * work where nothing queued can change them; server_conn.c). Only to a server that said it takes them (its knob ON: the game's
+ * preset, <cache dir>/env or its environment, VKBRIDGE_FAST_CREATE=0 there turns it off); the guest's VKBRIDGE_FAST_CREATE=0 also
+ * turns it off. Off: the requests and replies are the ones before it. */
+int vkb_fast_create(void)
+{
+    static int v = -1;
+    int c = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (c >= 0) return c;
+    int known, k = knob(VKB_KNOB_FAST_CREATE_SHIFT, &known);
+    if (!known) return 0; /* nothing from the server yet: as before, asked again next time */
+    const char *e = getenv("VKBRIDGE_FAST_CREATE");
+    int on = k == 1 && !(e && !strcmp(e, "0"));
+    /* 3: BC images too (no BC rule that weighs bytes alive asked for on the server) */
+    if (on && knob(VKB_KNOB_FAST_CREATE_BC_SHIFT, &known) == 1) on = 3;
+    /* VKBRIDGE_TEST_FAST_CREATE_ALL=1 (host tests): every image and buffer create sent to run ahead, for the server's own check */
+    const char *all = getenv("VKBRIDGE_TEST_FAST_CREATE_ALL");
+    if (on && all && !strcmp(all, "1")) on = 7;
+    __atomic_store_n(&v, on, __ATOMIC_RELAXED);
+    VKB_INFO("fast create: %s%s", on ? "on (image and buffer creates may run ahead of queued work; requirements come with the image)"
+                                     : k == 1 ? "off (the guest's VKBRIDGE_FAST_CREATE=0)" : k == 0 ? "off (the server's switch: off by default in this build, or VKBRIDGE_FAST_CREATE=0)"
+                                                                                               : "off (the server does not take it)",
+             on == 1 ? "; BC images as before (a BC rule weighing bytes alive is on)" : on == 7 ? "; VKBRIDGE_TEST_FAST_CREATE_ALL" : "");
+    return on;
+}
+
+/* vkb_fast_create's on/off without its line (the client's 'perf-switches:' line): *from 0 the guest's VKBRIDGE_FAST_CREATE=0,
+ * 1 the server's switch, 2 nothing from the server */
+int vkb_fast_create_setting(int *from)
+{
+    int known, k = knob(VKB_KNOB_FAST_CREATE_SHIFT, &known);
+    const char *e = getenv("VKBRIDGE_FAST_CREATE");
+    if (k == 1 && e && !strcmp(e, "0")) return *from = 0, 0;
+    *from = k >= 0 ? 1 : 2;
+    return k == 1;
 }
 
 /* *final: 0 while the server's switches are not in yet (the answer may change once) */

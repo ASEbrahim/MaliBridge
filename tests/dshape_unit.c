@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * dshape_unit: the register of dma-buf image shapes (server/server_dmabuf_shape.c), built alone. It decides
- * whether an OPTIMAL importer that names no modifier is laid out like a LINEAR exporter (Mali r49p1,
+ * whether an OPTIMAL importer that names no modifier is laid out like a LINEAR exporter (a player log: Mali r49p1,
  * gamescope's 1564x720 imports of Steam's windows asked 5193728 bytes of dma-bufs of 4558848).
  *   1 the a player log numbers: three LINEAR exports of 1564x720, an OPTIMAL image needing 5193728: answered
  *   2 another format, another size: not answered
@@ -42,7 +41,7 @@ int main(void)
         s = mk(&dev_a, 0x1000 + i, 44, 1564, 720, 1, 4558848, 6272);
         vkb_dshape_note(&s);
     }
-    check(vkb_dshape_linear_export(44, 1564, 720, 5193728, &out) == 1, "1 5193728 asked, LINEAR exports of 4558848 live: answered");
+    check(vkb_dshape_linear_export(44, 1564, 720, 5193728, &out) == 1, "1 a player log: 5193728 asked, LINEAR exports of 4558848 live: answered");
     check(out.linear && out.size == 4558848 && out.pitch == 6272, "1 the answer is the LINEAR export's size and pitch");
 
     /* 2 */

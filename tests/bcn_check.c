@@ -27,7 +27,7 @@
  * and copies are placed on that block's edges.
  * `bcn_check transcode zink`: the same quality check (every BC format, PSNR floors, "exact" fails) with the BC
  * images made as Zink makes them: usage SAMPLED|TRANSFER_SRC|TRANSFER_DST|COLOR_ATTACHMENT (0x17), flags
- * MUTABLE_FORMAT|EXTENDED_USAGE (0x108). The bridge must transcode them (they were all decoded). Then blocks
+ * MUTABLE_FORMAT|EXTENDED_USAGE (0x108). The bridge must transcode them (a player log: they were all decoded). Then blocks
  * drawn into uncompressed views of such images, as Mesa uploads BC data from a pixel buffer, must show in the texture
  * (test_zink_upload; a player log). `bcn_check upload` (the bridge decoding) runs that on decoded images after the decoding checks.
  * `bcn_check pcache [file]`: what the driver's pipeline cache spares on two of the transcoders
@@ -38,6 +38,7 @@
 
 #include <dlfcn.h>
 #include <math.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,7 +88,7 @@ F(vkCmdCopyBufferToImage); F(vkCmdBlitImage); F(vkCmdCopyImageToBuffer); F(vkDes
 F(vkFreeMemory); F(vkGetPhysicalDeviceProperties); F(vkCreateImageView); F(vkDestroyImageView); F(vkCmdCopyImage);
 F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCmdCopyImage2); F(vkCreateShaderModule); F(vkDestroyShaderModule);
 F(vkCreateDescriptorSetLayout); F(vkCreatePipelineLayout); F(vkCreateComputePipelines); F(vkCreateDescriptorPool);
-F(vkAllocateDescriptorSets); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
+F(vkAllocateDescriptorSets); F(vkResetDescriptorPool); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
 F(vkCreateRenderPass); F(vkDestroyRenderPass); F(vkCreateFramebuffer); F(vkDestroyFramebuffer); F(vkCmdBeginRenderPass);
 F(vkCmdEndRenderPass); F(vkCreateGraphicsPipelines); F(vkDestroyPipelineLayout); F(vkDestroyDescriptorSetLayout);
 F(vkDestroyDescriptorPool); F(vkCmdDraw); F(vkCmdSetViewport); F(vkCmdSetScissor); F(vkCmdClearAttachments); F(vkCmdBeginRendering);
@@ -423,12 +424,28 @@ static uint16_t lns_half(int c)
     return (uint16_t)(h > 0x7bff ? 0x7bff : h);
 }
 
-/* Decodes a block into RGBA floats; 0 if the block is outside what this decoder handles. */
-static int astc_decode(const uint8_t *b, float out[16][4])
+/* Colour endpoint modes 8 / 12 (LDR RGB / RGBA direct), blue contraction where the second colour sums lower. */
+static void cem_ldr(int cem, const int *v, int e0[4], int e1[4])
+{
+    int a0 = cem == 12 ? v[6] : 255, a1 = cem == 12 ? v[7] : 255;
+    if (v[1] + v[3] + v[5] >= v[0] + v[2] + v[4]) {
+        e0[0] = v[0], e0[1] = v[2], e0[2] = v[4], e0[3] = a0;
+        e1[0] = v[1], e1[1] = v[3], e1[2] = v[5], e1[3] = a1;
+    } else {
+        e0[0] = (v[1] + v[5]) >> 1, e0[1] = (v[3] + v[5]) >> 1, e0[2] = v[5], e0[3] = a1;
+        e1[0] = (v[0] + v[4]) >> 1, e1[1] = (v[2] + v[4]) >> 1, e1[2] = v[4], e1[3] = a0;
+    }
+}
+
+/* Decodes a block into RGBA floats; 0 if the block is outside what this decoder handles. ldr 0: the HDR blocks the BC6H
+ * transcoder makes (CEM 7 / 11, linear values); ldr 1: the LDR blocks the 4x4 transcoders make (CEM 8 / 12, UNORM16 / 65535,
+ * as a UNORM decode gives them). */
+static int astc_decode_ex(const uint8_t *b, float out[16][4], int ldr)
 {
     uint32_t mode = ab_get(b, 0, 11);
     if ((mode & 0x1ff) == 0x1fc) {
         int hdr = (mode >> 9) & 1;
+        if (ldr && hdr) return 0;
         for (int t = 0; t < 16; t++)
             for (int c = 0; c < 4; c++) {
                 uint32_t v = ab_get(b, 64 + 16 * c, 16);
@@ -455,7 +472,7 @@ static int astc_decode(const uint8_t *b, float out[16][4])
         cem = (int)(cf >> 2);
         pos = 29;
     }
-    if (cem != 7 && cem != 11) return 0;
+    if (ldr ? cem != 8 && cem != 12 : cem != 7 && cem != 11) return 0;
     int nv = pc * ((cem >> 2) + 1) * 2;
     if (nv > 18) return 0;
     int avail = 128 - wsize - pos - (dual ? 2 : 0);
@@ -487,15 +504,19 @@ static int astc_decode(const uint8_t *b, float out[16][4])
         int p = pc > 1 ? ap_select(seed, t & 3, t >> 2, pc) : 0;
         const int *pv = v + p * ((cem >> 2) + 1) * 2;
         int e0[4], e1[4];
-        if (cem == 11) cem11(pv, e0, e1);
+        if (ldr) cem_ldr(cem, pv, e0, e1);
+        else if (cem == 11) cem11(pv, e0, e1);
         else cem7(pv, e0, e1);
         for (int c = 0; c < 4; c++) {
             int wt = dual && c == plane2 ? w[2 * t + 1] : w[dual ? 2 * t : t];
-            out[t][c] = h2f(lns_half((e0[c] * (64 - wt) + e1[c] * wt + 32) >> 6));
+            out[t][c] = ldr ? ((e0[c] * 257) * (64 - wt) + (e1[c] * 257) * wt + 32) / 64 / 65535.0f
+                            : h2f(lns_half((e0[c] * (64 - wt) + e1[c] * wt + 32) >> 6));
         }
     }
     return 1;
 }
+
+static int astc_decode(const uint8_t *b, float out[16][4]) { return astc_decode_ex(b, out, 0); }
 
 /* Reference texels (RGBA float, sRGB formats still encoded) of one block. */
 static void decode_block(VkFormat f, const uint8_t *b, float out[16][4])
@@ -1796,8 +1817,8 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
 /* Zink renders BC blocks into uncompressed views of its BC images. Mesa's st_CompressedTexSubImage with a pixel
  * buffer bound draws the blocks, one texel a block, into an R32G32B32A32_UINT (16-byte blocks) or R16G16B16A16_UINT
  * (8-byte blocks) view of the level (Zink's images: BLOCK_TEXEL_VIEW_COMPATIBLE | MUTABLE_FORMAT | EXTENDED_USAGE,
- * COLOR_ATTACHMENT). What is drawn there must be what the BC texture shows afterwards: SOMA's terrain was
- * black on v0.5.5.2, where the draw went to a stand-in image and stayed there, and garbled on v0.5.5.1,
+ * COLOR_ATTACHMENT). What is drawn there must be what the BC texture shows afterwards: a player log (SOMA's terrain) was
+ * black on v0.5.5.2, where the draw went to a stand-in image and stayed there, and garbled on v0.5.5.1 (a player log),
  * where the blocks were drawn as colours into the decoded image. Here: level 0 (60x44, 15x11 blocks) gets the first
  * upload, then new blocks drawn in a viewport inside it and one block value cleared into a rect (vkCmdClearAttachments);
  * level 1 (30x22, 8x6 blocks: not a halving of 15x11) is drawn whole (with render passes, with the viewport set before
@@ -2757,6 +2778,85 @@ static int same_level(VkImage a, VkImage b, uint32_t mip, uint32_t w, uint32_t h
     return same;
 }
 
+/* Level mip of img blitted into RGBA8 of the given sRGB-ness (the bytes it holds, nothing converted) and read back. */
+static void read_level8(VkImage img, int srgb, uint32_t mip, uint32_t w, uint32_t h, uint8_t *out)
+{
+    size_t n = (size_t)w * h * 4;
+    VkDeviceMemory bm, im;
+    void *map;
+    VkBuffer buf = host_buffer(n, &bm, &map);
+    VkImage rgba = make_image(srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, 0, NULL, 0, &im);
+    VkCommandBuffer cb = begin();
+    barrier(cb, rgba, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rgba, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+    barrier(cb, rgba, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy rb = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, rgba, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rb);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    submit(cb);
+    memcpy(out, map, n);
+    vkDestroyImage(dev, rgba, NULL);
+    vkFreeMemory(dev, im, NULL);
+    vkDestroyBuffer(dev, buf, NULL);
+    vkFreeMemory(dev, bm, NULL);
+}
+
+/* A typeless copy between textures of one BC family that differ in sRGB-ness (D3D allows it; the bits move unchanged),
+ * from the transcoded 256x256 image (ts) into the decoded 512x512 one (fd), every level one down, as UE4 streams: the
+ * destination's bytes must be the source's (a blit between the two would convert the colours; the server once skipped
+ * such copies). Under a budget that decodes both, a BC1 UNORM image is 16-bit on one side: that one is copied through a
+ * temporary RGBA8 UNORM image both ways too. tol: a 16-bit image on either side rounds (A1R5G5B5: 8). */
+static void test_mixed_srgb(VkFormat ts, VkFormat fd, const char *name, int tol)
+{
+    enum { BIG = 512, SMALL = 256, BM = 10, SM = 9 };
+    level ls[SM], ll[BM];
+    chain(ts, IMG_PHOTO, SMALL, SM, 3, ls);
+    chain(fd, IMG_ROUGH, BIG, BM, 11, ll); /* other colours first: a copy skipped shows */
+    VkDeviceMemory m[2];
+    VkImage T = make_image(ts, SMALL, SMALL, SM, 1, 0, NULL, 0, &m[0]), L = make_image(fd, BIG, BIG, BM, 1, 0, NULL, 0, &m[1]);
+    if (!T || !L) {
+        printf("FAIL %s: cannot create the images\n", name);
+        failures++;
+        return;
+    }
+    upload_levels(T, ts, ls, SM);
+    upload_levels(L, fd, ll, BM);
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy in[SM];
+    for (uint32_t i = 0; i < SM; i++) {
+        uint32_t w = SMALL >> i ? SMALL >> i : 1;
+        in[i] = (VkImageCopy){{VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, i + 1, 0, 1}, {0, 0, 0}, {w, w, 1}};
+    }
+    vkCmdCopyImage(cb, T, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, SM, in);
+    barrier_all(cb, L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    int srgb_s = ts == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || ts == VK_FORMAT_BC3_SRGB_BLOCK || ts == VK_FORMAT_BC7_SRGB_BLOCK;
+    int worst = 0, bad = 0;
+    uint8_t *a = malloc((size_t)SMALL * SMALL * 4), *b = malloc((size_t)SMALL * SMALL * 4);
+    for (uint32_t i = 0; i < SM; i++) {
+        uint32_t w = SMALL >> i ? SMALL >> i : 1;
+        read_level8(T, srgb_s, i, w, w, a);
+        read_level8(L, !srgb_s, i + 1, w, w, b);
+        for (size_t k = 0; k < (size_t)w * w * 4; k++) {
+            int d = abs((int)a[k] - (int)b[k]);
+            if (d > worst) worst = d;
+        }
+    }
+    bad = worst > tol;
+    printf("%s %s: the bytes copied as they are (worst channel difference %d, allowed %d)\n", bad ? "FAIL" : "PASS", name, worst, tol);
+    failures += bad;
+    free(a);
+    free(b);
+    vkDestroyImage(dev, T, NULL);
+    vkDestroyImage(dev, L, NULL);
+    vkFreeMemory(dev, m[0], NULL);
+    vkFreeMemory(dev, m[1], NULL);
+}
+
 static void test_mixed_copy(VkFormat f, const char *name, VkImageCreateFlags flags, const VkFormat *list, uint32_t nlist, int want_same)
 {
     enum { BIG = 512, SMALL = 256, BM = 10, SM = 9 };
@@ -3022,9 +3122,1085 @@ static void test_many_cbs(void)
     vkFreeMemory(dev, um, NULL);
 }
 
+/* ------------------------------------------------------------------ converter variants run directly (`bcn_check shaders`) */
+
+/* The bridge's decoders and transcoders run on the driver with no bridge between (any GPU: compute only, lavapipe
+ * too), a variant against another over the same blocks, the output buffers compared byte for byte:
+ *   one dispatch a run (REGION_TABLE, VKBRIDGE_BC_ONE_DISPATCH): each 4x4 converter over 23 regions of random size,
+ *   layers and row pitch, a dispatch a region by the plain variant against ONE dispatch of all by the table variant
+ *   and a dispatch a region by the table variant (pc.pad 0), every flag the converter takes, fast and default search;
+ *   the palette search (BC_PALETTE, VKBRIDGE_BC_PALETTE) against the texel search: test_palette. */
+static VkDescriptorSetLayout sv_dsl;
+static VkPipelineLayout sv_layout;
+static VkDescriptorPool sv_dpool;
+
+typedef struct sv_region {
+    uint32_t src_word, row_blocks, layer_blocks, dst_word, w, h, layers;
+} sv_region;
+
+static int sv_init(void)
+{
+    if (sv_layout) return 1;
+    VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 3, b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &sv_dsl, 1, &pr};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 256};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 256, 1, &ps};
+    return !vkCreateDescriptorSetLayout(dev, &dci, NULL, &sv_dsl) && !vkCreatePipelineLayout(dev, &plci, NULL, &sv_layout) &&
+           !vkCreateDescriptorPool(dev, &dpci, NULL, &sv_dpool);
+}
+
+/* code at search q (specialization constant 0; decoders have none) */
+static VkPipeline sv_pipe(const uint32_t *code, size_t size, uint32_t q)
+{
+    static struct {
+        const uint32_t *code;
+        uint32_t q;
+        VkPipeline p;
+    } c[256];
+    int k = 0;
+    for (; k < 256 && c[k].code; k++)
+        if (c[k].code == code && c[k].q == q) return c[k].p;
+    if (k == 256) return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size, code};
+    VkShaderModule sm;
+    if (vkCreateShaderModule(dev, &smci, NULL, &sm)) return VK_NULL_HANDLE;
+    VkSpecializationMapEntry me = {0, 0, 4};
+    VkSpecializationInfo si = {1, &me, 4, &q};
+    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
+                                        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", &si},
+                                        sv_layout, VK_NULL_HANDLE, 0};
+    VkPipeline p;
+    VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &p);
+    vkDestroyShaderModule(dev, sm, NULL);
+    if (r) return VK_NULL_HANDLE;
+    c[k].code = code, c[k].q = q, c[k].p = p;
+    return p;
+}
+
+/* The regions converted by p into dst: a dispatch each (mode 0: plain push constants; 2: the same through a table
+ * variant, pc.pad 0) or one dispatch of all (mode 1, the table in tab). The time (submit to idle) in *ms. */
+static int sv_run(VkPipeline p, VkBuffer src, VkBuffer dst, VkBuffer tab, void *tab_map, const sv_region *r, uint32_t n, uint32_t flags, int mode,
+                  double *ms)
+{
+    vkResetDescriptorPool(dev, sv_dpool, 0);
+    VkCommandBuffer cb = begin();
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, sv_dpool, 1, &sv_dsl};
+    VkDescriptorSet set;
+    if (vkAllocateDescriptorSets(dev, &dai, &set)) return 0;
+    VkDescriptorBufferInfo bi[3] = {{src, 0, VK_WHOLE_SIZE}, {dst, 0, VK_WHOLE_SIZE}, {tab, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wr[3];
+    for (uint32_t i = 0; i < 3; i++)
+        wr[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[i], NULL};
+    vkUpdateDescriptorSets(dev, 3, wr, 0, NULL);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, sv_layout, 0, 1, &set, 0, NULL);
+    if (mode == 1) {
+        uint32_t *t = tab_map, wg = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t bw = (r[i].w + 3) / 4, bh = (r[i].h + 3) / 4, wx = (bw + 7) / 8, wy = (bh + 7) / 8;
+            uint32_t e[8] = {r[i].src_word, r[i].row_blocks, r[i].layer_blocks, r[i].dst_word, r[i].w, r[i].h, wg, wx | (wy << 16)};
+            memcpy(t + 8 * i, e, sizeof(e));
+            wg += wx * wy * r[i].layers;
+        }
+        uint32_t pc[8] = {0, n, 0, flags, 0, 1, 0, 0};
+        vkCmdPushConstants(cb, sv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(cb, wg, 1, 1);
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t bw = (r[i].w + 3) / 4, bh = (r[i].h + 3) / 4;
+            uint32_t pc[8] = {r[i].src_word, r[i].row_blocks, r[i].layer_blocks, flags, r[i].dst_word, 0, r[i].w, r[i].h};
+            vkCmdPushConstants(cb, sv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(cb, (bw + 7) / 8, (bh + 7) / 8, r[i].layers);
+        }
+    }
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    submit(cb);
+    if (ms) *ms = ms_since(&t0);
+    return 1;
+}
+
+static void test_region_table(void)
+{
+    static const struct {
+        const char *name;
+        const uint32_t *plain, *table;
+        size_t plain_size, table_size;
+        uint32_t in, out; /* bytes a block in the source, in the scratch */
+        uint32_t flags[4], nflags, tx;
+    } v[] = {
+        {"BC1 decoder", spv_bc1, spv_bc1_t, sizeof(spv_bc1), sizeof(spv_bc1_t), 8, 64, {0, 1}, 2, 0},
+        {"BC1 16-bit decoder", spv_bc1_16, spv_bc1_16_t, sizeof(spv_bc1_16), sizeof(spv_bc1_16_t), 8, 32, {0, 1}, 2, 0},
+        {"BC2 decoder", spv_bc2, spv_bc2_t, sizeof(spv_bc2), sizeof(spv_bc2_t), 16, 64, {0}, 1, 0},
+        {"BC3 decoder", spv_bc3, spv_bc3_t, sizeof(spv_bc3), sizeof(spv_bc3_t), 16, 64, {0}, 1, 0},
+        {"BC4 decoder", spv_bc4, spv_bc4_t, sizeof(spv_bc4), sizeof(spv_bc4_t), 8, 16, {0, 2}, 2, 0},
+        {"BC5 decoder", spv_bc5, spv_bc5_t, sizeof(spv_bc5), sizeof(spv_bc5_t), 16, 32, {0, 2}, 2, 0},
+        {"BC6H decoder", spv_bc6h, spv_bc6h_t, sizeof(spv_bc6h), sizeof(spv_bc6h_t), 16, 128, {0, 2}, 2, 0},
+        {"BC7 decoder", spv_bc7, spv_bc7_t, sizeof(spv_bc7), sizeof(spv_bc7_t), 16, 64, {0}, 1, 0},
+        {"BC1 -> ETC2", spv_bc1_etc2, spv_bc1_etc2_t, sizeof(spv_bc1_etc2), sizeof(spv_bc1_etc2_t), 8, 8, {0, 1, 4, 5}, 4, 1},
+        {"BC1 -> ASTC", spv_bc1_astc, spv_bc1_astc_t, sizeof(spv_bc1_astc), sizeof(spv_bc1_astc_t), 8, 16, {0, 1}, 2, 1},
+        {"BC2 -> ASTC", spv_bc2_astc, spv_bc2_astc_t, sizeof(spv_bc2_astc), sizeof(spv_bc2_astc_t), 16, 16, {0}, 1, 1},
+        {"BC3 -> ASTC", spv_bc3_astc, spv_bc3_astc_t, sizeof(spv_bc3_astc), sizeof(spv_bc3_astc_t), 16, 16, {0}, 1, 1},
+        {"BC4 -> EAC", spv_bc4_eac, spv_bc4_eac_t, sizeof(spv_bc4_eac), sizeof(spv_bc4_eac_t), 8, 8, {0, 2}, 2, 1},
+        {"BC5 -> EAC", spv_bc5_eac, spv_bc5_eac_t, sizeof(spv_bc5_eac), sizeof(spv_bc5_eac_t), 16, 16, {0, 2}, 2, 1},
+        {"BC6H -> ASTC HDR", spv_bc6h_astc, spv_bc6h_astc_t, sizeof(spv_bc6h_astc), sizeof(spv_bc6h_astc_t), 16, 16, {0, 2}, 2, 1},
+        {"BC7 -> ASTC", spv_bc7_astc, spv_bc7_astc_t, sizeof(spv_bc7_astc), sizeof(spv_bc7_astc_t), 16, 16, {0}, 1, 1},
+    };
+    enum { NR = 23 };
+    if (!sv_init()) {
+        printf("FAIL one dispatch a run: no pipeline layout\n");
+        failures++;
+        return;
+    }
+    for (size_t k = 0; k < sizeof(v) / sizeof(v[0]); k++) {
+        /* the regions: random sizes (1-72 texels a side, so cut blocks and partial workgroups), 1-3 layers, rows of the
+         * source padded now and then, the source and scratch places apart with gaps */
+        sv_region r[NR];
+        uint32_t sw = 0, dw = 0;
+        for (int i = 0; i < NR; i++) {
+            uint32_t w = 1 + rnd() % 72, h = 1 + rnd() % 72, layers = 1 + rnd() % 3, pad = rnd() % 3 == 0 ? 1 + rnd() % 3 : 0;
+            uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, rb = bw + pad, lb = rb * (bh + (pad ? 1 : 0));
+            r[i] = (sv_region){sw, rb, lb, dw, w, h, layers};
+            sw += (lb * layers * v[k].in) / 4 + 4 * (rnd() % 3);
+            dw += (bw * bh * layers * v[k].out) / 4;
+            dw = (dw + 63) & ~63u;
+        }
+        VkDeviceSize sb = (VkDeviceSize)sw * 4 + 64, db = (VkDeviceSize)dw * 4 + 256;
+        VkDeviceMemory sm, tm, dm[3];
+        void *sp, *tp, *dp[3];
+        VkBuffer src = host_buffer(sb, &sm, &sp), tab = host_buffer(NR * 32, &tm, &tp), dst[3];
+        for (uint32_t i = 0; i < sb; i++) ((uint8_t *)sp)[i] = (uint8_t)rnd();
+        for (int j = 0; j < 3; j++) dst[j] = host_buffer(db, &dm[j], &dp[j]);
+        int bad = 0, ran = 0;
+        for (uint32_t q = 0; q < (v[k].tx ? 2u : 1u); q++)
+            for (uint32_t fi = 0; fi < v[k].nflags; fi++) {
+                VkPipeline pp = sv_pipe(v[k].plain, v[k].plain_size, q), pt = sv_pipe(v[k].table, v[k].table_size, q);
+                if (!pp || !pt) {
+                    bad = -1;
+                    break;
+                }
+                for (int j = 0; j < 3; j++) memset(dp[j], 0xa5, db);
+                if (!sv_run(pp, src, dst[0], tab, tp, r, NR, v[k].flags[fi], 0, NULL) || !sv_run(pt, src, dst[1], tab, tp, r, NR, v[k].flags[fi], 1, NULL) ||
+                    !sv_run(pt, src, dst[2], tab, tp, r, NR, v[k].flags[fi], 2, NULL)) {
+                    bad = -1;
+                    break;
+                }
+                ran++;
+                uint32_t written = 0; /* the plain variant wrote its output (an empty run would compare equal too) */
+                for (uint32_t at = 0; at < db; at++) written += ((uint8_t *)dp[0])[at] != 0xa5;
+                if (written < dw * 4 / 2) {
+                    printf("FAIL %s, one dispatch a run (flags %u, search %u): the plain variant wrote %u of %u bytes\n", v[k].name, v[k].flags[fi], q,
+                           written, dw * 4);
+                    bad++;
+                }
+                if (memcmp(dp[0], dp[1], db) || memcmp(dp[0], dp[2], db)) {
+                    uint32_t at = 0;
+                    while (at < db && ((uint8_t *)dp[0])[at] == ((uint8_t *)dp[1])[at] && ((uint8_t *)dp[0])[at] == ((uint8_t *)dp[2])[at]) at++;
+                    printf("FAIL %s, one dispatch a run (flags %u, search %u): output differs from a dispatch a region from byte %u\n", v[k].name,
+                           v[k].flags[fi], q, at);
+                    bad++;
+                }
+            }
+        if (bad < 0) printf("FAIL %s, one dispatch a run: cannot build or run the variants\n", v[k].name);
+        else if (!bad)
+            printf("PASS %s, one dispatch a run: %d regions (%u bytes of output) identical to a dispatch a region, %d flag/search sets\n", v[k].name,
+                   NR, dw * 4, ran);
+        failures += bad != 0;
+        vkDestroyBuffer(dev, src, NULL);
+        vkDestroyBuffer(dev, tab, NULL);
+        vkFreeMemory(dev, sm, NULL);
+        vkFreeMemory(dev, tm, NULL);
+        for (int j = 0; j < 3; j++) {
+            vkDestroyBuffer(dev, dst[j], NULL);
+            vkFreeMemory(dev, dm[j], NULL);
+        }
+    }
+}
+
+/* The palette search (BC_PALETTE, VKBRIDGE_BC_PALETTE) against the texel search over the same blocks: BC1 -> ETC2 and
+ * BC4 / BC5 -> EAC, every flag (BC1: alpha forced or not, punch-through or not; BC4 / BC5: signed or not), every search
+ * (fast, default, high), on the test images, random blocks and special ones (equal endpoints, the 3-colour / 6-value
+ * modes, extremes), as whole images and as regions cut by the image's edge (texels past it repeat the nearest inside),
+ * plain and with one dispatch a run (the _tp variants): every output byte must be the same. Then the time of each on
+ * a 1024x1024 photo (submit to idle, the fastest of 3). */
+static void pal_special(VkFormat f, uint8_t *b, int i)
+{
+    int bytes = block_bytes(f);
+    memset(b, 0, bytes);
+    uint8_t *c = f == VK_FORMAT_BC5_UNORM_BLOCK || f == VK_FORMAT_BC5_SNORM_BLOCK ? b : b; /* BC4 channel(s) at 0 (and 8) */
+    switch (i % 8) {
+    case 0: memset(b, 0xff, bytes); break;                     /* extremes */
+    case 1: c[0] = c[1] = (uint8_t)(rnd() & 0xff); break;      /* equal endpoints, every index 0 */
+    case 2: c[0] = 0x10, c[1] = 0xf0, memset(c + 2, 0xff, bytes - 2); break; /* e0 < e1: 3-colour / 6-value mode, top index */
+    case 3: c[0] = 0x80, c[1] = 0x80, memset(c + 2, 0x92, bytes - 2); break; /* the signed minimum (-128 -> -127) */
+    case 4: c[0] = 0xff, c[1] = 0x00, memset(c + 2, 0x49, bytes - 2); break;
+    case 5: c[0] = 0x00, c[1] = 0xff, memset(c + 2, 0xb6, bytes - 2); break;
+    case 6: for (int k = 0; k < bytes; k++) b[k] = (uint8_t)rnd(); c[0] = c[1]; break;
+    default: for (int k = 0; k < bytes; k++) b[k] = (uint8_t)rnd(); break;
+    }
+    if ((f == VK_FORMAT_BC5_UNORM_BLOCK || f == VK_FORMAT_BC5_SNORM_BLOCK) && i % 3 == 0) memcpy(b + 8, b, 8);
+}
+
+static void test_palette(void)
+{
+    static const struct {
+        const char *name;
+        VkFormat f;
+        const uint32_t *plain, *pal, *paltab;
+        size_t plain_size, pal_size, paltab_size;
+        uint32_t out, flags[4], nflags;
+    } v[] = {
+        {"BC1 -> ETC2", VK_FORMAT_BC1_RGBA_UNORM_BLOCK, spv_bc1_etc2, spv_bc1_etc2_p, spv_bc1_etc2_tp, sizeof(spv_bc1_etc2), sizeof(spv_bc1_etc2_p),
+         sizeof(spv_bc1_etc2_tp), 8, {1, 4, 0, 5}, 4},
+        {"BC4 -> EAC", VK_FORMAT_BC4_UNORM_BLOCK, spv_bc4_eac, spv_bc4_eac_p, spv_bc4_eac_tp, sizeof(spv_bc4_eac), sizeof(spv_bc4_eac_p),
+         sizeof(spv_bc4_eac_tp), 8, {0, 2}, 2},
+        {"BC5 -> EAC", VK_FORMAT_BC5_UNORM_BLOCK, spv_bc5_eac, spv_bc5_eac_p, spv_bc5_eac_tp, sizeof(spv_bc5_eac), sizeof(spv_bc5_eac_p),
+         sizeof(spv_bc5_eac_tp), 16, {0, 2}, 2},
+    };
+    if (!sv_init()) {
+        printf("FAIL palette: no pipeline layout\n");
+        failures++;
+        return;
+    }
+    enum { RB = 64 }; /* blocks a row of the corpus (256 texels) */
+    for (size_t k = 0; k < sizeof(v) / sizeof(v[0]); k++) {
+        VkFormat f = v[k].f;
+        int ib = block_bytes(f);
+        /* the corpus, rows of 64 blocks: each test image (64 rows), its signed twin's blocks are the same bytes, then
+         * 64 rows of random and special blocks */
+        static const int kinds1[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_CUT}, kinds4[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT},
+                         kinds5[] = {IMG_NORMAL, IMG_PHOTO, IMG_ROUGH};
+        const int *kinds = k == 0 ? kinds1 : k == 1 ? kinds4 : kinds5;
+        int nk = k == 0 ? 4 : 3;
+        uint32_t rows = (uint32_t)(nk + 1) * 64, nblk = rows * RB;
+        uint8_t *corpus = malloc((size_t)nblk * ib);
+        for (int i = 0; i < nk; i++) {
+            uint8_t *img = image_blocks(k == 0 && kinds[i] != IMG_ALPHA_CUT ? VK_FORMAT_BC1_RGB_UNORM_BLOCK : f, kinds[i], 256, 256, 0, 0);
+            memcpy(corpus + (size_t)i * 64 * RB * ib, img, (size_t)64 * RB * ib);
+            free(img);
+        }
+        for (uint32_t i = 0; i < 64 * RB; i++) pal_special(f, corpus + ((size_t)nk * 64 * RB + i) * ib, (int)i);
+        /* regions: the whole corpus, then cuts of it whose right and bottom edges fall inside blocks */
+        sv_region r[8];
+        uint32_t nr = 0, dw = 0;
+        r[nr++] = (sv_region){0, RB, RB * rows, 0, RB * 4, rows * 4, 1};
+        dw = (uint32_t)((uint64_t)RB * rows * v[k].out / 4);
+        static const uint32_t cw[7] = {253, 1, 2, 3, 130, 61, 255}, chh[7] = {255, 3, 1, 2, 66, 37, 254};
+        for (int i = 0; i < 7; i++) {
+            uint32_t row0 = (uint32_t)i * 41 % (rows - 64);
+            dw = (dw + 63) & ~63u;
+            r[nr++] = (sv_region){(uint32_t)((uint64_t)row0 * RB * ib / 4), RB, RB * rows, dw, cw[i], chh[i], 1};
+            dw += ((cw[i] + 3) / 4) * ((chh[i] + 3) / 4) * v[k].out / 4;
+        }
+        VkDeviceSize db = (VkDeviceSize)dw * 4 + 256;
+        VkDeviceMemory sm, tm, dm[3];
+        void *sp, *tp, *dp[3];
+        VkBuffer src = host_buffer((VkDeviceSize)nblk * ib, &sm, &sp), tab = host_buffer(8 * 32, &tm, &tp), dst[3];
+        memcpy(sp, corpus, (size_t)nblk * ib);
+        for (int j = 0; j < 3; j++) dst[j] = host_buffer(db, &dm[j], &dp[j]);
+        int bad = 0, sets = 0;
+        uint64_t blocks = 0;
+        for (uint32_t q = 0; q < 3 && bad >= 0; q++)
+            for (uint32_t fi = 0; fi < v[k].nflags; fi++) {
+                VkPipeline pp = sv_pipe(v[k].plain, v[k].plain_size, q), pq = sv_pipe(v[k].pal, v[k].pal_size, q),
+                           pt = sv_pipe(v[k].paltab, v[k].paltab_size, q);
+                for (int j = 0; j < 3; j++) memset(dp[j], 0xa5, db);
+                if (!pp || !pq || !pt || !sv_run(pp, src, dst[0], tab, tp, r, nr, v[k].flags[fi], 0, NULL) ||
+                    !sv_run(pq, src, dst[1], tab, tp, r, nr, v[k].flags[fi], 0, NULL) || !sv_run(pt, src, dst[2], tab, tp, r, nr, v[k].flags[fi], 1, NULL)) {
+                    printf("FAIL %s palette: cannot build or run the variants\n", v[k].name);
+                    bad = -1;
+                    break;
+                }
+                sets++;
+                uint32_t diff = 0, difft = 0, nb = (uint32_t)(db / v[k].out);
+                for (uint32_t i = 0; i < nb; i++) {
+                    diff += memcmp((uint8_t *)dp[0] + (size_t)i * v[k].out, (uint8_t *)dp[1] + (size_t)i * v[k].out, v[k].out) != 0;
+                    difft += memcmp((uint8_t *)dp[0] + (size_t)i * v[k].out, (uint8_t *)dp[2] + (size_t)i * v[k].out, v[k].out) != 0;
+                }
+                uint32_t written = 0;
+                for (VkDeviceSize at = 0; at < db; at++) written += ((uint8_t *)dp[0])[at] != 0xa5;
+                blocks += nb;
+                if (diff || difft || written < dw * 4 / 2) {
+                    printf("FAIL %s palette (flags %u, search %u): %u of %u blocks differ from the texel search, %u with one dispatch a run (%u bytes written)\n",
+                           v[k].name, v[k].flags[fi], q, diff, nb, difft, written);
+                    bad++;
+                }
+            }
+        if (!bad)
+            printf("PASS %s palette: %llu blocks in %d flag/search sets (test images, random and special blocks, whole and cut regions) "
+                   "identical to the texel search, with and without one dispatch a run\n",
+                   v[k].name, (unsigned long long)blocks, sets);
+        failures += bad != 0;
+        vkDestroyBuffer(dev, src, NULL);
+        vkDestroyBuffer(dev, tab, NULL);
+        vkFreeMemory(dev, sm, NULL);
+        vkFreeMemory(dev, tm, NULL);
+        for (int j = 0; j < 3; j++) {
+            vkDestroyBuffer(dev, dst[j], NULL);
+            vkFreeMemory(dev, dm[j], NULL);
+        }
+        free(corpus);
+        /* the time, on a 1024x1024 photo-like level (the 256x256 image repeated) */
+        uint8_t *big = image_blocks(k == 0 ? VK_FORMAT_BC1_RGB_UNORM_BLOCK : f, k == 2 ? IMG_NORMAL : IMG_PHOTO, 1024, 1024, 0, 0);
+        VkBuffer bs = host_buffer((VkDeviceSize)256 * 256 * ib, &sm, &sp), bd = host_buffer((VkDeviceSize)256 * 256 * v[k].out, &dm[0], &dp[0]);
+        memcpy(sp, big, (size_t)256 * 256 * ib);
+        sv_region one = {0, 256, 256 * 256, 0, 1024, 1024, 1};
+        for (uint32_t q = 0; q < 2; q++) {
+            double tp_ = 1e9, tq_ = 1e9, ms;
+            VkPipeline pp = sv_pipe(v[k].plain, v[k].plain_size, q), pq = sv_pipe(v[k].pal, v[k].pal_size, q);
+            for (int rep = 0; rep < 3 && pp && pq; rep++) {
+                if (sv_run(pp, bs, bd, bd, NULL, &one, 1, v[k].flags[0], 0, &ms) && ms < tp_) tp_ = ms;
+                if (sv_run(pq, bs, bd, bd, NULL, &one, 1, v[k].flags[0], 0, &ms) && ms < tq_) tq_ = ms;
+            }
+            printf("INFO %s %s search, 1024x1024: texels %.1f ms, palette %.1f ms (%.2fx)\n", v[k].name, q ? "default" : "fast", tp_, tq_,
+                   tq_ > 0 ? tp_ / tq_ : 0);
+        }
+        free(big);
+        vkDestroyBuffer(dev, bs, NULL);
+        vkDestroyBuffer(dev, bd, NULL);
+        vkFreeMemory(dev, sm, NULL);
+        vkFreeMemory(dev, dm[0], NULL);
+    }
+}
+
+/* VKBRIDGE_BC_FAST's BC1 -> ETC2 variants (BC_FAST, shaders/etc2_fast.glsl: the palette search with less state a thread)
+ * against today's palette variant, byte for byte: every flag BC1 takes (RGB, RGBA, punch-through), the fast, default and
+ * high searches, a dispatch a region (_pf) and one dispatch a run (_tpf, table and alone). The corpus: the test images,
+ * the palette test's special and random blocks, and blocks whose colours sit at the ends of the range (where the
+ * candidates clamp: the large tables, T mode's +-d); BCN_FAST_CORPUS=<dir>: also every *_bc1_*.bin there (real images,
+ * BC1 blocks as `bcn_check transcode corpus` takes them). Also the time on a 1024x1024 level (CPU here: a ratio only). */
+static void test_fast(void)
+{
+    const uint32_t flags[4] = {1, 4, 0, 5};
+    const VkFormat f = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    if (!sv_init()) {
+        printf("FAIL fast: no pipeline layout\n");
+        failures++;
+        return;
+    }
+    enum { RB = 64, IB = 8, OB = 8 };
+    static const int kinds[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_CUT};
+    const int nk = 4, nspecial = 64, nedge = 128;
+    uint32_t rows = (uint32_t)(nk * 64 + nspecial + nedge), nblk = rows * RB;
+    uint8_t *corpus = malloc((size_t)nblk * IB);
+    for (int i = 0; i < nk; i++) {
+        uint8_t *img = image_blocks(kinds[i] != IMG_ALPHA_CUT ? VK_FORMAT_BC1_RGB_UNORM_BLOCK : f, kinds[i], 256, 256, 0, 0);
+        memcpy(corpus + (size_t)i * 64 * RB * IB, img, (size_t)64 * RB * IB);
+        free(img);
+    }
+    uint8_t *b = corpus + (size_t)nk * 64 * RB * IB;
+    for (uint32_t i = 0; i < (uint32_t)nspecial * RB; i++) pal_special(f, b + (size_t)i * IB, (int)i);
+    b += (size_t)nspecial * RB * IB;
+    for (uint32_t i = 0; i < (uint32_t)nedge * RB; i++, b += IB) {
+        /* each channel of each endpoint near 0, near the top, or anywhere; both endpoint orders; random indices */
+        uint32_t c[2];
+        for (int e = 0; e < 2; e++) {
+            uint32_t r = rnd(), ch[3], top[3] = {31, 63, 31};
+            for (int k = 0; k < 3; k++) {
+                uint32_t sel = (r >> (2 * k)) & 3, j = (r >> (8 + 4 * k)) & 7;
+                ch[k] = sel == 0 ? j % (top[k] + 1) : sel == 1 ? top[k] - j % (top[k] + 1) : rnd() % (top[k] + 1);
+            }
+            c[e] = (ch[0] << 11) | (ch[1] << 5) | ch[2];
+        }
+        uint32_t w0 = c[0] | (c[1] << 16), w1 = rnd();
+        memcpy(b, &w0, 4);
+        memcpy(b + 4, &w1, 4);
+    }
+    sv_region r[8];
+    uint32_t nr = 0, dw = 0;
+    r[nr++] = (sv_region){0, RB, RB * rows, 0, RB * 4, rows * 4, 1};
+    dw = RB * rows * OB / 4;
+    static const uint32_t cw[7] = {253, 1, 2, 3, 130, 61, 255}, chh[7] = {255, 3, 1, 2, 66, 37, 254};
+    for (int i = 0; i < 7; i++) {
+        uint32_t row0 = (uint32_t)i * 53 % (rows - 64);
+        dw = (dw + 63) & ~63u;
+        r[nr++] = (sv_region){row0 * RB * IB / 4, RB, RB * rows, dw, cw[i], chh[i], 1};
+        dw += ((cw[i] + 3) / 4) * ((chh[i] + 3) / 4) * OB / 4;
+    }
+    VkDeviceSize db = (VkDeviceSize)dw * 4 + 256;
+    VkDeviceMemory sm, tm, dm[4];
+    void *sp, *tp, *dp[4];
+    VkBuffer src = host_buffer((VkDeviceSize)nblk * IB, &sm, &sp), tab = host_buffer(8 * 32, &tm, &tp), dst[4];
+    memcpy(sp, corpus, (size_t)nblk * IB);
+    for (int j = 0; j < 4; j++) dst[j] = host_buffer(db, &dm[j], &dp[j]);
+    int bad = 0, sets = 0;
+    uint64_t blocks = 0;
+    for (uint32_t q = 0; q < 3 && bad >= 0; q++)
+        for (uint32_t fi = 0; fi < 4; fi++) {
+            VkPipeline pr = sv_pipe(spv_bc1_etc2_p, sizeof(spv_bc1_etc2_p), q), pf = sv_pipe(spv_bc1_etc2_pf, sizeof(spv_bc1_etc2_pf), q),
+                       pt = sv_pipe(spv_bc1_etc2_tpf, sizeof(spv_bc1_etc2_tpf), q);
+            for (int j = 0; j < 4; j++) memset(dp[j], 0xa5, db);
+            if (!pr || !pf || !pt || !sv_run(pr, src, dst[0], tab, tp, r, nr, flags[fi], 0, NULL) || !sv_run(pf, src, dst[1], tab, tp, r, nr, flags[fi], 0, NULL) ||
+                !sv_run(pt, src, dst[2], tab, tp, r, nr, flags[fi], 1, NULL) || !sv_run(pt, src, dst[3], tab, tp, r, nr, flags[fi], 2, NULL)) {
+                printf("FAIL BC1 -> ETC2 fast: cannot build or run the variants\n");
+                bad = -1;
+                break;
+            }
+            sets++;
+            uint32_t diff[3] = {0, 0, 0}, nb = (uint32_t)(db / OB), written = 0;
+            for (uint32_t i = 0; i < nb; i++)
+                for (int j = 0; j < 3; j++) diff[j] += memcmp((uint8_t *)dp[0] + (size_t)i * OB, (uint8_t *)dp[j + 1] + (size_t)i * OB, OB) != 0;
+            for (VkDeviceSize at = 0; at < db; at++) written += ((uint8_t *)dp[0])[at] != 0xa5;
+            blocks += nb;
+            if (diff[0] || diff[1] || diff[2] || written < dw * 4 / 2) {
+                printf("FAIL BC1 -> ETC2 fast (flags %u, search %u): %u / %u / %u of %u blocks differ from the palette variant (a dispatch a "
+                       "region / one a run / the table variant alone; %u bytes written)\n", flags[fi], q, diff[0], diff[1], diff[2], nb, written);
+                bad++;
+            }
+        }
+    /* real images (BCN_FAST_CORPUS): each whole, every flag, the fast and default searches */
+    const char *cdir = getenv("BCN_FAST_CORPUS");
+    int files = 0;
+    if (cdir && *cdir && bad >= 0) {
+        DIR *d = opendir(cdir);
+        struct dirent *de;
+        while (d && (de = readdir(d))) {
+            unsigned w, h;
+            if (!strstr(de->d_name, "_bc1_") || sscanf(strstr(de->d_name, "_bc1_") + 5, "%ux%u", &w, &h) != 2 || w % 4 || h % 4) continue;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", cdir, de->d_name);
+            FILE *fp = fopen(path, "rb");
+            size_t n = (size_t)(w / 4) * (h / 4) * IB;
+            uint8_t *img = malloc(n);
+            size_t got = fp ? fread(img, 1, n, fp) : 0;
+            if (fp) fclose(fp);
+            if (got != n) {
+                free(img);
+                continue;
+            }
+            files++;
+            VkDeviceMemory im, om[2];
+            void *ip, *op[2];
+            VkBuffer ib = host_buffer(n, &im, &ip), ob[2];
+            memcpy(ip, img, n);
+            for (int j = 0; j < 2; j++) ob[j] = host_buffer(n, &om[j], &op[j]);
+            sv_region one = {0, w / 4, (w / 4) * (h / 4), 0, w, h, 1};
+            for (uint32_t q = 0; q < 2; q++)
+                for (uint32_t fi = 0; fi < 4; fi++) {
+                    VkPipeline pr = sv_pipe(spv_bc1_etc2_p, sizeof(spv_bc1_etc2_p), q), pf = sv_pipe(spv_bc1_etc2_pf, sizeof(spv_bc1_etc2_pf), q);
+                    memset(op[0], 0xa5, n), memset(op[1], 0x5a, n);
+                    if (!sv_run(pr, ib, ob[0], ib, NULL, &one, 1, flags[fi], 0, NULL) || !sv_run(pf, ib, ob[1], ib, NULL, &one, 1, flags[fi], 0, NULL)) {
+                        bad++;
+                        continue;
+                    }
+                    uint32_t dif = 0;
+                    for (size_t i = 0; i < n / OB; i++) dif += memcmp((uint8_t *)op[0] + i * OB, (uint8_t *)op[1] + i * OB, OB) != 0;
+                    blocks += n / OB;
+                    sets++;
+                    if (dif) {
+                        printf("FAIL BC1 -> ETC2 fast, %s (flags %u, search %u): %u of %zu blocks differ\n", de->d_name, flags[fi], q, dif, n / OB);
+                        bad++;
+                    }
+                }
+            vkDestroyBuffer(dev, ib, NULL);
+            vkFreeMemory(dev, im, NULL);
+            for (int j = 0; j < 2; j++) {
+                vkDestroyBuffer(dev, ob[j], NULL);
+                vkFreeMemory(dev, om[j], NULL);
+            }
+            free(img);
+        }
+        if (d) closedir(d);
+        if (!files) {
+            printf("FAIL BC1 -> ETC2 fast: BCN_FAST_CORPUS=%s holds no *_bc1_<w>x<h>.bin\n", cdir);
+            bad++;
+        }
+    }
+    if (!bad)
+        printf("PASS BC1 -> ETC2 fast: %llu blocks in %d flag/search sets (test images, special, random and range-end blocks, whole "
+               "and cut regions%s) identical to the palette variant, a dispatch a region and one a run\n",
+               (unsigned long long)blocks, sets, files ? ", real images" : "");
+    failures += bad != 0;
+    vkDestroyBuffer(dev, src, NULL);
+    vkDestroyBuffer(dev, tab, NULL);
+    vkFreeMemory(dev, sm, NULL);
+    vkFreeMemory(dev, tm, NULL);
+    for (int j = 0; j < 4; j++) {
+        vkDestroyBuffer(dev, dst[j], NULL);
+        vkFreeMemory(dev, dm[j], NULL);
+    }
+    free(corpus);
+    /* the time on a 1024x1024 photo-like level (the 256x256 image repeated): lavapipe runs on the CPU, so a ratio only */
+    uint8_t *big = image_blocks(VK_FORMAT_BC1_RGB_UNORM_BLOCK, IMG_PHOTO, 1024, 1024, 0, 0);
+    VkBuffer bs = host_buffer((VkDeviceSize)256 * 256 * IB, &sm, &sp), bd = host_buffer((VkDeviceSize)256 * 256 * OB, &dm[0], &dp[0]);
+    memcpy(sp, big, (size_t)256 * 256 * IB);
+    sv_region one = {0, 256, 256 * 256, 0, 1024, 1024, 1};
+    for (uint32_t q = 0; q < 2; q++) {
+        double tr = 1e9, tf = 1e9, ms;
+        VkPipeline pr = sv_pipe(spv_bc1_etc2_p, sizeof(spv_bc1_etc2_p), q), pf = sv_pipe(spv_bc1_etc2_pf, sizeof(spv_bc1_etc2_pf), q);
+        for (int rep = 0; rep < 5 && pr && pf; rep++) {
+            if (sv_run(pr, bs, bd, bd, NULL, &one, 1, 1, 0, &ms) && ms < tr) tr = ms;
+            if (sv_run(pf, bs, bd, bd, NULL, &one, 1, 1, 0, &ms) && ms < tf) tf = ms;
+        }
+        printf("INFO BC1 -> ETC2 %s search, 1024x1024: palette %.1f ms, fast %.1f ms (%.2fx)\n", q ? "default" : "fast", tr, tf, tf > 0 ? tr / tf : 0);
+    }
+    free(big);
+    vkDestroyBuffer(dev, bs, NULL);
+    vkDestroyBuffer(dev, bd, NULL);
+    vkFreeMemory(dev, sm, NULL);
+    vkFreeMemory(dev, dm[0], NULL);
+}
+
+/* Two BC7 -> ASTC 4x4 outputs of the same regions (test_fast7) against the BC7 texels (bcdec), texels inside each region
+ * only: a = today's variant, b = a fast one. Why not only byte for byte: both encoders are float code (power iteration,
+ * inversesqrt, a least-squares refit, error sums, candidates by strict <) without `precise`, so Vulkan lets a driver
+ * contract a * b + c into an FMA, or not, per operation, and whether it does follows the code's shape, which is what the
+ * fast variant changed. Identical bits then hold where the compiler evaluates both shapes alike (Mesa 26.1 lavapipe), not on
+ * every conformant driver (Mesa 26.0.8 lavapipe, GitHub's ubuntu-26.04 runner: 5281 of 44832 blocks at search 2), nor
+ * promised on Mali / PowerVR. A near tie decided the other way picks another candidate of about the same error; a real
+ * encoder fault (a wrong partition, weights, endpoints or edge) does not, which these numbers show. */
+typedef struct f7_quality {
+    uint32_t blocks, diff, undec_a, undec_b, worse;   /* blocks; differing; undecodable in a / b; differing, b's error higher */
+    double se_a, se_b, n, dse_a, dse_b, dn;           /* squared error (8-bit units) and channel values: all, differing blocks */
+    double max_a, max_b, worst;                       /* largest channel error in differing blocks; largest block SSE b - a */
+} f7_quality;
+
+static void fast7_quality(const uint8_t *src, const sv_region *r, uint32_t nr, const uint8_t *a, const uint8_t *b, f7_quality *q)
+{
+    memset(q, 0, sizeof(*q));
+    for (uint32_t k = 0; k < nr; k++) {
+        uint32_t bw = (r[k].w + 3) / 4, bh = (r[k].h + 3) / 4;
+        for (uint32_t by = 0; by < bh; by++)
+            for (uint32_t bx = 0; bx < bw; bx++) {
+                const uint8_t *s = src + ((size_t)r[k].src_word / 4 + (size_t)by * r[k].row_blocks + bx) * 16;
+                size_t o = ((size_t)r[k].dst_word / 4 + (size_t)by * bw + bx) * 16;
+                uint8_t px[16 * 4];
+                float fa[16][4], fb[16][4];
+                bcdec_bc7(s, px, 16);
+                int ok_a = astc_decode_ex(a + o, fa, 1), ok_b = astc_decode_ex(b + o, fb, 1), d = memcmp(a + o, b + o, 16) != 0;
+                q->blocks++;
+                q->diff += d;
+                q->undec_a += !ok_a;
+                q->undec_b += !ok_b;
+                if (!ok_a || !ok_b) continue;
+                double ea = 0, eb = 0, ma = 0, mb = 0, n = 0;
+                for (int t = 0; t < 16; t++) {
+                    if (bx * 4 + (t & 3) >= r[k].w || by * 4 + (t >> 2) >= r[k].h) continue;
+                    for (int c = 0; c < 4; c++, n++) {
+                        double va = fa[t][c] * 255.0 - px[t * 4 + c], vb = fb[t][c] * 255.0 - px[t * 4 + c];
+                        ea += va * va, eb += vb * vb;
+                        if (fabs(va) > ma) ma = fabs(va);
+                        if (fabs(vb) > mb) mb = fabs(vb);
+                    }
+                }
+                q->se_a += ea, q->se_b += eb, q->n += n;
+                if (!d) continue;
+                q->dse_a += ea, q->dse_b += eb, q->dn += n;
+                q->worse += eb > ea;
+                if (ma > q->max_a) q->max_a = ma;
+                if (mb > q->max_b) q->max_b = mb;
+                if (eb - ea > q->worst) q->worst = eb - ea;
+            }
+    }
+}
+
+/* Where a fast variant's bytes differ from today's: still a pass, with a NOTE and the numbers, when every block decodes and
+ * the fast variant is no worse than today's beyond a near tie: over the whole set PSNR within F7_DB of today's, over the
+ * differing blocks the squared error within F7_REL of today's, and no block's squared error more than F7_BLOCK over
+ * today's (64 values 16 off each; a wrong partition, endpoint or weight costs far more). Else a FAIL with the same numbers.
+ * Measured on Mesa 26.0.8 lavapipe (2026-11-12, search 2, flags 0 and 32): 5281 of 44756 blocks differ, PSNR 32.902 today /
+ * 32.909 fast, differing blocks' SSE 8585655 / 8433985 (fast higher on 2129, lower or equal on 3152), worst block +3289.
+ * Returns 1 on a fail. */
+#define F7_DB 0.05
+#define F7_REL 0.05
+#define F7_BLOCK 16384.0
+static int fast7_judge(const char *what, const f7_quality *q)
+{
+    double pa = psnr(q->se_a, (long)q->n, 255), pb = psnr(q->se_b, (long)q->n, 255), da = psnr(q->dse_a, (long)q->dn, 255),
+           db = psnr(q->dse_b, (long)q->dn, 255);
+    int bad = !q->blocks || q->undec_a || q->undec_b || pb < pa - F7_DB || q->dse_b > q->dse_a * (1 + F7_REL) || q->worst > F7_BLOCK;
+    printf("%s BC7 -> ASTC fast, %s: %u of %u blocks differ from today's variant; all blocks PSNR today %.3f / fast %.3f dB; "
+           "differing blocks PSNR %.2f / %.2f dB, SSE %.0f / %.0f (fast higher on %u, lower or equal on %u; worst block +%.0f), "
+           "largest channel error %.1f / %.1f; undecodable %u / %u%s\n",
+           bad ? "FAIL" : "NOTE", what, q->diff, q->blocks, pa, pb, da, db, q->dse_a, q->dse_b, q->worse, q->diff - q->worse, q->worst,
+           q->max_a, q->max_b, q->undec_a, q->undec_b,
+           bad ? "" : " (near ties the driver's float rounding decided the other way; within the quality bounds)");
+    return bad;
+}
+
+/* VKBRIDGE_BC_FAST's BC7 -> ASTC variants (BC_FAST, shaders/astc_fast.glsl: the same encoder with less state a thread)
+ * against today's spv_bc7_astc, byte for byte: the fast, default and high searches, flags 0 and 32, a dispatch a region
+ * (_f) and one dispatch a run (_tf, table and alone). The corpus: the test images (photo, rough, gradient, soft and cut
+ * alpha, normals: modes 6 and 1 as bcn_check's encoder makes them), the same with random indices (their colours, any
+ * texel order), random blocks of every mode (cycled; and at random, with the reserved mode: every partition, rotation and
+ * index selection), flat blocks of every mode (void-extent), whole and cut regions (texels past the edge); and with
+ * BCN_FAST7_CORPUS=<dir> every *_rgba_<w>x<h>.bin there (real images, RGBA8 rows, encoded to BC7 here). Also the time on a
+ * 1024x1024 level (CPU here: a ratio only). */
+static void test_fast7(void)
+{
+    const uint32_t flags[2] = {0, 32};
+    const VkFormat f = VK_FORMAT_BC7_UNORM_BLOCK;
+    if (!sv_init()) {
+        printf("FAIL fast7: no pipeline layout\n");
+        failures++;
+        return;
+    }
+    enum { RB = 64, IB = 16, OB = 16 };
+    static const int kinds[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_SOFT, IMG_ALPHA_CUT, IMG_NORMAL};
+    const int nk = 6, nmix = 64, ncyc = 64, nrand = 32, nflat = 16;
+    uint32_t rows = (uint32_t)(nk * 64 + nmix + ncyc + nrand + nflat), nblk = rows * RB;
+    uint8_t *corpus = malloc((size_t)nblk * IB), *b = corpus;
+    for (int i = 0; i < nk; i++, b += (size_t)64 * RB * IB) {
+        uint8_t *img = image_blocks(f, kinds[i], 256, 256, 0, 0);
+        memcpy(b, img, (size_t)64 * RB * IB);
+        free(img);
+    }
+    for (uint32_t i = 0; i < (uint32_t)nmix * RB; i++, b += IB) {
+        /* an image block (mode 6 or 1) with random index bits: its colours, any texel order */
+        memcpy(b, corpus + (size_t)(rnd() % (uint32_t)(nk * 64 * RB)) * IB, IB);
+        for (int k = 11; k < 16; k++) b[k] ^= (uint8_t)rnd();
+    }
+    layout_blocks(f, b, ncyc * RB, LAYOUT_CYCLED, 0, NULL);
+    b += (size_t)ncyc * RB * IB;
+    layout_blocks(f, b, nrand * RB, LAYOUT_RANDOM, 0, NULL);
+    b += (size_t)nrand * RB * IB;
+    for (uint32_t i = 0; i < (uint32_t)nflat * RB; i++, b += IB) {
+        uint8_t c[4] = {(uint8_t)rnd(), (uint8_t)rnd(), (uint8_t)rnd(), (uint8_t)(i & 1 ? 255 : rnd())};
+        bc7_flat_block(b, (int)(i % 9), c);
+    }
+    sv_region r[8];
+    uint32_t nr = 0, dw = 0;
+    r[nr++] = (sv_region){0, RB, RB * rows, 0, RB * 4, rows * 4, 1};
+    dw = RB * rows * OB / 4;
+    static const uint32_t cw[7] = {253, 1, 2, 3, 130, 61, 255}, chh[7] = {255, 3, 1, 2, 66, 37, 254};
+    for (int i = 0; i < 7; i++) {
+        uint32_t row0 = (uint32_t)i * 101 % (rows - 64);
+        dw = (dw + 63) & ~63u;
+        r[nr++] = (sv_region){row0 * RB * IB / 4, RB, RB * rows, dw, cw[i], chh[i], 1};
+        dw += ((cw[i] + 3) / 4) * ((chh[i] + 3) / 4) * OB / 4;
+    }
+    VkDeviceSize db = (VkDeviceSize)dw * 4 + 256;
+    VkDeviceMemory sm, tm, dm[4];
+    void *sp, *tp, *dp[4];
+    VkBuffer src = host_buffer((VkDeviceSize)nblk * IB, &sm, &sp), tab = host_buffer(8 * 32, &tm, &tp), dst[4];
+    memcpy(sp, corpus, (size_t)nblk * IB);
+    for (int j = 0; j < 4; j++) dst[j] = host_buffer(db, &dm[j], &dp[j]);
+    int bad = 0, sets = 0, notes = 0;
+    uint64_t blocks = 0;
+    for (uint32_t q = 0; q < 3 && bad >= 0; q++)
+        for (uint32_t fi = 0; fi < 2; fi++) {
+            VkPipeline pr = sv_pipe(spv_bc7_astc, sizeof(spv_bc7_astc), q), pf = sv_pipe(spv_bc7_astc_f, sizeof(spv_bc7_astc_f), q),
+                       pt = sv_pipe(spv_bc7_astc_tf, sizeof(spv_bc7_astc_tf), q);
+            for (int j = 0; j < 4; j++) memset(dp[j], 0xa5, db);
+            if (!pr || !pf || !pt || !sv_run(pr, src, dst[0], tab, tp, r, nr, flags[fi], 0, NULL) || !sv_run(pf, src, dst[1], tab, tp, r, nr, flags[fi], 0, NULL) ||
+                !sv_run(pt, src, dst[2], tab, tp, r, nr, flags[fi], 1, NULL) || !sv_run(pt, src, dst[3], tab, tp, r, nr, flags[fi], 2, NULL)) {
+                printf("FAIL BC7 -> ASTC fast: cannot build or run the variants\n");
+                bad = -1;
+                break;
+            }
+            sets++;
+            uint32_t diff[3] = {0, 0, 0}, nb = (uint32_t)(db / OB), written = 0;
+            /* BCN_FAST7_BREAK=<n> (a check of this check): every n-th block of the fast outputs replaced by its neighbour, as a
+             * shifted row or a wrong block would be; must FAIL */
+            const char *brk = getenv("BCN_FAST7_BREAK");
+            for (uint32_t i = 0, k = brk ? (uint32_t)atoi(brk) : 0; k && i + 1 < nb; i += k)
+                for (int j = 1; j < 4; j++) memcpy((uint8_t *)dp[j] + (size_t)i * OB, (uint8_t *)dp[j] + (size_t)(i + 1) * OB, OB);
+            for (uint32_t i = 0; i < nb; i++)
+                for (int j = 0; j < 3; j++) diff[j] += memcmp((uint8_t *)dp[0] + (size_t)i * OB, (uint8_t *)dp[j + 1] + (size_t)i * OB, OB) != 0;
+            for (VkDeviceSize at = 0; at < db; at++) written += ((uint8_t *)dp[0])[at] != 0xa5;
+            blocks += nb;
+            if (written < dw * 4 / 2) {
+                printf("FAIL BC7 -> ASTC fast (flags %u, search %u): today's variant wrote %u bytes of %u\n", flags[fi], q, written, dw * 4);
+                bad++;
+            } else if (!diff[0] && !diff[1] && !diff[2]) {
+                /* identical: the quality both have, once a search (shows the decoder the NOTE path uses works on this run) */
+                f7_quality fq;
+                fast7_quality(corpus, r, nr, dp[0], dp[1], &fq);
+                if (fi == 0)
+                    printf("INFO BC7 -> ASTC fast (search %u): identical to today's variant, %u blocks PSNR %.3f dB against the BC7 "
+                           "texels, undecodable %u\n", q, fq.blocks, psnr(fq.se_a, (long)fq.n, 255), fq.undec_a);
+            } else {
+                /* bytes differ: judged by quality against the BC7 texels (fast7_quality: why identity is not a given) */
+                static const char *vn[3] = {"a dispatch a region", "one a run", "the table variant alone"};
+                for (int j = 0; j < 3; j++) {
+                    if (!diff[j]) continue;
+                    f7_quality fq;
+                    char what[96];
+                    fast7_quality(corpus, r, nr, dp[0], dp[j + 1], &fq);
+                    snprintf(what, sizeof(what), "flags %u, search %u, %s", flags[fi], q, vn[j]);
+                    if (fast7_judge(what, &fq)) bad++;
+                    else notes++;
+                }
+            }
+        }
+    /* real images (BCN_FAST7_CORPUS): RGBA8 crops encoded to BC7 here, each whole, the three searches */
+    const char *cdir = getenv("BCN_FAST7_CORPUS");
+    int files = 0;
+    if (cdir && *cdir && bad >= 0) {
+        DIR *d = opendir(cdir);
+        struct dirent *de;
+        while (d && (de = readdir(d))) {
+            unsigned w, h;
+            if (!strstr(de->d_name, "_rgba_") || sscanf(strstr(de->d_name, "_rgba_") + 6, "%ux%u", &w, &h) != 2 || w % 4 || h % 4) continue;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", cdir, de->d_name);
+            FILE *fp = fopen(path, "rb");
+            size_t npx = (size_t)w * h * 4, n = (size_t)(w / 4) * (h / 4) * IB;
+            uint8_t *rgba = malloc(npx), *img = malloc(n);
+            size_t got = fp ? fread(rgba, 1, npx, fp) : 0;
+            if (fp) fclose(fp);
+            if (got != npx) {
+                free(rgba);
+                free(img);
+                continue;
+            }
+            for (unsigned by = 0; by < h / 4; by++)
+                for (unsigned bx = 0; bx < w / 4; bx++) {
+                    uint8_t px[16][4];
+                    for (int t = 0; t < 16; t++) memcpy(px[t], rgba + (((size_t)(by * 4 + (t >> 2)) * w) + bx * 4 + (t & 3)) * 4, 4);
+                    enc_block(f, px, IMG_PHOTO, (int)bx, (int)by, img + ((size_t)by * (w / 4) + bx) * IB);
+                }
+            free(rgba);
+            files++;
+            VkDeviceMemory im, om[2];
+            void *ip, *op[2];
+            VkBuffer ib = host_buffer(n, &im, &ip), ob[2];
+            memcpy(ip, img, n);
+            for (int j = 0; j < 2; j++) ob[j] = host_buffer(n, &om[j], &op[j]);
+            sv_region one = {0, w / 4, (w / 4) * (h / 4), 0, w, h, 1};
+            for (uint32_t q = 0; q < 3; q++) {
+                VkPipeline pr = sv_pipe(spv_bc7_astc, sizeof(spv_bc7_astc), q), pf = sv_pipe(spv_bc7_astc_f, sizeof(spv_bc7_astc_f), q);
+                memset(op[0], 0xa5, n), memset(op[1], 0x5a, n);
+                if (!sv_run(pr, ib, ob[0], ib, NULL, &one, 1, 0, 0, NULL) || !sv_run(pf, ib, ob[1], ib, NULL, &one, 1, 0, 0, NULL)) {
+                    bad++;
+                    continue;
+                }
+                uint32_t dif = 0;
+                for (size_t i = 0; i < n / OB; i++) dif += memcmp((uint8_t *)op[0] + i * OB, (uint8_t *)op[1] + i * OB, OB) != 0;
+                blocks += n / OB;
+                sets++;
+                if (dif) {
+                    f7_quality fq;
+                    char what[300];
+                    fast7_quality(img, &one, 1, op[0], op[1], &fq);
+                    snprintf(what, sizeof(what), "%s (search %u)", de->d_name, q);
+                    if (fast7_judge(what, &fq)) bad++;
+                    else notes++;
+                }
+            }
+            vkDestroyBuffer(dev, ib, NULL);
+            vkFreeMemory(dev, im, NULL);
+            for (int j = 0; j < 2; j++) {
+                vkDestroyBuffer(dev, ob[j], NULL);
+                vkFreeMemory(dev, om[j], NULL);
+            }
+            free(img);
+        }
+        if (d) closedir(d);
+        if (!files) {
+            printf("FAIL BC7 -> ASTC fast: BCN_FAST7_CORPUS=%s holds no *_rgba_<w>x<h>.bin\n", cdir);
+            bad++;
+        }
+    }
+    if (!bad && !notes)
+        printf("PASS BC7 -> ASTC fast: %llu blocks in %d flag/search sets (test images, their colours in any order, every mode cycled "
+               "and at random, flat blocks, whole and cut regions%s) identical to today's variant, a dispatch a region and one a run\n",
+               (unsigned long long)blocks, sets, files ? ", real images" : "");
+    else if (!bad)
+        printf("PASS BC7 -> ASTC fast: %llu blocks in %d flag/search sets%s, a dispatch a region and one a run: identical to today's "
+               "variant but for the %d NOTE set(s) above, within the quality bounds (all blocks' PSNR within %.2f dB of today's, the "
+               "differing blocks' error within %.0f%%, no block more than %.0f over)\n",
+               (unsigned long long)blocks, sets, files ? " (and real images)" : "", notes, F7_DB, F7_REL * 100, F7_BLOCK);
+    failures += bad != 0;
+    vkDestroyBuffer(dev, src, NULL);
+    vkDestroyBuffer(dev, tab, NULL);
+    vkFreeMemory(dev, sm, NULL);
+    vkFreeMemory(dev, tm, NULL);
+    for (int j = 0; j < 4; j++) {
+        vkDestroyBuffer(dev, dst[j], NULL);
+        vkFreeMemory(dev, dm[j], NULL);
+    }
+    free(corpus);
+    /* the time on a 1024x1024 level (the 256x256 photo-like image with soft alpha, repeated): lavapipe runs on the CPU, so a
+     * ratio only */
+    uint8_t *big = image_blocks(f, IMG_PHOTO, 1024, 1024, 0, 0);
+    VkBuffer bs = host_buffer((VkDeviceSize)256 * 256 * IB, &sm, &sp), bd = host_buffer((VkDeviceSize)256 * 256 * OB, &dm[0], &dp[0]);
+    memcpy(sp, big, (size_t)256 * 256 * IB);
+    sv_region one = {0, 256, 256 * 256, 0, 1024, 1024, 1};
+    for (uint32_t q = 0; q < 2; q++) {
+        double tr = 1e9, tf = 1e9, ms;
+        VkPipeline pr = sv_pipe(spv_bc7_astc, sizeof(spv_bc7_astc), q), pf = sv_pipe(spv_bc7_astc_f, sizeof(spv_bc7_astc_f), q);
+        for (int rep = 0; rep < 5 && pr && pf; rep++) {
+            if (sv_run(pr, bs, bd, bd, NULL, &one, 1, 0, 0, &ms) && ms < tr) tr = ms;
+            if (sv_run(pf, bs, bd, bd, NULL, &one, 1, 0, 0, &ms) && ms < tf) tf = ms;
+        }
+        printf("INFO BC7 -> ASTC %s search, 1024x1024: today %.1f ms, fast %.1f ms (%.2fx)\n", q ? "default" : "fast", tr, tf, tf > 0 ? tr / tf : 0);
+    }
+    free(big);
+    vkDestroyBuffer(dev, bs, NULL);
+    vkDestroyBuffer(dev, bd, NULL);
+    vkFreeMemory(dev, sm, NULL);
+    vkFreeMemory(dev, dm[0], NULL);
+}
+
+/* ------------------------------------------------------------------ alpha-tested foliage (a player log, Saints Row IV)
+ *
+ * `bcn_check transcode alpha`: leaves on transparent texels, as alpha-tested foliage cards are made: alpha 0 or 255
+ * with anti-aliased edge texels (4x4 supersampled coverage), the transparent texels' RGB a pale fill (or black), and
+ * the whole mip chain box-filtered from it (the small levels' alpha is mostly between 0 and 1). Each level is
+ * encoded here as BC1 RGBA (punch-through at 128), BC2, BC3 and BC7 (mode 5, alpha its own channel, as encoders
+ * put cut-out foliage), uploaded, transcoded by the bridge (ETC2 RGB8A1 / ASTC 4x4) and read back. A game's alpha
+ * test keeps a texel when alpha >= ref (0.5 here): a texel whose BC alpha is clearly on one side of the test
+ * (<= 0.25 or >= 0.75) and comes out on the other is a hole in a leaf or, worse, a transparent texel drawn with its
+ * fill colour (a "ghost": the pale halo in the player's shots). Native BC has none by definition (the reference
+ * IS the BC decode); the transcode must have none either. Flips of anti-aliased texels near the ref (within
+ * 0.25 of it) are counted and printed, not failed: they move an edge by under a texel. */
+static int alpha_only;
+
+/* BC7 mode 5 (rotation 0): RGB 7-bit endpoints with 2-bit indices, alpha 8-bit endpoints with its own 2-bit indices. */
+static void enc_bc7_mode5(const float px[16][4], uint8_t *out)
+{
+    static const int w2[4] = {0, 21, 43, 64};
+    float lo[4], hi[4];
+    axis_ends(px, NULL, 3, lo, hi);
+    int c[2][3], a[2] = {255, 0};
+    for (int k = 0; k < 3; k++) c[0][k] = (int)lroundf(lo[k] * 127 / 255), c[1][k] = (int)lroundf(hi[k] * 127 / 255);
+    for (int t = 0; t < 16; t++) a[0] = px[t][3] < a[0] ? (int)px[t][3] : a[0], a[1] = px[t][3] > a[1] ? (int)px[t][3] : a[1];
+    float e[2][3];
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 3; k++) e[i][k] = (float)((c[i][k] << 1) | (c[i][k] >> 6));
+    int ci[16], ai[16];
+    for (int t = 0; t < 16; t++) {
+        float be = 1e30f, bea = 1e30f;
+        for (int j = 0; j < 4; j++) {
+            float d = 0;
+            for (int k = 0; k < 3; k++) {
+                float v = (e[0][k] * (64 - w2[j]) + e[1][k] * w2[j] + 32) / 64;
+                d += (px[t][k] - v) * (px[t][k] - v);
+            }
+            if (d < be) be = d, ci[t] = j;
+            float va = (float)((a[0] * (64 - w2[j]) + a[1] * w2[j] + 32) >> 6);
+            if (fabsf(px[t][3] - va) < bea) bea = fabsf(px[t][3] - va), ai[t] = j;
+        }
+    }
+    /* anchor (texel 0) index msb 0: swap the endpoints and invert */
+    if (ci[0] & 2) {
+        for (int k = 0; k < 3; k++) { int x = c[0][k]; c[0][k] = c[1][k]; c[1][k] = x; }
+        for (int t = 0; t < 16; t++) ci[t] = 3 - ci[t];
+    }
+    if (ai[0] & 2) {
+        int x = a[0]; a[0] = a[1]; a[1] = x;
+        for (int t = 0; t < 16; t++) ai[t] = 3 - ai[t];
+    }
+    memset(out, 0, 16);
+    int pos = 0;
+    bits_put(out, &pos, 6, 32); /* mode 5 */
+    bits_put(out, &pos, 2, 0);  /* rotation */
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < 2; i++) bits_put(out, &pos, 7, (uint32_t)c[i][k]);
+    bits_put(out, &pos, 8, (uint32_t)a[0]);
+    bits_put(out, &pos, 8, (uint32_t)a[1]);
+    for (int t = 0; t < 16; t++) bits_put(out, &pos, t ? 2 : 1, (uint32_t)ci[t]);
+    for (int t = 0; t < 16; t++) bits_put(out, &pos, t ? 2 : 1, (uint32_t)ai[t]);
+}
+
+/* The foliage image, S x S, 8-bit RGBA: leaves where a noise field is over 0.5 (4x4 supersampled: anti-aliased
+ * edges), green with detail; transparent texels pale (fill 1), black (fill 0) or noise (fill 2). */
+static void foliage(uint8_t *img, int S, int fill)
+{
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++) {
+            int cov = 0;
+            for (int sy = 0; sy < 4; sy++)
+                for (int sx = 0; sx < 4; sx++) {
+                    float fx = x + (sx + 0.5f) / 4, fy = y + (sy + 0.5f) / 4;
+                    cov += fbm(fx / 9.0f, fy / 9.0f, 97, 3) + 0.25f * (fbm(fx / 2.5f, fy / 2.5f, 101, 2) - 0.5f) > 0.52f;
+                }
+            float d = fbm(x / 3.0f, y / 3.0f, 103, 2) - 0.5f, l = fbm(x / 24.0f, y / 24.0f, 107, 3);
+            uint8_t *p = img + ((size_t)y * S + x) * 4;
+            if (cov) {
+                p[0] = u8(0.18f + 0.25f * l + 0.2f * d), p[1] = u8(0.35f + 0.35f * l + 0.25f * d), p[2] = u8(0.08f + 0.1f * l + 0.1f * d);
+            } else if (fill == 2) { /* whatever the exporter left: noise of any colour */
+                p[0] = u8(fbm(x / 1.5f, y / 1.5f, 109, 2) * 1.6f - 0.3f), p[1] = u8(fbm(x / 1.5f, y / 1.5f, 113, 2) * 1.6f - 0.3f);
+                p[2] = u8(fbm(x / 1.5f, y / 1.5f, 127, 2) * 1.6f - 0.3f);
+            } else if (fill) {
+                p[0] = u8(0.88f + 0.1f * d), p[1] = u8(0.86f + 0.1f * d), p[2] = u8(0.92f + 0.1f * d);
+            } else {
+                p[0] = p[1] = p[2] = 0;
+            }
+            p[3] = (uint8_t)((cov * 255 + 8) / 16);
+        }
+}
+
+/* Box-filtered half of a w x h RGBA8 level (odd sizes: the last row / column counted once more). */
+static uint8_t *half_level(const uint8_t *src, uint32_t w, uint32_t h, uint32_t *nw, uint32_t *nh)
+{
+    *nw = w > 1 ? w / 2 : 1, *nh = h > 1 ? h / 2 : 1;
+    uint8_t *d = malloc((size_t)*nw * *nh * 4);
+    for (uint32_t y = 0; y < *nh; y++)
+        for (uint32_t x = 0; x < *nw; x++)
+            for (int c = 0; c < 4; c++) {
+                uint32_t x0 = x * 2 < w ? x * 2 : w - 1, x1 = x * 2 + 1 < w ? x * 2 + 1 : w - 1;
+                uint32_t y0 = y * 2 < h ? y * 2 : h - 1, y1 = y * 2 + 1 < h ? y * 2 + 1 : h - 1;
+                int s = src[((size_t)y0 * w + x0) * 4 + c] + src[((size_t)y0 * w + x1) * 4 + c] + src[((size_t)y1 * w + x0) * 4 + c] +
+                        src[((size_t)y1 * w + x1) * 4 + c];
+                d[((size_t)y * *nw + x) * 4 + c] = (uint8_t)((s + 2) / 4);
+            }
+    return d;
+}
+
+/* The blocks of an RGBA8 level in format f (BC7: mode 5 where a texel has alpha, else enc_bc7). */
+static uint8_t *encode_level(VkFormat f, const uint8_t *rgba, uint32_t w, uint32_t h)
+{
+    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+    int bytes = block_bytes(f);
+    uint8_t *b = calloc((size_t)bw * bh, bytes);
+    for (uint32_t by = 0; by < bh; by++)
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            uint8_t px[16][4];
+            int alpha = 0;
+            for (int t = 0; t < 16; t++) {
+                uint32_t x = bx * 4 + (t & 3), y = by * 4 + (t >> 2);
+                x = x < w ? x : w - 1, y = y < h ? y : h - 1;
+                memcpy(px[t], rgba + ((size_t)y * w + x) * 4, 4);
+                alpha |= px[t][3] != 255;
+            }
+            uint8_t *o = b + ((size_t)by * bw + bx) * bytes;
+            if (is_bc7(f) && alpha) {
+                float fp[16][4];
+                for (int t = 0; t < 16; t++)
+                    for (int c = 0; c < 4; c++) fp[t][c] = px[t][c];
+                enc_bc7_mode5(fp, o);
+            } else {
+                enc_block(f, (const uint8_t(*)[4])px, IMG_PHOTO, (int)bx, (int)by, o);
+            }
+        }
+    return b;
+}
+
+/* A level of img (TRANSFER_SRC_OPTIMAL) as RGBA32F into out (w x h x 4). */
+static void read_level_f(VkImage img, uint32_t mip, uint32_t w, uint32_t h, float *out)
+{
+    VkDeviceMemory rm;
+    VkImage rgba = make_image(VK_FORMAT_R32G32B32A32_SFLOAT, w, h, 1, 1, 0, NULL, 0, &rm);
+    if (!readback) {
+        VkDeviceMemory bm;
+        readback = host_buffer((VkDeviceSize)4096 * 4096 * 4, &bm, &readback_map);
+    }
+    VkCommandBuffer cb = begin();
+    barrier(cb, rgba, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rgba, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+    barrier(cb, rgba, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy rb = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, rgba, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &rb);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    submit(cb);
+    memcpy(out, readback_map, (size_t)w * h * 16);
+    vkDestroyImage(dev, rgba, NULL);
+    vkFreeMemory(dev, rm, NULL);
+}
+
+/* The other of a BC format's UNORM / sRGB pair (BC4-BC6H: itself) */
+static VkFormat srgb_pair(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK: return VK_FORMAT_BC2_SRGB_BLOCK;
+    case VK_FORMAT_BC2_SRGB_BLOCK: return VK_FORMAT_BC2_UNORM_BLOCK;
+    case VK_FORMAT_BC3_UNORM_BLOCK: return VK_FORMAT_BC3_SRGB_BLOCK;
+    case VK_FORMAT_BC3_SRGB_BLOCK: return VK_FORMAT_BC3_UNORM_BLOCK;
+    case VK_FORMAT_BC7_UNORM_BLOCK: return VK_FORMAT_BC7_SRGB_BLOCK;
+    case VK_FORMAT_BC7_SRGB_BLOCK: return VK_FORMAT_BC7_UNORM_BLOCK;
+    default: return f;
+    }
+}
+
+static const char *const fill_name[3] = {"black", "pale", "noise"};
+
+static void test_alpha_edges(VkFormat f, const char *name, int fill)
+{
+    enum { S = 1024, MIPS = 11 };
+    level lv[MIPS];
+    uint8_t *cur = malloc((size_t)S * S * 4);
+    foliage(cur, S, fill);
+    uint32_t w = S, h = S;
+    VkDeviceSize total = 0, off[MIPS];
+    for (int m = 0; m < MIPS; m++) {
+        lv[m] = (level){w, h, (w + 3) / 4, (h + 3) / 4, encode_level(f, cur, w, h)};
+        off[m] = total;
+        total += (VkDeviceSize)lv[m].bw * lv[m].bh * block_bytes(f);
+        uint32_t nw, nh;
+        uint8_t *nx = half_level(cur, w, h, &nw, &nh);
+        free(cur);
+        cur = nx, w = nw, h = nh;
+    }
+    free(cur);
+    VkDeviceMemory um, im;
+    void *upp;
+    VkBuffer up = host_buffer(total, &um, &upp);
+    for (int m = 0; m < MIPS; m++) memcpy((uint8_t *)upp + off[m], lv[m].blocks, (size_t)lv[m].bw * lv[m].bh * block_bytes(f));
+    /* as DXVK makes a D3D11 BC texture: mutable, its UNORM and sRGB formats listed (the player's images: flags 0x8, 2 view formats) */
+    VkFormat list[2] = {f, srgb_pair(f)};
+    VkImage img = make_image(f, S, S, MIPS, 1, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, list, 2, &im);
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy r[MIPS];
+    for (int m = 0; m < MIPS; m++)
+        r[m] = (VkBufferImageCopy){off[m], 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)m, 0, 1}, {0, 0, 0}, {lv[m].w, lv[m].h, 1}};
+    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, MIPS, r);
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    float *got = malloc((size_t)S * S * 16);
+    long ghosts = 0, holes = 0, flips = 0, edge = 0, n_all = 0;
+    printf("%s, transparent texels %s:\n", name, fill_name[fill]);
+    for (int m = 0; m < MIPS; m++) {
+        read_level_f(img, (uint32_t)m, lv[m].w, lv[m].h, got);
+        long g = 0, ho = 0, fl = 0, ed = 0, n = 0;
+        double gc[3] = {0}, emax = 0;
+        int bytes = block_bytes(f);
+        for (uint32_t by = 0; by < lv[m].bh; by++)
+            for (uint32_t bx = 0; bx < lv[m].bw; bx++) {
+                float want[16][4];
+                decode_block(f, lv[m].blocks + ((size_t)by * lv[m].bw + bx) * bytes, want);
+                for (int t = 0; t < 16; t++) {
+                    uint32_t x = bx * 4 + (t & 3), y = by * 4 + (t >> 2);
+                    if (x >= lv[m].w || y >= lv[m].h) continue;
+                    const float *p = got + ((size_t)y * lv[m].w + x) * 4;
+                    float ra = want[t][3], ga = p[3];
+                    n++;
+                    emax = fmax(emax, fabsf(ga - ra));
+                    if (ra > 0 && ra < 1) ed++;
+                    if ((ra >= 0.5f) == (ga >= 0.5f)) continue;
+                    if (ra <= 0.25f) {
+                        g++;
+                        for (int c = 0; c < 3; c++) gc[c] += is_srgb(f) ? lin2srgb(p[c]) : p[c];
+                    } else if (ra >= 0.75f) {
+                        ho++;
+                    } else {
+                        fl++;
+                    }
+                }
+            }
+        if (g) printf("  mip %d (%ux%u): %ld ghost texel(s) (transparent drawn, mean colour %.2f %.2f %.2f), %ld hole(s), %ld edge flip(s) of %ld edge texels, max alpha error %.3f\n",
+                      m, lv[m].w, lv[m].h, g, gc[0] / g, gc[1] / g, gc[2] / g, ho, fl, ed, emax);
+        else printf("  mip %d (%ux%u): 0 ghost texels, %ld hole(s), %ld edge flip(s) of %ld edge texels, max alpha error %.3f\n", m, lv[m].w, lv[m].h, ho, fl, ed, emax);
+        ghosts += g, holes += ho, flips += fl, edge += ed, n_all += n;
+    }
+    int bad = ghosts || holes;
+    printf("%s %s (%s fill): %ld ghost texel(s), %ld hole(s) at alpha ref 0.5 over %ld texels (11 levels); %ld edge flip(s) of %ld edge texels\n",
+           bad ? "FAIL" : "PASS", name, fill_name[fill], ghosts, holes, n_all, flips, edge);
+    failures += bad;
+    free(got);
+    for (int m = 0; m < MIPS; m++) free(lv[m].blocks);
+    vkDestroyImage(dev, img, NULL);
+    vkDestroyBuffer(dev, up, NULL);
+    vkFreeMemory(dev, um, NULL);
+    vkFreeMemory(dev, im, NULL);
+}
+
 int main(int argc, char **argv)
 {
-    int gpu = 0, hdr_only = 0, bc7_only = 0, mix_only = 0, zink_only = 0;
+    int gpu = 0, hdr_only = 0, bc7_only = 0, mix_only = 0, zink_only = 0, shaders_only = 0;
     const char *pcache_file = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "transcode")) tx = 1;
@@ -3035,6 +4211,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "mixcopy")) mix_only = 1;
         else if (!strcmp(argv[i], "zink")) zink_only = zink_style = 1;
         else if (!strcmp(argv[i], "upload")) zink_decoded = 1;
+        else if (!strcmp(argv[i], "shaders")) shaders_only = 1;
+        else if (!strcmp(argv[i], "alpha")) alpha_only = 1;
         else if (!strcmp(argv[i], "pcache")) pcache_file = i + 1 < argc ? argv[++i] : "bcn_check-pcache.bin";
         else gpu = atoi(argv[i]);
     }
@@ -3077,6 +4255,28 @@ int main(int argc, char **argv)
             dynr_ok = 1;
         }
     }
+    /* No 1.3 core dynamicRendering: a bridge that emulates VK_KHR_dynamic_rendering (a driver without it, Mali-G77 r32p1,
+     * a player log; VKB_MISSING_ADD=dynrend) offers it as an extension; enable that the way Zink does on such a device */
+    VkPhysicalDeviceDynamicRenderingFeatures fdr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+    const char *dr_ext = "VK_KHR_dynamic_rendering";
+    int dr_via_ext = 0;
+    PFN_vkEnumerateDeviceExtensionProperties edep = (PFN_vkEnumerateDeviceExtensionProperties)gipa(inst, "vkEnumerateDeviceExtensionProperties");
+    if (!dynr_ok) {
+        uint32_t ne = 0;
+        edep(pd, NULL, &ne, NULL);
+        VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
+        edep(pd, NULL, &ne, ep);
+        for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, dr_ext)) dr_via_ext = 1;
+        free(ep);
+        if (dr_via_ext) {
+            fdr.dynamicRendering = VK_TRUE;
+            fdr.pNext = (void *)dci.pNext;
+            dci.pNext = &fdr;
+            dci.enabledExtensionCount = 1;
+            dci.ppEnabledExtensionNames = &dr_ext;
+            dynr_ok = 1;
+        }
+    }
     if (vkCreateDevice(pd, &dci, NULL, &dev)) return 2;
 #undef G
 #define G(n) n = (PFN_##n)vkGetDeviceProcAddr(dev, #n)
@@ -3091,6 +4291,8 @@ int main(int argc, char **argv)
     if (dynr_ok) {
         G(vkCmdBeginRendering);
         G(vkCmdEndRendering);
+        if (!vkCmdBeginRendering) vkCmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(dev, "vkCmdBeginRenderingKHR");
+        if (!vkCmdEndRendering) vkCmdEndRendering = (PFN_vkCmdEndRendering)vkGetDeviceProcAddr(dev, "vkCmdEndRenderingKHR");
     }
     if (props.apiVersion >= VK_API_VERSION_1_3) {
         G(vkCmdCopyBufferToImage2);
@@ -3099,7 +4301,7 @@ int main(int argc, char **argv)
     G(vkCreateShaderModule); G(vkDestroyShaderModule); G(vkCreateDescriptorSetLayout); G(vkCreatePipelineLayout);
     G(vkCreateComputePipelines); G(vkCreateDescriptorPool); G(vkAllocateDescriptorSets); G(vkUpdateDescriptorSets);
     G(vkCmdBindPipeline); G(vkCmdBindDescriptorSets); G(vkCmdPushConstants); G(vkCmdDispatch);
-    G(vkCreatePipelineCache); G(vkGetPipelineCacheData); G(vkDestroyPipelineCache); G(vkDestroyPipeline);
+    G(vkCreatePipelineCache); G(vkGetPipelineCacheData); G(vkDestroyPipelineCache); G(vkDestroyPipeline); G(vkResetDescriptorPool);
 #undef G
     vkGetDeviceQueue(dev, 0, 0, &queue);
     if (tx && props.apiVersion >= VK_API_VERSION_1_3) {
@@ -3119,9 +4321,33 @@ int main(int argc, char **argv)
     }
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, 0};
     vkCreateCommandPool(dev, &pci, NULL, &pool);
+    if (alpha_only) { /* `bcn_check transcode alpha`: alpha-tested foliage through the transcoders (a player log) */
+        if (!tx) {
+            printf("FAIL alpha needs the bridge's transcoding (bcn_check transcode alpha)\n");
+            return 1;
+        }
+        test_alpha_edges(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 RGBA -> ETC2 RGB8A1, foliage", 0);
+        test_alpha_edges(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, "BC1 RGBA sRGB -> ETC2 RGB8A1 sRGB, foliage", 0);
+        for (int fill = 1; fill <= 3; fill++) { /* pale, noise, black */
+            test_alpha_edges(VK_FORMAT_BC2_UNORM_BLOCK, tx_name(VK_FORMAT_BC2_UNORM_BLOCK, "BC2 -> ASTC 4x4, foliage"), fill % 3);
+            test_alpha_edges(VK_FORMAT_BC3_UNORM_BLOCK, tx_name(VK_FORMAT_BC3_UNORM_BLOCK, "BC3 -> ASTC 4x4, foliage"), fill % 3);
+            test_alpha_edges(VK_FORMAT_BC3_SRGB_BLOCK, tx_name(VK_FORMAT_BC3_SRGB_BLOCK, "BC3 sRGB -> ASTC 4x4 sRGB, foliage"), fill % 3);
+            test_alpha_edges(VK_FORMAT_BC7_UNORM_BLOCK, tx_name(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4, foliage"), fill % 3);
+        }
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
     if (pcache_file) { /* `bcn_check pcache [file]`: what the driver's pipeline cache does for compute pipelines */
         test_pcache(spv_bc7_astc, sizeof(spv_bc7_astc), "BC7 -> ASTC transcoder", pcache_file, 0);
         test_pcache(spv_bc1_etc2, sizeof(spv_bc1_etc2), "BC1 -> ETC2 transcoder", pcache_file, 1);
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
+    if (shaders_only) { /* `bcn_check shaders`: converter variants against each other, run directly (any GPU) */
+        test_region_table();
+        test_palette();
+        test_fast();
+        test_fast7();
         printf("%s\n", failures ? "FAILED" : "OK");
         return failures ? 1 : 0;
     }
@@ -3149,6 +4375,12 @@ int main(int argc, char **argv)
         test_mixed_copy(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 mixed copies", 0, NULL, 0, 0);
         test_mixed_copy(VK_FORMAT_BC5_SNORM_BLOCK, "BC5 snorm mixed copies", 0, NULL, 0, 0);
         test_mixed_copy(VK_FORMAT_BC6H_UFLOAT_BLOCK, tx_hdr ? "BC6H -> ASTC 4x4 HDR mixed copies" : "BC6H (decoded both sides) copies", 0, NULL, 0, 0);
+        /* sRGB on one side only (typeless copies): through a temporary image, the bits unchanged */
+        test_mixed_srgb(VK_FORMAT_BC3_SRGB_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK, "BC3 sRGB transcoded into BC3 UNORM decoded", 0);
+        test_mixed_srgb(VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK, "BC7 UNORM transcoded into BC7 sRGB decoded", 0);
+        test_mixed_srgb(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 sRGB transcoded into BC1 UNORM decoded (16-bit)", 8);
+        /* the other way: from BC1 UNORM (16-bit when the budget decodes it too) into BC1 sRGB decoded (RGBA8) */
+        test_mixed_srgb(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK, "BC1 UNORM (16-bit if decoded) into BC1 sRGB decoded", 8);
         printf("%s\n", failures ? "FAILED" : "OK");
         return failures ? 1 : 0;
     }

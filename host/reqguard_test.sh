@@ -3,9 +3,9 @@
 # vkb_guard_serve): a driver fault there takes that program's device down, not the server with every
 # program on it. The players' fingerprints, imitated beneath every layer (server_crashctx.c,
 # VKBRIDGE_TEST_CRASH_CMD, VKBRIDGE_TEST_CRASH_ONCE=1: the first such call of a client faults):
-#   - No Man's Sky's last crash (a player log vkbridge-server.log:4074 :1601): "crashed with signal
+#   - No Man's Sky's last crash (a player log vkbridge-server.log:4074, a player log :1601): "crashed with signal
 #     11 ... in vkCmdDraw" / vkCmdDrawIndexed inside a command buffer's replay;
-#   - Dying Light, Mali-G1-Ultra: SIGSEGV at 0x32 in the driver's vkQueueSubmit2.
+#   - a player log (Dying Light, Mali-G1-Ultra): SIGSEGV at 0x32 in the driver's vkQueueSubmit2.
 #   1  a fault in a replayed vkCmdDraw: the server lives and says which program, which call, which
 #      command of the stream (command N of M);
 #   2  that program sees VK_ERROR_DEVICE_LOST (its calls refused) and ends: no hang;

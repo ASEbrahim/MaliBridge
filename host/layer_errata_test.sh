@@ -7,7 +7,7 @@
 #      r54p3, a job manager GPU, an Arm driver whose version cannot be read; clamp_zero (MK-32) on
 #      r49p1 only for a beta build and only in safe mode, on r51p0, off from r52p0; cull_nontri
 #      (MK-16) always in safe mode, below r52 in performance mode; dedicated_import (MK-39) below
-#      r54p1 and for an unknown version; stencil_layout (MK-11) r41p0-r54p0; dyn_reemit (MK-04) below r44p1 in performance mode;
+#      r54p1 and for an unknown version; stencil_layout (MK-11) r41p0-r54p0; split_varying (MK-47) on every Arm driver; import_serial (MK-48) r44p1 on a Mali-G615 MC6 only; dyn_reemit (MK-04) below r44p1 in performance mode;
 #   2  VKBRIDGE_ERRATA=+name,-name forces, an unknown name is warned about;
 #   3  the no-op example fix with its imitation beneath it, on a device whose null descriptors are
 #      emulated: the layer's own image views (the stand-ins; the app makes none) go through both.
@@ -75,34 +75,43 @@ matrix() { # mode version expected
     [ "$got" = "$3" ]
     step $? "$1 mode, $2: $got$([ "$got" = "$3" ] || echo " (want $3)")"
 }
-matrix safe r44p1 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix safe v1.r49p1-03bet0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
+matrix safe r44p1 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe v1.r49p1-03bet0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
 echo "$new" | grep -q "driver r49p1 beta (VKBRIDGE_FAKE_DRIVER_VERSION \"v1.r49p1-03bet0\")" &&
   echo "$new" | grep -q "errata: view_quarantine ON (always; safe mode" &&
   echo "$new" | grep -q "errata: clamp_zero ON (r49p1 in r49p1-r49p1 (a beta build: Arm's fix in r49p1 not confirmed for it); safe mode) - MK-32"
 step $? "the beta driverInfo string decoded, the reasons logged ($(echo "$new" | grep -o 'errata: view_quarantine ON.*'); $(echo "$new" | grep -o 'errata: clamp_zero ON.*' | cut -c1-60)...)"
-matrix safe v1.r49p1-01eac0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix safe r51p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix safe r52p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix safe r54p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix safe r54p2 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri
-matrix safe r54p3 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri
-matrix performance r44p1 wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r44p0 wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r36p0 wait_retry,dyn_reemit,vb_split,view_counts,cull_nontri,dedicated_import
-matrix performance v1.r49p1-03bet0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix performance r52p0 wait_retry,dyn_reemit,vb_split,view_counts,dedicated_import,stencil_layout
-matrix performance r54p2 wait_retry,vb_split,view_counts
-matrix performance r54p3 wait_retry,vb_split,view_counts
-matrix performance r46p0:jm wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r46p0:csf wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r50p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix safe not-a-version wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
+matrix safe v1.r49p1-01eac0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r51p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r52p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r54p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r54p2 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,split_varying
+matrix safe r54p3 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,split_varying
+matrix performance r44p1 wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r44p0 wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r36p0 wait_retry,dyn_reemit,vb_split,view_counts,cull_nontri,dedicated_import,split_varying
+matrix performance v1.r49p1-03bet0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r52p0 wait_retry,dyn_reemit,vb_split,view_counts,dedicated_import,stencil_layout,split_varying
+matrix performance r54p2 wait_retry,vb_split,view_counts,split_varying
+matrix performance r54p3 wait_retry,vb_split,view_counts,split_varying
+matrix performance r46p0:jm wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r46p0:csf wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r50p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe not-a-version wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+# import_serial (MK-48): a player's Mali-G615 MC6 on r44p1 only (VKBRIDGE_FAKE_DRIVER_VERSION=<version>@<deviceName>: the GPU name the gates see);
+# the same r44p1 on the S10+'s G720, the G615 MC2 phones and r44p0 stay off
+matrix safe "r44p1@Mali-G615 MC6" wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying,import_serial
+matrix performance "r44p1@Mali-G615 MC6" wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying,import_serial
+matrix safe "r44p1@Mali-G615 MC2" wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe "r44p1@Mali-G720-Immortalis MC12" wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance "r44p1@Mali-G720-Immortalis MC12" wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe "r44p0@Mali-G615 MC6" wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe "r49p1@Mali-G615 MC6" wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
 
 # 2 switches
 device VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts,no_such_erratum
 got=$(on_set)
-[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,clamp_zero,cull_nontri,dedicated_import,stencil_layout,example ] &&
+[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying,example ] &&
   echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
   echo "$new" | grep -q "no erratum named no_such_erratum" && echo "$new" | grep -q "errata: example ON (VKBRIDGE_ERRATA=+example)"
 step $? "VKBRIDGE_ERRATA=+example,-view_counts: $got; the unknown name warned about"

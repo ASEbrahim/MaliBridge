@@ -13,10 +13,10 @@
 #        Mesa's bug where the desktop's Mesa has it (informational, not a failure)
 #     4  a client that is not Zink on the imitated driver: no extended dynamic state offered
 #     5  the desktop driver's own extended dynamic state (nothing imitated): not emulated
-#     7  r38p1 job manager with the Steam-mode fix (EDS1 hidden from Zink, Vulkan 1.1): emulated, right
-#        (Galaxy Tab S9 FE: Steam's menus flashing on the GPU)
-#     8  r38p1 CSF with the Steam-mode fix (Dimensity 9200's Immortalis-G715): emulated, right
-#     9  r44p1 and r49p1 CSF (Galaxy Tab S10+, S11 Ultra): neither the Steam-mode fix nor the emulation, right
+#     7  r38p1 job manager with the A1 fix (EDS1 hidden from Zink, Vulkan 1.1): emulated, right
+#        (Galaxy Tab S9 FE, a player log: Steam's menus flashing on the GPU)
+#     8  r38p1 CSF with the A1 fix (Dimensity 9200's Immortalis-G715): emulated, right
+#     9  r44p1 and r49p1 CSF (Galaxy Tab S10+, S11 Ultra): neither the A1 fix nor the emulation, right
 #     6  headless Chromium (when installed): the page through the imitated r32p1 with the
 #        emulation is the same picture as through the bridge at Vulkan 1.3; with it off, it differs
 #        where Mesa has the bug (informational)
@@ -84,7 +84,7 @@ echo "$r1" | grep -q "^RESULT ok" && echo "$r2" | grep -q "^RESULT ok" &&
   [ "$(logged 'a1: VK_EXT_extended_dynamic_state not offered')" -ge 1 ] &&
   [ "$(logged 'extended dynamic state 1 and 2 for Zink: emulated')" -ge 2 ] &&
   ! grep -q "variant failed" "$VKB_SERVER_LOG" && summary | grep -q " 0 failed.* 0 draw(s) dropped"
-step $? "r38p1 job manager (Steam-mode fix on; Galaxy Tab S9 FE): $(echo "$r1" | cut -c1-28); gleds $(echo "$r2" | cut -c1-24)"
+step $? "r38p1 job manager (A1 fix on; Galaxy Tab S9 FE, a player log): $(echo "$r1" | cut -c1-28); gleds $(echo "$r2" | cut -c1-24)"
 
 # 8
 VKB_MISSING_ADD=vidyn mali VKBRIDGE_FAKE_DRIVER_VERSION=r38p1:csf
@@ -93,7 +93,7 @@ echo "$r1" | grep -q "^RESULT ok" && echo "$r2" | grep -q "^RESULT ok" &&
   [ "$(logged 'a1: VK_EXT_extended_dynamic_state not offered.*(Arm driver r38, CSF, ')" -ge 1 ] &&
   [ "$(logged 'extended dynamic state 1 and 2 for Zink: emulated')" -ge 2 ] &&
   ! grep -q "variant failed" "$VKB_SERVER_LOG" && summary | grep -q " 0 failed.* 0 draw(s) dropped"
-step $? "r38p1 CSF (Steam-mode fix on): $(echo "$r1" | cut -c1-28); gleds $(echo "$r2" | cut -c1-24)"
+step $? "r38p1 CSF (A1 fix on;): $(echo "$r1" | cut -c1-28); gleds $(echo "$r2" | cut -c1-24)"
 
 # 9
 for v in r44p1:csf r49p1:csf; do
@@ -101,7 +101,7 @@ for v in r44p1:csf r49p1:csf; do
   r1=$(gl glvtxlayout.py); r2=$(gl gleds.py)
   echo "$r1" | grep -q "^RESULT ok" && echo "$r2" | grep -q "^RESULT ok" &&
     [ "$(logged 'a1: ')" = 0 ] && [ "$(logged 'extended dynamic state 1 and 2 for Zink: emulated')" = 0 ]
-  step $? "${v%%:*} CSF: no Steam-mode fix, not emulated; $(echo "$r1" | cut -c1-28); gleds $(echo "$r2" | cut -c1-24)"
+  step $? "${v%%:*} CSF: no A1 fix, not emulated; $(echo "$r1" | cut -c1-28); gleds $(echo "$r2" | cut -c1-24)"
 done
 
 # 6

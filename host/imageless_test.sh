@@ -47,7 +47,9 @@ run() {
   timeout 120 "$@" >$work/run.log 2>&1
   rc=$?
   res=$(tail -1 $work/run.log)
-  [ $rc = 0 ] || grep '^FAIL\|^RESULT\|rror' $work/run.log | head -3 | sed 's/^/       /'
+  # A check that must fail (EXPECT_FAIL=1, step 3) gets its FAIL lines marked: run_ci_tests.sh quotes every indented
+  # "FAIL" line of a failed script as a failure, and step 3's expected ones read as the cause in run 42257307116.
+  [ $rc = 0 ] || grep '^FAIL\|^RESULT\|rror' $work/run.log | head -3 | sed "s/^/       ${EXPECT_FAIL:+(expected) }/"
 }
 counts() { grep -o 'imageless framebuffer emulation, device [0-9]*: .*' "$log" | tail -1 | sed 's/.*: //'; }
 emulated() { grep -q "imageless framebuffers emulated on device" "$log"; }
@@ -72,7 +74,7 @@ stop
 step $? "r21-r26, emulated: $(counts); $res"
 # 3
 start VKBRIDGE_EMU_IMAGELESS=0
-run "$out/imageless_check"
+EXPECT_FAIL=1 run "$out/imageless_check"
 stop
 [ $rc != 0 ] && grep -q "^FAIL imageless framebuffers offered: extension missing, feature 0" $work/run.log && ! emulated
 step $? "r21-r26, VKBRIDGE_EMU_IMAGELESS=0: not offered ($res)"

@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Timeline semaphores on a driver without them (VKB_EMU_TIMELINE).
  *
  * Arm's Vulkan 1.1 drivers before r20 (Mali-G52 r18p0 on the Kirin 810, Mali-G76 r19p0 on the
- * Exynos 880) have no VK_KHR_timeline_semaphore. gamescope needs Vulkan 1.2 with
+ * Exynos 880, a player log) have no VK_KHR_timeline_semaphore. gamescope needs Vulkan 1.2 with
  * timeline semaphores (it numbers its submissions on one, waits on it from the CPU and reads its
  * value to recycle command buffers), and Zink asks for them too. The bridge keeps the timeline
  * itself; the driver only ever sees binary semaphores and fences:
@@ -80,7 +79,19 @@ typedef struct vkb_timeline {
     PFN_vkResetFences reset_fences;
     PFN_vkGetFenceStatus fence_status;
     PFN_vkWaitForFences wait_fences;
+    PFN_vkQueueWaitIdle queue_idle;
+    PFN_vkDeviceWaitIdle device_idle;
+    PFN_vkQueueBindSparse bind_sparse;
+    PFN_vkGetFenceFdKHR fence_fd;
     unsigned long submits, cpu_waits;
+    /* deferred submits (tl_queue): a submit that waits for a value nothing has signalled yet goes to its queue's
+     * worker, and the submits after it on that queue behind it */
+    vkb_srv_table *table;
+    pthread_cond_t jcond; /* a job queued or finished, or quit */
+    struct tl_queue *queues;
+    uint32_t live_jobs; /* queued or running, all queues (atomic reads outside the lock) */
+    int quit;
+    unsigned long deferred, behind, dropped;
 } vkb_timeline;
 
 /* ------------------------------------------------------------------ decision */
@@ -103,6 +114,8 @@ int vkb_timeline_missing(const vkb_dispatch *idt, VkPhysicalDevice pd)
     free(e);
     return !have;
 }
+
+static void queue_drain(vkb_timeline *tl, VkQueue q, VkFence f, VkSemaphore sem); /* deferred submits, below */
 
 /* ------------------------------------------------------------------ state */
 
@@ -313,6 +326,10 @@ static VkResult wait_values(vkb_timeline *tl, uint32_t n, const VkSemaphore *sem
         int done = 0;
         uint32_t unknown = 0;
         pthread_mutex_lock(&tl->lock);
+        if (tl->quit) { /* the device goes (vkb_timeline_device_quiesce): a deferred submit's wait ends */
+            pthread_mutex_unlock(&tl->lock);
+            return VK_ERROR_DEVICE_LOST;
+        }
         uint32_t reached = 0;
         for (uint32_t i = 0; i < n; i++) {
             tl_sem *s = sem_find(tl, (uint64_t)(uintptr_t)sems[i]);
@@ -390,6 +407,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tl_GetSemaphoreFdKHR(VkDevice d, const VkS
         VKB_ONCE(VKB_LOG_WARN, "timeline semaphores (emulated): an fd export of one refused");
         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
     }
+    if (gi) queue_drain(tl, VK_NULL_HANDLE, VK_NULL_HANDLE, gi->semaphore); /* its signal still with a queue's worker */
     return tl->get_fd(d, gi, fd);
 }
 
@@ -566,7 +584,9 @@ static VkResult wait_ready(vkb_timeline *tl, uint32_t n, const tl_wait *w)
         if (reached) continue;
         __atomic_add_fetch(&tl->cpu_waits, 1, __ATOMIC_RELAXED);
         VKB_ONCE(VKB_LOG_INFO, "timeline semaphores (emulated): a submit waits on the CPU for a value still to come (logged once)");
+        vkb_srv_parked(1); /* it may wait for a later request of the program (a host signal): server_conn.c order_wait */
         VkResult r = wait_values(tl, 1, &w[i].sem, &w[i].value, 0, UINT64_MAX);
+        vkb_srv_parked(0);
         if (r != VK_SUCCESS) return r;
     }
     return VK_SUCCESS;
@@ -658,11 +678,335 @@ static VkResult batch_copy(vkb_timeline *tl, const tl_batch *b, tl_run *r)
     return VK_SUCCESS;
 }
 
+/* ------------------------------------------------------------------ deferred submits
+ *
+ * A submit that waits for a timeline value nothing has signalled yet (a wait-before-signal: no host signal, no
+ * signal on the GPU) used to wait for it on its connection's thread (wait_ready). What releases it - a host
+ * vkSignalSemaphore, or another thread's submit - is a later request of the same program, and the program's
+ * order (server_conn.c order_wait) held that request back behind the waiting one: the program stood still until
+ * order_wait gave up after 3 s, and for good when no thread of the program had ended yet (order_wait gives up
+ * only then). Now the rest of such a submit (its batches from the waiting one on, and the app's fence) is copied
+ * and handed to its queue's worker thread, which waits for the values and submits; the request is answered at
+ * once, so the order goes on and the signal runs. Until the worker has submitted it, every later submit on that
+ * queue goes to the worker behind it (the queue's submission order); vkQueueWaitIdle, vkDeviceWaitIdle and
+ * vkQueueBindSparse wait for the queue's jobs first, as the driver's own would wait for the submit, and an fd
+ * export of a fence or semaphore a job holds waits for that job. A real driver with timeline semaphores takes
+ * the submit at once and waits on the GPU: the same order, the same values. Drivers with timeline semaphores
+ * never get here (no vkb_timeline on their devices). */
+
+typedef struct tl_job {
+    struct tl_job *next;
+    uint32_t n;
+    int two;
+    tl_batch *b; /* copies, in `mem` */
+    VkFence fence;
+    void **mem;
+    uint32_t nmem, memcap;
+} tl_job;
+
+typedef struct tl_queue {
+    VkQueue q;
+    vkb_timeline *tl;
+    tl_job *head, *tail; /* head: the one the worker runs */
+    uint32_t jobs;
+    pthread_t th;
+    int started;
+    struct tl_queue *next;
+} tl_queue;
+
+static VkResult submit_any(vkb_timeline *tl, VkQueue q, uint32_t n, const tl_batch *b, VkFence fence, int two, int may_defer);
+
+static void *job_alloc(tl_job *j, size_t bytes)
+{
+    if (j->nmem == j->memcap) {
+        uint32_t c = j->memcap ? j->memcap * 2 : 16;
+        void **m = realloc(j->mem, c * sizeof(*m));
+        if (!m) return NULL;
+        j->mem = m;
+        j->memcap = c;
+    }
+    void *p = calloc(1, bytes ? bytes : 1);
+    if (p) j->mem[j->nmem++] = p;
+    return p;
+}
+
+static void *job_dup(tl_job *j, const void *src, size_t bytes, int *ok)
+{
+    if (!src || !bytes) return NULL;
+    void *p = job_alloc(j, bytes);
+    if (!p) {
+        *ok = 0;
+        return NULL;
+    }
+    memcpy(p, src, bytes);
+    return p;
+}
+
+static void job_free(tl_job *j)
+{
+    if (!j) return;
+    for (uint32_t i = 0; i < j->nmem; i++) free(j->mem[i]);
+    free(j->mem);
+    free(j);
+}
+
+/* A copy of a batch's pNext chain: the structures a submit may carry that the bridge knows; 0 for any other. */
+static int copy_chain(tl_job *j, const void *chain, const void **out)
+{
+    int ok = 1;
+    VkBaseOutStructure *first = NULL, *last = NULL;
+    for (const VkBaseInStructure *b = chain; b && ok; b = b->pNext) {
+        VkBaseOutStructure *c = NULL;
+        switch (b->sType) {
+        case VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO: {
+            const VkTimelineSemaphoreSubmitInfo *x = (const void *)b;
+            VkTimelineSemaphoreSubmitInfo *y = job_dup(j, x, sizeof(*x), &ok);
+            if (!y) break;
+            y->pWaitSemaphoreValues = job_dup(j, x->pWaitSemaphoreValues, x->waitSemaphoreValueCount * sizeof(uint64_t), &ok);
+            y->pSignalSemaphoreValues = job_dup(j, x->pSignalSemaphoreValues, x->signalSemaphoreValueCount * sizeof(uint64_t), &ok);
+            c = (VkBaseOutStructure *)y;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO: {
+            const VkDeviceGroupSubmitInfo *x = (const void *)b;
+            VkDeviceGroupSubmitInfo *y = job_dup(j, x, sizeof(*x), &ok);
+            if (!y) break;
+            y->pWaitSemaphoreDeviceIndices = job_dup(j, x->pWaitSemaphoreDeviceIndices, x->waitSemaphoreCount * sizeof(uint32_t), &ok);
+            y->pCommandBufferDeviceMasks = job_dup(j, x->pCommandBufferDeviceMasks, x->commandBufferCount * sizeof(uint32_t), &ok);
+            y->pSignalSemaphoreDeviceIndices =
+                job_dup(j, x->pSignalSemaphoreDeviceIndices, x->signalSemaphoreCount * sizeof(uint32_t), &ok);
+            c = (VkBaseOutStructure *)y;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO:
+            c = job_dup(j, b, sizeof(VkProtectedSubmitInfo), &ok);
+            break;
+        case VK_STRUCTURE_TYPE_PERFORMANCE_QUERY_SUBMIT_INFO_KHR:
+            c = job_dup(j, b, sizeof(VkPerformanceQuerySubmitInfoKHR), &ok);
+            break;
+        default:
+            VKB_ONCE(VKB_LOG_INFO, "timeline semaphores (emulated): a submit's structure %d is not one the bridge copies; that "
+                                   "submit waits for its value on its own thread, as before (logged once)", (int)b->sType);
+            ok = 0;
+        }
+        if (!c) {
+            ok = 0;
+            break;
+        }
+        c->pNext = NULL;
+        if (last) last->pNext = c;
+        else first = c;
+        last = c;
+    }
+    *out = first;
+    return ok;
+}
+
+/* A job of these batches (n may be 0: the fence alone), NULL when one cannot be copied (or no memory). */
+static tl_job *job_new(uint32_t n, const tl_batch *b, VkFence fence, int two)
+{
+    tl_job *j = calloc(1, sizeof(*j));
+    if (!j) return NULL;
+    int ok = 1;
+    j->n = n;
+    j->two = two;
+    j->fence = fence;
+    j->b = job_alloc(j, n * sizeof(*j->b));
+    ok = j->b != NULL;
+    for (uint32_t i = 0; i < n && ok; i++) {
+        j->b[i].two = two;
+        if (two) {
+            const VkSubmitInfo2 *s = b[i].src;
+            VkSubmitInfo2 *c = job_dup(j, s, sizeof(*s), &ok);
+            if (!c) break;
+            for (uint32_t k = 0; k < s->waitSemaphoreInfoCount; k++) ok &= s->pWaitSemaphoreInfos[k].pNext == NULL;
+            for (uint32_t k = 0; k < s->commandBufferInfoCount; k++) ok &= s->pCommandBufferInfos[k].pNext == NULL;
+            for (uint32_t k = 0; k < s->signalSemaphoreInfoCount; k++) ok &= s->pSignalSemaphoreInfos[k].pNext == NULL;
+            if (!ok) {
+                VKB_ONCE(VKB_LOG_INFO, "timeline semaphores (emulated): a submit's semaphore or command buffer has a structure the "
+                                       "bridge does not copy; that submit waits for its value on its own thread, as before (logged once)");
+                break;
+            }
+            c->pWaitSemaphoreInfos = job_dup(j, s->pWaitSemaphoreInfos, s->waitSemaphoreInfoCount * sizeof(VkSemaphoreSubmitInfo), &ok);
+            c->pCommandBufferInfos = job_dup(j, s->pCommandBufferInfos, s->commandBufferInfoCount * sizeof(VkCommandBufferSubmitInfo), &ok);
+            c->pSignalSemaphoreInfos =
+                job_dup(j, s->pSignalSemaphoreInfos, s->signalSemaphoreInfoCount * sizeof(VkSemaphoreSubmitInfo), &ok);
+            if (ok) ok = copy_chain(j, s->pNext, &c->pNext);
+            j->b[i].src = c;
+        } else {
+            const VkSubmitInfo *s = b[i].src;
+            VkSubmitInfo *c = job_dup(j, s, sizeof(*s), &ok);
+            if (!c) break;
+            c->pWaitSemaphores = job_dup(j, s->pWaitSemaphores, s->waitSemaphoreCount * sizeof(VkSemaphore), &ok);
+            c->pWaitDstStageMask = job_dup(j, s->pWaitDstStageMask, s->waitSemaphoreCount * sizeof(VkPipelineStageFlags), &ok);
+            c->pCommandBuffers = job_dup(j, s->pCommandBuffers, s->commandBufferCount * sizeof(VkCommandBuffer), &ok);
+            c->pSignalSemaphores = job_dup(j, s->pSignalSemaphores, s->signalSemaphoreCount * sizeof(VkSemaphore), &ok);
+            if (ok) ok = copy_chain(j, s->pNext, &c->pNext);
+            j->b[i].src = c;
+        }
+    }
+    if (!ok) {
+        job_free(j);
+        return NULL;
+    }
+    return j;
+}
+
+/* Does this job hold the fence, or signal the (binary) semaphore? */
+static int job_has(const tl_job *j, VkFence f, VkSemaphore sem)
+{
+    if (f && j->fence == f) return 1;
+    if (!sem) return 0;
+    for (uint32_t i = 0; i < j->n; i++) {
+        if (j->two) {
+            const VkSubmitInfo2 *s = j->b[i].src;
+            for (uint32_t k = 0; k < s->signalSemaphoreInfoCount; k++)
+                if (s->pSignalSemaphoreInfos[k].semaphore == sem) return 1;
+        } else {
+            const VkSubmitInfo *s = j->b[i].src;
+            for (uint32_t k = 0; k < s->signalSemaphoreCount; k++)
+                if (s->pSignalSemaphores[k] == sem) return 1;
+        }
+    }
+    return 0;
+}
+
+static tl_queue *queue_of(vkb_timeline *tl, VkQueue q) /* lock held */
+{
+    tl_queue *w = tl->queues;
+    while (w && w->q != q) w = w->next;
+    return w;
+}
+
+static void *queue_worker(void *arg)
+{
+    tl_queue *w = arg;
+    vkb_timeline *tl = w->tl;
+    vkb_srv_set_current_table(tl->table); /* the layers beneath find their state by it */
+    pthread_mutex_lock(&tl->lock);
+    for (;;) {
+        while (!w->head && !tl->quit) pthread_cond_wait(&tl->jcond, &tl->lock);
+        if (tl->quit) break;
+        tl_job *j = w->head;
+        pthread_mutex_unlock(&tl->lock);
+        VkResult r = submit_any(tl, w->q, j->n, j->b, j->fence, j->two, 0);
+        pthread_mutex_lock(&tl->lock);
+        if (tl->quit && r != VK_SUCCESS) break; /* ended by the quit: counted as dropped there */
+        w->head = j->next;
+        if (!w->head) w->tail = NULL;
+        w->jobs--;
+        __atomic_sub_fetch(&tl->live_jobs, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&tl->jcond);
+        pthread_mutex_unlock(&tl->lock);
+        job_free(j);
+        if (r != VK_SUCCESS) {
+            /* nobody to give the result to: the device is taken as lost, so that the app's waits end */
+            VKB_ERR("timeline semaphores (emulated): a deferred submit failed in the driver (%d); the device is taken as lost", r);
+            vkb_lost_mark(tl->table, "a deferred submit (an emulated timeline's wait-before-signal) failed in the driver");
+        }
+        pthread_mutex_lock(&tl->lock);
+    }
+    pthread_mutex_unlock(&tl->lock);
+    vkb_srv_set_current_table(NULL);
+    return NULL;
+}
+
+/* Queue a job on q's worker (lock held; the worker started on first use). 0: no thread could be made. */
+static int queue_push(vkb_timeline *tl, VkQueue q, tl_job *j)
+{
+    tl_queue *w = queue_of(tl, q);
+    if (!w) {
+        w = calloc(1, sizeof(*w));
+        if (!w) return 0;
+        w->q = q;
+        w->tl = tl;
+        w->next = tl->queues;
+        tl->queues = w;
+    }
+    if (!w->started) {
+        if (pthread_create(&w->th, NULL, queue_worker, w) != 0) return 0;
+        pthread_setname_np(w->th, "vkb-tlqueue");
+        w->started = 1;
+    }
+    if (w->tail) w->tail->next = j;
+    else w->head = j;
+    w->tail = j;
+    w->jobs++;
+    __atomic_add_fetch(&tl->live_jobs, 1, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&tl->jcond);
+    return 1;
+}
+
+/* Hand batches to q's worker. 1: queued (the caller answers VK_SUCCESS), 0: not (copy or thread failed). */
+static int defer(vkb_timeline *tl, VkQueue q, uint32_t n, const tl_batch *b, VkFence fence, int two, int behind)
+{
+    tl_job *j = job_new(n, b, fence, two);
+    if (!j) return 0;
+    pthread_mutex_lock(&tl->lock);
+    int ok = !tl->quit && queue_push(tl, q, j);
+    if (ok) {
+        if (behind) tl->behind++;
+        else tl->deferred++;
+    }
+    pthread_mutex_unlock(&tl->lock);
+    if (!ok) {
+        job_free(j);
+        return 0;
+    }
+    if (!behind)
+        VKB_ONCE(VKB_LOG_INFO, "timeline semaphores (emulated): a submit waiting for a value nothing has signalled yet goes to its "
+                               "queue's worker (logged once)");
+    return 1;
+}
+
+/* Has q jobs (queued or running)? */
+static int queue_busy(vkb_timeline *tl, VkQueue q)
+{
+    if (!__atomic_load_n(&tl->live_jobs, __ATOMIC_ACQUIRE)) return 0;
+    pthread_mutex_lock(&tl->lock);
+    tl_queue *w = queue_of(tl, q);
+    int busy = w && w->jobs;
+    pthread_mutex_unlock(&tl->lock);
+    return busy;
+}
+
+/* Wait until q's jobs (all queues' with q NULL; with f or sem, only the jobs holding them) have been submitted. */
+static void queue_drain(vkb_timeline *tl, VkQueue q, VkFence f, VkSemaphore sem)
+{
+    if (!__atomic_load_n(&tl->live_jobs, __ATOMIC_ACQUIRE)) return;
+    int parked = 0;
+    pthread_mutex_lock(&tl->lock);
+    for (;;) {
+        int wait = 0;
+        for (tl_queue *w = tl->queues; w && !wait; w = w->next) {
+            if (q && w->q != q) continue;
+            for (tl_job *j = w->head; j && !wait; j = j->next) wait = (!f && !sem) || job_has(j, f, sem);
+        }
+        if (!wait || tl->quit) break;
+        if (!parked) vkb_srv_parked(1), parked = 1; /* waits for a later request of the program, perhaps: order_wait */
+        pthread_cond_wait(&tl->jcond, &tl->lock);
+    }
+    pthread_mutex_unlock(&tl->lock);
+    if (parked) vkb_srv_parked(0);
+}
+
+/* Is any of these values neither reached nor signalled by work on the GPU (lock held)? */
+static int waits_later(vkb_timeline *tl, uint32_t n, const tl_wait *w)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        tl_sem *s = sem_find(tl, (uint64_t)(uintptr_t)w[i].sem);
+        if (!s) continue;
+        sem_update(tl, s);
+        if (s->value < w[i].value && !sem_reaching(s, w[i].value)) return 1;
+    }
+    return 0;
+}
+
 /* Batches in runs: a batch that signals a timeline ends its run (the run's fence says when); one
  * that waits for a timeline value not reached yet first sends the runs ahead of it to the GPU, then
  * waits for the value on the CPU (wait_ready). The app's fence goes with the last run, or alone
  * after it: it signals when everything before it has finished. */
-static VkResult submit_any(vkb_timeline *tl, VkQueue q, uint32_t n, const tl_batch *b, VkFence fence, int two)
+static VkResult submit_any(vkb_timeline *tl, VkQueue q, uint32_t n, const tl_batch *b, VkFence fence, int two, int may_defer)
 {
     tl_run r;
     memset(&r, 0, sizeof(r));
@@ -684,6 +1028,16 @@ static VkResult submit_any(vkb_timeline *tl, VkQueue q, uint32_t n, const tl_bat
         if (nw) {
             /* r has no timeline signals here: a batch with them was sent at once */
             if (r.n) res = run_submit(tl, q, &r, two, VK_NULL_HANDLE);
+            if (res == VK_SUCCESS && may_defer) {
+                /* a value nothing has signalled yet: this batch and the rest to the queue's worker (deferred submits) */
+                pthread_mutex_lock(&tl->lock);
+                int later = waits_later(tl, nw, waits);
+                pthread_mutex_unlock(&tl->lock);
+                if (later && defer(tl, q, n - i, b + i, fence, two, 0)) {
+                    run_free(&r);
+                    return VK_SUCCESS;
+                }
+            }
             if (res == VK_SUCCESS) res = wait_ready(tl, nw, waits);
             if (res != VK_SUCCESS) break;
         }
@@ -701,10 +1055,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL tl_QueueSubmit(VkQueue q, uint32_t n, cons
 {
     vkb_timeline *tl = tl_of();
     if (!tl) return VK_ERROR_DEVICE_LOST;
-    if (!n) return tl->submit(q, n, si, fence);
     tl_batch bs[64], *b = n <= 64 ? bs : calloc(n, sizeof(*b));
     if (!b) return VK_ERROR_OUT_OF_HOST_MEMORY;
     for (uint32_t i = 0; i < n; i++) b[i] = (tl_batch){&si[i], 0};
+    if (queue_busy(tl, q)) {
+        /* behind a deferred submit on this queue: to its worker too (the queue's order), or after it */
+        int queued = defer(tl, q, n, b, fence, 0, 1);
+        if (!queued) queue_drain(tl, q, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        if (queued) {
+            if (b != bs) free(b);
+            return VK_SUCCESS;
+        }
+    }
+    if (!n) {
+        if (b != bs) free(b);
+        return tl->submit(q, n, si, fence);
+    }
     pthread_mutex_lock(&tl->lock);
     int any = any_timeline(tl, n, b);
     pthread_mutex_unlock(&tl->lock);
@@ -728,7 +1094,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL tl_QueueSubmit(VkQueue q, uint32_t n, cons
         r = tl->submit(q, n, changed ? c : si, fence);
         if (c != cs) free(c);
     } else {
-        r = submit_any(tl, q, n, b, fence, 0);
+        r = submit_any(tl, q, n, b, fence, 0, 1);
     }
     if (b != bs) free(b);
     return r;
@@ -738,16 +1104,60 @@ static VKAPI_ATTR VkResult VKAPI_CALL tl_QueueSubmit2(VkQueue q, uint32_t n, con
 {
     vkb_timeline *tl = tl_of();
     if (!tl || !tl->submit2) return VK_ERROR_DEVICE_LOST;
-    if (!n) return tl->submit2(q, n, si, fence);
     tl_batch bs[64], *b = n <= 64 ? bs : calloc(n, sizeof(*b));
     if (!b) return VK_ERROR_OUT_OF_HOST_MEMORY;
     for (uint32_t i = 0; i < n; i++) b[i] = (tl_batch){&si[i], 1};
+    if (queue_busy(tl, q)) {
+        int queued = defer(tl, q, n, b, fence, 1, 1);
+        if (!queued) queue_drain(tl, q, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        if (queued) {
+            if (b != bs) free(b);
+            return VK_SUCCESS;
+        }
+    }
+    if (!n) {
+        if (b != bs) free(b);
+        return tl->submit2(q, n, si, fence);
+    }
     pthread_mutex_lock(&tl->lock);
     int any = any_timeline(tl, n, b);
     pthread_mutex_unlock(&tl->lock);
-    VkResult r = any ? submit_any(tl, q, n, b, fence, 1) : tl->submit2(q, n, si, fence);
+    VkResult r = any ? submit_any(tl, q, n, b, fence, 1, 1) : tl->submit2(q, n, si, fence);
     if (b != bs) free(b);
     return r;
+}
+
+/* The driver waits for what was submitted; a deferred submit is not yet: its queue's worker first. */
+static VKAPI_ATTR VkResult VKAPI_CALL tl_QueueWaitIdle(VkQueue q)
+{
+    vkb_timeline *tl = tl_of();
+    if (!tl) return VK_ERROR_DEVICE_LOST;
+    queue_drain(tl, q, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    return tl->queue_idle(q);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL tl_DeviceWaitIdle(VkDevice d)
+{
+    vkb_timeline *tl = tl_of();
+    if (!tl) return VK_ERROR_DEVICE_LOST;
+    queue_drain(tl, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    return tl->device_idle(d);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL tl_QueueBindSparse(VkQueue q, uint32_t n, const VkBindSparseInfo *bi, VkFence f)
+{
+    vkb_timeline *tl = tl_of();
+    if (!tl) return VK_ERROR_DEVICE_LOST;
+    queue_drain(tl, q, VK_NULL_HANDLE, VK_NULL_HANDLE); /* after the queue's earlier submits, as on the driver */
+    return tl->bind_sparse(q, n, bi, f);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL tl_GetFenceFdKHR(VkDevice d, const VkFenceGetFdInfoKHR *gi, int *fd)
+{
+    vkb_timeline *tl = tl_of();
+    if (!tl) return VK_ERROR_DEVICE_LOST;
+    if (gi) queue_drain(tl, VK_NULL_HANDLE, gi->fence, VK_NULL_HANDLE); /* a fence a deferred submit holds: once submitted */
+    return tl->fence_fd(d, gi, fd);
 }
 
 /* ------------------------------------------------------------------ device */
@@ -776,7 +1186,17 @@ void vkb_timeline_device_init(vkb_srv_table *t, uint32_t emu)
     tl->reset_fences = t->dt.vkResetFences;
     tl->fence_status = t->dt.vkGetFenceStatus;
     tl->wait_fences = t->dt.vkWaitForFences;
+    tl->table = t;
+    pthread_cond_init(&tl->jcond, NULL);
+    tl->queue_idle = t->dt.vkQueueWaitIdle;
+    tl->device_idle = t->dt.vkDeviceWaitIdle;
+    tl->bind_sparse = t->dt.vkQueueBindSparse;
+    tl->fence_fd = t->dt.vkGetFenceFdKHR;
     t->timeline = tl;
+    if (tl->queue_idle) t->dt.vkQueueWaitIdle = tl_QueueWaitIdle;
+    if (tl->device_idle) t->dt.vkDeviceWaitIdle = tl_DeviceWaitIdle;
+    if (tl->bind_sparse) t->dt.vkQueueBindSparse = tl_QueueBindSparse;
+    if (tl->fence_fd) t->dt.vkGetFenceFdKHR = tl_GetFenceFdKHR;
     t->dt.vkCreateSemaphore = tl_CreateSemaphore;
     t->dt.vkDestroySemaphore = tl_DestroySemaphore;
     t->dt.vkQueueSubmit = tl_QueueSubmit;
@@ -788,10 +1208,48 @@ void vkb_timeline_device_init(vkb_srv_table *t, uint32_t emu)
     if (tl->import_fd) t->dt.vkImportSemaphoreFdKHR = tl_ImportSemaphoreFdKHR;
 }
 
+/* Before the device goes (vkDestroyDevice, or its program ended without it): the queues' workers stopped, the
+ * submits still with them dropped (a valid program has none left: its submits are done before it destroys the
+ * device; a program that ended with one waiting for a value it never signalled has). */
+void vkb_timeline_device_quiesce(vkb_srv_table *t)
+{
+    vkb_timeline *tl = t->timeline;
+    if (!tl) return;
+    pthread_mutex_lock(&tl->lock);
+    tl->quit = 1;
+    pthread_cond_broadcast(&tl->jcond);
+    pthread_cond_broadcast(&tl->cond);
+    pthread_mutex_unlock(&tl->lock);
+    unsigned long dropped = 0;
+    for (tl_queue *w = tl->queues; w; w = w->next) {
+        if (w->started) pthread_join(w->th, NULL);
+        w->started = 0;
+        while (w->head) {
+            tl_job *j = w->head;
+            w->head = j->next;
+            job_free(j);
+            dropped++;
+        }
+        w->tail = NULL;
+        w->jobs = 0;
+    }
+    __atomic_store_n(&tl->live_jobs, 0, __ATOMIC_RELEASE);
+    tl->dropped += dropped;
+    if (dropped)
+        VKB_WARN("timeline semaphores (emulated): %lu deferred submit(s) dropped with the device (they waited for values "
+                 "never signalled)", dropped);
+}
+
 void vkb_timeline_device_destroy(vkb_srv_table *t)
 {
     vkb_timeline *tl = t->timeline;
     if (!tl) return;
+    vkb_timeline_device_quiesce(t);
+    while (tl->queues) {
+        tl_queue *w = tl->queues;
+        tl->queues = w->next;
+        free(w);
+    }
     t->timeline = NULL;
     for (int b = 0; b < TL_BUCKETS; b++)
         while (tl->sems[b]) {
@@ -813,7 +1271,10 @@ void vkb_timeline_device_destroy(vkb_srv_table *t)
         free(f);
     }
     if (tl->submits)
-        VKB_INFO("timeline semaphores (emulated): %lu driver submit(s), %lu CPU wait(s) for values still to come", tl->submits, tl->cpu_waits);
+        VKB_INFO("timeline semaphores (emulated): %lu driver submit(s), %lu CPU wait(s) for values still to come, %lu submit(s) "
+                 "deferred to a queue's worker (%lu queued behind them, %lu dropped)", tl->submits, tl->cpu_waits, tl->deferred,
+                 tl->behind, tl->dropped);
+    pthread_cond_destroy(&tl->jcond);
     pthread_cond_destroy(&tl->cond);
     pthread_mutex_destroy(&tl->lock);
     free(tl);

@@ -32,6 +32,8 @@ jobs:
 
         steps:
             - name: Install System Dependencies
+              # libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri: Mesa's Zink over the bridge (host/imageless_test.sh steps 4-7,
+              # through EGL surfaceless); the runner image has no OpenGL libraries of its own
               run: |
                   sudo apt-get update
                   sudo apt-get install -y --no-install-recommends \
@@ -41,6 +43,10 @@ jobs:
                     xxd \
                     libvulkan-dev \
                     mesa-vulkan-drivers \
+                    libegl1 \
+                    libegl-mesa0 \
+                    libgl1 \
+                    libgl1-mesa-dri \
                     vulkan-tools \
                     python3 \
                     catch2

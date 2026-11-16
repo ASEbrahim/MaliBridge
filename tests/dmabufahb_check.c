@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * dmabufahb_check: dma-buf memory as gamescope, Xwayland and Zink use it, on a bridge whose driver has
  * none (server_dmabuf_ahb.c: the pages are AHardwareBuffers on Android, the desktop driver's own
  * dma-bufs in host tests). Process A exports:
@@ -19,7 +18,7 @@
  * reads its colour back. Argument "ahb" (the bridge's path): the format's modifiers are LINEAR alone
  * and an explicit import at another row pitch is refused.
  * Argument "linear-only" (the bridge's path where the start's check failed OPTIMAL images and passed LINEAR
- * ones): gamescope's OPTIMAL export is refused, as is an import into an OPTIMAL image made without
+ * ones, a player log): gamescope's OPTIMAL export is refused, as is an import into an OPTIMAL image made without
  * the handle type and a dma-buf image that cannot be LINEAR (a depth format, 4 samples: query and creation);
  * gamescope's OPTIMAL import with the handle type is still made (LINEAR) and reads Zink's colour back.
  * Usage: dmabufahb_check [foreign-refused] [ahb] [linear-only]  - exit 77 when the device offers no dma-buf memory,

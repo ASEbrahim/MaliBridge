@@ -385,6 +385,26 @@ VKAPI_ATTR VkResult VKAPI_CALL fake_CreatePipelineLayout(
 VKAPI_ATTR void VKAPI_CALL
 fake_DestroyPipelineLayout(VkPipelineLayout, const VkAllocationCallbacks *) {}
 
+// The BC emulation's one-dispatch table buffer (server_emu_bcn.c vkb_emu_bcn_install, on by default since bd370a1) asks the driver
+// for a buffer and its memory requirements at device creation: memory type 0 (the only one fake_GetPhysicalDeviceMemoryProperties has).
+VKAPI_ATTR VkResult VKAPI_CALL fake_CreateBuffer(VkDevice, const VkBufferCreateInfo *info, const VkAllocationCallbacks *,
+                                                 VkBuffer *buffer) {
+    if (!info || !buffer)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    *buffer = fake_handle<VkBuffer>();
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL fake_GetBufferMemoryRequirements(VkDevice, VkBuffer, VkMemoryRequirements *req) {
+    if (!req)
+        return;
+    req->size = 65536;
+    req->alignment = 256;
+    req->memoryTypeBits = 1u;
+}
+
+VKAPI_ATTR void VKAPI_CALL fake_DestroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks *) {}
+
 } // namespace
 
 FakeDriver::FakeDriver() {
@@ -560,6 +580,10 @@ PFN_vkVoidFunction FakeDriver::device_proc(const char *name) {
          reinterpret_cast<PFN_vkVoidFunction>(fake_CreatePipelineLayout)},
         {"vkDestroyPipelineLayout",
          reinterpret_cast<PFN_vkVoidFunction>(fake_DestroyPipelineLayout)},
+        {"vkCreateBuffer", reinterpret_cast<PFN_vkVoidFunction>(fake_CreateBuffer)},
+        {"vkGetBufferMemoryRequirements",
+         reinterpret_cast<PFN_vkVoidFunction>(fake_GetBufferMemoryRequirements)},
+        {"vkDestroyBuffer", reinterpret_cast<PFN_vkVoidFunction>(fake_DestroyBuffer)},
     };
     for (const auto &entry : table)
         if (std::strcmp(entry.name, name) == 0)

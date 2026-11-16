@@ -18,14 +18,14 @@
 #  10  VKBRIDGE_FAKE_MISSING / VKBRIDGE_SERVER_HIDE_EXTS from <cache dir>/env reach the startup
 #      self-test: the native features are emulated and the hidden driver extensions are not
 #      offered, with no client-side setting (a newer Mali taking an older one's paths);
-#  11  an early VK_TIMEOUT (VKBRIDGE_WAIT_FAKE_RESULT=timeout; Stray on the Dimensity 9500):
+#  11  an early VK_TIMEOUT (VKBRIDGE_WAIT_FAKE_RESULT=timeout; Stray on the Dimensity 9500, a player log):
 #      waits with no timeout whose work finishes 300 ms later get VK_SUCCESS then, through a VK_TIMEOUT
 #      every 20 ms, one server line per kind; finite waits still end at their deadline;
 #  12  the same with VKBRIDGE_ERRATA=-wait_retry (the old behaviour): the app gets VK_TIMEOUT within
 #      ~20 ms, the client logs it once per kind and the server's report layer warns;
 #  13  the protocol hash is unchanged;
 #  14  a semaphore wait past its deadline with the work submitted (DXVK's 5 s hang check, Stray on
-#      the Dimensity 9500; here a 1 s timeout on work done at 1.5 s): VK_SUCCESS when the
+#      the Dimensity 9500, a player log; here a 1 s timeout on work done at 1.5 s): VK_SUCCESS when the
 #      work is done, one server line; what nothing was submitted to signal still times out at 1 s;
 #      and the same under the -3 imitation (the grace's own waits fail too);
 #  15  VKBRIDGE_WAIT_GRACE_S=0: VK_TIMEOUT at the 1 s deadline (the old behaviour), no line.
@@ -151,7 +151,7 @@ r=$?
   grep -q "vkWaitForFences returned VK_TIMEOUT after .*before the app's deadline (no timeout" "$log"
 step $? "the old behaviour (VKBRIDGE_ERRATA=-wait_retry): the app gets VK_TIMEOUT early (sem $(grep -o 'sem-late.*ms' $work/12.log | grep -o ': [0-9-]* after [0-9]* ms' | cut -c3-), fence $(grep -o 'fence-late.*ms' $work/12.log | grep -o ': [0-9-]* after [0-9]* ms' | cut -c3-)), logged by the client and the server ($(tail -1 $work/12.log))"
 # 13
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 # 14
 start

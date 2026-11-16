@@ -16,12 +16,23 @@
  * saved as dump-spirv/g-<hash>.spv). Subnautica (2026-10-12): GPU 98 % busy at 1300 MHz for 6 fps
  * on 1200 draws in 52 passes at 1280x720, and DXVK's HUD could not say which; this showed a
  * 160x128 pass taking 75 + 37 ms a frame, its draws DXVK's stream output geometry shaders (fixed by
- * the fold in server_emu_shader.c). VKBRIDGE_GPU_PROF=2 also splits passes by their first pipeline
- * and saves every module's SPIR-V under dump-spirv/ by that hash.
+ * the fold in server_emu_shader.c). VKBRIDGE_GPU_PROF=2 also splits passes by their first pipeline,
+ * ends a run of dispatches where the compute pipeline changes (otherwise the run shares one span, billed to
+ * its first pipeline whatever the others cost; one pipeline's dispatches back to back stay one span, so a
+ * command buffer of hundreds of dispatches keeps within its QUERIES stamps) and saves every module's SPIR-V
+ * under dump-spirv/ by that hash. A command buffer that runs out of stamps is measured up to there; the
+ * report says how many did ("cut short").
  * Subnautica paused underwater after the fold (2026-10-12, ~23 ms GPU a frame at ~33 fps): the split
  * spans showed no bridge work of note (no uploads, 0.5 ms of the game's copies; the dispatches are
  * its ocean FFT), every attachment and decoded BC texture kept AFBC, and =2 named the costliest
  * draw a full-screen ray march (2.2 ms, screen-space reflections).
+ * Reading and reporting (2026-11-08, after Lies of P's vkd3d-proton frames gave no line in 3.5 minutes): a finished command
+ * buffer is read back by a timer thread (every 100 ms, results fetched without waiting: not ready yet is tried again, for 10 s),
+ * or when it is begun again or freed, whichever comes first; the summary is printed by that thread every 5 s whether or not
+ * anything was read (so silence means the profiler is off, and every way of being off logs one line saying why). vkd3d-proton
+ * allocates and frees command buffers, passes its draws through vkCmdDrawIndirectCount / vkCmdDrawMultiEXT and its compute
+ * through vkCmdDispatchBase: counted. A primary begun with a pInheritanceInfo is read as primary (the level is noted at
+ * allocation). A recording that was never submitted is told from the one read before by its first and last stamps.
  * VKBRIDGE_GPU_PROF=counters adds Mali's hardware counters (server_hwcnt.c: why the GPU is busy -
  * which queue, which shader core unit, external memory), =counters-only reads those alone.
  * Off unless asked for.
@@ -39,6 +50,8 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#define DROP_S 10.0 /* a finished command buffer whose stamps never come back (never submitted) is let go after this */
+#define POLL_BUDGET 256 /* pending command buffers tried per 100 ms */
 #define QUERIES 512
 #define SEGS (QUERIES - 1)
 #define CB_BUCKETS 512
@@ -61,6 +74,8 @@ typedef struct gp_seg {
     uint32_t ops, barriers;
     uint32_t fmt[2], dfmt;
     uint32_t draws, dispatches;
+    uint32_t icalls;  /* indirect-count draw calls (vkCmdDrawIndirectCount, vkCmdDrawIndexedIndirectCount): not in draws */
+    uint64_t imax;    /* the most draws those calls could make (their maxDrawCount) */
     uint64_t prims; /* vertices or indices x instances; indirect draws count 0 */
     VkPipeline bound;
     VkPipeline pipe[4]; /* the first pipelines drawn with, and their draws and prims */
@@ -73,6 +88,14 @@ typedef struct gp_cb {
     VkQueryPool pool;
     uint32_t n; /* stamps written */
     int on, secondary;
+    int lvl_known, lvl_secondary; /* from vkAllocateCommandBuffers */
+    VkCommandPool cmdpool;
+    int pending;      /* ended, not yet read */
+    double ended_at;
+    int have_last;    /* the first and last stamps of the run read last: a read equal to them is that run again (the pool is reset only when the buffer runs) */
+    uint64_t last_t0, last_t1;
+    struct gp_cb *pnext; /* the pending list */
+    int cut; /* ran out of stamps: what came after is in no span */
     VkPipeline bound, cbound; /* graphics, compute */
     gp_seg seg[SEGS];
     struct gp_cb *next;
@@ -108,8 +131,8 @@ typedef struct gp_key {
     gp_seg k; /* shape fields only */
     gp_seg worst; /* the costliest instance, with its pipelines */
     uint64_t worst_ns;
-    uint64_t ns, prims;
-    uint32_t count, draws, dispatches, ops, barriers;
+    uint64_t ns, prims, imax;
+    uint32_t count, draws, dispatches, ops, barriers, icalls;
 } gp_key;
 
 typedef struct vkb_gprof {
@@ -124,7 +147,14 @@ typedef struct vkb_gprof {
     gp_pipe *pipes[VIEW_BUCKETS];
     gp_mod *mods[VIEW_BUCKETS];
     gp_key keys[KEYS];
-    uint32_t nkeys, cbs_read, cbs_dropped;
+    uint32_t nkeys, cbs_read, cbs_dropped, cbs_cut;
+    uint32_t cbs_begun, cbs_ended, cbs_freed, cbs_secondary; /* since the last summary */
+    uint32_t cbs_pending_n;
+    gp_cb *pending;
+    double period_s;
+    pthread_t thread;
+    int thread_on, stop;
+    uint32_t fallback; /* hook calls that found no table of the thread and used the last profiled device */
     uint32_t made[256][2], made_new; /* images made by core format: with AFBC, without */
     uint64_t total_ns;
     double since;
@@ -149,6 +179,15 @@ typedef struct vkb_gprof {
     PFN_vkCmdDrawIndexedIndirect draw_indexed_indirect;
     PFN_vkCmdDispatch dispatch;
     PFN_vkCmdDispatchIndirect dispatch_indirect;
+    PFN_vkCmdDispatchBase dispatch_base;
+    PFN_vkCmdDrawIndirectCount draw_indirect_count;
+    PFN_vkCmdDrawIndexedIndirectCount draw_indexed_indirect_count;
+    PFN_vkCmdDrawMultiEXT draw_multi;
+    PFN_vkCmdDrawMultiIndexedEXT draw_multi_indexed;
+    PFN_vkCmdDrawIndirectByteCountEXT draw_bytecount;
+    PFN_vkAllocateCommandBuffers alloc_cbs;
+    PFN_vkFreeCommandBuffers free_cbs;
+    PFN_vkDestroyCommandPool destroy_cmdpool;
     PFN_vkCreateGraphicsPipelines gfx;
     PFN_vkCreateComputePipelines comp;
     PFN_vkCreateShaderModule create_mod;
@@ -201,7 +240,10 @@ static vkb_gprof *cur(void)
 {
     vkb_srv_table *t = vkb_srv_current_table();
     vkb_gprof *g = t && t->id < 4096 ? profs[t->id] : NULL;
-    return g ? g : __atomic_load_n(&last, __ATOMIC_ACQUIRE);
+    if (g) return g;
+    g = __atomic_load_n(&last, __ATOMIC_ACQUIRE);
+    if (g) __atomic_fetch_add(&g->fallback, 1, __ATOMIC_RELAXED);
+    return g;
 }
 
 /* Called with the lock held. */
@@ -243,8 +285,13 @@ static void report(vkb_gprof *g, double now)
 {
     double span = now - g->since;
     qsort(g->keys, g->nkeys, sizeof(g->keys[0]), by_ns);
-    VKB_INFO("gpu prof %.1fs: %.1f ms GPU/s in %u command buffers (%u unread), %u pass shapes", span,
-             g->total_ns / 1e6 / span, g->cbs_read, g->cbs_dropped, g->nkeys);
+    char cut[64] = "";
+    if (g->cbs_cut) snprintf(cut, sizeof(cut), ", %u cut short at %d stamps", g->cbs_cut, QUERIES);
+    VKB_INFO("gpu prof %.1fs: %.1f ms GPU/s in %u command buffers (%u unread%s), %u pass shapes", span,
+             g->total_ns / 1e6 / span, g->cbs_read, g->cbs_dropped, cut, g->nkeys);
+    VKB_INFO("  gpu prof device %u: %u primary begun, %u ended, %u freed, %u secondary begun, %u waiting to be read, %u calls without a device table",
+             g->t->id, g->cbs_begun, g->cbs_ended, g->cbs_freed, g->cbs_secondary, g->cbs_pending_n,
+             __atomic_exchange_n(&g->fallback, 0, __ATOMIC_RELAXED));
     for (uint32_t i = 0; i < g->nkeys && i < (by_pipe ? 24u : 14u); i++) {
         const gp_key *k = &g->keys[i];
         if (k->k.kind == SEG_BETWEEN)
@@ -257,6 +304,8 @@ static void report(vkb_gprof *g, double now)
                      k->ns / 1e6 / span, 100.0 * k->ns / (g->total_ns ? g->total_ns : 1), k->k.w, k->k.h, k->k.ncolor,
                      k->k.fmt[0], k->k.fmt[1], k->k.dfmt, k->k.msaa, k->k.load, k->k.nocomp, k->k.storage, k->count,
                      k->ns / 1e3 / k->count, k->draws, (unsigned long long)k->prims);
+        if (k->icalls)
+            VKB_INFO("      %u indirect-count draw calls (up to %llu draws, not in the draw count above)", k->icalls, (unsigned long long)k->imax);
         if (k->k.kind == SEG_PASS && k->barriers) VKB_INFO("      %u barriers inside", k->barriers);
         if ((k->k.kind == SEG_PASS || k->dispatches) && i < (by_pipe ? 12u : 4u))
             for (int j = 0; j < (by_pipe ? 1 : 4) && k->worst.pipe[j]; j++)
@@ -277,20 +326,48 @@ static void report(vkb_gprof *g, double now)
     }
     g->nkeys = 0;
     g->total_ns = 0;
-    g->cbs_read = g->cbs_dropped = 0;
+    g->cbs_read = g->cbs_dropped = g->cbs_cut = 0;
+    g->cbs_begun = g->cbs_ended = g->cbs_freed = g->cbs_secondary = 0;
     g->since = now;
 }
 
-/* Called with the lock held, before the command buffer is recorded again. */
-static void harvest(vkb_gprof *g, gp_cb *e)
+static void unpend(vkb_gprof *g, gp_cb *e)
 {
-    if (e->n < 2) return;
-    uint64_t ts[QUERIES];
-    if (g->results(g->dev, e->pool, 0, e->n, sizeof(uint64_t) * e->n, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
-        g->cbs_dropped++; /* recorded, never submitted */
+    if (!e->pending) return;
+    e->pending = 0;
+    for (gp_cb **pp = &g->pending; *pp; pp = &(*pp)->pnext)
+        if (*pp == e) {
+            *pp = e->pnext;
+            break;
+        }
+    e->pnext = NULL;
+    if (g->cbs_pending_n) g->cbs_pending_n--;
+}
+
+/* Called with the lock held. Reads a finished command buffer's stamps without waiting. final: it is being begun again or freed,
+ * so what is not readable now never will be (dropped); otherwise not readable is tried again until DROP_S old. */
+static void consume(vkb_gprof *g, gp_cb *e, int final)
+{
+    if (!e->pending) return;
+    if (e->n < 2) {
+        unpend(g, e);
         return;
     }
+    uint64_t ts[QUERIES];
+    VkResult r = g->results(g->dev, e->pool, 0, e->n, sizeof(uint64_t) * e->n, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    int stale = r == VK_SUCCESS && e->have_last && ts[0] == e->last_t0 && ts[e->n - 1] == e->last_t1;
+    if (r != VK_SUCCESS || stale) {
+        if (!final && now_s() - e->ended_at < DROP_S) return;
+        unpend(g, e);
+        g->cbs_dropped++; /* recorded, never submitted (or its results lost with the pool) */
+        return;
+    }
+    e->have_last = 1;
+    e->last_t0 = ts[0];
+    e->last_t1 = ts[e->n - 1];
+    unpend(g, e);
     g->cbs_read++;
+    if (e->cut) g->cbs_cut++;
     for (uint32_t i = 0; i + 1 < e->n; i++) {
         uint64_t d = ((ts[i + 1] - ts[i]) & g->mask);
         uint64_t ns = (uint64_t)(d * g->period_ns);
@@ -319,11 +396,46 @@ static void harvest(vkb_gprof *g, gp_cb *e)
         k->draws += s->draws;
         k->dispatches += s->dispatches;
         k->prims += s->prims;
+        k->icalls += s->icalls;
+        k->imax += s->imax;
         k->ops += s->ops;
         k->barriers += s->barriers;
     }
-    double now = now_s();
-    if (now - g->since >= REPORT_S) report(g, now);
+}
+
+/* Called with the lock held: the entry and its pool go (the command buffer is freed). */
+static void cb_remove(vkb_gprof *g, gp_cb *e)
+{
+    consume(g, e, 1);
+    unpend(g, e);
+    unsigned b = hk((uint64_t)(uintptr_t)e->cb, CB_BUCKETS);
+    for (gp_cb **pp = &g->cbs[b]; *pp; pp = &(*pp)->next)
+        if (*pp == e) {
+            *pp = e->next;
+            break;
+        }
+    if (g->destroy_pool && e->pool) g->destroy_pool(g->dev, e->pool, NULL);
+    free(e);
+}
+
+/* The timer thread: finished command buffers read (without waiting), the summary every period_s whether or not anything came. */
+static void *gp_thread(void *arg)
+{
+    vkb_gprof *g = arg;
+    while (!__atomic_load_n(&g->stop, __ATOMIC_ACQUIRE)) {
+        usleep(100000);
+        pthread_mutex_lock(&g->lock);
+        gp_cb *e = g->pending;
+        for (int budget = POLL_BUDGET; e && budget > 0; budget--) {
+            gp_cb *next = e->pnext;
+            consume(g, e, 0);
+            e = next;
+        }
+        double now = now_s();
+        if (now - g->since >= g->period_s) report(g, now);
+        pthread_mutex_unlock(&g->lock);
+    }
+    return NULL;
 }
 
 /* Closes the open span with a stamp and opens the next. Outside render passes only. */
@@ -331,6 +443,7 @@ static gp_seg *next_seg(vkb_gprof *g, gp_cb *e, VkCommandBuffer cb)
 {
     if (e->secondary) return NULL;
     if (!e->on || e->n >= QUERIES) {
+        if (e->on) e->cut = 1;
         e->on = 0;
         return NULL;
     }
@@ -355,9 +468,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL gp_BeginCommandBuffer(VkCommandBuffer cb, 
     if (r != VK_SUCCESS) return r;
     pthread_mutex_lock(&g->lock);
     gp_cb *e = cb_get(g, cb, 1);
-    if (e && bi && bi->pInheritanceInfo) {
+    /* The level is what vkAllocateCommandBuffers said; a pInheritanceInfo on a primary is ignored by the driver and passed by some apps. */
+    int sec = e ? (e->lvl_known ? e->lvl_secondary : (bi && bi->pInheritanceInfo && (bi->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT))) : 0;
+    if (e && sec) {
         /* Secondary (DXVK records its render passes' draws in them): counts only, added to the
          * primary's open span when executed. */
+        consume(g, e, 1);
+        g->cbs_secondary++;
         e->secondary = 1;
         e->n = 1;
         e->on = 1;
@@ -365,10 +482,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL gp_BeginCommandBuffer(VkCommandBuffer cb, 
         memset(&e->seg[0], 0, sizeof(e->seg[0]));
     } else if (e) {
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, QUERIES, 0};
-        if (!e->secondary) harvest(g, e);
+        consume(g, e, 1);
+        if (e->secondary) e->have_last = 0;
         e->secondary = 0;
+        e->cut = 0;
         e->on = 0;
         e->n = 0;
+        g->cbs_begun++;
         if (e->pool || g->create_pool(g->dev, &qi, NULL, &e->pool) == VK_SUCCESS) {
             g->reset(cb, e->pool, 0, QUERIES);
             e->on = 1;
@@ -388,9 +508,71 @@ static VKAPI_ATTR VkResult VKAPI_CALL gp_EndCommandBuffer(VkCommandBuffer cb)
     if (e && e->on && !e->secondary) {
         next_seg(g, e, cb);
         e->on = 0;
+        g->cbs_ended++;
+        if (e->n >= 2 && !e->pending) {
+            e->pending = 1;
+            e->ended_at = now_s();
+            e->pnext = g->pending;
+            g->pending = e;
+            g->cbs_pending_n++;
+        }
     }
     pthread_mutex_unlock(&g->lock);
     return g->end(cb);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL gp_AllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *out)
+{
+    vkb_gprof *g = cur();
+    VkResult r = g->alloc_cbs(d, ai, out);
+    if (r != VK_SUCCESS || !ai) return r;
+    pthread_mutex_lock(&g->lock);
+    for (uint32_t i = 0; i < ai->commandBufferCount; i++) {
+        gp_cb *e = cb_get(g, out[i], 1);
+        if (!e) continue;
+        unpend(g, e); /* a handle of a freed or destroyed buffer coming back */
+        e->have_last = 0;
+        e->on = 0;
+        e->n = 0;
+        e->secondary = 0;
+        e->lvl_known = 1;
+        e->lvl_secondary = ai->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        e->cmdpool = ai->commandPool;
+    }
+    pthread_mutex_unlock(&g->lock);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL gp_FreeCommandBuffers(VkDevice d, VkCommandPool pool, uint32_t n, const VkCommandBuffer *cbs)
+{
+    vkb_gprof *g = cur();
+    pthread_mutex_lock(&g->lock);
+    for (uint32_t i = 0; cbs && i < n; i++) {
+        gp_cb *e = cb_get(g, cbs[i], 0);
+        if (e) {
+            g->cbs_freed++;
+            cb_remove(g, e);
+        }
+    }
+    pthread_mutex_unlock(&g->lock);
+    g->free_cbs(d, pool, n, cbs);
+}
+
+/* Its command buffers are freed with it. */
+static VKAPI_ATTR void VKAPI_CALL gp_DestroyCommandPool(VkDevice d, VkCommandPool pool, const VkAllocationCallbacks *a)
+{
+    vkb_gprof *g = cur();
+    pthread_mutex_lock(&g->lock);
+    for (int b = 0; b < CB_BUCKETS; b++)
+        for (gp_cb *e = g->cbs[b], *nx; e; e = nx) {
+            nx = e->next;
+            if (e->cmdpool == pool && pool != VK_NULL_HANDLE) {
+                g->cbs_freed++;
+                cb_remove(g, e);
+            }
+        }
+    pthread_mutex_unlock(&g->lock);
+    g->destroy_cmdpool(d, pool, a);
 }
 
 static void pass_begin(vkb_gprof *g, VkCommandBuffer cb, const VkRenderingInfo *ri, const VkRenderPassBeginInfo *bi)
@@ -490,11 +672,14 @@ static void add_pipe(gp_seg *s, VkPipeline p, uint32_t draws, uint64_t prims)
     }
 }
 
-static void count(vkb_gprof *g, VkCommandBuffer cb, uint32_t draws, uint32_t dispatches, uint64_t prims)
+static void count2(vkb_gprof *g, VkCommandBuffer cb, uint32_t draws, uint32_t dispatches, uint64_t prims, uint32_t icalls, uint64_t imax)
 {
     pthread_mutex_lock(&g->lock);
     gp_seg *s = open_seg(cb_get(g, cb, 0));
     if (s) {
+        s->icalls += icalls;
+        s->imax += imax;
+        if (icalls) add_pipe(s, s->bound, icalls, 0);
         s->draws += draws;
         s->dispatches += dispatches;
         s->prims += prims;
@@ -502,6 +687,11 @@ static void count(vkb_gprof *g, VkCommandBuffer cb, uint32_t draws, uint32_t dis
         else if (dispatches) add_pipe(s, cb_get(g, cb, 0)->cbound, dispatches, prims);
     }
     pthread_mutex_unlock(&g->lock);
+}
+
+static void count(vkb_gprof *g, VkCommandBuffer cb, uint32_t draws, uint32_t dispatches, uint64_t prims)
+{
+    count2(g, cb, draws, dispatches, prims, 0, 0);
 }
 
 static VKAPI_ATTR void VKAPI_CALL gp_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *cbs)
@@ -516,6 +706,8 @@ static VKAPI_ATTR void VKAPI_CALL gp_CmdExecuteCommands(VkCommandBuffer cb, uint
         s->draws += y->draws;
         s->dispatches += y->dispatches;
         s->prims += y->prims;
+        s->icalls += y->icalls;
+        s->imax += y->imax;
         for (int j = 0; j < 4 && y->pipe[j]; j++) add_pipe(s, y->pipe[j], y->pdraws[j], y->pprims[j]);
     }
     pthread_mutex_unlock(&g->lock);
@@ -569,13 +761,59 @@ static VKAPI_ATTR void VKAPI_CALL gp_CmdDrawIndexedIndirect(VkCommandBuffer cb, 
     g->draw_indexed_indirect(cb, b, o, n, st);
 }
 
-/* A command outside render passes: a new span when its kind differs from the open one's. */
+/* vkd3d-proton's draws: ExecuteIndirect and its multi-draw and stream-out forms. The count is read by the GPU: the calls are counted,
+ * with the most draws they could make. */
+static VKAPI_ATTR void VKAPI_CALL gp_CmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkBuffer cbuf, VkDeviceSize co, uint32_t max, uint32_t st)
+{
+    vkb_gprof *g = cur();
+    count2(g, cb, 0, 0, 0, 1, max);
+    g->draw_indirect_count(cb, b, o, cbuf, co, max, st);
+}
+
+static VKAPI_ATTR void VKAPI_CALL gp_CmdDrawIndexedIndirectCount(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkBuffer cbuf, VkDeviceSize co, uint32_t max,
+                                                                 uint32_t st)
+{
+    vkb_gprof *g = cur();
+    count2(g, cb, 0, 0, 0, 1, max);
+    g->draw_indexed_indirect_count(cb, b, o, cbuf, co, max, st);
+}
+
+static VKAPI_ATTR void VKAPI_CALL gp_CmdDrawMultiEXT(VkCommandBuffer cb, uint32_t n, const VkMultiDrawInfoEXT *v, uint32_t inst, uint32_t fi, uint32_t st)
+{
+    vkb_gprof *g = cur();
+    uint64_t prims = 0;
+    for (uint32_t i = 0; v && i < n; i++) prims += (uint64_t)((const VkMultiDrawInfoEXT *)((const char *)v + (size_t)i * (st ? st : sizeof(*v))))->vertexCount * inst;
+    count(g, cb, n, 0, prims);
+    g->draw_multi(cb, n, v, inst, fi, st);
+}
+
+static VKAPI_ATTR void VKAPI_CALL gp_CmdDrawMultiIndexedEXT(VkCommandBuffer cb, uint32_t n, const VkMultiDrawIndexedInfoEXT *v, uint32_t inst, uint32_t fi,
+                                                            uint32_t st, const int32_t *vo)
+{
+    vkb_gprof *g = cur();
+    uint64_t prims = 0;
+    for (uint32_t i = 0; v && i < n; i++) prims += (uint64_t)((const VkMultiDrawIndexedInfoEXT *)((const char *)v + (size_t)i * (st ? st : sizeof(*v))))->indexCount * inst;
+    count(g, cb, n, 0, prims);
+    g->draw_multi_indexed(cb, n, v, inst, fi, st, vo);
+}
+
+static VKAPI_ATTR void VKAPI_CALL gp_CmdDrawIndirectByteCountEXT(VkCommandBuffer cb, uint32_t inst, uint32_t fi, VkBuffer cb2, VkDeviceSize co, uint32_t cbo,
+                                                                 uint32_t vs)
+{
+    vkb_gprof *g = cur();
+    count(g, cb, 1, 0, 0);
+    g->draw_bytecount(cb, inst, fi, cb2, co, cbo, vs);
+}
+
+/* A command outside render passes: a new span when its kind differs from the open one's, and
+ * under =2 a dispatch with another compute pipeline than the open run's (its pipe[0]). */
 static void op(vkb_gprof *g, VkCommandBuffer cb, int kind)
 {
     pthread_mutex_lock(&g->lock);
     gp_cb *e = cb_get(g, cb, 0);
     gp_seg *s = open_seg(e);
-    if (s && s->kind == SEG_BETWEEN && s->sub != kind) {
+    int other_pipe = by_pipe && kind == OP_DISPATCH && s && s->sub == OP_DISPATCH && s->dispatches && s->pipe[0] != e->cbound;
+    if (s && s->kind == SEG_BETWEEN && (s->sub != kind || other_pipe)) {
         s = next_seg(g, e, cb);
         if (s) s->sub = (uint8_t)kind;
     }
@@ -657,6 +895,14 @@ static VKAPI_ATTR void VKAPI_CALL gp_CmdDispatchIndirect(VkCommandBuffer cb, VkB
     op(g, cb, OP_DISPATCH);
     count(g, cb, 0, 1, 0);
     g->dispatch_indirect(cb, b, o);
+}
+
+static VKAPI_ATTR void VKAPI_CALL gp_CmdDispatchBase(VkCommandBuffer cb, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z)
+{
+    vkb_gprof *g = cur();
+    op(g, cb, OP_DISPATCH);
+    count(g, cb, 0, 1, (uint64_t)x * y * z);
+    g->dispatch_base(cb, bx, by, bz, x, y, z);
 }
 
 static uint64_t spv_hash(const uint32_t *code, size_t size)
@@ -891,23 +1137,41 @@ int vkb_gprof_wanted(void)
 
 void vkb_gprof_device_init(vkb_srv_table *t)
 {
-    if (t->id >= 4096 || !vkb_gprof_wanted()) return;
+    if (!vkb_gprof_wanted()) return;
+    if (t->id >= 4096) {
+        VKB_INFO("device %u: GPU profiler off (device id beyond the 4096 it tracks)", t->id);
+        return;
+    }
     const char *mode = vkb_srv_env("VKBRIDGE_GPU_PROF");
     by_pipe = !strcmp(mode, "2");
     if (strstr(mode, "counters")) { /* Mali's hardware counters too (server_hwcnt.c), or alone */
         vkb_hwcnt_start();
-        if (!strcmp(mode, "counters-only")) return;
+        if (!strcmp(mode, "counters-only")) {
+            VKB_INFO("device %u: GPU profiler off (VKBRIDGE_GPU_PROF=counters-only reads the hardware counters alone)", t->id);
+            return;
+        }
     }
-    if (!t->real.vkCreateQueryPool || !t->real.vkGetQueryPoolResults || !t->real.vkCmdWriteTimestamp || !t->real.vkCmdResetQueryPool ||
-        !t->real.vkBeginCommandBuffer || !t->real.vkEndCommandBuffer || !t->real.vkCreateImageView || !t->real.vkDestroyImageView ||
-        !t->real.vkCmdDraw || !t->real.vkCmdDrawIndexed || !t->real.vkCmdDrawIndirect || !t->real.vkCmdDrawIndexedIndirect ||
-        !t->real.vkCmdDispatch || !t->real.vkCmdDispatchIndirect || !t->real.vkCmdBindPipeline ||
-        !t->real.vkCmdExecuteCommands)
+    char missing[400] = "";
+#define NEED(name)                                                                                   \
+    do {                                                                                             \
+        if (!t->real.name) snprintf(missing + strlen(missing), sizeof(missing) - strlen(missing), " %s", #name); \
+    } while (0)
+    NEED(vkCreateQueryPool); NEED(vkGetQueryPoolResults); NEED(vkCmdWriteTimestamp); NEED(vkCmdResetQueryPool);
+    NEED(vkBeginCommandBuffer); NEED(vkEndCommandBuffer); NEED(vkCreateImageView); NEED(vkDestroyImageView);
+    NEED(vkCmdDraw); NEED(vkCmdDrawIndexed); NEED(vkCmdDrawIndirect); NEED(vkCmdDrawIndexedIndirect);
+    NEED(vkCmdDispatch); NEED(vkCmdDispatchIndirect); NEED(vkCmdBindPipeline); NEED(vkCmdExecuteCommands);
+#undef NEED
+    if (*missing) {
+        VKB_INFO("device %u: GPU profiler off (the driver lacks:%s)", t->id, missing);
         return;
+    }
     PFN_vkGetPhysicalDeviceProperties props = (PFN_vkGetPhysicalDeviceProperties)vkb_gipa(t->instance, "vkGetPhysicalDeviceProperties");
     PFN_vkGetPhysicalDeviceQueueFamilyProperties qfp =
         (PFN_vkGetPhysicalDeviceQueueFamilyProperties)vkb_gipa(t->instance, "vkGetPhysicalDeviceQueueFamilyProperties");
-    if (!props || !qfp) return;
+    if (!props || !qfp) {
+        VKB_INFO("device %u: GPU profiler off (vkGetPhysicalDeviceProperties or QueueFamilyProperties not found)", t->id);
+        return;
+    }
     VkPhysicalDeviceProperties p;
     props(t->physical, &p);
     VkQueueFamilyProperties q[16];
@@ -922,12 +1186,20 @@ void vkb_gprof_device_init(vkb_srv_table *t)
         return;
     }
     vkb_gprof *g = calloc(1, sizeof(*g));
-    if (!g) return;
+    if (!g) {
+        VKB_INFO("device %u: GPU profiler off (out of memory)", t->id);
+        return;
+    }
     g->t = t;
     g->dev = t->device;
     g->period_ns = p.limits.timestampPeriod;
     g->mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
     g->since = now_s();
+    g->period_s = REPORT_S;
+    {
+        const char *ps = vkb_srv_env("VKBRIDGE_TEST_GPROF_S"); /* host tests */
+        if (ps && atof(ps) > 0) g->period_s = atof(ps);
+    }
     pthread_mutex_init(&g->lock, NULL);
     g->create_pool = t->real.vkCreateQueryPool;
     g->destroy_pool = t->real.vkDestroyQueryPool;
@@ -950,6 +1222,15 @@ void vkb_gprof_device_init(vkb_srv_table *t)
     HOOK(vkCmdDrawIndexedIndirect, gp_CmdDrawIndexedIndirect, draw_indexed_indirect);
     HOOK(vkCmdDispatch, gp_CmdDispatch, dispatch);
     HOOK(vkCmdDispatchIndirect, gp_CmdDispatchIndirect, dispatch_indirect);
+    HOOK(vkCmdDispatchBase, gp_CmdDispatchBase, dispatch_base);
+    HOOK(vkCmdDrawIndirectCount, gp_CmdDrawIndirectCount, draw_indirect_count);
+    HOOK(vkCmdDrawIndexedIndirectCount, gp_CmdDrawIndexedIndirectCount, draw_indexed_indirect_count);
+    HOOK(vkCmdDrawMultiEXT, gp_CmdDrawMultiEXT, draw_multi);
+    HOOK(vkCmdDrawMultiIndexedEXT, gp_CmdDrawMultiIndexedEXT, draw_multi_indexed);
+    HOOK(vkCmdDrawIndirectByteCountEXT, gp_CmdDrawIndirectByteCountEXT, draw_bytecount);
+    HOOK(vkAllocateCommandBuffers, gp_AllocateCommandBuffers, alloc_cbs);
+    HOOK(vkFreeCommandBuffers, gp_FreeCommandBuffers, free_cbs);
+    HOOK(vkDestroyCommandPool, gp_DestroyCommandPool, destroy_cmdpool);
     HOOK(vkCreateImageView, gp_CreateImageView, create_view);
     g->create_mod = t->real.vkCreateShaderModule;
     if (g->create_mod) {
@@ -996,7 +1277,10 @@ void vkb_gprof_device_init(vkb_srv_table *t)
     HOOK(vkCmdPipelineBarrier2, gp_vkCmdPipelineBarrier2, o.vkCmdPipelineBarrier2);
     profs[t->id] = g;
     __atomic_store_n(&last, g, __ATOMIC_RELEASE);
-    VKB_INFO("device %u: GPU profiler on (timestamp period %.2f ns, %u bits; summary every %.0f s)", t->id, g->period_ns, bits, REPORT_S);
+    if (pthread_create(&g->thread, NULL, gp_thread, g) == 0) g->thread_on = 1;
+    VKB_INFO("device %u: GPU profiler on (timestamp period %.2f ns, %u bits; summary every %.0f s%s%s)", t->id, g->period_ns, bits, g->period_s,
+             g->thread_on ? "" : "; NO timer thread: read only when a command buffer is begun again or freed",
+             g->alloc_cbs && g->free_cbs ? "" : "; command buffer levels unknown");
 }
 
 void vkb_gprof_device_destroy(vkb_srv_table *t)
@@ -1019,6 +1303,15 @@ void vkb_gprof_device_destroy(vkb_srv_table *t)
     UNHOOK(vkCmdDrawIndexedIndirect, gp_CmdDrawIndexedIndirect, draw_indexed_indirect);
     UNHOOK(vkCmdDispatch, gp_CmdDispatch, dispatch);
     UNHOOK(vkCmdDispatchIndirect, gp_CmdDispatchIndirect, dispatch_indirect);
+    UNHOOK(vkCmdDispatchBase, gp_CmdDispatchBase, dispatch_base);
+    UNHOOK(vkCmdDrawIndirectCount, gp_CmdDrawIndirectCount, draw_indirect_count);
+    UNHOOK(vkCmdDrawIndexedIndirectCount, gp_CmdDrawIndexedIndirectCount, draw_indexed_indirect_count);
+    UNHOOK(vkCmdDrawMultiEXT, gp_CmdDrawMultiEXT, draw_multi);
+    UNHOOK(vkCmdDrawMultiIndexedEXT, gp_CmdDrawMultiIndexedEXT, draw_multi_indexed);
+    UNHOOK(vkCmdDrawIndirectByteCountEXT, gp_CmdDrawIndirectByteCountEXT, draw_bytecount);
+    UNHOOK(vkAllocateCommandBuffers, gp_AllocateCommandBuffers, alloc_cbs);
+    UNHOOK(vkFreeCommandBuffers, gp_FreeCommandBuffers, free_cbs);
+    UNHOOK(vkDestroyCommandPool, gp_DestroyCommandPool, destroy_cmdpool);
     UNHOOK(vkCreateImageView, gp_CreateImageView, create_view);
     if (g->create_mod) {
         if (t->dt.vkCreateShaderModule == gp_CreateShaderModule) t->dt.vkCreateShaderModule = g->create_mod;
@@ -1054,6 +1347,11 @@ void vkb_gprof_device_destroy(vkb_srv_table *t)
     UNHOOK(vkCmdPipelineBarrier, gp_vkCmdPipelineBarrier, o.vkCmdPipelineBarrier);
     UNHOOK(vkCmdPipelineBarrier2, gp_vkCmdPipelineBarrier2, o.vkCmdPipelineBarrier2);
     profs[t->id] = NULL;
+    if (g->thread_on) { /* before the entries go */
+        __atomic_store_n(&g->stop, 1, __ATOMIC_RELEASE);
+        pthread_join(g->thread, NULL);
+        g->thread_on = 0;
+    }
     if (__atomic_load_n(&last, __ATOMIC_ACQUIRE) == g) {
         vkb_gprof *other = NULL;
         for (int i = 0; i < 4096 && !other; i++) other = profs[i];

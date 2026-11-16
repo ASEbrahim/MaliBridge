@@ -472,6 +472,49 @@ const char *const *vkb_client_device_exts(uint32_t *n)
     return client_device_exts;
 }
 
+/* One line per device (made once, at vkCreateDevice; nothing per frame): each performance switch the client acts on, its
+ * value and where it came from, so one Send-logs says what was on in a session ("did it help"): "guest env" (the game's
+ * environment, which wins), the server's (vkb_server_pd_info.perf_src: "env file" = <cache dir>/env, what the app writes;
+ * "server env"; "preset file" = <cache dir>/presets/<appid>.env; "built-in preset"), else "default". PRESENT_WAIT=1(pacer):
+ * offered to DXVK because the pacer is on. The server's own switches (BC fast converters, the overlay's cap) have lines
+ * of their own in the server's log. */
+static const char *psrc_name(uint32_t s)
+{
+    switch (s) {
+    case VKB_PSRC_CACHE_ENV: return "env file";
+    case VKB_PSRC_ENV: return "server env";
+    case VKB_PSRC_PRESET_FILE: return "preset file";
+    case VKB_PSRC_PRESET_BUILTIN: return "built-in preset";
+    default: return "default";
+    }
+}
+
+static void perf_switches_line(const vkb_physdev *pd)
+{
+    extern int vkb_fast_create_setting(int *from);
+    extern uint32_t vkb_query_late_probe_setting(int *guest);
+    uint32_t ps = pd->info.perf_src;
+    int pf, pfin, pacer = vkb_pacer_setting(&pf, &pfin);
+    int wf, pw = vkb_wsi_present_wait_setting(pd, &wf);
+    const char *pwv = pw ? "1" : "0";
+    if (pw && wf == VKB_PWF_SERVER && pd->info.present_wait == VKB_PRESENT_WAIT_COMMIT) pwv = "commit";
+    if (pw && wf == VKB_PWF_GUEST) {
+        const char *e = getenv("VKBRIDGE_PRESENT_WAIT");
+        if (e && !strcmp(e, "commit")) pwv = "commit";
+    }
+    int ff, fc = vkb_fast_create_setting(&ff);
+    int lg;
+    uint32_t lp = vkb_query_late_probe_setting(&lg);
+    VKB_INFO("perf-switches: PACER=%d(%s) PRESENT_WAIT=%s(%s) FAST_CREATE=%d(%s) QUERY_LATE_PROBE_MS=%u(%s)", pacer,
+             pf == 0 ? "guest env" : pf == 1 ? psrc_name(VKB_PSRC_GET(ps, VKB_PSRC_PACER_SHIFT)) : "default", pwv,
+             wf == VKB_PWF_GUEST    ? "guest env"
+             : wf == VKB_PWF_SERVER ? psrc_name(VKB_PSRC_GET(ps, VKB_PSRC_PRESENT_WAIT_SHIFT))
+             : wf == VKB_PWF_PACER  ? "pacer"
+                                    : "default",
+             fc, ff == 0 ? "guest env" : ff == 1 ? psrc_name(VKB_PSRC_GET(ps, VKB_PSRC_FAST_CREATE_SHIFT)) : "default", lp,
+             lg ? "guest env" : "default");
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
                                                      const VkAllocationCallbacks *pAllocator, VkDevice *pDevice)
 {
@@ -541,6 +584,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkCreateDevice(VkPhysicalDevice physicalDe
     vkb_query_init_device(dev);
     vkb_sm_init_device(dev);
     VKB_INFO("device created on %s", pd->props.deviceName);
+    perf_switches_line(pd);
     *pDevice = (VkDevice)dev;
     return VK_SUCCESS;
 }
@@ -550,6 +594,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyDevice(VkDevice device, const VkAlloc
     (void)pAllocator;
     if (!device) return;
     vkb_device *dev = vkb_dev(device);
+    vkb_wsi_pool_drop_device(dev);
     vkb_bufview_destroy_device(dev);
     vkb_query_destroy_device(dev);
     vkb_sm_destroy_device(dev);
@@ -745,6 +790,124 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetSemaphoreCounterValue(VkDevice device
     return vkb_note_error("vkGetSemaphoreCounterValue", vkb_wire_vkGetSemaphoreCounterValue(device, semaphore, pValue));
 }
 
+/* Query reads without the flush and the order barrier (VKBRIDGE_QUERY_NOBARRIER=0 turns it off), like the status polls above.
+ * A query read that reaches the server (a late or unmirrored query, a pool the mirror does not cover) was a synchronous call:
+ * the whole queue written first on the reading thread's socket, then the server's order wait behind every request any thread
+ * had queued. BL2 on the Xiaomi 15T: ~1.2 ms a frame of the RenderingThread's 1.4-1.5 ms of bridge time;
+ * Tekken 7 (G615): 2.2-2.5 s of every 10 s on UE4's RenderThread, 0.79 ms a read, while an idle round trip is ~65 us.
+ * A read without VK_QUERY_RESULT_WAIT_BIT may say "not available" at any moment before the query is: an answer from before the
+ * server has run the app's later queued work (its submit) is one a slower GPU would give. What it may NOT do is say "available,
+ * <the last use's value>" after the app's own host reset of that query returned (the  class: walls read as 0 samples):
+ * so per query the seq of the last vkResetQueryPool that covered it (a range over 64 queries: one pool-wide note), and a read
+ * keeps the barrier until those have run (as fences and events after a host reset). A pool ever reset on the GPU
+ * (vkCmdResetQueryPool) keeps the barrier for good: there the new use's reset is GPU work in a submit, and only the barrier
+ * keeps the answer behind it. WAIT reads keep the barrier (they must see the submitted work); WAIT reads of results already in
+ * the mirror never reach here (query.c). The answer itself (64/32-bit, availability, partial) is the driver's, as before. */
+#define QRESET_SLOTS 16384
+static hostop_slot qreset[QRESET_SLOTS];
+static uint64_t qreset_spilled;
+static pthread_mutex_t qreset_lock = PTHREAD_MUTEX_INITIALIZER;
+static vkb_map gpu_reset_pools; /* VkQueryPool -> (void *)1 */
+static pthread_once_t gpu_reset_once = PTHREAD_ONCE_INIT;
+static void gpu_reset_init(void) { vkb_map_init(&gpu_reset_pools); }
+
+static int query_nobarrier(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_QUERY_NOBARRIER");
+        v = e && *e && strcmp(e, "0"); /* v0.5.5.4: off by default; VKBRIDGE_QUERY_NOBARRIER=1 */
+    }
+    return v;
+}
+
+/* VKBRIDGE_TEST_QUERY_NOGATE=1 (host tests only, querypoll_test.sh): the host-reset check left out, to show the test sees it. */
+static int query_test_nogate(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_TEST_QUERY_NOGATE");
+        v = e && *e && strcmp(e, "0");
+        if (v) VKB_WARN("VKBRIDGE_TEST_QUERY_NOGATE=1: query reads go without the barrier even right after a host reset (test only)");
+    }
+    return v;
+}
+
+static uint64_t qreset_key(VkQueryPool pool, uint32_t q)
+{
+    return (uint64_t)(uintptr_t)pool ^ (((uint64_t)q + 1) * 0x9e3779b97f4a7c15ull);
+}
+
+static hostop_slot *qreset_find(uint64_t key)
+{
+    uint64_t k = key * 0xff51afd7ed558ccdull;
+    return &qreset[(k ^ (k >> 29)) & (QRESET_SLOTS - 1)];
+}
+
+/* Under qreset_lock. */
+static void qreset_put(uint64_t key, uint64_t seq)
+{
+    hostop_slot *h = qreset_find(key);
+    if (h->key != key && h->seq > qreset_spilled && !vkb_async_ran(h->seq)) qreset_spilled = h->seq;
+    h->key = key;
+    h->seq = seq;
+}
+
+/* query.c, after a host vkResetQueryPool went out. */
+void vkb_query_host_reset_note(VkQueryPool pool, uint32_t first, uint32_t count)
+{
+    uint64_t seq = vkb_async_seq_last();
+    if (!seq || !query_nobarrier() || !count) return;
+    pthread_mutex_lock(&qreset_lock);
+    if (count > 64) qreset_put(qreset_key(pool, UINT32_MAX), seq);
+    else
+        for (uint32_t q = first; q < first + count; q++) qreset_put(qreset_key(pool, q), seq);
+    pthread_mutex_unlock(&qreset_lock);
+}
+
+/* query.c, when a command buffer records vkCmdResetQueryPool. */
+void vkb_query_gpu_reset_note(VkQueryPool pool)
+{
+    if (!pool) return;
+    pthread_once(&gpu_reset_once, gpu_reset_init);
+    if (!vkb_map_get(&gpu_reset_pools, (uint64_t)(uintptr_t)pool)) vkb_map_put(&gpu_reset_pools, (uint64_t)(uintptr_t)pool, (void *)1);
+}
+
+void vkb_query_pool_gone(VkQueryPool pool)
+{
+    if (!pool) return;
+    pthread_once(&gpu_reset_once, gpu_reset_init);
+    vkb_map_remove(&gpu_reset_pools, (uint64_t)(uintptr_t)pool);
+}
+
+/* 1: this read may go without the barrier (marks this thread's next call). */
+static int query_poll_free(VkQueryPool pool, uint32_t first, uint32_t count, VkQueryResultFlags flags)
+{
+    if (!query_nobarrier() || (flags & (VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_WITH_STATUS_BIT_KHR)) || !count || count > 64) return 0;
+    if (vkb_query_detect_ask(pool, first, count)) return 0; /* the mirror's lateness check keeps it (query.c) */
+    pthread_once(&gpu_reset_once, gpu_reset_init);
+    if (vkb_map_get(&gpu_reset_pools, (uint64_t)(uintptr_t)pool)) {
+        VKB_ONCE(VKB_LOG_INFO, "query reads of pool %llx keep the barrier: it is reset on the GPU (vkCmdResetQueryPool); logged once",
+                 (unsigned long long)(uintptr_t)pool);
+        return 0;
+    }
+    if (!query_test_nogate()) {
+        pthread_mutex_lock(&qreset_lock);
+        uint64_t seq = qreset_spilled;
+        hostop_slot *h = qreset_find(qreset_key(pool, UINT32_MAX));
+        if (h->key == qreset_key(pool, UINT32_MAX) && h->seq > seq) seq = h->seq;
+        for (uint32_t q = first; q < first + count; q++) {
+            uint64_t k = qreset_key(pool, q);
+            h = qreset_find(k);
+            if (h->key == k && h->seq > seq) seq = h->seq;
+        }
+        pthread_mutex_unlock(&qreset_lock);
+        if (seq && !vkb_async_ran(seq)) return 0;
+    }
+    vkb_call_poll_next();
+    return 1;
+}
+
 /* DXVK polls each pending query until the GPU is done with it: ~15,000 round trips a second in
  * Deep Rock Galactic, most answered "not ready". After a not-ready answer, plain polls of the same
  * queries (no wait, no availability or partial values, which must be written) are answered here
@@ -834,6 +997,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetQueryPoolResults(VkDevice device, VkQ
         return qr;
     }
     uint64_t gen = quiet_gen_now();
+    query_poll_free(queryPool, firstQuery, queryCount, flags);
     VkResult r = vkb_wire_vkGetQueryPoolResults(device, queryPool, firstQuery, queryCount, dataSize, pData, stride, flags);
     r = vkb_qvis_imitate(queryPool, firstQuery, queryCount, r); /* host tests only */
     vkb_query_wire_answer(vkb_dev(device), queryPool, firstQuery, queryCount, r); /* a query stuck in the mirror (query.c) */

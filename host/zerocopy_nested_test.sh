@@ -40,7 +40,7 @@ fake_start() { # fake_start <log> [fake args...]
   stop_fake
   local log=$1; shift
   : > "$log"
-  rm -f "$work/nested.sock" "$work/host.sock"
+  rm -f "$work/nested.sock" "$work/host.sock" "$work/fake.out" # the last fake's "ready" is not this one's
   python3 -I ../tests/fake_nested_wayland.py --nested "$work/nested.sock" --host "$work/host.sock" --log "$log" "$@" \
     > "$work/fake.out" 2>&1 &
   fake=$!

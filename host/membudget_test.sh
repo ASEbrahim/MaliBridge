@@ -15,10 +15,10 @@
 #   (steps 1-5 force the offer with VKBRIDGE_EMU_MEMBUDGET=1: the PC has more than 12800 MB of RAM, no default cap)
 # Players' fingerprints (MemTotal, MemAvailable at the game's start, its GPU memory and the free memory / swap in
 # its last minutes, from their server logs; VKBRIDGE_FAKE_MEMTOTAL_MB / _MEMAVAIL_MB / _SWAPTOTAL_MB / _SWAPFREE_MB):
-#   7  vivo V2515 11350 MB, 2850 free at the start, the server killed: offered (started short), shown
+#   7  a player log (vivo V2515 11350 MB, 2850 free at the start, the server killed): offered (started short), shown
 #      heap 2560; 2850 free -> budget 2560 usage 0; 2304 MB held, 327 free -> 2304 + 327 - 1536 = 1095;
-#   8  same phone, 3507 free at the start: offered, heap 3072; 2880 held, 467 free -> 1811;
-#   9  Ultra 12 GB 11245 MB, 3270 at the start, swap 0 of 12287, the app killed at 834 free: 1431 free
+#   8  a player log (same phone, 3507 free at the start): offered, heap 3072; 2880 held, 467 free -> 1811;
+#   9  a player log (Ultra 12 GB 11245 MB, 3270 at the start, swap 0 of 12287, the app killed at 834 free): 1431 free
 #      (over an eighth of RAM) not low; 834 -> low by the swap rule: 2368 + 834 - 1536 = 1666; 1500 (swap still
 #      used up, under a sixth) still low; 2000 -> normal;
 #  10  (Pixel 9a 7322 MB, 3174 at the start, MemAvailable 0 and swap 10 of 3661 at the kill): 0 free -> low,
@@ -140,25 +140,25 @@ step $([ -z "$r" ] && echo 0 || echo 1) "driver's own extension: the bridge's pa
 player() { local n=$1; shift; start $n VKBRIDGE_FAKE_MISSING=membudget VKBRIDGE_BUDGET_LOW_HOLD_MS=0 "$@"; }
 # 7 a player log
 r=
-player e78j VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=2850
+player mem1 VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=2850
 run MBC_ALLOC_MB=2304 MBC_STEPS=2850,327
 echo "$v" | grep -q '^ext=yes' || r="$r not-offered"
 [ "$(field 2850 1 size_mb)" = 2560 ] && [ "$(field 2850 1 budget_mb)" = 2560 ] && [ "$(field 2850 1 usage_mb)" = 0 ] || r="$r 2850($(field 2850 1 budget_mb)/$(field 2850 1 usage_mb) of $(field 2850 1 size_mb))"
 near "$(field 327 1 budget_mb)" 1095 8 && near "$(field 327 1 usage_mb)" 2304 8 || r="$r 327($(field 327 1 budget_mb)/$(field 327 1 usage_mb))"
 grep -q 'heap cap: process .* at most 2560 MB, not 4096: 2850 MB free' "$log" || r="$r cap-log"
-step $([ -z "$r" ] && echo 0 || echo 1) "11350 MB, 2850 free at start: heap $(field 2850 1 size_mb), 2850 free -> $(field 2850 1 budget_mb)/$(field 2850 1 usage_mb), 2304 held + 327 free -> $(field 327 1 budget_mb)/$(field 327 1 usage_mb) (want 1095/2304)${r:+ (failed:$r)}"
+step $([ -z "$r" ] && echo 0 || echo 1) "a player log (11350 MB, 2850 free at start): heap $(field 2850 1 size_mb), 2850 free -> $(field 2850 1 budget_mb)/$(field 2850 1 usage_mb), 2304 held + 327 free -> $(field 327 1 budget_mb)/$(field 327 1 usage_mb) (want 1095/2304)${r:+ (failed:$r)}"
 
 # 8 a player log
 r=
-player quwd VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=3507
+player mem2 VKBRIDGE_FAKE_MEMTOTAL_MB=11350 VKBRIDGE_FAKE_MEMAVAIL_MB=3507
 run MBC_ALLOC_MB=2880 MBC_STEPS=467
 echo "$v" | grep -q '^ext=yes' || r="$r not-offered"
 [ "$(field 467 1 size_mb)" = 3072 ] && near "$(field 467 1 budget_mb)" 1811 8 && near "$(field 467 1 usage_mb)" 2880 8 || r="$r 467($(field 467 1 budget_mb)/$(field 467 1 usage_mb) of $(field 467 1 size_mb))"
-step $([ -z "$r" ] && echo 0 || echo 1) "3507 free at start: heap $(field 467 1 size_mb), 2880 held + 467 free -> $(field 467 1 budget_mb)/$(field 467 1 usage_mb) (want 1811/2880)${r:+ (failed:$r)}"
+step $([ -z "$r" ] && echo 0 || echo 1) "a player log (3507 free at start): heap $(field 467 1 size_mb), 2880 held + 467 free -> $(field 467 1 budget_mb)/$(field 467 1 usage_mb) (want 1811/2880)${r:+ (failed:$r)}"
 
-# 9 swap used up
+# 9 a player log: swap used up
 r=
-player ems5 VKBRIDGE_FAKE_MEMTOTAL_MB=11245 VKBRIDGE_FAKE_MEMAVAIL_MB=3270 VKBRIDGE_FAKE_SWAPTOTAL_MB=12287 VKBRIDGE_FAKE_SWAPFREE_MB=0
+player mem3 VKBRIDGE_FAKE_MEMTOTAL_MB=11245 VKBRIDGE_FAKE_MEMAVAIL_MB=3270 VKBRIDGE_FAKE_SWAPTOTAL_MB=12287 VKBRIDGE_FAKE_SWAPFREE_MB=0
 run MBC_ALLOC_MB=2368 MBC_STEPS=1431,834,1500,2000
 echo "$v" | grep -q '^ext=yes' || r="$r not-offered"
 hs=$(field 1431 1 size_mb)
@@ -167,7 +167,7 @@ near "$(field 834 1 budget_mb)" 1666 8 && near "$(field 834 1 usage_mb)" 2368 8 
 near "$(field 1500 1 budget_mb)" 2332 8 || r="$r 1500($(field 1500 1 budget_mb))"
 [ "$(field 2000 1 budget_mb)" = "$hs" ] && [ "$(field 2000 1 usage_mb)" = 0 ] || r="$r 2000($(field 2000 1 budget_mb))"
 grep -q 'memory budget: 834 MB free (under 768 MB, or swap used up)' "$log" || r="$r enter-log"
-step $([ -z "$r" ] && echo 0 || echo 1) "swap 0 of 12287: 1431 free -> $(field 1431 1 budget_mb) (heap $hs, not low), 834 -> $(field 834 1 budget_mb)/$(field 834 1 usage_mb) (want 1666/2368), 1500 -> $(field 1500 1 budget_mb) (still low), 2000 -> $(field 2000 1 budget_mb)${r:+ (failed:$r)}"
+step $([ -z "$r" ] && echo 0 || echo 1) "a player log (swap 0 of 12287): 1431 free -> $(field 1431 1 budget_mb) (heap $hs, not low), 834 -> $(field 834 1 budget_mb)/$(field 834 1 usage_mb) (want 1666/2368), 1500 -> $(field 1500 1 budget_mb) (still low), 2000 -> $(field 2000 1 budget_mb)${r:+ (failed:$r)}"
 
 # 10 : MemAvailable 0
 r=

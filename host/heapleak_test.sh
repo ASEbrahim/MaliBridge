@@ -1,5 +1,5 @@
 #!/bin/bash
-# The server's heap with what Detroit: Become Human did (a player log, G925: the heap 520 MB -> 3.6 GB at
+# The server's heap with what Detroit: Become Human did (a player log: the heap 520 MB -> 3.6 GB at
 # the game's start, then +~110 MB a minute until the server aborted), tests/heapleak_check.c:
 #   1. pools: six empty FREE_DESCRIPTOR_SET pools of 45056 sets asked 20 times each for a set bigger
 #      than the pool: refused as before, and at most one overflow pool per app pool made for them
@@ -72,11 +72,11 @@ step $? "heapleak_check frames: $(tail -1 $work/frames.out)"
 a=$(sed -n 's/^server anon at 2000: \([0-9]*\) KB/\1/p' $work/frames.out)
 b=$(sed -n 's/^server anon at end: \([0-9]*\) KB/\1/p' $work/frames.out)
 lim=${HEAPLEAK_MAX_KB:-4096}
-step $([ -n "$a" ] && [ -n "$b" ] && [ $((b - a)) -lt $lim ]; echo $?) "server anonymous memory from frame 2000 to the end: ${a:-?} -> ${b:-?} KB (+$((${b:-0} - ${a:-0})) KB, under $lim)"
+step $([ -n "$a" ] && [ -n "$b" ] && [ $((b - a)) -lt $lim ]; echo $?) "server anonymous memory from frame 2000 to the end: ${a:-?} -> ${b:-?} KB (+$(( ${b:-0} - ${a:-0} )) KB, under $lim)"
 pc=$(grep -o "pipeline caches [0-9]*K" $work/frames.log | sed 's/[^0-9]//g')
 pc_over=$(sed -n 's/.*would be \([0-9]*\) KB.*over the .* limit for one program.*/\1/p' $work/frames.log | head -1)
 pc_last=$(echo "$pc" | tail -1)
-step $([ -n "$pc_over" ] && [ -n "$pc_last" ] && [ "$pc_last" -le $((${pc_over:-0} + 64)) ]; echo $?) "the server's own cache stays where it went over the limit: ${pc_over:-?}K -> ${pc_last:-?}K"
+step $([ -n "$pc_over" ] && [ -n "$pc_last" ] && [ "$pc_last" -le $(( ${pc_over:-0} + 64 )) ]; echo $?) "the server's own cache stays where it went over the limit: ${pc_over:-?}K -> ${pc_last:-?}K"
 stop_server
 
 # 3. nullcache: pipelines made without an app cache (DXVK, vkd3d-proton) go into the server's own;
@@ -114,10 +114,10 @@ built=${fb% *} hits=${fb#* }
 sa=$(sed -n 's/^seeds asked again: //p' $work/nullplay.out)
 rp=$(sed -n 's/^repeats: //p' $work/nullplay.out)
 want=$(( ${sa:-0} + ${rp:-0} * 9 / 10 ))
-step $([ -n "$fb" ] && [ -n "$sa" ] && [ "${hits:-0}" -ge "$want" ] && [ "${hits:-0}" -le $((${sa:-0} + ${rp:-0})) ]; echo $?) "still found in the cache: ${hits:-?} of ${built:-?} pipelines (the file's ${sa:-?} asked again + this session's ${rp:-?} repeats; at least $want)"
+step $([ -n "$fb" ] && [ -n "$sa" ] && [ "${hits:-0}" -ge "$want" ] && [ "${hits:-0}" -le $(( ${sa:-0} + ${rp:-0} )) ]; echo $?) "still found in the cache: ${hits:-?} of ${built:-?} pipelines (the file's ${sa:-?} asked again + this session's ${rp:-?} repeats; at least $want)"
 na=$(sed -n 's/^server anon at 2000: \([0-9]*\) KB/\1/p' $work/nullplay.out)
 nb=$(sed -n 's/^server anon at end: \([0-9]*\) KB/\1/p' $work/nullplay.out)
-step $([ -n "$na" ] && [ -n "$nb" ] && [ $((nb - na)) -lt $lim ]; echo $?) "server anonymous memory from frame 2000 to the end: ${na:-?} -> ${nb:-?} KB (+$((${nb:-0} - ${na:-0})) KB, under $lim)"
+step $([ -n "$na" ] && [ -n "$nb" ] && [ $((nb - na)) -lt $lim ]; echo $?) "server anonymous memory from frame 2000 to the end: ${na:-?} -> ${nb:-?} KB (+$(( ${nb:-0} - ${na:-0} )) KB, under $lim)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; fi
 [ $fails = 0 ]

@@ -1,5 +1,5 @@
 ; clip_vs_block.spvasm with source line debug info, as No Man's Sky's glslang vertex shaders carry
-;: an OpLine whose line number (100) equals the id of the gl_PerVertex variable
+; (a player log): an OpLine whose line number (100) equals the id of the gl_PerVertex variable
 ; (%100; assembled with --preserve-numeric-ids). The line number is a literal; spirv_clip.c read it
 ; as a use of the block, left gl_ClipDistance a built-in and Mali's compiler crashed on the
 ; pipeline. Draws the same quad: the left half is clipped.

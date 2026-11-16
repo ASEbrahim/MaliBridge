@@ -71,15 +71,15 @@ run VKBRIDGE_MODE=performance VKBRIDGE_FAKE_DRIVER_VERSION=r49p1 -- cullmode_che
 [ $r4 = 0 ] && ! has "$on4" cull_nontri && [ $rc = 0 ] && has "$(on_set)" cull_nontri &&
   echo "$new" | grep -q "errata: cull_nontri ON (r49p1 in r0p0-r51 (ANGLE: below r52"
 step $? "performance mode: off on r52p0, on on r49p1 ($(echo "$new" | grep -o 'errata: cull_nontri ON ([^)]*' | cut -c1-60)...)"
-# 5
-run VKBRIDGE_ERRATA_IMITATE=dyn_reemit,cull_nontri -- dynstate_check
+# 5 (dyn_state:none: safe mode keeps dyn_reemit on, as on a driver whose start-up check has not passed; on this desktop driver it passed)
+run VKBRIDGE_ERRATA_PROBE=dyn_state:none VKBRIDGE_ERRATA_IMITATE=dyn_reemit,cull_nontri -- dynstate_check
 r5=$rc res5=$res
-run VKBRIDGE_ERRATA_IMITATE=dyn_reemit,cull_nontri -- cullmode_check
+run VKBRIDGE_ERRATA_PROBE=dyn_state:none VKBRIDGE_ERRATA_IMITATE=dyn_reemit,cull_nontri -- cullmode_check
 [ $r5 = 0 ] && [ $rc = 0 ]
 step $? "with dyn_reemit, both imitated: dynstate_check $res5; cullmode_check $res"
 
 # 6
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

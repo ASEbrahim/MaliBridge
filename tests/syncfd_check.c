@@ -3,7 +3,7 @@
  * syncfd_check: a sync-fd export (vkGetSemaphoreFdKHR, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT)
  * of a binary semaphore whose signalling batch the driver has not handed to the kernel yet: the
  * batch waits on a timeline value another thread signals HOLD_MS later. A driver with a submit
- * thread (Mesa's RADV here; Samsung's Xclipse driver is suspected of the same: Xwayland
+ * thread (Mesa's RADV here; Samsung's Xclipse driver is suspected of the same, a player log: Xwayland
  * stuck in this call, the X server with it) answers the export only once the batch is out.
  *
  *   syncfd_check direct|bounded|stall|order|orderoff|any
@@ -16,17 +16,22 @@
  *     stall:   an empty submit and a vkDeviceWaitIdle on another thread after it, nothing else (the server holds the
  *              submit: VKBRIDGE_TEST_DELAY_CMD; its log then says what the wait waited for);
  *     order:   a submit the server holds (VKBRIDGE_TEST_DELAY_CMD) and, on the same thread right after it, a sync-fd
- *              export of what it signals (Xwayland's pattern): with VKBRIDGE_SYNCFD_ORDER_MS below the hold
+ *              export of what it signals (Xwayland's pattern, a player log): with VKBRIDGE_SYNCFD_ORDER_MS below the hold
  *              the export is answered at that deadline with fd -1; the queue goes idle once the submit is out;
  *     orderoff: the same with the order deadline off: the export waits for the whole hold;
  *     endstall: a command buffer of a few recorded commands is ended (asynchronous through the bridge, its stream replayed
  *              by the server) and a vkDeviceWaitIdle on another thread waits behind it. The server holds the replay of
  *              one command (VKBRIDGE_TEST_DELAY_CMD=vkCmdSetViewport) or the driver's own End (=driver-end): its log then
- *              names the command it is in (Xwayland's End never returned on Xclipse);
+ *              names the command it is in (a player log: Xwayland's End never returned on Xclipse);
  *     any:     printed, not judged.
  *   Both then check an ordinary export (the batch out at once): quick, a valid fd, and that the fd
  *   signals once the queue is idle. A driver that does not block (the first export quick in
- *   "direct") prints "SKIP" and exits 0.
+ *   "direct") prints "SKIP" and exits 0, and so does a device without timeline semaphores (the held
+ *   batch cannot be made: vkSignalSemaphore is NULL on a Vulkan 1.1 device, which the late signal
+ *   thread called and crashed on under run_tests' common Mali profile).
+ *   An fd of -1 from the driver once the batch is out is "already signalled" (the spec allows it for a
+ *   sync fd; lavapipe answers so): accepted where the check is about the driver's answer, the timing
+ *   checks unchanged (the bridge's own -1 comes at its deadline, well before the batch is out).
  * One line per step, "OK: ..." / "FAILED: ..." / "SKIP: ..." last.
  */
 #define VK_NO_PROTOTYPES
@@ -257,7 +262,7 @@ int main(int argc, char **argv)
         if (!strcmp(expect, "order"))
             check(r == VK_SUCCESS && fd == -1 && took < 2000, "the export is answered at the order deadline with fd -1");
         else
-            check(r == VK_SUCCESS && fd >= 0 && took >= 3000, "the export waits for the held submit and gives a sync fd");
+            check(r == VK_SUCCESS && fd >= -1 && took >= 3000, "the export waits for the held submit and gives a sync fd (or -1: already signalled)");
         if (fd >= 0) close(fd);
         t0 = now_ms();
         r = vkQueueWaitIdle(queue);
@@ -270,7 +275,7 @@ int main(int argc, char **argv)
         fd = export_fd(b0, &r);
         took = now_ms() - t0;
         printf("  ordinary batch: export %d, fd %d, %.1f ms\n", r, fd, took);
-        check(r == VK_SUCCESS && fd >= 0 && took < 500, "an ordinary export is quick and real");
+        check(r == VK_SUCCESS && fd >= -1 && took < 500, "an ordinary export is quick and real (or -1: already signalled)");
         if (fd >= 0) close(fd);
         vkDeviceWaitIdle(dev);
         vkDestroySemaphore(dev, b0, NULL);
@@ -283,8 +288,15 @@ int main(int argc, char **argv)
     /* 1: the held batch */
     VkSemaphoreTypeCreateInfo tci = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0};
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &tci, 0};
-    VkSemaphore timeline = VK_NULL_HANDLE, b = exportable();
-    vkCreateSemaphore(dev, &sci, NULL, &timeline);
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    VkResult tr = vkSignalSemaphore ? vkCreateSemaphore(dev, &sci, NULL, &timeline) : VK_ERROR_FEATURE_NOT_PRESENT;
+    if (tr != VK_SUCCESS || !timeline) {
+        printf("SKIP: %s has no timeline semaphores (vkSignalSemaphore %s, create %d): the held batch cannot be made\n",
+               props.deviceName, vkSignalSemaphore ? "found" : "NULL", tr);
+        vkDestroyDevice(dev, NULL);
+        return 0;
+    }
+    VkSemaphore b = exportable();
     VkResult r = submit_signal(b, timeline);
     if (r != VK_SUCCESS) {
         printf("FAILED: the held submit: %d\n", r);
@@ -304,7 +316,7 @@ int main(int argc, char **argv)
             vkDeviceWaitIdle(dev);
             return 0;
         }
-        check(r == VK_SUCCESS && fd >= 0 && took >= HOLD_MS * 0.8, "the export waits for the batch and gives a sync fd");
+        check(r == VK_SUCCESS && fd >= -1 && took >= HOLD_MS * 0.8, "the export waits for the batch and gives a sync fd (or -1: already signalled)");
     } else if (!strcmp(expect, "bounded")) {
         check(r == VK_SUCCESS && took < HOLD_MS * 0.7, "the export returns before the batch is out (the server's bound)");
         check(fd == -1 || fd >= 0, "the fd is -1 (already signalled) or a sync fd");

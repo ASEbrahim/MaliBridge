@@ -1,11 +1,11 @@
 #!/bin/bash
-# Mali-G925 r49p1, Feed the Cups through Zink and a player log (Mali-G615 r44p1, WEBFISHING
+# a player log (Mali-G925 r49p1, Feed the Cups through Zink) and a player log (Mali-G615 r44p1, WEBFISHING
 # through Zink): the one server died in Mali's vkCmdBeginTransformFeedbackEXT (near-null reads, 0xe78
 # and 0xe60), command 31 of a stream that had bound its pipeline. The vertex-input layer
 # (server_vidyn.c; vb_bake the same) holds a kept pipeline's bind until the draw, and Zink begins
 # transform feedback between the bind and the draw: the driver had no graphics pipeline bound.
 # The begin now binds what the draw would. And a begin with no pipeline at all (one that failed to
-# build) is left out in the replay with its end, as draws are.
+# build) is left out in the replay with its end, as draws are (a player log).
 # VKBRIDGE_TEST_CRASH_CMD=xfb_unbound imitates Mali: a begin that reaches the driver with no graphics
 # pipeline bound in its command buffer faults at 0xe78.
 #   1  Zink's shape (xfb_check zink, the vertex input emulated: VKBRIDGE_FAKE_MISSING=vidyn): every
@@ -48,7 +48,7 @@ start zinknofix VKBRIDGE_FAKE_MISSING=vidyn VKBRIDGE_XFB_BIND_FIRST=0 VKBRIDGE_R
 gone; dead=$?
 line=$(grep -m1 "crashed with signal" "$work/zinknofix.log")
 [ $dead = 0 ] && echo "$line" | grep -q "address 0xe78) in vkCmdBeginTransformFeedbackEXT" && grep -q "replaying command buffer .* vkCmdBindPipeline" "$work/zinknofix.log"
-step $? "2 A/B: with VKBRIDGE_XFB_BIND_FIRST=0 the server dies: ${line#*E }"
+step $? "2 A/B: with VKBRIDGE_XFB_BIND_FIRST=0 the server dies as in a player log: ${line#*E }"
 srv=
 
 start nopipe

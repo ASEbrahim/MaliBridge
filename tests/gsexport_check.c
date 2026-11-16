@@ -16,7 +16,9 @@
  * reported (what the compositor would see), and the dma-buf imported as gamescope imports a client's
  * (an image at the explicit LINEAR modifier, its memory requirement within the dma-buf, red read
  * out of it). Host imitation of r32p1: VKBRIDGE_FAKE_MISSING=dmabufmod
- * with the export emulation on (dmabufexport, VKBRIDGE_TEST_EXPORT_PAGES=driver). Exit status 0
+ * with the export emulation on (dmabufexport, VKBRIDGE_TEST_EXPORT_PAGES=driver). Also the format's
+ * modifier list, as Zink and gamescope read it (LINEAR listed). host/drmmod_test.sh runs it where the
+ * driver has no VK_EXT_image_drm_format_modifier at all (Mali-G720 r49p1; lavapipe). Exit status 0
  * only if all pass.
  */
 #define _GNU_SOURCE
@@ -392,6 +394,24 @@ int main(void)
     if (!setup(c)) {
         check(0, "Vulkan setup (VK_EXT_external_memory_dma_buf, VK_EXT_image_drm_format_modifier)", NULL);
         return 1;
+    }
+    /* the format's modifiers, as Zink (zink_get_modifier_props) and gamescope ask them: LINEAR among them,
+     * one plane, sampled */
+    {
+        VkDrmFormatModifierPropertiesListEXT ml = {VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT};
+        VkFormatProperties2 fp = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &ml};
+        I(vkGetPhysicalDeviceFormatProperties2)(c->pd, VK_FORMAT_B8G8R8A8_UNORM, &fp);
+        VkDrmFormatModifierPropertiesEXT mp[16];
+        ml.drmFormatModifierCount = ml.drmFormatModifierCount > 16 ? 16 : ml.drmFormatModifierCount;
+        ml.pDrmFormatModifierProperties = mp;
+        if (ml.drmFormatModifierCount) I(vkGetPhysicalDeviceFormatProperties2)(c->pd, VK_FORMAT_B8G8R8A8_UNORM, &fp);
+        int lin = 0;
+        for (uint32_t i = 0; i < ml.drmFormatModifierCount; i++)
+            lin |= mp[i].drmFormatModifier == MOD_LINEAR && mp[i].drmFormatModifierPlaneCount == 1 &&
+                   (mp[i].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+        char d[80];
+        snprintf(d, sizeof(d), "%u modifier(s)", ml.drmFormatModifierCount);
+        check(lin, "B8G8R8A8: the LINEAR modifier listed (one plane, sampled)", d);
     }
     /* gamescope's two kinds of flippable image (XR24 / AR24 -> B8G8R8A8) */
     query(c, "output image", VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);

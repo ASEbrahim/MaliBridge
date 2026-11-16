@@ -254,7 +254,10 @@ int main(void)
     char d[512];
 #define G(n) n = (PFN_##n)gipa(inst, #n)
     G(vkCreateInstance);
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "vkbridge-desc-limits", 1, "vkbridge", 1, VK_API_VERSION_1_2};
+    /* DESC_CHECK_ENGINE=vkd3d: the engine name vkd3d-proton gives (the server treats its devices as vkd3d's) */
+    const char *engine = getenv("DESC_CHECK_ENGINE");
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "vkbridge-desc-limits", 1, engine && *engine ? engine : "vkbridge", 1,
+                             VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL};
     if (vkCreateInstance(&ici, NULL, &inst)) {
         check(0, "instance", NULL);
@@ -454,6 +457,28 @@ int main(void)
         if (r == VK_SUCCESS) r = vkQueueWaitIdle(queue);
         snprintf(d, sizeof(d), "%d, got %x %x %x", r, res[0], res[1], res[2]);
         check(r == VK_SUCCESS && !memcmp(res, want[i], sizeof(want[i])), what[i], d);
+    }
+
+    /* vkd3d's CBV set (its extra SSBOs first, then the heap's uniform buffers) and its raw SSBO set
+     * from one pool sized as vkd3d sizes it: the heap of each type plus the extra SSBOs. A server
+     * that cuts the sets must leave the pool room for both. */
+    {
+        VkDescriptorSetLayout cl[2] = {make_layout(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL), make_layout(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, 0, NULL)};
+        VkDescriptorPoolSize cps[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, COUNT}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, COUNT + 1}};
+        VkDescriptorPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, 2, 2, cps};
+        VkDescriptorPool cp = VK_NULL_HANDLE;
+        uint32_t cc[2] = {COUNT, COUNT};
+        VkDescriptorSetVariableDescriptorCountAllocateInfo cvi = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO, NULL, 2, cc};
+        VkDescriptorSetAllocateInfo cai2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, &cvi, VK_NULL_HANDLE, 2, cl};
+        VkDescriptorSet cs[2];
+        VkResult cr = !cl[0] || !cl[1] ? VK_ERROR_INITIALIZATION_FAILED : vkCreateDescriptorPool(dev, &cpci, NULL, &cp);
+        if (cr == VK_SUCCESS) {
+            cai2.descriptorPool = cp;
+            cr = vkAllocateDescriptorSets(dev, &cai2, cs);
+        }
+        snprintf(d, sizeof(d), "%d", cr);
+        check(cr == VK_SUCCESS, "vkd3d's CBV set and raw SSBO set from one pool (heap + extra SSBOs)", d);
+        if (cp) vkDestroyDescriptorPool(dev, cp, NULL);
     }
 
     vkDestroyDescriptorPool(dev, up, NULL);

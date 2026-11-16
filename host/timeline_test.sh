@@ -1,10 +1,13 @@
 #!/bin/bash
 # Timeline semaphores kept by the bridge where the driver has none (server_timeline.c): Mali r18p0 /
-# r19p0 (a player log Mali-G52 Mali-G76, Vulkan 1.1) have no VK_KHR_timeline_semaphore, which
+# r19p0 (a player log Mali-G52, a player log Mali-G76, Vulkan 1.1) have no VK_KHR_timeline_semaphore, which
 # gamescope (Vulkan 1.2) and Zink need. VKBRIDGE_FAKE_MISSING=timeline hides the desktop driver's
 # and takes the bridge's path. tests/timeline_check.c's eight steps (host signal, GPU signal with
 # the app's fence, a wait inside one submit, wait-before-signal from another thread, wait-any,
-# binary semaphores beside it, 200 numbered submits) in each of:
+# binary semaphores beside it, 200 numbered submits) in each of the steps below; TL_MODE=wbs-exit / wbs-alive (a
+# wait-before-signal across two threads with a submit queued behind it: done within 100 ms of the host signal,
+# the queue's order kept) on the driver's own and imitated, and wbs-abandon (a device destroyed with a submit
+# waiting for good) imitated:
 #   1  the driver's own, through VK_KHR_timeline_semaphore (nothing of the bridge's in the way)
 #   2  the driver's own, Vulkan 1.2 core names
 #   3  imitated (FAKE_MISSING=timeline), the extension: the log says the bridge keeps them, and the
@@ -48,6 +51,14 @@ check core native-core
 passed native-core && ! grep -q "timeline semaphores: emulated" "$log"
 step $? "2 the driver's own, Vulkan 1.2 ($(tail -1 "$work/check-native-core.log")); nothing of the bridge's" "$work/check-native-core.log"
 
+for m in wbs-exit wbs-alive; do
+  TL_MODE=$m check "" native-$m
+  passed native-$m
+  step $? "the driver's own, $m ($(grep -m1 -o 'W wbs.*' "$work/check-native-$m.log" || tail -1 "$work/check-native-$m.log"))" "$work/check-native-$m.log"
+done
+! grep -q "queue's worker\|deferred submit" "$log"
+step $? "the driver's own: nothing of the bridge's deferred submits" "$log"
+
 start emu VKBRIDGE_FAKE_MISSING=timeline
 check "" emu
 passed emu && grep -q "timeline semaphores: emulated with fences" "$log" && grep -q "timeline semaphores (emulated): [0-9]* driver submit" "$log"
@@ -55,6 +66,21 @@ step $? "3 imitated, the extension ($(tail -1 "$work/check-emu.log"); $(grep -m1
 check core emu-core
 passed emu-core
 step $? "4 imitated, Vulkan 1.2 ($(tail -1 "$work/check-emu-core.log"))" "$work/check-emu-core.log"
+# deferred submits (server_timeline.c): a wait-before-signal across two threads, the submitting thread gone
+# (before: ~3 s, order_wait's give-up) or still there (before: no end); a plain submit queued behind it
+for m in wbs-exit wbs-alive; do
+  TL_MODE=$m check "" emu-$m
+  passed emu-$m
+  step $? "imitated, $m ($(grep -m1 -o 'W wbs.*' "$work/check-emu-$m.log" || tail -1 "$work/check-emu-$m.log"))" "$work/check-emu-$m.log"
+done
+grep -q "goes to its queue's worker" "$log" && ! grep -q "waited 3 s for asynchronous request" "$log"
+step $? "imitated: the waiting submits went to the queue's worker, no 3 s order give-up" "$log"
+TL_MODE=wbs-abandon check "" emu-abandon
+passed emu-abandon && kill -0 $srv 2>/dev/null
+step $? "imitated, wbs-abandon: the device destroyed with a submit waiting for good, server alive ($(grep -m1 -o 'W wbs.*' "$work/check-emu-abandon.log"))" "$work/check-emu-abandon.log"
+for _ in $(seq 40); do grep -q "deferred submit(s) dropped with the device" "$log" && break; sleep 0.05; done
+grep -q "1 deferred submit(s) dropped with the device" "$log"
+step $? "imitated, wbs-abandon: the waiting submit dropped with the device (logged)" "$log"
 if grep -q "vkbridge-server E" "$log"; then step 1 "server errors in the imitated runs" "$log"; fi
 
 start off VKBRIDGE_FAKE_MISSING=timeline VKBRIDGE_EMU_TIMELINE=0

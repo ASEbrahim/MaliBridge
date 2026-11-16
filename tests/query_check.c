@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "smoke_spv.h"
 
@@ -74,6 +75,25 @@ static long wire_polls(void)
 static int no_wire(long before)
 {
     return !mirror || wire_polls() == before;
+}
+
+/* A spin on not-ready queries: with the mirror on, only the late probe's asks (client/query.c: a query not ready in the mirror for
+ * VKBRIDGE_QUERY_LATE_PROBE_MS is asked of the server once, at most once a pool per 50 ms: <= 20 a second + 8, as querystuck_check's
+ * drg/batman allow); none with VKBRIDGE_QUERY_LATE_PROBE_MS=0. */
+static int probe_wire_ok(long before, double secs, long *wire)
+{
+    *wire = wire_polls() - before;
+    if (!mirror) return 1;
+    const char *pe = getenv("VKBRIDGE_QUERY_LATE_PROBE_MS");
+    long allowed = pe && !strcmp(pe, "0") ? 0 : (long)(secs * 20) + 8;
+    return *wire <= allowed;
+}
+
+static double mono_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
 static uint32_t find_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -293,6 +313,7 @@ static void test_host_reset_reuse(void)
     char d[256];
     VkQueryPool pool = make_pool(VK_QUERY_TYPE_OCCLUSION, 4);
     long w0 = wire_polls();
+    double t0 = mono_s();
     int bad = -1, iters = 200;
     long not_ready = 0, polls = 0;
     for (int it = 0; it < iters && bad < 0; it++) {
@@ -323,10 +344,12 @@ static void test_host_reset_reuse(void)
             if (r != VK_SUCCESS || !samples_ok(v[q], want[q])) bad = it;
         vkWaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull);
     }
-    long wire = wire_polls() - w0;
-    snprintf(d, sizeof(d), "%d rounds, %ld polls (%ld not ready), %ld round trips%s", iters, polls, not_ready, wire,
+    double secs = mono_s() - t0;
+    long wire;
+    int wire_ok = probe_wire_ok(w0, secs, &wire);
+    snprintf(d, sizeof(d), "%d rounds in %.1f s, %ld polls (%ld not ready), %ld round trips%s", iters, secs, polls, not_ready, wire,
              bad < 0 ? "" : " - wrong result");
-    check(bad < 0 && no_wire(w0), "host reset + reuse, polled without WAIT", d);
+    check(bad < 0 && wire_ok, "host reset + reuse, polled without WAIT (mirror on: only the late probe's asks)", d);
     vkDestroyQueryPool(dev, pool, NULL);
 }
 

@@ -20,9 +20,13 @@
  *   "always" (safe mode on a driver not in range) leaves it out. A state a static pipeline
  *   overrides counts as unset until the app sets it again; vkCmdExecuteCommands leaves the
  *   primary's state undefined, so it is forgotten there too; vkBeginCommandBuffer starts afresh.
+ *   Where the driver's ranges name only Arm 3893903/3893905 (r48p0-r53p0 CSF: e->scope
+ *   VKB_DYN_SCOPE_EDS3), only the EDS3 states are kept and sent again; a command buffer that never
+ *   set one costs the bind no lookup.
  *   Imitation (host): beneath the fix, vkCmdBindPipeline puts every state its pipeline declares
  *   dynamic back to the pipeline's own create-info values (strides included: the bound buffers
- *   are bound again with the pipeline's strides), and a pipeline with a static sample mask, line
+ *   are bound again with the pipeline's strides; VKBRIDGE_ERRATA_IMITATE_DYN=eds3: the EDS3 states
+ *   only), and a pipeline with a static sample mask, line
  *   mode or conservative mode gets the app's last dynamic value of it.
  *
  * vb_split (MK-05; Arm erratum 3786496, r42-r47, ANGLE gates every driver below r48):
@@ -146,7 +150,7 @@ typedef struct vkb_errata_cmd {
     uint64_t gen; /* changes when a command buffer's state goes (the per-thread cache) */
     cbs *cb[CB_BUCKETS];
     pinfo *pl[PL_BUCKETS];
-    int life_on, imi_vb_on, imi_vb_bug, imi_vb_single;
+    int life_on, imi_vb_on, imi_vb_bug, imi_vb_single, imi_dyn_eds3;
     vkb_dispatch life, imi_vb, imi_dyn, fix_dyn, fix_vb; /* each wrapper set's next one down */
     vkb_dispatch fix_cull, imi_cull;
     uint64_t cull_none, cull_sent, cull_custom, imi_cull_dropped;
@@ -592,13 +596,14 @@ static VKAPI_ATTR void VKAPI_CALL i_CmdBindPipeline(VkCommandBuffer cb, VkPipeli
     if (bp != VK_PIPELINE_BIND_POINT_GRAPHICS || !pinfo_get(c, p, &pi)) return;
     cbs *s = cb_find(c, cb, 1);
     if (!s) return;
-    /* the dynamic states go back to the pipeline's own (ignored) values */
-    uint32_t m = pi.dyn & ~S_STRIDE;
+    /* the dynamic states go back to the pipeline's own (ignored) values (VKBRIDGE_ERRATA_IMITATE_DYN=eds3:
+     * the EDS3 ones only, Arm 3893905's shape on r48p0-r53p0) */
+    uint32_t m = pi.dyn & ~S_STRIDE & (c->imi_dyn_eds3 ? S_EDS3 : S_ALL);
     if (!(pi.has & H_DS)) m &= ~S_DS;
     if (!(pi.has & H_RS)) m &= ~S_RS;
     if (!(pi.has & H_MS)) m &= ~S_SMASK;
     unsigned n = emit(&c->imi_dyn, cb, &pi.v, m);
-    if ((pi.dyn & S_STRIDE) && (pi.has & H_VI) && s->d_buf) {
+    if ((pi.dyn & S_STRIDE) && (pi.has & H_VI) && s->d_buf && !c->imi_dyn_eds3) {
         for (uint32_t b = 0; b < NVB; b++)
             if (s->d_buf >> b & 1) s->dvb[b].stride = (pi.vi_bind >> b & 1) ? pi.vi_stride[b] : 0, s->d_stride |= 1u << b;
         n += rebind(&c->imi_dyn, cb, s->dvb, s->d_buf);
@@ -695,18 +700,21 @@ static VKAPI_ATTR void VKAPI_CALL f_CmdBindPipeline(VkCommandBuffer cb, VkPipeli
     if (bp != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
     ADD(c->binds, 1);
     cbs *s = cb_find(c, cb, 0);
-    if (!s || !(s->set | s->ever | s->vb_stride)) return;
+    vkb_errata_dev *e = c->owner;
+    /* VKB_DYN_SCOPE_EDS3 (r48p0-r53p0): the EDS3 states only; a command buffer that never set one
+     * has nothing to send, and the rest of the bookkeeping below only serves the other states */
+    uint32_t scope = (e->scope[VKB_ERRATUM_DYN_REEMIT] & VKB_DYN_SCOPE_EDS3) ? S_EDS3 : S_ALL;
+    if (!s || !((s->set | s->ever | s->vb_stride) & scope)) return;
     pinfo pi;
     if (!pinfo_get(c, p, &pi)) {
         ADD(c->nopipe, 1);
         return;
     }
-    unsigned n = emit(&c->fix_dyn, cb, &s->v, pi.dyn & s->set), nv = 0, ns = 0;
-    if (pi.dyn & S_STRIDE)
+    unsigned n = emit(&c->fix_dyn, cb, &s->v, pi.dyn & s->set & scope), nv = 0, ns = 0;
+    if ((pi.dyn & S_STRIDE) && (scope & S_STRIDE))
         nv = rebind(&c->fix_dyn, cb, s->vb, s->vb_stride & s->vb_buf);
-    else
+    else if (!(pi.dyn & S_STRIDE))
         s->vb_stride = 0; /* static strides: the dynamic ones are gone */
-    vkb_errata_dev *e = c->owner;
     if ((e->targeted | e->imitated) >> VKB_ERRATUM_DYN_REEMIT & 1) {
         uint32_t st = S_EDS3 & ~pi.dyn & s->ever;
         if (!(pi.has & H_MS)) st &= ~S_SMASK;
@@ -930,6 +938,9 @@ void vkb_errata_dyn_imitate(vkb_srv_table *t, vkb_errata_dev *e)
     if (!c) return;
     life_install(t, c);
     c->imi_dyn = t->real;
+    const char *shape = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE_DYN");
+    c->imi_dyn_eds3 = shape && !strcmp(shape, "eds3");
+    if (c->imi_dyn_eds3 && !e->probe) VKB_WARN("errata: dyn_reemit imitated for the EDS3 states only (VKBRIDGE_ERRATA_IMITATE_DYN=eds3)");
     ERRATA_HOOK(t, vkCmdBindPipeline, i_CmdBindPipeline);
     ERRATA_HOOK(t, vkCmdSetSampleMaskEXT, i_CmdSetSampleMaskEXT);
     ERRATA_HOOK(t, vkCmdSetLineRasterizationModeEXT, i_CmdSetLineRasterizationModeEXT);

@@ -43,6 +43,15 @@ static int enable_sent;
 static uint64_t win_t0, win_worst;
 static uint32_t win_frames, win_over;
 static vkb_hitch_wait win[VKB_HITCH_W_COUNT];
+/* the window's frame times (server_perf.c: its p50/p90 and repeated frames): 0.25 ms bins to 100 ms, longer ones
+ * by value (the rest of them, past WH_LONG, as 100 ms) */
+#define WH_BIN_US 250u
+#define WH_BINS 400u
+#define WH_LONG 64u
+static uint16_t win_hist[WH_BINS];
+static uint32_t win_long[WH_LONG], win_nlong, win_long_lost;
+static uint64_t prt_ns; /* the swapchain's waits that were round trips, this window (atomic) */
+static uint32_t prt_n;
 
 uint64_t vkb_hitch_now(void)
 {
@@ -115,6 +124,10 @@ void vkb_hitch_rt(uint32_t cmd, uint64_t ns)
     int kind = VKB_HITCH_W_RT;
     if (cmd == VKB_CMD_vkWaitForFences || cmd == VKB_CMD_vkWaitSemaphores || cmd == VKB_CMD_vkQueueWaitIdle || cmd == VKB_CMD_vkDeviceWaitIdle)
         kind = vkb_hitch_in_present ? VKB_HITCH_W_PRESENT : VKB_HITCH_W_APP;
+    if (kind == VKB_HITCH_W_PRESENT) {
+        __atomic_add_fetch(&prt_ns, ns, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&prt_n, 1, __ATOMIC_RELAXED);
+    }
     vkb_hitch_waited(kind, cmd, ns);
 }
 
@@ -138,6 +151,58 @@ static void window_add(void)
             memcpy(win[i].max_thread, acc[i].max_thread, sizeof(win[i].max_thread));
         }
     }
+}
+
+/* A frame's time into the window's distribution (under lock). */
+static void hist_add(uint64_t ft_ns)
+{
+    uint64_t b = ft_ns / (WH_BIN_US * 1000ull);
+    if (b < WH_BINS) win_hist[b]++;
+    else if (win_nlong < WH_LONG) win_long[win_nlong++] = ft_ns / 1000 > UINT32_MAX ? UINT32_MAX : (uint32_t)(ft_ns / 1000);
+    else win_long_lost++;
+}
+
+/* The window's frame times at 50 and 90 % (us, a bin's middle) and its repeated frames: each frame over 1.5x the
+ * median counts round(frame / median) - 1 refreshes on which the picture before stayed; then the window starts
+ * again (under lock). */
+static void hist_take(uint32_t *p50, uint32_t *p90, uint32_t *repeats)
+{
+    uint64_t n = win_nlong + win_long_lost;
+    for (uint32_t i = 0; i < WH_BINS; i++) n += win_hist[i];
+    *p50 = *p90 = *repeats = 0;
+    for (uint32_t i = 1; i < win_nlong; i++) /* a few long frames: insertion sort */
+        for (uint32_t j = i; j > 0 && win_long[j - 1] > win_long[j]; j--) {
+            uint32_t t = win_long[j];
+            win_long[j] = win_long[j - 1], win_long[j - 1] = t;
+        }
+    if (n) {
+        uint64_t want50 = n / 2, want90 = n * 9 / 10, acc = 0;
+        int got50 = 0, got90 = 0;
+        for (uint32_t i = 0; i < WH_BINS && !got90; i++) {
+            acc += win_hist[i];
+            uint32_t mid = i * WH_BIN_US + WH_BIN_US / 2;
+            if (!got50 && acc > want50) *p50 = mid, got50 = 1;
+            if (acc > want90) *p90 = mid, got90 = 1;
+        }
+        for (uint32_t i = 0; i < win_nlong && !got90; i++) {
+            acc++;
+            if (!got50 && acc > want50) *p50 = win_long[i], got50 = 1;
+            if (acc > want90) *p90 = win_long[i], got90 = 1;
+        }
+        if (!got50) *p50 = WH_BINS * WH_BIN_US;
+        if (!got90) *p90 = WH_BINS * WH_BIN_US;
+        double med = *p50, rep = 0;
+        for (uint32_t i = 0; i < WH_BINS; i++) {
+            double mid = i * WH_BIN_US + WH_BIN_US / 2.0;
+            if (win_hist[i] && mid > 1.5 * med) rep += win_hist[i] * (double)(long)(mid / med + 0.5 - 1);
+        }
+        for (uint32_t i = 0; i < win_nlong; i++)
+            if (win_long[i] > 1.5 * med) rep += (double)(long)(win_long[i] / med + 0.5 - 1);
+        if (win_long_lost) rep += win_long_lost * (double)(long)(WH_BINS * WH_BIN_US / med + 0.5 - 1);
+        *repeats = rep > UINT32_MAX ? UINT32_MAX : (uint32_t)rep;
+    }
+    memset(win_hist, 0, sizeof(win_hist));
+    win_nlong = win_long_lost = 0;
 }
 
 /* At each vkQueuePresentKHR, before anything of it runs (wsi.c). */
@@ -183,6 +248,7 @@ void vkb_hitch_present(void)
         if (!win_t0) win_t0 = t_start;
         window_add();
         win_frames++;
+        hist_add(ft);
         win_over += ft >= (uint64_t)threshold_ms * 1000000ull;
         if (ft > win_worst) win_worst = ft;
         if (now - win_t0 >= WINDOW_NS) {
@@ -195,6 +261,9 @@ void vkb_hitch_present(void)
             wm.worst_ns = win_worst;
             wm.over = win_over;
             memcpy(wm.w, win, sizeof(wm.w));
+            hist_take(&wm.ft_p50_us, &wm.ft_p90_us, &wm.repeats);
+            wm.present_rt_ns = __atomic_exchange_n(&prt_ns, 0, __ATOMIC_RELAXED);
+            wm.present_rt_n = __atomic_exchange_n(&prt_n, 0, __ATOMIC_RELAXED);
             memset(win, 0, sizeof(win));
             win_t0 = now, win_frames = win_over = 0, win_worst = 0;
             send_win = 1;

@@ -136,6 +136,16 @@ typedef struct vkb_msg_hdr {
 } vkb_msg_hdr;
 #define VKB_MAGIC 0x32424b56u   /* "VKB2" */
 #define VKB_F_NOREPLY 1u
+/* A request made by the swapchain's own wait for a frame (client/wsi.c, vkb_hitch_in_present): the server times its
+ * queue wait and its handler for the present wait split (server_perf.c). An older server ignores the bit. */
+#define VKB_F_PRESENT_WAIT 2u
+/* VKBRIDGE_FAST_CREATE, sent only to a server that said it takes them (VKB_KNOB_FAST_CREATE_SHIFT). FAST_CREATE: a vkCreateImage /
+ * vkCreateBuffer that may run ahead of the process's queued asynchronous requests: the barrier is sent as always; the server
+ * runs the create at once where nothing queued can change what it makes, else waits for the barrier first, as without the bit
+ * (server_conn.c vkb_srv_fast_create_pre). CREATE_REQS: vkCreateImage's reply ends with the image's requirements
+ * (vkb_srv_fast_create_reply). */
+#define VKB_F_FAST_CREATE 4u
+#define VKB_F_CREATE_REQS 8u
 
 /* Reply status codes (vkb_msg_hdr.cmd in replies). */
 #define VKB_ST_OK 0u

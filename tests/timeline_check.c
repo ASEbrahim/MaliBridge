@@ -129,6 +129,43 @@ typedef struct thr_arg {
     VkResult r;
 } thr_arg;
 
+/* TL_MODE (deferred submits, server_timeline.c): a thread submits a fill waiting for value 1 of a fresh
+ * timeline and signalling 2, then exits (wbs-exit) or stays (wbs-alive); the main thread queues a copy of the
+ * filled buffer on the same queue with a fence, reads the value, signals 1 from the host and waits for 2 and
+ * the fence: done within 100 ms of the signal, the copy after the fill (the queue's order), and no hang (a
+ * watchdog ends the program after 15 s). wbs-abandon: a submit waits for a value never signalled and the
+ * device is destroyed (the server must not hang on it). */
+typedef struct wbs_arg {
+    VkSemaphore s;
+    VkCommandBuffer cb;
+    VkResult r;
+    int submitted, release, keep;
+    pthread_mutex_t m;
+    pthread_cond_t c;
+} wbs_arg;
+
+static void *wbs2_thread(void *a)
+{
+    wbs_arg *t = a;
+    uint64_t w = 1, s = 2;
+    t->r = submit(&t->s, &w, 1, t->cb, &t->s, &s, 1, VK_NULL_HANDLE);
+    pthread_mutex_lock(&t->m);
+    t->submitted = 1;
+    pthread_cond_broadcast(&t->c);
+    while (t->keep && !t->release) pthread_cond_wait(&t->c, &t->m);
+    pthread_mutex_unlock(&t->m);
+    return NULL;
+}
+
+static void *watchdog(void *a)
+{
+    sleep(15);
+    printf("FAIL %s: hung (no answer in 15 s)\n", (const char *)a);
+    fflush(stdout);
+    _exit(1);
+    return NULL;
+}
+
 static void *wbs_thread(void *a)
 {
     thr_arg *t = a;
@@ -286,6 +323,71 @@ int main(int argc, char **argv)
         BindBuf(dev, mb[i].b, mb[i].m, 0);
         MapMem(dev, mb[i].m, 0, VK_WHOLE_SIZE, 0, (void **)&mb[i].p);
         memset(mb[i].p, 0, 4096);
+    }
+
+    const char *mode = getenv("TL_MODE");
+    if (mode && *mode) {
+        pthread_t wd;
+        pthread_create(&wd, NULL, watchdog, (void *)mode);
+        PFN_vkWaitForFences WaitFences = (PFN_vkWaitForFences)gdpa(dev, "vkWaitForFences");
+        VkSemaphoreTypeCreateInfo wty = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0};
+        VkSemaphoreCreateInfo wsci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &wty};
+        VkSemaphore ws;
+        CreateSem(dev, &wsci, NULL, &ws);
+        if (!strcmp(mode, "wbs-abandon")) {
+            uint64_t w = 7;
+            double a0 = now_ms();
+            VkResult ra = submit(&ws, &w, 1, cmd_fill(mb[2].b, 4096, 0x0badf00du, 1), NULL, NULL, 0, VK_NULL_HANDLE);
+            uint64_t v = value(ws);
+            DestroyDevice(dev, NULL);
+            double da = now_ms() - a0;
+            CHECK(ra == VK_SUCCESS && v == 0 && da < 2000, "W wbs-abandon: submit %d, value %llu, device destroyed after %.1f ms", ra,
+                  (unsigned long long)v, da);
+            printf("%s: %d failure(s)\n", fails ? "FAILED" : "OK", fails);
+            return fails ? 1 : 0;
+        }
+        wbs_arg ta = {ws, cmd_fill(mb[2].b, 4096, 0xabcd5678u, 1), VK_ERROR_UNKNOWN, 0, 0, !strcmp(mode, "wbs-alive"),
+                      PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+        VkCommandBuffer cpy = cmd_copy(mb[2].b, mb[1].b, 4096);
+        VkFenceCreateInfo wfci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence wf;
+        CreateFence(dev, &wfci, NULL, &wf);
+        double a0 = now_ms();
+        pthread_t th;
+        pthread_create(&th, NULL, wbs2_thread, &ta);
+        pthread_mutex_lock(&ta.m);
+        while (!ta.submitted) pthread_cond_wait(&ta.c, &ta.m);
+        pthread_mutex_unlock(&ta.m);
+        if (!ta.keep) pthread_join(th, NULL);
+        VkResult rc = submit(NULL, NULL, 0, cpy, NULL, NULL, 0, wf); /* behind it on the queue */
+        usleep(50000);
+        uint64_t before = value(ws);
+        VkResult fbefore = FenceStatus(dev, wf);
+        uint32_t px = mb[1].p[0];
+        double a1 = now_ms();
+        VkSemaphoreSignalInfo s1 = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, NULL, ws, 1};
+        VkResult rs = SignalSemaphore(dev, &s1);
+        VkResult w2 = wait1(ws, 2, 5000000000ull);
+        VkResult fw = WaitFences(dev, 1, &wf, VK_TRUE, 5000000000ull);
+        double a2 = now_ms();
+        if (ta.keep) {
+            pthread_mutex_lock(&ta.m);
+            ta.release = 1;
+            pthread_cond_broadcast(&ta.c);
+            pthread_mutex_unlock(&ta.m);
+            pthread_join(th, NULL);
+        }
+        CHECK(ta.r == VK_SUCCESS && rc == VK_SUCCESS && before == 0 && fbefore == VK_NOT_READY && px == 0 && rs == VK_SUCCESS &&
+                  w2 == VK_SUCCESS && fw == VK_SUCCESS && value(ws) == 2 && mb[1].p[0] == 0xabcd5678u && mb[1].p[1023] == 0xabcd5678u &&
+                  a2 - a1 < 100 && a1 - a0 < 150,
+              "W %s: submits %d %d, before the signal value %llu, copy fence %d, buffer 0x%08x; signal %d, wait 2 %d, fence %d, "
+              "copied 0x%08x; %.1f ms from the signal (%.1f ms before it)",
+              mode, ta.r, rc, (unsigned long long)before, fbefore, px, rs, w2, fw, mb[1].p[0], a2 - a1, a1 - a0);
+        WaitIdle(dev);
+        DestroySem(dev, ws, NULL);
+        DestroyDevice(dev, NULL);
+        printf("%s: %d failure(s)\n", fails ? "FAILED" : "OK", fails);
+        return fails ? 1 : 0;
     }
 
     /* 2 */

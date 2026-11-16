@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Query results answered from a client-side mirror.
  *
  * Deep Rock Galactic (DX11 through DXVK 3.1, tablet) made ~10,400 vkGetQueryPoolResults round
@@ -33,7 +32,8 @@
  * only the first is copied; the others (mirrored by a host reset) are found by the stuck-query
  * check below, which asks the server about a query the mirror has said "not ready" for too long.
  *
- * VKBRIDGE_QUERY_MIRROR=0 turns this off, VKBRIDGE_QUERY_MIRROR_OCCLUSION=0 for occlusion pools only.
+ * VKBRIDGE_QUERY_MIRROR=0 turns this off, VKBRIDGE_QUERY_MIRROR_OCCLUSION=0 for occlusion pools only;
+ * VKBRIDGE_QUERY_STUCK_MS sets the stuck-query time.
  */
 #define _GNU_SOURCE
 #include "vkb_client.h"
@@ -56,6 +56,7 @@ typedef struct vkb_qmirror {
     uint32_t *nr_polls;      /* per query: not-ready answers from the mirror in a row (stuck_ask) */
     uint32_t *nr_since;      /* per query: ms clock of the first of them */
     uint32_t late;           /* atomic: a query of this pool was found done on the GPU while the mirror said not ready (stuck_ask) */
+    uint32_t probe_at;       /* atomic: ms clock of this pool's last late probe (stuck_ask), 0 = none yet */
 } vkb_qmirror;
 
 typedef struct vkb_qop {
@@ -236,6 +237,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkDestroyQueryPool(VkDevice device, VkQueryPoo
     vkb_device *d = vkb_dev(device);
     vkb_wire_vkDestroyQueryPool(device, queryPool, pAllocator);
     vkb_qvis_pool_destroy(queryPool);
+    vkb_query_pool_gone(queryPool);
     vkb_qmirror *m = d->qm ? vkb_map_remove(&d->qm->pools, (uint64_t)queryPool) : NULL;
     if (m) mirror_free(d, m);
 }
@@ -258,6 +260,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkResetQueryPool(VkDevice device, VkQueryPool 
     }
     vkb_qvis_reset(queryPool, firstQuery, queryCount);
     vkb_wire_vkResetQueryPool(device, queryPool, firstQuery, queryCount);
+    vkb_query_host_reset_note(queryPool, firstQuery, queryCount); /* icd.c: reads keep the barrier until it has run */
 }
 
 /* ------------------------------------------------------------------ recording */
@@ -306,6 +309,7 @@ VKAPI_ATTR void VKAPI_CALL vkb_ep_vkCmdResetQueryPool(VkCommandBuffer commandBuf
                                                       uint32_t queryCount)
 {
     vkb_wire_vkCmdResetQueryPool(commandBuffer, queryPool, firstQuery, queryCount);
+    vkb_query_gpu_reset_note(queryPool); /* icd.c: this pool's reads keep the barrier */
     vkb_cmdbuf *cb = vkb_cb(commandBuffer);
     if (cb->recording) vkb_qvis_reset(queryPool, firstQuery, queryCount);
     vkb_qmirror *m = mirror_of(cb->device, queryPool);
@@ -548,7 +552,7 @@ const char *vkb_query_why_wire(void) { return why_wire ? why_wire : "?"; }
  * render thread spun at 100% of a core for minutes in this file's not-ready answer (61% of its
  * samples), with no syscalls, every DXVK thread idle, the server idle and no bridge call pending,
  * until UE4 gave up ("GameThread timed out waiting for RenderThread after 120.00 secs"). The GPU
- * had the query; the mirror's ready word was never set. With the mirror off every load
+ * had the query; the mirror's ready word was never set. With VKBRIDGE_QUERY_MIRROR=0 every load
  * passed. Whatever leaves a value PENDING (an update lost on the way, a query ended where no copy
  * follows it - a multiview pass ends N queries per vkCmdEndQuery and only the first is copied),
  * the mirror must not say "not ready" forever: no call of the app's ever reaches the
@@ -558,13 +562,46 @@ const char *vkb_query_why_wire(void) { return why_wire ? why_wire : "?"; }
  * never) in a row is asked of the server once. A pool in which that found a result (a "late" pool: the
  * mirror's copy sits at the end of the command buffer, the driver has the result when the render pass
  * is done, so on a slow frame the mirror is late by the rest of it) asks after LATE_MS for its other
- * queries too: Sifu (UE4) stalled 0.2-1.7 s once per query, 128 times in one pool. If the driver has it, the query leaves the mirror
+ * queries too: Sifu (UE4, a player log) stalled 0.2-1.7 s once per query, 128 times in one pool. If the driver has it, the query leaves the mirror
  * (answered by the server, the authority, until its next reset or copy mirrors it again) and the
  * case is logged; if not, the count starts over. The normal case is untouched: a result reaches
- * the mirror at most a GPU frame after its submit (Stray at 14 fps: ~70 ms),
+ * the mirror at most a GPU frame after its submit (Stray at 14 fps: ~70 ms; lite_bench: 24 ms),
  * and a poll that sees it ready costs no round trip, as before. The clock is read on the first 64
  * not-ready answers of a run and then every 64th, so a tight spin pays almost nothing for it. */
 #define LATE_MS 2
+/* The late probe (2026-11-10, Bright Memory: Infinite on the S10+): whether a pool got marked late hung on one frame. A
+ * load frame of >= 200 ms right after the level load let a query sit not ready in the mirror for the stuck time while the
+ * driver had it; then the server answered for the rest of the session (render thread 63% of a core, 21.4-22.5 fps). Without
+ * such a frame (fast create and the BC_FAST converters shortened the load frames: 5 of 5 runs with fast create on) the mirror
+ * answered all session, each result only at the end of DXVK's command buffer, 2-26 ms after the driver had it, and UE4's
+ * render thread spun at 94% of a core (20.6-21.2 fps); the same in older PERF rounds without fast create (20.7-21.4 vs
+ * 21.7-24.4 fps). So a pool not yet late is also probed: a query not ready in the mirror for PROBE_MS is asked of the server
+ * once, at most once per PROBE_GAP_MS a pool (<= 20 round trips a second a pool, only while a thread spins on a not-ready
+ * query). The server having it marks the pool late, as the 200 ms rule does; the server not having it changes nothing (the
+ * query's own 200 ms count goes on). VKBRIDGE_QUERY_LATE_PROBE_MS=0 turns the probe off (the old rule alone). */
+#define PROBE_GAP_MS 50
+#define PROBE_MS_DEFAULT 4
+
+/* the value without a line; *guest 1 when the guest's environment set it (the client's own switch only) */
+uint32_t vkb_query_late_probe_setting(int *guest)
+{
+    const char *e = getenv("VKBRIDGE_QUERY_LATE_PROBE_MS");
+    *guest = e && *e;
+    int v = *guest ? atoi(e) : PROBE_MS_DEFAULT;
+    return v < 0 ? 0 : (uint32_t)v;
+}
+
+static uint32_t probe_ms(void)
+{
+    static int v = -2;
+    if (v == -2) {
+        int guest;
+        v = (int)vkb_query_late_probe_setting(&guest);
+        if (!v) VKB_INFO("query mirror: late probe off (VKBRIDGE_QUERY_LATE_PROBE_MS=0): a pool is found late only by the stuck time");
+    }
+    return (uint32_t)v;
+}
+
 static uint32_t stuck_ms(void)
 {
     static int v = -2;
@@ -588,9 +625,21 @@ static __thread struct {
     vkb_qmirror *m;
     VkQueryPool pool;
     uint32_t first, count, ms;
+    int detect; /* the pool was not late yet: this ask decides whether it is (the late probe or the stuck time) */
 } stuck_probe;
 
-/* One not-ready answer for query q: 1 when it has been not ready long enough to ask the server. */
+/* icd.c: 1 when this thread's read about to go to the server is the mirror's lateness check of a pool not yet late. That read
+ * keeps the flush and the order barrier (VKBRIDGE_QUERY_NOBARRIER leaves it as it was), so its "not ready on the server either"
+ * covers every request queued before it, as when the late probe was built (Bright Memory): a barrier-free check could
+ * find the driver not done only because the server had not yet run the app's submit, and leave the pool unmarked. At most one
+ * such read per PROBE_GAP_MS a pool plus one per stuck time a query, so the barrier costs nothing measurable here. */
+int vkb_query_detect_ask(VkQueryPool pool, uint32_t first, uint32_t count)
+{
+    return stuck_probe.m && stuck_probe.detect && stuck_probe.pool == pool && stuck_probe.first == first && stuck_probe.count == count;
+}
+
+/* One not-ready answer for query q: 1 when it has been not ready long enough to ask the server (the stuck time, or LATE_MS in a
+ * late pool), 2 for the late probe of a pool not yet late; 0 = answer from the mirror. */
 static int stuck_ask(vkb_qmirror *m, uint32_t q, uint32_t *held)
 {
     uint32_t limit = stuck_ms();
@@ -605,8 +654,18 @@ static int stuck_ask(vkb_qmirror *m, uint32_t q, uint32_t *held)
         return 0;
     }
     if (!late && n > 64 && (n & 63)) return 0;
-    uint32_t t = now_ms() - __atomic_load_n(&m->nr_since[q], __ATOMIC_RELAXED);
-    if (t < limit) return 0;
+    uint32_t now = now_ms();
+    uint32_t t = now - __atomic_load_n(&m->nr_since[q], __ATOMIC_RELAXED);
+    if (t < limit) {
+        /* The late probe (above): one ask of the server, the query's run of not-ready answers kept. */
+        uint32_t pm = probe_ms();
+        if (late || !pm || t < pm) return 0;
+        uint32_t last = __atomic_load_n(&m->probe_at, __ATOMIC_RELAXED);
+        if (last && now - last < PROBE_GAP_MS) return 0;
+        if (!__atomic_compare_exchange_n(&m->probe_at, &last, now ? now : 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 0;
+        *held = t;
+        return 2;
+    }
     /* Start over: if the server says not ready either, the next question comes a period later. */
     __atomic_store_n(&m->nr_polls[q], 0, __ATOMIC_RELAXED);
     *held = t;
@@ -667,13 +726,16 @@ int vkb_query_results(vkb_device *d, VkQueryPool pool, uint32_t first, uint32_t 
     why_wire = "not ready in the mirror (VKBRIDGE_QUERY_NOTREADY_WIRE=1)";
     if (!all && notready_wire()) return 0; /* the driver may have it before the mirror's copy ran */
     uint32_t held = 0;
-    if (!all && stuck_ask(m, first_nr, &held)) {
-        why_wire = "not ready in the mirror for VKBRIDGE_QUERY_STUCK_MS (asked once)";
+    int ask = !all ? stuck_ask(m, first_nr, &held) : 0;
+    if (ask) {
+        why_wire = ask == 2 ? "late probe: not ready in the mirror for VKBRIDGE_QUERY_LATE_PROBE_MS (asked once)"
+                            : "not ready in the mirror for VKBRIDGE_QUERY_STUCK_MS (asked once)";
         stuck_probe.m = m;
         stuck_probe.pool = pool;
         stuck_probe.first = first;
         stuck_probe.count = count;
         stuck_probe.ms = held;
+        stuck_probe.detect = !__atomic_load_n(&m->late, __ATOMIC_RELAXED) || ask == 2;
         return 0;
     }
     int ready_all = 1;

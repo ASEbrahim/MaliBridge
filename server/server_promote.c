@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Vulkan version promotion: a device offered at Vulkan 1.2 or 1.3 on a driver below it, when every
  * piece that version made core is there - as the driver's extension, or done by the bridge.
  *
@@ -362,7 +361,7 @@ static const struct {
 #define NIMPLICIT (sizeof(implicit13) / sizeof(implicit13[0]))
 
 /* What Vulkan 1.2 made core that gamescope never uses: on a driver whose 1.2 lacks only these (Mali
- * r18p0/r19p0 on the Kirin 810 and Exynos 880, once timeline semaphores are the
+ * r18p0/r19p0 on the Kirin 810 and Exynos 880, a player log, once timeline semaphores are the
  * bridge's) gamescope's instance alone is offered 1.2, each of these features reported false, as
  * the driver has them. gamescope 3.16 checks only apiVersion >= 1.2 and turns on timelineSemaphore,
  * scalarBlockLayout, shaderFloat16 (when reported) and 1.3's dynamicRendering (emulated on 1.1
@@ -684,7 +683,9 @@ static void fill_core_features(const translate *x, const promo_gpu *g, VkBaseOut
         if (r->ef == EF_PRIVATE) v = VK_TRUE; /* the client's own (descriptor.c) */
         *(VkBool32 *)((uint8_t *)c + r->core_off) = v;
     }
-    /* A shuffle where the driver has them, else a chain of constant-lane broadcasts (spirv_downgrade.h). */
+    /* A shuffle where the driver has them, else a chain of constant-lane broadcasts (spirv_downgrade.h):
+     * either way the same values, so the feature is the bridge's wherever promotion runs. Mali r18-r26
+     * (G52, G57, G72, G76, G77) have ballot but no shuffles, and this was all their Vulkan 1.2 lacked. */
     if (core[1]) ((VkPhysicalDeviceVulkan12Features *)core[1])->subgroupBroadcastDynamicId = g && (g->shuffle || g->lanes);
     /* Mali r18/r19 have no timeline semaphores; the bridge's are complete (server_timeline.c) */
     if (core[1] && g && g->timeline_emu) ((VkPhysicalDeviceVulkan12Features *)core[1])->timelineSemaphore = VK_TRUE;

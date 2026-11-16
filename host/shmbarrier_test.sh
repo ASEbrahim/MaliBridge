@@ -17,6 +17,11 @@
 #   4d VKBRIDGE_SPIRV_SUBST=1: <cache dir>/spv-subst/<app hash>.spv used in place of the module
 #      (then rewritten as the app's); a file that is not SPIR-V not used; nothing without the switch;
 #   4e VKBRIDGE_SHARED_BARRIER_LOCKSTEP=all: logged; the check's loops are not RE2's kind: as level 2;
+#   4f VKBRIDGE_SHARED_BARRIER_ONLY=lockstep (+ LOCKSTEP=all): a module the lockstep rewrite takes is rewritten whatever its
+#      hash (RE2's loop, rebound to the check's one storage buffer, put in through VKBRIDGE_SPIRV_SUBST); the check's own
+#      module (shared memory, not that kind of loop) is left as it was. (Its bound now comes from a storage buffer, so
+#      level 2 adds memory barriers only there; the filter is what this step checks.) RE3 on Proton Experimental (11-14): another DXVK
+#      build gave the pair other hashes and a hash list rewrote nothing;
 #   5  vkbridge-smoke with it on: all pass, nothing of its rewritten (no shared memory);
 #   6  the pass over the corpus (tests/shmbarrier/*.spvasm, tests/corpus, the check's shader), at
 #      level 1, level 2 and level 2 with the lockstep loops (-L: RE2's ballot loop pattern given a
@@ -212,5 +217,23 @@ grep -q "^lockstep.spv: lockstep: 1 loop(s)$" "$work/corpusL.log" &&
 nrw=$(ls "$work/rw" | wc -l) nrw2=$(ls "$work/rw2" | wc -l) nrwL=$(ls "$work/rwL" | wc -l)
 [ $rc = 0 ] && [ $ok6 = 0 ] && [ "${vbad:-1}" = 0 ] && [ "${vok:-0}" = $((nrw + nrw2 + nrwL)) ] && [ "$nrw" = 14 ] && [ "$nrw2" = 14 ] && [ "$nrwL" = 14 ]
 step $? "corpus: $(grep -o '[0-9]* modules, [0-9]* rewritten' "$work/corpus.log") at each level; spirv-val: ${vok:-?} clean, ${vbad:-?} invalid"
+
+# 4f (after the corpus: needs spirv-as)
+sed -e '/OpDecorate %u /d' -e '/OpMemberDecorate %U /d' -e '/OpDecorate %U Block/d' -e '/^ *%U = /d' -e '/^ *%pUu = /d' \
+    -e '/^ *%u = /d' -e '/^ *%pUuint = /d' -e 's/%np = OpAccessChain %pUuint %u %uint_0/%np = OpAccessChain %pSBu %b %uint_0/' \
+    ../tests/shmbarrier/lockstep.spvasm > "$work/lsb0.spvasm"
+mkdir -p "$cache/spv-subst"
+$run_t spirv-as --target-env vulkan1.1 -o "$work/lsb0.spv" "$work/lsb0.spvasm" && cp "$work/lsb0.spv" "$cache/spv-subst/$hash.spv"
+run "$out/shmbarrier_check" -- VKBRIDGE_SPIRV_SUBST=1 VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_SHARED_BARRIER_ONLY=lockstep VKBRIDGE_SHARED_BARRIER_LOCKSTEP=all
+n_ls=$new t_ls=$(total)
+rm -rf "$cache/spv-subst"
+run "$out/shmbarrier_check" -- VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_SHARED_BARRIER_ONLY=lockstep VKBRIDGE_SHARED_BARRIER_LOCKSTEP=all
+n_lo=$new t_lo=$(total)
+echo "$n_ls" | grep -q "SPIR-V subst: 1 module(s) replaced" && echo "$t_ls" | grep -q ": 1 of 1 module(s) rewritten" &&
+  echo "$n_ls" | grep -q "shm_barrier: lockstep: 1 module(s), 1 loop(s)" &&
+  echo "$n_ls" | grep -q "shm_barrier only for VKBRIDGE_SHARED_BARRIER_ONLY=lockstep (lockstep: the modules the lockstep rewrite takes)" &&
+  echo "$t_lo" | grep -q ": 0 of 1 module(s) rewritten, 0 control and 0 memory" &&
+  echo "$n_lo" | grep -q "shm_barrier: 1 module(s) left as they were by VKBRIDGE_SHARED_BARRIER_ONLY/_SKIP"
+step $? "VKBRIDGE_SHARED_BARRIER_ONLY=lockstep: RE2's loop (any hash) rewritten: $t_ls; the check's own module left: $t_lo"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

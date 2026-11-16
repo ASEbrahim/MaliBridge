@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Host-visible memory shared with the client.
  *
  * A Linux program maps Vulkan memory and writes to it directly; those writes must land in the
@@ -34,8 +33,10 @@
 #ifdef __ANDROID__
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #endif
+#include "vkb_page.h"
 #include "vkb_server.h"
 #include "server_emu.h"
+#include "server_import_type.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -213,11 +214,19 @@ static const char *const cls_name[CLS_N] = {"plain", "hostptr", "dmabuf", "ahb",
 #define ST_TOP 4
 typedef struct { int64_t bytes, n; } st_pair;
 typedef struct { int64_t n, src, dec, drv; } st_bc; /* per app BC format: compressed, decoded texels, driver's size */
+/* Images that are not BC, per format (ledger 357: a Unity game's 6,583 such images, 2.7 GB, filled a
+ * 7.2 GB phone and the line could not say what they were): the driver's size, and of it the images
+ * with a mip chain that are only sampled/copied (what VKBRIDGE_TEX_MAXDIM=<n>,all may take), those
+ * of them with a side over 1024, and render targets / storage images. ST_FMTS formats; later ones
+ * are summed as format 0 ("other"). */
+#define ST_FMTS 24
+typedef struct { int32_t fmt; int64_t n, bytes, mips, over, targets; } st_fmt;
 static struct {
     pthread_mutex_t lock;
     st_pair cls[CLS_N], type[ST_TYPES], ded[3];
     st_pair img, img_bc, img_bc_src, buf;
     st_bc bc[VK_FORMAT_BC7_SRGB_BLOCK - VK_FORMAT_BC1_RGB_UNORM_BLOCK + 1];
+    st_fmt fmt[ST_FMTS + 1];          /* [ST_FMTS]: the formats past the table */
     struct { int pid; int64_t bytes; } pid[ST_PIDS];
     uint64_t allocs, frees;           /* cumulative */
     int64_t alloc_bytes, free_bytes;  /* cumulative */
@@ -284,6 +293,23 @@ void vkb_memstat_image(VkFormat bc, int64_t bytes, int64_t bc_src_bytes, int64_t
     pthread_mutex_unlock(&st.lock);
 }
 
+void vkb_memstat_image_shape(VkFormat format, int shape, int64_t bytes)
+{
+    int sign = bytes < 0 ? -1 : 1;
+    pthread_mutex_lock(&st.lock);
+    st_fmt *f = &st.fmt[ST_FMTS];
+    for (int i = 0; i < ST_FMTS; i++)
+        if (st.fmt[i].fmt == (int32_t)format && st.fmt[i].n) { f = &st.fmt[i]; break; }
+    if (f == &st.fmt[ST_FMTS] && sign > 0)
+        for (int i = 0; i < ST_FMTS; i++)
+            if (!st.fmt[i].n) { f = &st.fmt[i]; f->fmt = (int32_t)format; f->bytes = f->mips = f->over = f->targets = 0; break; }
+    f->n += sign, f->bytes += bytes;
+    if (shape & VKB_IMG_SHAPE_TARGET) f->targets += bytes;
+    if (shape & VKB_IMG_SHAPE_MIPS) f->mips += bytes;
+    if (shape & VKB_IMG_SHAPE_OVER) f->over += bytes;
+    pthread_mutex_unlock(&st.lock);
+}
+
 void vkb_memstat_buffer(int64_t bytes)
 {
     pthread_mutex_lock(&st.lock);
@@ -317,6 +343,8 @@ static long status_kb(const char *buf, const char *key)
 static int mem_low_now; /* vkb_mem_low (atomic) */
 
 int vkb_mem_low(void) { return __atomic_load_n(&mem_low_now, __ATOMIC_RELAXED); }
+static int mem_tight_now; /* vkb_mem_tight (atomic) */
+int vkb_mem_tight(void) { return __atomic_load_n(&mem_tight_now, __ATOMIC_RELAXED) || vkb_mem_low(); }
 
 /* SwapFree in KB, 0 when unknown or none. */
 static uint64_t swapfree_kb(void)
@@ -359,6 +387,7 @@ static void *st_thread(void *arg)
             if (!low && avail < total / 8) low = entered = 1;
             else if (low && avail > total / 6) low = 0;
         }
+        __atomic_store_n(&mem_tight_now, avail && total && avail < total / 6, __ATOMIC_RELAXED);
         if (low != vkb_mem_low()) {
             __atomic_store_n(&mem_low_now, low, __ATOMIC_RELAXED);
             if (!low) VKB_INFO("memory: %llu MB free of %llu MB again; idle descriptor pools are kept again", (unsigned long long)(avail >> 10),
@@ -370,7 +399,10 @@ static void *st_thread(void *arg)
             heap_purge();
             last_purge = now.tv_sec;
         }
-        if (!lines && !entered) continue;
+        if (!lines && !entered) {
+            vkb_hk_tick(0, 0); /* memtop on growth with the lines off too (server_heapkind.c) */
+            continue;
+        }
         char sbuf[4096] = "";
         int sfd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
         if (sfd >= 0) {
@@ -418,6 +450,27 @@ static void *st_thread(void *arg)
             if (st.bc[i].n)
                 ADD(" fmt%d %lld:%lldM>%lldM>%lldM", VK_FORMAT_BC1_RGB_UNORM_BLOCK + i, (long long)st.bc[i].n, MB(st.bc[i].src),
                     MB(st.bc[i].dec), MB(st.bc[i].drv));
+        {   /* the non-BC formats, largest first (4), then the rest summed */
+            int shown[ST_FMTS + 1] = {0}, any = 0;
+            for (int k = 0; k < 4; k++) {
+                int best = -1;
+                for (int i = 0; i < ST_FMTS; i++)
+                    if (st.fmt[i].n > 0 && !shown[i] && (best < 0 || st.fmt[i].bytes > st.fmt[best].bytes)) best = i;
+                if (best < 0) break;
+                shown[best] = 1;
+                const st_fmt *f = &st.fmt[best];
+                ADD("%s fmt%d %lld:%lldM (mips %lldM, over 1024 %lldM, targets %lldM)", any++ ? "" : " | other images", f->fmt,
+                    (long long)f->n, MB(f->bytes), MB(f->mips), MB(f->over), MB(f->targets));
+            }
+            st_fmt rest = st.fmt[ST_FMTS];
+            for (int i = 0; i < ST_FMTS; i++)
+                if (st.fmt[i].n > 0 && !shown[i])
+                    rest.n += st.fmt[i].n, rest.bytes += st.fmt[i].bytes, rest.mips += st.fmt[i].mips, rest.over += st.fmt[i].over,
+                        rest.targets += st.fmt[i].targets;
+            if (rest.n > 0)
+                ADD("%s rest %lld:%lldM (mips %lldM, over 1024 %lldM, targets %lldM)", any ? "" : " | other images", (long long)rest.n,
+                    MB(rest.bytes), MB(rest.mips), MB(rest.over), MB(rest.targets));
+        }
         ADD(" | +%llu allocs %lldM, -%llu frees %lldM", (unsigned long long)(st.allocs - last_allocs), MB(st.alloc_bytes - last_ab),
             (unsigned long long)(st.frees - last_frees), MB(st.free_bytes - last_fb));
         last_allocs = st.allocs, last_frees = st.frees, last_ab = st.alloc_bytes, last_fb = st.free_bytes;
@@ -432,10 +485,20 @@ static void *st_thread(void *arg)
             if (st.pid[i].pid && st.pid[i].bytes > 0) ADD(" %d:%lldM", st.pid[i].pid, MB(st.pid[i].bytes));
         ADD(" | pipelines +%llu (%llu), pipeline caches %lluK, desc overflow pools %llu", (unsigned long long)(made - last_made),
             (unsigned long long)made, (unsigned long long)(pc_bytes >> 10), (unsigned long long)pools);
+        int run_pids[ST_PIDS];
+        for (int i = 0; i < ST_PIDS; i++) run_pids[i] = low ? st.pid[i].pid : 0;
         last_made = made;
         int64_t gpu = live;
-#undef ADD
         pthread_mutex_unlock(&st.lock);
+        /* with memory low, the requests running for a second or more (what the server is inside while
+         * it grows: Pixel 2026-11-10, 6 GB of heap in 10 s and no line named the call); asked after
+         * st.lock is let go (the connections' lock is taken inside) */
+        for (int i = 0; i < ST_PIDS; i++) {
+            const char *call;
+            double run = run_pids[i] ? vkb_srv_running_longest(run_pids[i], &call, NULL, 0) : 0;
+            if (run >= 1.0 && call) ADD(" | running %d %s %.1fs", run_pids[i], call, run);
+        }
+#undef ADD
         if (lines) VKB_INFO("%s | bc scratch %lldM", line, MB(vkb_emu_bcn_scratch_live()));
         if (entered && ++lows <= 4)
             VKB_WARN("memory low: %llu MB free of %llu MB (swap free %llu MB); the server holds %ld MB (GPU memory %lld MB, heap %lld MB, "
@@ -443,6 +506,7 @@ static void *st_thread(void *arg)
                      "may close apps, and the bridge with the game%s",
                      (unsigned long long)(avail >> 10), (unsigned long long)(total >> 10), (unsigned long long)(swap >> 10), rss >> 10, MB(gpu),
                      heap, (unsigned long long)(pc_bytes >> 20), lows == 4 ? " (said 4 times, not again)" : "");
+        vkb_hk_tick(entered, lines); /* memkind:/memtop: (server_heapkind.c) */
     }
     return NULL;
 }
@@ -866,6 +930,9 @@ static uint64_t ahb_export_cpu = 2ull | (2ull << 4);
  * emulation's pages are a dma-buf the driver itself exports from a plain allocation (made, exported,
  * freed: the fd keeps the pages). It lets the export emulation run on the host with
  * VKBRIDGE_FAKE_MISSING=dmabufexport; never on Android. */
+/* VKBRIDGE_TEST_EXPORT_PAGES=memfd: the pages are memfds, for a desktop driver that imports dma-bufs
+ * but exports none (lavapipe without access to /dev/udmabuf: the CI's driver). Returns 1 (driver), 2
+ * (memfd), 0. */
 static int test_driver_pages(void)
 {
 #ifdef __ANDROID__
@@ -874,7 +941,7 @@ static int test_driver_pages(void)
     static int on = -1;
     if (on < 0) {
         const char *v = vkb_srv_env_global("VKBRIDGE_TEST_EXPORT_PAGES");
-        on = v && !strcmp(v, "driver");
+        on = v && !strcmp(v, "driver") ? 1 : v && !strcmp(v, "memfd") ? 2 : 0;
     }
     return on;
 #endif
@@ -900,12 +967,23 @@ const char *vkb_mem_ahb_export_result(void)
 const char *vkb_mem_export_backing_name(void)
 {
     int b = vkb_mem_export_backing();
-    return b == 1 ? "dma-heap" : b == 2 ? "AHardwareBuffer" : b == 3 ? "driver's own dma-bufs (host test)" : "none";
+    return b == 1 ? "dma-heap" : b == 2 ? "AHardwareBuffer" : b == 3 ? (test_driver_pages() == 2 ? "memfds (host test)" : "driver's own dma-bufs (host test)") : "none";
 }
 
 /* VKBRIDGE_TEST_EXPORT_PAGES=driver: len bytes the driver allocates in memory type type and exports. */
 static int driver_pages(vkb_srv_table *t, uint64_t len, uint32_t type)
 {
+#ifndef __ANDROID__
+    if (test_driver_pages() == 2) {
+        int fd = memfd_create("vkb-export-pages", MFD_CLOEXEC);
+        if (fd >= 0 && ftruncate(fd, (off_t)len) != 0) {
+            close(fd);
+            fd = -1;
+        }
+        VKB_ONCE(VKB_LOG_INFO, "export emulation: pages from memfds (VKBRIDGE_TEST_EXPORT_PAGES=memfd, host test)");
+        return fd;
+    }
+#endif
     const vkb_dispatch *dt = &t->real;
     if (!dt->vkGetMemoryFdKHR) return -1;
     VkExportMemoryAllocateInfo ex = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
@@ -1201,7 +1279,7 @@ static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties(VkPhysi
 }
 
 /*
- * VK_EXT_memory_budget that follows the memory really free (player logs: phones of 11 GB
+ * VK_EXT_memory_budget that follows the memory really free (a player log: phones of 11 GB
  * with 2.5-3 GB free at the Steam menu, games closed by the system at 1.2-1.4 GB free). The driver's budget
  * and the client's heap cap say how much the GPU could have; DXVK and vkd3d-proton re-read the budget while
  * they run and stay under it, so it is lowered to what the GPU's memory plus the memory available now can
@@ -1290,9 +1368,9 @@ static void budget_follow_props2(VkPhysicalDeviceMemoryProperties2 *mp)
  *   the heap it shows. Row 111's rule (live + MemAvailable - 1.5 GB) is below the heap on nearly every
  *   mem: line of every Mali log, the Ultra 16 GB and the S10+ included, so it is not used as it stands.
  *   Low memory: MemAvailable under VKBRIDGE_BUDGET_LOW_MB (768) for VKBRIDGE_BUDGET_LOW_HOLD_MS (2000 ms), until
- *   it is over that + 256 MB again; or swap used up with little free (memb_swap_short). No run on
+ *   it is over that + 256 MB again; or swap used up with little free (memb_swap_short, a player log). No run on
  *   the owner's tablets went under 768 MB (lowest 834); the two vivo runs the system killed (a player log,
- *   QUWD) sat at 330-750 MB in their last minutes. Then each
+ *   a player log) sat at 330-750 MB in their last minutes. Then each
  *   device-local heap: heapBudget = max(1 GB, this process's GPU memory + MemAvailable - reserve), at most
  *   the heap (reserve: VKBRIDGE_BUDGET_RESERVE_MB, 1536, row 111's), heapUsage = this process's GPU memory
  *   (the server's count, `pids` on the mem: lines). DXVK then frees its empty chunks and defragments, and
@@ -1325,9 +1403,9 @@ static uint64_t memb_avail_kb(void)
     return budget_avail_kb();
 }
 
-/* Swap used up while little is free: Ultra 12 GB, the app closed by Android's low-memory killer at
- * 834 MB free had swap free 0 for minutes with 834-1431 MB free, never under 768; Pixel 9a (killed)
- * 0-10 MB of 3661 (game died) 380 of 8191. SwapFree under 5% of SwapTotal with MemAvailable under an
+/* Swap used up while little is free: a player log (Ultra 12 GB, the app closed by Android's low-memory killer at
+ * 834 MB free) had swap free 0 for minutes with 834-1431 MB free, never under 768; Pixel 9a (killed)
+ * 0-10 MB of 3661, a player log (game died) 380 of 8191. SwapFree under 5% of SwapTotal with MemAvailable under an
  * eighth of RAM (vkb_mem_low's line); leaving: over 10% or over a sixth. The owner's tablets: once (an
  * Ultra 12 GB run, 973 MB free, swap 0), real pressure too. Read only when that little is free. */
 static int memb_swap_short(uint64_t avail_mb, int leaving)
@@ -1430,8 +1508,26 @@ static VKAPI_ATTR void VKAPI_CALL lazy_GetPhysicalDeviceMemoryProperties2(VkPhys
  * (VK_ERROR_FORMAT_NOT_SUPPORTED, with or without a format list), yet makes that very image on an
  * imported dma-buf, its UNORM storage and SRGB views included. gamescope asks so for every image it
  * hands the compositor (UNORM and SRGB views) and aborted with no modifier left (Mali-G76 MC4). Such
- * a refusal is asked again without the flag and its format list. */
+ * a refusal at the LINEAR modifier (the only one DroidDeck's compositor offers) is asked again without
+ * the flag and its format list.
+ * Installed over pv_mutable_linear (PV-02, server_errata_pvmutable.c): where that erratum answers the
+ * refusal, this sees its answer and does nothing. Only where the driver's own dma-buf export is used:
+ * with the export emulation (VKB_EMU_DMABUF_EXPORT) or the AHardwareBuffer path (VKB_EMU_DMABUF_AHB)
+ * on, the client already answers such a refusal from plain LINEAR tiling and the server makes the
+ * image plain LINEAR (client/physdev.c, server_emu_layer.c linear_mod_plain), as Mali-G57 / G68 r32p1
+ * phones do today; the retry leaves them as they are. VKBRIDGE_DMABUF_MUTABLE_RETRY=0 turns it off,
+ * =1 has it on there too. */
 static PFN_vkGetPhysicalDeviceImageFormatProperties2 mutable_next;
+
+static int mutable_retry_wanted(VkPhysicalDevice pd)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_DMABUF_MUTABLE_RETRY");
+    if (v && *v) return strcmp(v, "0") != 0;
+    const vkb_srv_table *t = vkb_srv_current_table();
+    if (t && t->is_device) t = t->parent;
+    const vkb_pd_knowledge *k = t ? vkb_pd_lookup(&t->real, pd) : NULL;
+    return k && !(k->info.emu & (VKB_EMU_DMABUF_EXPORT | VKB_EMU_DMABUF_AHB));
+}
 
 static VKAPI_ATTR VkResult VKAPI_CALL mutable_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd,
                                                                                      const VkPhysicalDeviceImageFormatInfo2 *info,
@@ -1441,11 +1537,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL mutable_GetPhysicalDeviceImageFormatProper
     if (r != VK_ERROR_FORMAT_NOT_SUPPORTED || info->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
         !(info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
         return r;
-    int dmabuf = 0;
-    for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext)
+    int dmabuf = 0, linear = 1;
+    for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext) {
         if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
             dmabuf = ((const VkPhysicalDeviceExternalImageFormatInfo *)b)->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    if (!dmabuf) return r;
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+            linear = ((const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *)b)->drmFormatModifier == 0; /* DRM_FORMAT_MOD_LINEAR */
+    }
+    /* LINEAR only: a compressed or tiled modifier (AFBC) can truly refuse UNORM / SRGB views, and taken as
+     * usable it would be picked over LINEAR and fail when the image is made */
+    if (!dmabuf || !linear || !mutable_retry_wanted(pd)) return r;
     VkPhysicalDeviceImageFormatInfo2 *ii = (VkPhysicalDeviceImageFormatInfo2 *)info;
     VkBaseOutStructure *list = vkb_emu_chain_take(ii, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
     ii->flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -1462,12 +1563,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL mutable_GetPhysicalDeviceImageFormatProper
     return r;
 }
 
+/* over PV-02's image-format query (server_instance.c), so the erratum's answer comes first */
+void vkb_mem_mutable_instance_install(vkb_srv_table *t)
+{
+    if (!t->dt.vkGetPhysicalDeviceImageFormatProperties2) return;
+    mutable_next = t->dt.vkGetPhysicalDeviceImageFormatProperties2;
+    t->dt.vkGetPhysicalDeviceImageFormatProperties2 = mutable_GetPhysicalDeviceImageFormatProperties2;
+}
+
 void vkb_mem_instance_install(vkb_srv_table *t)
 {
-    if (t->dt.vkGetPhysicalDeviceImageFormatProperties2) {
-        mutable_next = t->dt.vkGetPhysicalDeviceImageFormatProperties2;
-        t->dt.vkGetPhysicalDeviceImageFormatProperties2 = mutable_GetPhysicalDeviceImageFormatProperties2;
-    }
     if (t->real.vkGetPhysicalDeviceMemoryProperties2) t->dt.vkGetPhysicalDeviceMemoryProperties2 = lazy_GetPhysicalDeviceMemoryProperties2;
     if (!fake_lazy()) return;
     if (t->real.vkGetPhysicalDeviceMemoryProperties) t->dt.vkGetPhysicalDeviceMemoryProperties = lazy_GetPhysicalDeviceMemoryProperties;
@@ -2182,7 +2287,10 @@ static VkResult test_scanout_alloc(vkb_srv_table *t, uint32_t w, uint32_t h, uin
                                    uint32_t *pitch, uint64_t *size, uint32_t *ahb_format)
 {
     const char *on = vkb_srv_env_global("VKBRIDGE_TEST_SCANOUT");
-    if (!on || strcmp(on, "1")) return VK_ERROR_FEATURE_NOT_PRESENT;
+    /* "memfd": the pages from a memfd instead, for a driver that exports no dma-bufs but imports them by
+     * mapping the fd (lavapipe without /dev/udmabuf): the present path's tests (host/present_path_test.sh) */
+    int memfd = on && !strcmp(on, "memfd");
+    if (!on || (strcmp(on, "1") && !memfd)) return VK_ERROR_FEATURE_NOT_PRESENT;
     uint32_t f;
     switch (vkformat) {
     case VK_FORMAT_R8G8B8A8_UNORM:
@@ -2196,8 +2304,8 @@ static VkResult test_scanout_alloc(vkb_srv_table *t, uint32_t w, uint32_t h, uin
     uint64_t len = ((uint64_t)p * h + 4095u) & ~4095ull;
     VkPhysicalDeviceMemoryProperties mp;
     t->real.vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
-    int fd = -1;
-    for (uint32_t i = 0; i < mp.memoryTypeCount && fd < 0; i++)
+    int fd = memfd ? vkb_memfd("vkbridge-test-scanout", len) : -1;
+    for (uint32_t i = 0; !memfd && i < mp.memoryTypeCount && fd < 0; i++)
         if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) fd = driver_pages(t, len, i);
     if (fd < 0) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     char one = 'h', cb[CMSG_SPACE(sizeof(int))];
@@ -2221,7 +2329,8 @@ static VkResult test_scanout_alloc(vkb_srv_table *t, uint32_t w, uint32_t h, uin
     *pitch = p;
     *size = len;
     *ahb_format = f;
-    VKB_ONCE(VKB_LOG_INFO, "scanout: %ux%u stand-in gralloc buffers from the driver's own dma-bufs (VKBRIDGE_TEST_SCANOUT=1, host test)", w, h);
+    VKB_ONCE(VKB_LOG_INFO, "scanout: %ux%u stand-in gralloc buffers from %s (VKBRIDGE_TEST_SCANOUT=%s, host test)", w, h,
+             memfd ? "memfds" : "the driver's own dma-bufs", on);
     return VK_SUCCESS;
 }
 #endif
@@ -2267,44 +2376,82 @@ static void close_import_fds(const void *pNext)
 }
 
 /*
- * A dma-buf import with a dedicated image or buffer, in a type the driver's fd properties leave
- * out, moved to one they list that the resource allows too, never lazily allocated or protected.
- * Without the struct (the resource unknown), or with no such type, the type stays: Mali took
- * dma-bufs in its type 0 though its fd properties say type 1 only. The
- * client offers its device-local type for every importable fd (client/memory.c): on Mali the fd's
- * own type is host-visible, which the client offers only as shared, so the fd's client bits were
- * 0 and gamescope's DMA-BUF patch for other GPUs found no type to import in.
+ * A dma-buf import in a type the driver's fd properties leave out. With a dedicated image or
+ * buffer it is moved at once to the closest type they list that the resource allows too
+ * (server_import_type.c: never lazily allocated or protected, never giving up host-visible or
+ * coherent). Without the struct (the resource unknown) the type stays for the first try, because
+ * Mali took dma-bufs in its type 0 though its fd properties say type 1 only; the closest listed type
+ * is returned in *retry for a second try when that one fails (PowerVR's dma-bufs go only in the
+ * types its fd properties list). The client offers its device-local type for every importable fd
+ * (client/memory.c): on Mali the fd's own type is host-visible, which the client offers only as
+ * shared, so the fd's client bits were 0 and gamescope's DMA-BUF patch for other GPUs found no
+ * type to import in.
  */
-static void fit_import_type(vkb_srv_table *t, VkMemoryAllocateInfo *ai, int fd)
+static void fit_import_type(vkb_srv_table *t, VkMemoryAllocateInfo *ai, int fd, int *retry)
 {
+    *retry = -1;
     const vkb_dispatch *dt = &t->real;
     VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
     if (!dt->vkGetMemoryFdPropertiesKHR ||
         dt->vkGetMemoryFdPropertiesKHR(t->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) != VK_SUCCESS ||
         !fp.memoryTypeBits || ai->memoryTypeIndex >= 32 || (fp.memoryTypeBits & (1u << ai->memoryTypeIndex)))
         return;
+    /* The resource's own mask where the import names one (a dedicated image or buffer); without it
+     * the dma-buf's alone, narrowed by the asked type's flags (server_import_type.c) */
     const VkMemoryDedicatedAllocateInfo *d = NULL;
     for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
         if (b->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) d = (const VkMemoryDedicatedAllocateInfo *)b;
-    if (!d || (!d->image && !d->buffer)) return;
+    uint32_t want = UINT32_MAX;
     VkMemoryRequirements req;
-    if (d->image)
+    if (d && d->image) {
         dt->vkGetImageMemoryRequirements(t->device, d->image, &req);
-    else
+        want = req.memoryTypeBits;
+    } else if (d && d->buffer) {
         dt->vkGetBufferMemoryRequirements(t->device, d->buffer, &req);
-    uint32_t want = req.memoryTypeBits;
+        want = req.memoryTypeBits;
+    }
     VkPhysicalDeviceMemoryProperties mp;
     dt->vkGetPhysicalDeviceMemoryProperties(t->physical, &mp);
-    uint32_t ordinary = 0;
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
-        if (!(mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT))) ordinary |= 1u << i;
-    uint32_t bits = fp.memoryTypeBits & want & ordinary;
+    const char *why;
+    int pick;
+    if (vkb_driver_id(&t->real, t->physical, t->api_version) != VK_DRIVER_ID_IMAGINATION_PROPRIETARY) {
+        /* every driver but PowerVR's: test49's rule as it was - a dedicated resource to the lowest type its mask, the
+         * dma-buf's and the ordinary types share; without one the type stays for the import as asked (Mali takes it),
+         * and only if the driver refuses that is it tried once more in the closest listed type (a path that was an
+         * error before) */
+        if (want == UINT32_MAX) {
+            *retry = vkb_import_type_pick(&mp, ai->memoryTypeIndex, fp.memoryTypeBits, want, &why);
+            return;
+        }
+        uint32_t ordinary = 0;
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+            if (!(mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT))) ordinary |= 1u << i;
+        uint32_t bits = fp.memoryTypeBits & want & ordinary;
+        static int told_arm;
+        if (__atomic_fetch_add(&told_arm, 1, __ATOMIC_RELAXED) < 4)
+            VKB_INFO("dma-buf import: type %u is not one the dma-buf takes (types 0x%x, the %s 0x%x); %s %d", ai->memoryTypeIndex,
+                     fp.memoryTypeBits, d->image ? "image" : "buffer", want,
+                     bits ? "imported in type" : "kept, none fits", bits ? __builtin_ctz(bits) : (int)ai->memoryTypeIndex);
+        if (bits) ai->memoryTypeIndex = (uint32_t)__builtin_ctz(bits);
+        return;
+    }
+    /* PowerVR: the closest listed type (server_import_type.c), a dedicated resource at once, else as a retry */
+    pick = vkb_import_type_pick(&mp, ai->memoryTypeIndex, fp.memoryTypeBits, want, &why);
+    int now = want != UINT32_MAX; /* a dedicated resource: moved now; else tried as asked first */
     static int told;
-    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
-        VKB_INFO("dma-buf import: type %u is not one the dma-buf takes (types 0x%x, the %s 0x%x); %s %d", ai->memoryTypeIndex,
-                 fp.memoryTypeBits, d->image ? "image" : "buffer", want,
-                 bits ? "imported in type" : "kept, none fits", bits ? __builtin_ctz(bits) : (int)ai->memoryTypeIndex);
-    if (bits) ai->memoryTypeIndex = (uint32_t)__builtin_ctz(bits);
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4) {
+        const char *what = d && d->image ? "image" : d && d->buffer ? "buffer" : "resource";
+        if (now || pick < 0)
+            VKB_INFO("dma-buf import: type %u is not one the dma-buf takes (types 0x%x, the %s 0x%x); %s %d (%s)", ai->memoryTypeIndex,
+                     fp.memoryTypeBits, what, want, pick >= 0 ? "imported in type" : "kept, none fits",
+                     pick >= 0 ? pick : (int)ai->memoryTypeIndex, why);
+        else
+            VKB_INFO("dma-buf import: type %u is not one the dma-buf takes (types 0x%x, no dedicated resource); tried as asked, type %d if "
+                     "that fails (%s)", ai->memoryTypeIndex, fp.memoryTypeBits, pick, why);
+    }
+    if (pick < 0) return;
+    if (now) ai->memoryTypeIndex = (uint32_t)pick;
+    else *retry = pick;
 }
 
 /* An allocation of BIG_ALLOC or more is logged with how long it took and where (BIG_LINES per
@@ -2368,7 +2515,7 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             ded_image = (uint64_t)(uintptr_t)((const VkMemoryDedicatedAllocateInfo *)b)->image;
     const char *rec_path = "plain";
     {
-        /* for the crash line: what this allocation is, before any driver call */
+        /* for the crash line: what this allocation is, before any driver call (a player log) */
         uint64_t ino = 0;
         int wants_export = 0;
         for (const VkBaseInStructure *b = ai.pNext; b; b = b->pNext) {
@@ -2426,8 +2573,9 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
                 import_fd = ((const VkImportMemoryFdInfoKHR *)b)->fd;
         int emulating = t->pd && (t->pd->info.emu & VKB_EMU_DMABUF_EXPORT) && wants_dmabuf_export(&ai);
         const char *path = import_fd >= 0 ? "dma-buf import" : opaque ? "opaque fd as dma-buf" : "plain";
+        int retry_type = -1;
         if (import_fd >= 0) {
-            fit_import_type(t, &ai, import_fd);
+            fit_import_type(t, &ai, import_fd, &retry_type);
             m->type = ai.memoryTypeIndex;
             /* A dma-buf smaller than the import asks for is refused by the driver
              * (VK_ERROR_INVALID_EXTERNAL_HANDLE): said with both sizes, the first few times. */
@@ -2478,6 +2626,14 @@ void vkb_sv_vkAllocateMemory(vkb_srv_call *c)
             int keep = emulating ? fcntl(import_fd, F_DUPFD_CLOEXEC, 0) : -1;
             if (emulating) chain_drop(&ai.pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
             r = c->dt->vkAllocateMemory(dev, &ai, NULL, &m->mem);
+            if (r != VK_SUCCESS && import_fd >= 0 && retry_type >= 0 && (uint32_t)retry_type != ai.memoryTypeIndex) {
+                /* the driver refused the type as asked: the closest one its fd properties list */
+                VKB_ONCE(VKB_LOG_INFO, "dma-buf import in type %u refused (%d); imported in type %d, which its fd properties list", ai.memoryTypeIndex,
+                         r, retry_type);
+                ai.memoryTypeIndex = (uint32_t)retry_type;
+                m->type = type = ai.memoryTypeIndex;
+                r = c->dt->vkAllocateMemory(dev, &ai, NULL, &m->mem);
+            }
             if (r == VK_SUCCESS && keep >= 0) m->export_fd1 = keep + 1;
             else if (keep >= 0) close(keep);
         }
@@ -2599,6 +2755,9 @@ typedef struct {
     int more_usages; /* the sharing test looks for a buffer usage that allows the type (resources disagree) */
     int unflagged;   /* the test buffer is made without the strategy's external handle type (the fallback below) */
     uint32_t told;   /* test buffers' masks logged, per strategy and unflagged (log_test_buffer) */
+    int pvr;         /* PowerVR's driver (driverID, else vendor 0x1010): the repeated no-flush passes; every other driver keeps one */
+    uint32_t salt;   /* the test patterns' salt: another for each repeated no-flush pass (a stale cache line of the pass
+                      * before holds the same pattern otherwise); 0 for the flushed pass and the first */
 } selftest;
 
 /* Buffer usages the probes try: what apps make (all in one, vertex/index, indirect, uniform,
@@ -2710,18 +2869,62 @@ static int submit_and_wait(selftest *st, VkCommandBuffer cb)
  * the cache maintenance the server does for the client (always flushed). */
 static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush, int cached);
 
+/* A type counts as coherent for the self-test when the driver says so. Host builds: types named in the mask
+ * VKBRIDGE_SELFTEST_FAKE_NONCOHERENT count as not (the host driver's memory is coherent, so the test then
+ * shows the no-flush path). */
+static int type_coherent(const selftest *st, uint32_t type)
+{
+    int c = (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+#ifndef __ANDROID__
+    const char *fake = vkb_srv_env_global("VKBRIDGE_SELFTEST_FAKE_NONCOHERENT");
+    if (fake && *fake && (strtoul(fake, NULL, 0) >> type & 1)) c = 0;
+#endif
+    return c;
+}
+
 /* Without flushes first: imported pages from an uncached heap are coherent in practice even where
  * the driver's type does not say HOST_COHERENT (Mali-G720: dma-heap imports land in type 1,
- * HOST_CACHED without COHERENT, and pass with no flush). Only if that fails, with flushes. */
+ * HOST_CACHED without COHERENT, and pass with no flush). Only if that fails, with flushes.
+ *
+ * "Passes once" is a weak claim for pages the CPU caches: a stale line is only seen when the line is
+ * still in the cache, and 256 KB can have been evicted by then. So the no-flush test is repeated, each
+ * pass with other data (the pass before may have left the same pattern in the cache) and a fresh
+ * allocation: NOFLUSH_PASSES times, NOFLUSH_PASSES_CACHED for a HOST_CACHED type, and any one failure
+ * sends the type to the flushed test (the cost of a flush is small, a stale read is a corrupt frame).
+ * Host builds: VKBRIDGE_SELFTEST_STALE_AT=k makes the k-th pass of a type read stale. */
+#define NOFLUSH_PASSES 3
+#define NOFLUSH_PASSES_CACHED 5
+
 static int test_type(selftest *st, uint32_t s, uint32_t type)
 {
-    int coherent_flag = (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-    if (!coherent_flag && !vkb_srv_env_global("VKBRIDGE_SELFTEST_NOFLUSH")) {
-        int r = test_type_mode(st, s, type, 1, 0);
-        if (r) {
-            VKB_INFO("  %s, type %u: coherent in practice (no flushes needed)", vkb_mem_strategy_name(s), type);
+    if (!type_coherent(st, type) && !vkb_srv_env_global("VKBRIDGE_SELFTEST_NOFLUSH")) {
+        /* the repeated passes on PowerVR (the 16 KB-page Pixels the claim was doubted on); every other driver keeps test49's one pass
+         * (a Mali's "coherent in practice" types stay so: the same memory path and no longer self-test) */
+        const int want = !st->pvr ? 1 : (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? NOFLUSH_PASSES_CACHED : NOFLUSH_PASSES;
+        int stale_at = 0, done = 0;
+#ifndef __ANDROID__
+        const char *sa = vkb_srv_env_global("VKBRIDGE_SELFTEST_STALE_AT");
+        stale_at = sa && *sa ? atoi(sa) : 0;
+#endif
+        for (; done < want; done++) {
+            st->salt = (uint32_t)done * 0x9e3779b9u;
+            int r = test_type_mode(st, s, type, 1, 0);
+            if (r && stale_at == done + 1) {
+                VKB_INFO("  %s, type %u: pass %d read stale data (VKBRIDGE_SELFTEST_STALE_AT, imitated)", vkb_mem_strategy_name(s), type, done + 1);
+                r = 0;
+            }
+            if (!r) break;
+        }
+        st->salt = 0;
+        if (done == want) {
+            if (want == 1)
+                VKB_INFO("  %s, type %u: coherent in practice (no flushes needed)", vkb_mem_strategy_name(s), type);
+            else
+                VKB_INFO("  %s, type %u: coherent in practice (no flushes needed; %d passes)", vkb_mem_strategy_name(s), type, want);
             return 1;
         }
+        if (done > 0)
+            VKB_INFO("  %s, type %u: passed %d of %d no-flush passes, then failed: flushes are used for it", vkb_mem_strategy_name(s), type, done, want);
     }
     return test_type_mode(st, s, type, 0, 0);
 }
@@ -2805,30 +3008,30 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush,
         VKB_INFO("  %s, type %u: bind/map failed", vkb_mem_strategy_name(s), type);
         goto out;
     }
-    int coherent = (st->mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    int coherent = type_coherent(st, type);
     /* VKBRIDGE_SELFTEST_NOFLUSH=1 forces it for every type. */
     if (no_flush || vkb_srv_env_global("VKBRIDGE_SELFTEST_NOFLUSH")) coherent = 1;
     if (cached) coherent = 0; /* always flushed: what the client does with these pages */
     VkMappedMemoryRange whole = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, m->mem, 0, VK_WHOLE_SIZE};
 
     /* 1: the two CPU mappings are the same pages. */
-    for (uint32_t i = 0; i < TEST_SIZE / 4; i += 997) ((volatile uint32_t *)cmap)[i] = 0x11220000u + i;
+    for (uint32_t i = 0; i < TEST_SIZE / 4; i += 997) ((volatile uint32_t *)cmap)[i] = (0x11220000u + i) ^ st->salt;
     __sync_synchronize();
     for (uint32_t i = 0; i < TEST_SIZE / 4; i += 997) {
-        if (((volatile uint32_t *)smap)[i] != 0x11220000u + i) {
+        if (((volatile uint32_t *)smap)[i] != ((0x11220000u + i) ^ st->salt)) {
             VKB_INFO("  %s, type %u: CPU mappings differ at word %u", vkb_mem_strategy_name(s), type, i);
             goto out;
         }
     }
     /* 2: GPU writes, client reads.  3: client writes, GPU copies, client reads the copy. */
-    for (uint32_t i = TEST_SIZE / 8; i < TEST_SIZE / 8 + TEST_SIZE / 32; i++) ((volatile uint32_t *)cmap)[i] = 0x5a000000u ^ (i * 2654435761u);
+    for (uint32_t i = TEST_SIZE / 8; i < TEST_SIZE / 8 + TEST_SIZE / 32; i++) ((volatile uint32_t *)cmap)[i] = 0x5a000000u ^ (i * 2654435761u) ^ st->salt;
     if (!coherent) st_flush(st, m, &whole, 1);
     VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, st->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     VkCommandBuffer cb;
     if (dt->vkAllocateCommandBuffers(st->dev, &cai, &cb) != VK_SUCCESS) goto out;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     dt->vkBeginCommandBuffer(cb, &bi);
-    dt->vkCmdFillBuffer(cb, buf, 0, TEST_SIZE / 8, 0xA5A5A5A5u);
+    dt->vkCmdFillBuffer(cb, buf, 0, TEST_SIZE / 8, 0xA5A5A5A5u ^ st->salt);
     /* Layout (bytes): [0, N/8) GPU fill; [N/2, N/2 + N/8) written by the client and copied by
      * the GPU to [3N/4, 3N/4 + N/8). */
     VkBufferCopy region = {TEST_SIZE / 2, TEST_SIZE / 4 * 3, TEST_SIZE / 8};
@@ -2844,14 +3047,14 @@ static int test_type_mode(selftest *st, uint32_t s, uint32_t type, int no_flush,
     }
     if (!coherent) st_flush(st, m, &whole, 0);
     for (uint32_t i = 0; i < TEST_SIZE / 32; i++) {
-        if (((volatile uint32_t *)cmap)[i] != 0xA5A5A5A5u) {
+        if (((volatile uint32_t *)cmap)[i] != (0xA5A5A5A5u ^ st->salt)) {
             VKB_INFO("  %s, type %u: the client does not see a GPU write (word %u = 0x%08x)", vkb_mem_strategy_name(s), type, i,
                      ((volatile uint32_t *)cmap)[i]);
             goto out;
         }
     }
     for (uint32_t i = 0; i < TEST_SIZE / 32; i++) {
-        uint32_t want = 0x5a000000u ^ ((TEST_SIZE / 8 + i) * 2654435761u);
+        uint32_t want = 0x5a000000u ^ ((TEST_SIZE / 8 + i) * 2654435761u) ^ st->salt;
         uint32_t got = ((volatile uint32_t *)cmap)[TEST_SIZE / 16 * 3 + i];
         if (got != want) {
             VKB_INFO("  %s, type %u: the GPU does not see a client write (word %u = 0x%08x, want 0x%08x)", vkb_mem_strategy_name(s),
@@ -3212,6 +3415,11 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     st.idt = idt;
     st.pd = pd;
     idt->vkGetPhysicalDeviceMemoryProperties(pd, &st.mp);
+    {
+        VkPhysicalDeviceProperties pp;
+        idt->vkGetPhysicalDeviceProperties(pd, &pp);
+        st.pvr = vkb_driver_is_powervr(&pp, k->info.driver_id);
+    }
 
     uint32_t nq = 0;
     idt->vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, NULL);
@@ -3326,8 +3534,9 @@ void vkb_mem_selftest(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hostp};
     idt->vkGetPhysicalDeviceProperties2(pd, &p2);
-    st.import_align = hostp.minImportedHostPointerAlignment ? hostp.minImportedHostPointerAlignment : 4096;
-    if (st.import_align < 4096) st.import_align = 4096;
+    st.import_align = vkb_import_align(hostp.minImportedHostPointerAlignment); /* never below the kernel's page (16 KB option) */
+    VKB_INFO("memory sharing: host-pointer import alignment %llu (driver says %llu, kernel page %zu)", (unsigned long long)st.import_align,
+             (unsigned long long)hostp.minImportedHostPointerAlignment, vkb_page_size());
 
     k->info.strategy = VKB_MEM_NONE;
     k->info.image_types = probe_image_types(&st);

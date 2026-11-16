@@ -42,7 +42,9 @@
  * right) folds such stages into the vertex shader; a compiler spinning on the UE4 LUT shape gives
  * those pipelines their stand-in at once instead of after a 10 s timeout; a BC transcoder that
  * does not build (within VKBRIDGE_PROBE_TX_TIMEOUT_S, 20 s: they are slow, not stuck, on some
- * drivers) leaves its formats decoded. VKBRIDGE_PROBE_APPLY=0 records without applying.
+ * drivers) leaves its formats decoded; a new variant of the BC converters (one dispatch a run, the palette search) that
+ * does not build, hangs or converts one byte differently from the old one is not used (bc_variants: the old one stays,
+ * and none is used before it passed). VKBRIDGE_PROBE_APPLY=0 records without applying.
  *
  * The MK probes - viewport_flip, bitwise_vec, dyn_state, vb_strides, view3d_layers, wait_eintr,
  * rendering_churn, fp16_math: one per Mali driver erratum (server_errata.c) a probe can tell, MK-06's only
@@ -69,13 +71,18 @@
  * longer (to stop a session inside it), or end in error without running (could not set up: what
  * safe mode does not take as verified); VKBRIDGE_FAKE_MISSING applies as everywhere (a feature taken as missing is
  * already emulated, so its probe is skipped). VKBRIDGE_PROBE_TX_FAKE=<transcoder>:<ms>,... (BC7->ASTC:5000)
- * makes that BC transcoder's build take ms longer, inside its watchdog.
+ * makes that BC transcoder's build take ms longer, inside its watchdog; VKBRIDGE_PROBE_BCV_FAKE=<variant>:<differ|fail|slow|hang>,...
+ * ("BC1 decode table:differ") changes one byte of that converter variant's output, fails its build, or makes its check
+ * 3 s or 600 s longer (bc_variants; a hang is interrupted at VKBRIDGE_PROBE_TX_TIMEOUT_S).
  */
 #define _GNU_SOURCE
+#include <inttypes.h>
 #include "vkb_server.h"
 #include "server_emu.h"
+#include "server_errata.h"
 #include "vkb_ext_alias.h"
 #include "probe_spv.h"
+#include "spirv_names.h"
 
 #include <dirent.h>
 #ifdef __ANDROID__
@@ -84,14 +91,17 @@
 #include <sys/mman.h>
 #include <vulkan/vulkan_android.h>
 #endif
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -101,9 +111,9 @@
 #endif
 
 /* Bump when a probe is added, removed or its pass criterion changes: cached profiles are re-run. */
-#define PROBE_VERSION 3
+#define PROBE_VERSION 7
 #define MAX_RESULTS 48
-#define DETAIL 480
+#define DETAIL 640
 
 enum { PS_PASS, PS_FAIL, PS_CRASH, PS_HANG, PS_DIED, PS_SKIP, PS_ERROR, PS_COUNT };
 static const char *const ps_name[PS_COUNT] = {"pass", "fail", "crash", "hang", "died", "skip", "error"};
@@ -113,8 +123,8 @@ typedef struct presult {
     int status;
     double ms;
     uint32_t emu;    /* emulation switched on because of it (decide: in the mode in force) */
-    uint32_t flags;  /* VKB_PROBE_FLAG_* set because of it (decide) */
-    uint32_t want;   /* raw: the flags the probe asked for (it saw a failure they answer) */
+    uint64_t flags;  /* VKB_PROBE_FLAG_* set because of it (decide) */
+    uint64_t want;   /* raw: the flags the probe asked for (it saw a failure they answer) */
     uint32_t cases;  /* raw: the sub-cases that ran (bit i: the probe's case i, probe_def.cases) */
     uint32_t failed; /* raw: the sub-cases that did not pass */
     char detail[DETAIL];
@@ -153,12 +163,48 @@ typedef struct pprofile {
 static pthread_mutex_t plock = PTHREAD_MUTEX_INITIALIZER;
 static pprofile profiles[VKB_MAX_PDS];
 static int nprofiles;
-static uint32_t pflags; /* runtime flags in force */
+/* test50: every runtime flag its own bit. The PERF line's BC fast verdicts and the PowerVR line's PV-01 / PV-04 forms were
+ * merged onto the same bits (0x400000, 0x1000000); one bit twice makes the sum of the flags differ from their OR. */
+_Static_assert(((uint64_t)VKB_PROBE_FLAG_LUT_NOW + (uint64_t)VKB_PROBE_FLAG_GS_FOLD + (uint64_t)VKB_PROBE_FLAG_SPIRV_FIX + (uint64_t)VKB_PROBE_FLAG_TX_ETC2 + (uint64_t)VKB_PROBE_FLAG_TX_EAC + (uint64_t)VKB_PROBE_FLAG_TX_ASTC + (uint64_t)VKB_PROBE_FLAG_TX_ASTC_HDR + (uint64_t)VKB_PROBE_FLAG_TX_BC7 + (uint64_t)VKB_PROBE_FLAG_BC_TAB + (uint64_t)VKB_PROBE_FLAG_BC_PAL_ETC2 + (uint64_t)VKB_PROBE_FLAG_BC_PAL_EAC + (uint64_t)VKB_PROBE_FLAG_BC_FAST_ETC2 + (uint64_t)VKB_PROBE_FLAG_BC_FAST_ASTC + (uint64_t)VKB_PROBE_FLAG_WAIT_LOST + (uint64_t)VKB_PROBE_FLAG_MK_WAIT + (uint64_t)VKB_PROBE_FLAG_MK_FLIP + (uint64_t)VKB_PROBE_FLAG_MK_BITWISE + (uint64_t)VKB_PROBE_FLAG_MK_DYN + (uint64_t)VKB_PROBE_FLAG_MK_VB + (uint64_t)VKB_PROBE_FLAG_MK_VB_SINGLE + (uint64_t)VKB_PROBE_FLAG_MK_CHURN + (uint64_t)VKB_PROBE_FLAG_MK_VIEW3D + (uint64_t)VKB_PROBE_FLAG_MK_FP16 + (uint64_t)VKB_PROBE_FLAG_PV_MUTABLE + (uint64_t)VKB_PROBE_FLAG_PV_NAMES + (uint64_t)VKB_PROBE_FLAG_PV_BGRA_STORE + (uint64_t)VKB_PROBE_FLAG_PV_VIEW3D + (uint64_t)VKB_PROBE_FLAG_PV_V3D_ARRAY1 + (uint64_t)VKB_PROBE_FLAG_PV_V3D_2D1 + (uint64_t)VKB_PROBE_FLAG_PV_V3D_COPY + (uint64_t)VKB_PROBE_FLAG_PV_V3D_FB + (uint64_t)VKB_PROBE_FLAG_PV_V3D_FBCOPY + (uint64_t)VKB_PROBE_FLAG_PV_FBLOOP) == ((uint64_t)VKB_PROBE_FLAG_LUT_NOW | (uint64_t)VKB_PROBE_FLAG_GS_FOLD | (uint64_t)VKB_PROBE_FLAG_SPIRV_FIX | (uint64_t)VKB_PROBE_FLAG_TX_ETC2 | (uint64_t)VKB_PROBE_FLAG_TX_EAC | (uint64_t)VKB_PROBE_FLAG_TX_ASTC | (uint64_t)VKB_PROBE_FLAG_TX_ASTC_HDR | (uint64_t)VKB_PROBE_FLAG_TX_BC7 | (uint64_t)VKB_PROBE_FLAG_BC_TAB | (uint64_t)VKB_PROBE_FLAG_BC_PAL_ETC2 | (uint64_t)VKB_PROBE_FLAG_BC_PAL_EAC | (uint64_t)VKB_PROBE_FLAG_BC_FAST_ETC2 | (uint64_t)VKB_PROBE_FLAG_BC_FAST_ASTC | (uint64_t)VKB_PROBE_FLAG_WAIT_LOST | (uint64_t)VKB_PROBE_FLAG_MK_WAIT | (uint64_t)VKB_PROBE_FLAG_MK_FLIP | (uint64_t)VKB_PROBE_FLAG_MK_BITWISE | (uint64_t)VKB_PROBE_FLAG_MK_DYN | (uint64_t)VKB_PROBE_FLAG_MK_VB | (uint64_t)VKB_PROBE_FLAG_MK_VB_SINGLE | (uint64_t)VKB_PROBE_FLAG_MK_CHURN | (uint64_t)VKB_PROBE_FLAG_MK_VIEW3D | (uint64_t)VKB_PROBE_FLAG_MK_FP16 | (uint64_t)VKB_PROBE_FLAG_PV_MUTABLE | (uint64_t)VKB_PROBE_FLAG_PV_NAMES | (uint64_t)VKB_PROBE_FLAG_PV_BGRA_STORE | (uint64_t)VKB_PROBE_FLAG_PV_VIEW3D | (uint64_t)VKB_PROBE_FLAG_PV_V3D_ARRAY1 | (uint64_t)VKB_PROBE_FLAG_PV_V3D_2D1 | (uint64_t)VKB_PROBE_FLAG_PV_V3D_COPY | (uint64_t)VKB_PROBE_FLAG_PV_V3D_FB | (uint64_t)VKB_PROBE_FLAG_PV_V3D_FBCOPY | (uint64_t)VKB_PROBE_FLAG_PV_FBLOOP), "two VKB_PROBE_FLAG_* share a bit");
+static uint64_t pflags; /* runtime flags in force (33 of them: wider than 32 bits since test50) */
 
-int vkb_probe_flag(uint32_t f)
+int vkb_probe_flag(uint64_t f)
 {
     return (__atomic_load_n(&pflags, __ATOMIC_ACQUIRE) & f) != 0;
 }
+
+static int bcv_state; /* vkb_probe_bc_variants (atomic) */
+
+/* BC fast converters (VKBRIDGE_BC_FAST): on by default only on the GPUs measured as strong (Mali-G925 / Immortalis-G925: BC7 -62%;
+ * Mali-G720 / Immortalis-G720: probe 1.3 s once, then 1.4 ms, RE3 bc hitches 6/4 -> 0/0). A weak Mali-G68 paid a 65 s first-launch probe
+ * for them and had a worse first session; unmeasured GPUs stay as before. A model name counts when "G925" / "G720" stands as a whole
+ * word in it ("Mali-G925-Immortalis MC12", "Immortalis-G720 MC10"; not "G7205"). VKBRIDGE_TEST_BC_GPU=<name> (host tests, the server's
+ * environment only) stands in for the GPU's name. */
+int vkb_bc_gpu_measured(const char *name)
+{
+    static const char *const ok[] = {"G925", "G720"};
+    if (!name) return 0;
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+        for (const char *h = name; (h = strstr(h, ok[i])) != NULL; h++) {
+            char after = h[strlen(ok[i])];
+            int before_ok = h == name || !isalnum((unsigned char)h[-1]);
+            if (before_ok && !isalnum((unsigned char)after)) return 1;
+        }
+    return 0;
+}
+
+/* 1: the BC fast converters (and their variants in the bc_variants probe) are in play on this GPU: the name is measured, or
+ * VKBRIDGE_BC_FAST is set (an explicit setting wins both ways). */
+int vkb_bc_fast_gate(const char *deviceName, int *explicit_env)
+{
+    const char *fv = vkb_srv_env("VKBRIDGE_BC_FAST"), *t = getenv("VKBRIDGE_TEST_BC_GPU");
+    int ex = fv && *fv;
+    if (explicit_env) *explicit_env = ex;
+    if (ex) return 1;
+    return vkb_bc_gpu_measured(t && *t ? t : deviceName);
+}
+
+int vkb_probe_bc_variants(void) { return __atomic_load_n(&bcv_state, __ATOMIC_ACQUIRE); }
 
 static double mono_ms(void)
 {
@@ -210,16 +256,22 @@ typedef struct pctx {
     /* the running probe */
     int st;
     int gpu_stuck; /* a submission never finished, or the device was lost: the device is abandoned */
+    int starved;   /* a build reached its limit while it mostly waited for a CPU (guard_starved): the probe not counted */
     char detail[DETAIL];
     size_t dlen;
     pobj objs[96];
     int nobjs;
     /* flags a probe asks for when it does not pass (bc transcoders: per target) */
-    uint32_t want_flags;
+    uint64_t want_flags;
     uint32_t cases, failed; /* sub-cases run / not passed (MK probes) */
     int layer_vs_passed;
+    int tx_status;      /* bc_transcoders' result this profile (-1: none) */
     int fp16; /* shaderFloat16 on the probe device (fp16_math) */
+    int pvr;    /* Imagination's driver (driverID, else vendor 0x1010): PV-04's extra sub-cases and the feedback-loop extension */
+    int fbloop; /* attachmentFeedbackLoopLayout on the probe device (view3d_layers' feedback-loop sub-cases) */
 } pctx;
+
+static double rq_wait_ms(void);
 
 static int has_ext(const pctx *c, const char *name)
 {
@@ -434,8 +486,9 @@ static int dev_create(pctx *c)
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingFeatures dr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    const char *exts[24];
+    const char *exts[28];
     uint32_t ne = 0;
     void *chain = NULL;
     c->divisor_name = has_ext(c, "VK_KHR_vertex_attribute_divisor")   ? "VK_KHR_vertex_attribute_divisor"
@@ -456,6 +509,12 @@ static int dev_create(pctx *c)
         if (has_ext(c, "VK_KHR_dynamic_rendering")) dr.pNext = chain, chain = &dr, exts[ne++] = "VK_KHR_dynamic_rendering";
     }
     if (has_ext(c, "VK_EXT_extended_dynamic_state3")) eds3.pNext = chain, chain = &eds3, exts[ne++] = "VK_EXT_extended_dynamic_state3";
+    /* feedback loops (view3d_layers' sub-cases 5-7, pv_view3d_base): asked for on PowerVR only (and under PV-04's or PV-06's host
+     * imitation), so the probe device of every other GPU is made as in test49 */
+    const char *v3imi = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE");
+    if ((c->pvr || (v3imi && (strstr(v3imi, "pv_view3d_base") || strstr(v3imi, "pv_fbloop_split")))) &&
+        has_ext(c, "VK_EXT_attachment_feedback_loop_layout") && c->api >= VK_API_VERSION_1_1)
+        fbl.pNext = chain, chain = &fbl, exts[ne++] = "VK_EXT_attachment_feedback_loop_layout";
     f2.pNext = chain;
     if (i->vkGetPhysicalDeviceFeatures2) i->vkGetPhysicalDeviceFeatures2(c->pd, &f2);
     else i->vkGetPhysicalDeviceFeatures(c->pd, &f2.features);
@@ -505,6 +564,7 @@ static int dev_create(pctx *c)
     memset((char *)&v13 + offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess), 0,
            sizeof(v13) - offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess));
     v13.dynamicRendering = dyn_rendering;
+    VkBool32 fbloop = fbl.attachmentFeedbackLoopLayout;
     VkBool32 smask = eds3.extendedDynamicState3SampleMask;
     memset((char *)&eds3 + offsetof(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT, extendedDynamicState3TessellationDomainOrigin), 0,
            sizeof(eds3) - offsetof(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT, extendedDynamicState3TessellationDomainOrigin));
@@ -558,6 +618,7 @@ static int dev_create(pctx *c)
     c->dynrender = dyn_rendering && c->d.vkCmdBeginRendering && c->d.vkCmdEndRendering;
     c->multi_vp = want.multiViewport && c->api >= VK_API_VERSION_1_2 && got12.shaderOutputViewportIndex;
     c->fp16 = c->api >= VK_API_VERSION_1_2 && got12.shaderFloat16;
+    c->fbloop = fbloop && c->api >= VK_API_VERSION_1_1;
     return 1;
 }
 
@@ -759,8 +820,11 @@ static void p_identity(pctx *c)
     VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
     if (c->api >= VK_API_VERSION_1_2 && c->idt->vkGetPhysicalDeviceProperties2) c->idt->vkGetPhysicalDeviceProperties2(c->pd, &p2);
-    say(c, "%s, Vulkan %u.%u.%u, driver 0x%08x", c->props.deviceName, VK_API_VERSION_MAJOR(c->props.apiVersion),
-        VK_API_VERSION_MINOR(c->props.apiVersion), VK_API_VERSION_PATCH(c->props.apiVersion), c->props.driverVersion);
+    int pvr = vkb_driver_is_powervr(&c->props, dp.driverID);
+    say(c, "%s, Vulkan %u.%u.%u, %s", c->props.deviceName, VK_API_VERSION_MAJOR(c->props.apiVersion),
+        VK_API_VERSION_MINOR(c->props.apiVersion), VK_API_VERSION_PATCH(c->props.apiVersion), pvr ? "PowerVR driver" : "driver");
+    if (pvr) say(c, " CL %u (0x%08x)", c->props.driverVersion, c->props.driverVersion);
+    else say(c, " 0x%08x", c->props.driverVersion);
     if (dp.driverName[0]) say(c, " (%s: %s)", dp.driverName, dp.driverInfo);
     say(c, ", %u device extensions", c->next);
     int any = 0;
@@ -1309,6 +1373,18 @@ static double tx_limit_s(void)
     return t > sub_limit_s() ? t : sub_limit_s();
 }
 
+/* A guarded build that reached its limit (VKB_GUARD_TIMED_OUT) while this thread mostly waited for a CPU (the background
+ * probes run at the lowest priority, a game may hold every core): without that wait it would have ended inside its limit,
+ * so the limit did not measure the build. Marks the probe not counted (run_probes: run again at the next start). */
+static int guard_starved(pctx *c, double w0, double t0, double limit_s)
+{
+    double w = w0 >= 0 ? rq_wait_ms() - w0 : 0, ms = mono_ms() - t0;
+    if (w < 1000 || ms - w >= 0.75 * limit_s * 1000.0) return 0;
+    c->starved = 1;
+    say(c, " (%.1f s of it waiting for a CPU)", w / 1000);
+    return 1;
+}
+
 /* VKBRIDGE_PROBE_TX_FAKE=<name>:<ms>,...: that transcoder's build takes ms longer (host tests). */
 static long tx_fake_ms(const char *name)
 {
@@ -1317,6 +1393,20 @@ static long tx_fake_ms(const char *name)
     for (const char *p = v; p && (p = strstr(p, name)); p += n)
         if ((p == v || p[-1] == ',') && p[n] == ':') return atol(p + n + 1);
     return 0;
+}
+
+typedef struct bcv_check {
+    pctx *c;
+    VkPipelineCache cache;
+    int index, r;
+    double ms;
+    char why[160];
+} bcv_check;
+
+static void bcv_one(void *arg)
+{
+    bcv_check *b = arg;
+    b->r = vkb_emu_bcn_check_variant(&b->c->d, b->c->dev, b->c->q, b->c->qf, &b->c->mp, b->cache, b->index, &b->ms, b->why, sizeof(b->why));
 }
 
 static void p_bc_transcoders(pctx *c)
@@ -1342,6 +1432,7 @@ static void p_bc_transcoders(pctx *c)
         const char *name = vkb_emu_bcn_transcoder_name(k, &flag);
         tx_build b = {c, cache, k, VK_ERROR_UNKNOWN, 0, tx_fake_ms(name)};
         int sig = 0;
+        double w0 = rq_wait_ms(), t0 = mono_ms();
         int g = vkb_guard_run("probe: BC transcoder", limit, tx_one, &b, &sig);
         if (g == VKB_GUARD_DONE && b.r == VK_SUCCESS) {
             int s = b.ms > sub_limit_s() * 1000.0;
@@ -1349,8 +1440,10 @@ static void p_bc_transcoders(pctx *c)
             say(c, "%s%s %.0f ms%s", k ? ", " : "", name, b.ms, s ? " (slow)" : "");
             continue;
         }
-        if (g == VKB_GUARD_TIMED_OUT)
+        if (g == VKB_GUARD_TIMED_OUT) {
             say(c, "%s%s HANG (still compiling after %.0f s, interrupted; a compile, no GPU work)", k ? ", " : "", name, limit);
+            guard_starved(c, w0, t0, limit);
+        }
         else
             say(c, "%s%s %s", k ? ", " : "", name, g == VKB_GUARD_CRASHED ? "CRASH" : "FAILED");
         c->want_flags |= flag;
@@ -1371,6 +1464,176 @@ static void p_bc_transcoders(pctx *c)
     /* after a hang or a crash the cache is left as it is (the build may still be in it) */
     if (!stuck) vkb_pcache_own_close(&c->d, c->dev, cache, path);
     if (c->want_flags) say(c, " - formats of a failed transcoder are decoded instead");
+    outcome(c, PS_PASS);
+}
+
+/* The bc_variants verdict, kept apart from the device profile: the profile's key holds the bridge build (VKB_GIT), so every update
+ * of the bridge probed again - ~64 s of the driver compiling ~100 converter pipelines in the background of the first game session on
+ * a Galaxy A35 (Mali-G68). The compile work is the cost (the blocks checked are a few hundred bytes), so the answer is kept for
+ * what it depends on: the GPU, the driver build and its pipeline-cache UUID, and the converters compared (a hash of their SPIR-V).
+ * Only a complete answer is kept (every variant built, ran and passed, or ran and differed: both are deterministic); a hang, a
+ * crash, a build or setup failure, VKBRIDGE_PROBE=force and the imitation switches leave no file and are never read from one.
+ * No file, a damaged one or another key: the probe runs as before; nothing passed: the old converters (vkb_probe_bc_variants). */
+static int bcv_bg; /* the probe runs in the background thread, after the server listens */
+static int clients_gone;
+
+static int bcv_verdict_path(pctx *c, char *key, size_t kcap, char *path, size_t pcap)
+{
+    const char *dir = vkb_pcache_dir(), *salt = vkb_srv_env("VKBRIDGE_TEST_BCV_SALT"), *mode = vkb_srv_env("VKBRIDGE_PROBE"), *fake = vkb_srv_env("VKBRIDGE_PROBE_BCV_FAKE");
+    if (!dir || (mode && !strcmp(mode, "force")) || (fake && *fake) || vkb_srv_env("VKBRIDGE_PROBE_BCV_NOCACHE")) return 0;
+    char u[2 * VK_UUID_SIZE + 1];
+    for (int i = 0; i < VK_UUID_SIZE; i++) snprintf(u + 2 * i, 3, "%02x", c->props.pipelineCacheUUID[i]);
+    snprintf(key, kcap, "bcv1:%04x:%04x:%08x:%s:%016llx:%s%s", c->props.vendorID, c->props.deviceID, c->props.driverVersion, u,
+             (unsigned long long)vkb_emu_bcn_variants_hash(), vkb_bc_fast_gate(c->props.deviceName, NULL) ? "" : "nofast:", salt ? salt : "");
+    snprintf(path, pcap, "%s/bcv-%04x-%04x-%08x-%.16s.txt", dir, c->props.vendorID, c->props.deviceID, c->props.driverVersion, u);
+    return 1;
+}
+
+/* 1: a verdict for exactly this GPU, driver and converter set is on file (*flags: what it turned off); 0: probe. */
+static int bcv_verdict_read(pctx *c, uint32_t *flags)
+{
+    char key[160], path[600], buf[400];
+    if (!bcv_verdict_path(c, key, sizeof(key), path, sizeof(path))) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *nl = strchr(buf, '\n');
+    unsigned fl = 0;
+    if (!nl) return 0;
+    *nl = 0;
+    if (strcmp(buf, key) || sscanf(nl + 1, "flags 0x%x", &fl) != 1 || (fl & ~(uint32_t)VKB_PROBE_FLAG_BC_ALL)) return 0;
+    *flags = fl;
+    return 1;
+}
+
+static void bcv_verdict_write(pctx *c, uint32_t flags)
+{
+    char key[160], path[600], tmp[620];
+    if (!bcv_verdict_path(c, key, sizeof(key), path, sizeof(path))) return;
+    snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f && errno == ENOENT && vkb_cache_dir_ensure()) f = fopen(tmp, "w");
+    if (!f) {
+        vkb_cache_write_failed("the BC converter verdict", errno);
+        return; /* not kept: the next start probes again */
+    }
+    fprintf(f, "%s\nflags 0x%x\n", key, flags);
+    int ok = fflush(f) == 0 && !ferror(f);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || rename(tmp, path) != 0) unlink(tmp);
+}
+
+/* While a game is connected the background probe leaves the driver's compiler half the time (a pause as long as the variant took,
+ * 1.5 s at most; VKBRIDGE_PROBE_BCV_DUTY=0: none): the verdict comes later, the old converters serve meanwhile, as before it. */
+static void bcv_pace(double took_ms)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PROBE_BCV_DUTY");
+    if ((v && *v == '0') || !__atomic_load_n(&bcv_bg, __ATOMIC_ACQUIRE) || __atomic_load_n(&clients_gone, __ATOMIC_ACQUIRE)) return;
+    double ms = took_ms > 1500 ? 1500 : took_ms;
+    struct timespec ts = {(time_t)(ms / 1000), (long)(((long long)ms % 1000) * 1000000)};
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
+/* The BC converters' new variants (one dispatch a run, the palette search; server_emu_bcn.c vkb_emu_bcn_check_variant):
+ * each built and run on this driver beside the old variant on the same blocks, under the compile watchdog one at a time
+ * (VKBRIDGE_PROBE_TX_TIMEOUT_S, 20 s, as the transcoders: a driver's compiler may be slow but must not be stuck). A variant
+ * that does not build, hangs or gives one byte that differs turns its part off for this driver build (VKB_PROBE_FLAG_BC_*:
+ * one dispatch a run, or the palette search of BC1 -> ETC2 or BC4 / BC5 -> EAC); the old variants stay, so a game only
+ * misses the speed-up. A game never uses a new variant before this probe has passed it (vkb_probe_bc_variants). After a
+ * hang or a crash nothing more is compiled here: the rest counts as failed. Transcoders whose target the GPU does not
+ * sample are never used on it: skipped. */
+static void p_bc_variants(pctx *c)
+{
+    if (!(c->emu & VKB_EMU_BCN)) {
+        say(c, "BC native: no converters");
+        outcome(c, PS_SKIP);
+        return;
+    }
+    /* PowerVR: not run. On the Pixel 10 Pro XL (DXT 25.1) its one-dispatch BC2->ASTC table check never finished (2026-11-10
+     * 22:27:09 'GPU HANG (the GPU did not finish in 5 s)', the GPU firmware's only core dump at 22:27:02, then SystemUI's fence ANR
+     * and three system_server restarts), and two later runs hit the limit in BC7->ASTC's: on this GPU a hang stops the whole phone, not
+     * just the probe. The old variants are what PowerVR has run; a game only misses the speed-up. VKBRIDGE_BCV_PROBE=1 runs it. */
+    if (c->pvr && !env_on("VKBRIDGE_BCV_PROBE", 0)) {
+        say(c, "PowerVR: not run (its GPU hung in this probe on the Pixel 10 Pro XL, and a hang there stops the phone); old variants only");
+        outcome(c, PS_SKIP);
+        return;
+    }
+    if (c->tx_status == PS_HANG || c->tx_status == PS_CRASH || c->tx_status == PS_DIED) {
+        say(c, "bc_transcoders %s: not tried (the driver's compiler may be stuck); old variants only", ps_name[c->tx_status]);
+        c->want_flags |= VKB_PROBE_FLAG_BC_ALL;
+        outcome(c, PS_FAIL);
+        return;
+    }
+    uint32_t kept = 0;
+    if (bcv_verdict_read(c, &kept)) {
+        c->want_flags |= kept;
+        say(c, "kept verdict for this GPU, driver and converter set (no builds)");
+        if (kept)
+            say(c, " - off:%s%s%s%s%s", kept & VKB_PROBE_FLAG_BC_TAB ? " one dispatch a run" : "", kept & VKB_PROBE_FLAG_BC_PAL_ETC2 ? " BC1->ETC2 palette" : "",
+                kept & VKB_PROBE_FLAG_BC_PAL_EAC ? " BC4/BC5->EAC palette" : "", kept & VKB_PROBE_FLAG_BC_FAST_ETC2 ? " BC1->ETC2 palette fast" : "",
+                kept & VKB_PROBE_FLAG_BC_FAST_ASTC ? " BC7->ASTC fast" : "");
+        if (kept) VKB_WARN("probe: bc_variants: a kept verdict says these converter variants differed on this driver; the old ones stay (flags 0x%x)", kept);
+        outcome(c, PS_PASS);
+        return;
+    }
+    uint32_t before = c->want_flags & VKB_PROBE_FLAG_BC_ALL;
+    int uncached = 0; /* a failure that is not a deterministic answer: no verdict kept */
+    char path[512];
+    VkPipelineCache cache = vkb_pcache_own_open(&c->d, &c->props, c->dev, "probe", path, sizeof(path));
+    int n = vkb_emu_bcn_variants(), stuck = 0, done = 0, skipped = 0, tx = vkb_emu_bcn_transcode_wanted();
+    int fast_set = vkb_bc_fast_gate(c->props.deviceName, NULL);
+    double limit = tx_limit_s();
+    for (int k = 0; k < n; k++) {
+        uint32_t flag = 0;
+        VkFormat target;
+        const char *name = vkb_emu_bcn_variant_name(k, &flag, &target);
+        /* the BC_FAST variants (new since test47) are checked only where they may be used (the measured GPUs, or VKBRIDGE_BC_FAST set):
+         * elsewhere the probe is test47's (table and palette variants), at its cost */
+        if ((flag & (VKB_PROBE_FLAG_BC_FAST_ETC2 | VKB_PROBE_FLAG_BC_FAST_ASTC)) && !fast_set) continue;
+        if (target != VK_FORMAT_UNDEFINED) {
+            VkFormatProperties fp = {0};
+            c->idt->vkGetPhysicalDeviceFormatProperties(c->pd, target, &fp);
+            if (!tx || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+                skipped++;
+                continue;
+            }
+        }
+        if (c->want_flags & flag) continue; /* its part is off already */
+        bcv_check b = {c, cache, k, -1, 0, ""};
+        int sig = 0;
+        double w0 = rq_wait_ms(), t0 = mono_ms();
+        int g = vkb_guard_run("probe: BC variant", limit, bcv_one, &b, &sig);
+        if (g == VKB_GUARD_DONE && b.r == 0) {
+            done++;
+            bcv_pace(mono_ms() - t0);
+            continue;
+        }
+        if (g != VKB_GUARD_DONE || b.r != 1) uncached = 1;
+        say(c, "%s%s: %s", c->dlen ? "; " : "", name,
+            g == VKB_GUARD_TIMED_OUT ? "HANG (interrupted at the limit)" : g == VKB_GUARD_CRASHED ? "CRASH" : b.r == 1 ? "DIFFERS" : b.r == -2 ? "GPU HANG" : "FAILED");
+        if (g == VKB_GUARD_DONE && b.why[0]) say(c, " (%s)", b.why);
+        if (g == VKB_GUARD_TIMED_OUT) guard_starved(c, w0, t0, limit);
+        c->want_flags |= flag;
+        outcome(c, g == VKB_GUARD_TIMED_OUT || b.r == -2 ? PS_HANG : g == VKB_GUARD_CRASHED ? PS_CRASH : PS_FAIL);
+        if (g != VKB_GUARD_DONE || b.r == -2) {
+            stuck = 1;
+            if (b.r == -2) c->gpu_stuck = 1;
+            c->want_flags |= VKB_PROBE_FLAG_BC_ALL; /* the rest not tried */
+            say(c, "; the rest not tried");
+            break;
+        }
+    }
+    say(c, "%s%d same as the old variants", c->dlen ? "; " : "", done);
+    if (skipped) say(c, ", %d skipped (target not sampled here)", skipped);
+    if (c->want_flags & VKB_PROBE_FLAG_BC_ALL)
+        say(c, " - off:%s%s%s%s%s", c->want_flags & VKB_PROBE_FLAG_BC_TAB ? " one dispatch a run" : "",
+            c->want_flags & VKB_PROBE_FLAG_BC_PAL_ETC2 ? " BC1->ETC2 palette" : "", c->want_flags & VKB_PROBE_FLAG_BC_PAL_EAC ? " BC4/BC5->EAC palette" : "",
+            c->want_flags & VKB_PROBE_FLAG_BC_FAST_ETC2 ? " BC1->ETC2 palette fast" : "", c->want_flags & VKB_PROBE_FLAG_BC_FAST_ASTC ? " BC7->ASTC fast" : "");
+    if (!stuck) vkb_pcache_own_close(&c->d, c->dev, cache, path);
+    if (!stuck && !uncached && !before && !c->gpu_stuck) bcv_verdict_write(c, c->want_flags & VKB_PROBE_FLAG_BC_ALL);
     outcome(c, PS_PASS);
 }
 
@@ -2588,7 +2851,96 @@ static void p_vb_strides(pctx *c)
  * VK_REMAINING_ARRAY_LAYERS, cleared as a 3-layer framebuffer: slices 1-3 written, slice 0 keeps
  * what it had. Wrong slices, or a refused view, fail; a device loss is a hang as usual. Record
  * only: view_counts is on everywhere. */
-static void p_view3d_layers(pctx *c)
+/* One view of type vt (base layer 1, `layers` layers) of the 3D image i cleared as a fb_layers-layer
+ * framebuffer and read back into out through ob: 1 the slices are as `want` ("-WWW" form: W cleared by the
+ * view, - untouched), 0 wrong (sl: what was written, or "refused"), -1 could not run.
+ * copy: the same slices rendered through a 2D-array image of the bridge's own, copied in before and out after the
+ * pass (pv_view3d_base's copy form, server_errata_view3d.c: vkb_pv3d_begin / vkb_pv3d_end, the code the fix records) */
+static int view3d_run(pctx *c, VkImage i, VkBuffer ob, void *out, VkImageViewType vt, uint32_t layers, uint32_t fb_layers, const char *want,
+                      char sl[8], int copy)
+{
+    VkResult r;
+    VkImageView v = VK_NULL_HANDLE;
+    vkb_pv3d_pair pair = {i, VK_NULL_HANDLE, 0, 1, fb_layers, {{0, 0}, {4, 4}}, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL};
+    if (copy) {
+        VkImageCreateInfo si = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {4, 4, 1}, 1, layers,
+                                VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        pair.shadow = img(c, &si, &r);
+        if (pair.shadow) v = view(c, pair.shadow, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_FORMAT_R8G8B8A8_UNORM, layers);
+        if (!v) {
+            snprintf(sl, 8, "refused");
+            return 0;
+        }
+    } else {
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, i, vt, VK_FORMAT_R8G8B8A8_UNORM,
+                                    {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, layers}};
+        r = c->d.vkCreateImageView(c->dev, &vi, NULL, &v);
+        if (r != VK_SUCCESS) {
+            snprintf(sl, 8, "refused");
+            return 0;
+        }
+        track(c, O_VIEW, H(v));
+    }
+    VkAttachmentDescription ad = {0, VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL};
+    VkAttachmentReference ar = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sd = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ar, NULL, NULL, 0, NULL};
+    VkSubpassDependency dep = {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, 0};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &ad, 1, &sd, 1, &dep};
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    if (c->d.vkCreateRenderPass(c->dev, &rpi, NULL, &rp) != VK_SUCCESS) {
+        return -1;
+    }
+    track(c, O_RP, H(rp));
+    VkFramebufferCreateInfo fi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &v, 4, 4, fb_layers};
+    if (c->d.vkCreateFramebuffer(c->dev, &fi, NULL, &fb) != VK_SUCCESS) {
+        return -1;
+    }
+    track(c, O_FB, H(fb));
+    VkCommandBuffer cb = cmd(c);
+    if (!cb) {
+        return -1;
+    }
+    img_barrier(c, cb, i, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
+    VkClearColorValue before = {{0x11 / 255.0f, 0x11 / 255.0f, 0x11 / 255.0f, 0x11 / 255.0f}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    c->d.vkCmdClearColorImage(cb, i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &before, 1, &all);
+    img_barrier(c, cb, i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 1);
+    VkClearValue cv;
+    cv.color = (VkClearColorValue){{0xcc / 255.0f, 0xcc / 255.0f, 0xcc / 255.0f, 0xcc / 255.0f}};
+    VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {4, 4}}, 1, &cv};
+    if (copy) vkb_pv3d_begin(&c->d, cb, &pair, 0); /* loadOp CLEAR: nothing to copy in */
+    c->d.vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    c->d.vkCmdEndRenderPass(cb);
+    if (copy) vkb_pv3d_end(&c->d, cb, &pair, 1);
+    VkBufferImageCopy rg = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {4, 4, 4}};
+    c->d.vkCmdCopyImageToBuffer(cb, i, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ob, 1, &rg);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    c->d.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    if (submit(c, cb) != VK_SUCCESS) {
+        return -1;
+    }
+    const uint8_t *o = out;
+    for (int z = 0; z < 4; z++) {
+        int n11 = 0, ncc = 0;
+        for (int k = 0; k < 64; k++) n11 += o[z * 64 + k] == 0x11, ncc += o[z * 64 + k] == 0xcc;
+        sl[z] = n11 == 64 ? '-' : ncc == 64 ? 'W' : '?';
+    }
+    sl[4] = 0;
+    return !strcmp(sl, want);
+}
+
+/* view3d_layers on every driver but PowerVR: test49's probe as it was, one sub-case (MK-07), so no other GPU runs
+ * PV-04's extra views and renders and its result is the same as before */
+static void p_view3d_layers_one(pctx *c)
 {
     if (c->api < VK_API_VERSION_1_1) {
         say(c, "Vulkan 1.0: no 2D array views of 3D images");
@@ -2679,6 +3031,304 @@ static void p_view3d_layers(pctx *c)
     say(c, "slices written: %s (want -WWW: 1-3 cleared by the view, 0 untouched)", sl);
     if (!ok) c->want_flags |= VKB_PROBE_FLAG_MK_VIEW3D;
     outcome(c, ok ? PS_PASS : PS_FAIL);
+}
+
+/* PV-04's other pattern (PowerVR CXTP 25.3, Pixel 11): a feedback loop - ATTACHMENT_FEEDBACK_LOOP_OPTIMAL, draws of one
+ * colour per layer, a pipeline barrier inside the pass, then draws that sample the 3D image at their own texel and
+ * write it red and blue swapped - into a 3-slice 2D-array view (base 1) of a 4x4x4 3D image: the sampling reads wrong
+ * values. mode 0 the view as the app makes it; 1 the same through a 2D-array image of the bridge's own, copied in and out
+ * with the pass split at the barrier (what the fix records: vkb_pv3d_begin / vkb_pv3d_copy_sync / vkb_pv3d_end); 2 the
+ * control, a plain 3-layer 2D-array image (no 3D image in it). Layers by gl_Layer from the vertex shader, or from a
+ * geometry shader where the device has no shaderOutputLayer. mode 3 is the control's loop with the pass split at the barrier:
+ * ended there, begun again with loadOp LOAD (a render pass of the same attachment that loads what the first stored, starts
+ * where it ended), no copy at all - the form pv_fbloop_split (PV-06, server_errata_view3d.c) records. 1 the slices are as wanted ("-bbb": b drawn, read back and
+ * swapped; - untouched; the control "bbb"), 0 wrong (sl: what they hold, ? other), -1 could not run. */
+#define FB_W 4
+#define FB_BASE 1
+#define FB_CNT 3
+
+static uint32_t fb_col(uint32_t l)
+{
+    return (20u + 40u * l) | (200u - 30u * l) << 8 | 85u << 16 | 255u << 24;
+}
+
+static uint32_t fb_swap(uint32_t c)
+{
+    return (c & 0xff00ff00u) | (c & 0xffu) << 16 | (c >> 16 & 0xffu);
+}
+
+static VkPipeline fb_pipe(pctx *c, VkRenderPass rp, VkPipelineLayout pl, int rd, int rd3, int loop)
+{
+    int gs = !c->layer_vs;
+    VkShaderModule vs = gs ? module(c, spv_probe_fbl_gsvs, sizeof(spv_probe_fbl_gsvs)) : module(c, spv_probe_fbl_vs, sizeof(spv_probe_fbl_vs));
+    VkShaderModule gm = gs ? module(c, spv_probe_fbl_gs, sizeof(spv_probe_fbl_gs)) : VK_NULL_HANDLE;
+    VkShaderModule fs = !rd ? module(c, spv_probe_fbl_col, sizeof(spv_probe_fbl_col))
+                        : rd3 ? module(c, spv_probe_fbl_rd3, sizeof(spv_probe_fbl_rd3)) : module(c, spv_probe_fbl_rd2a, sizeof(spv_probe_fbl_rd2a));
+    if (!vs || !fs || (gs && !gm)) return VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo st[3] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", NULL},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, gm, "main", NULL}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
+    VkViewport vp = {0, 0, FB_W, FB_W, 0, 1};
+    VkRect2D sc = {{0, 0}, {FB_W, FB_W}};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, &vp, 1, &sc};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, 0, 0, VK_POLYGON_MODE_FILL,
+                                                 VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1.0f};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState ba = {0, 0, 0, 0, 0, 0, 0, 0xf};
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba, {0, 0, 0, 0}};
+    VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL,
+                                       loop ? VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0, gs ? 3u : 2u, st, &vi, &ia, NULL, &vps, &rs,
+                                       &ms, NULL, &cbs, NULL, pl, rp, 0, VK_NULL_HANDLE, -1};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (c->d.vkCreateGraphicsPipelines(c->dev, VK_NULL_HANDLE, 1, &pi, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    track(c, O_PIPE, H(p));
+    return p;
+}
+
+/* a view of img (type vt, layers from base) that is only used as usage u (a 2D-array view of a 3D image takes the attachment usage only) */
+static VkImageView fb_view(pctx *c, VkImage i, VkImageViewType vt, uint32_t base, uint32_t layers, VkImageUsageFlags u)
+{
+    VkImageViewUsageCreateInfo ui = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, u};
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, u ? &ui : NULL, 0, i, vt, VK_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 0},
+                                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, base, layers}};
+    VkImageView v = VK_NULL_HANDLE;
+    if (c->d.vkCreateImageView(c->dev, &vi, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
+    track(c, O_VIEW, H(v));
+    return v;
+}
+
+static int fb_run(pctx *c, int mode, char sl[8])
+{
+    static const VkImageUsageFlags fbu = VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    const VkImageLayout lay = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+    int is3d = mode < 2, nsl = is3d ? FB_W : FB_CNT;
+    int split = mode == 1 || mode == 3; /* the pass ended at the barrier and begun again */
+    VkImageUsageFlags use = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | fbu;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u,
+                            is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {FB_W, FB_W, is3d ? FB_W : 1u}, 1, is3d ? 1u : FB_CNT,
+                            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, use, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkResult r;
+    VkImage im = img(c, &ci, &r);
+    VkImage sh = VK_NULL_HANDLE;
+    if (mode == 1) {
+        VkImageCreateInfo si = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {FB_W, FB_W, 1}, 1, FB_CNT,
+                                VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | fbu,
+                                VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        sh = img(c, &si, &r);
+    }
+    VkImageView att = !im ? VK_NULL_HANDLE
+                      : mode == 1 ? (sh ? fb_view(c, sh, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, FB_CNT, 0) : VK_NULL_HANDLE)
+                      : mode == 0 ? fb_view(c, im, VK_IMAGE_VIEW_TYPE_2D_ARRAY, FB_BASE, FB_CNT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | fbu)
+                                  : fb_view(c, im, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, FB_CNT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | fbu);
+    VkImageView smp = !im ? VK_NULL_HANDLE
+                      : is3d ? fb_view(c, im, VK_IMAGE_VIEW_TYPE_3D, 0, 1, VK_IMAGE_USAGE_SAMPLED_BIT)
+                             : fb_view(c, im, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, FB_CNT, VK_IMAGE_USAGE_SAMPLED_BIT);
+    void *out = NULL;
+    VkBuffer ob = buf(c, 4u * FB_W * FB_W * FB_W, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &out);
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VkSampler smpl = VK_NULL_HANDLE;
+    if (c->d.vkCreateSampler(c->dev, &sci, NULL, &smpl) == VK_SUCCESS) track(c, O_SAMPLER, H(smpl));
+    if (!im || !att || !smp || !ob || !smpl) return -1;
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    VkDescriptorSetLayout dl = dsl(c, &b, 1, 0, NULL);
+    VkPipelineLayout pl = dl ? layout_push(c, VK_SHADER_STAGE_FRAGMENT_BIT, 4, 1, &dl) : VK_NULL_HANDLE;
+    VkDescriptorSet set = dl ? set_alloc(c, dl) : VK_NULL_HANDLE;
+    if (!pl || !set) return -1;
+    VkDescriptorImageInfo dii = {smpl, smp, lay};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &dii, NULL, NULL};
+    c->d.vkUpdateDescriptorSets(c->dev, 1, &w, 0, NULL);
+    /* the app's pass, and the copy form's second part (loads what the first stored, starts where it ended) */
+    VkAttachmentDescription ad = {0, VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, lay, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL};
+    VkAttachmentReference ar = {0, lay};
+    VkSubpassDescription sd = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ar, NULL, NULL, 0, NULL};
+    VkSubpassDependency dep[2] = {
+        {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_ACCESS_TRANSFER_READ_BIT, 0},
+        {0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_ACCESS_SHADER_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT | VK_DEPENDENCY_FEEDBACK_LOOP_BIT_EXT}};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &ad, 1, &sd, 2, dep};
+    VkRenderPass rp = VK_NULL_HANDLE, rp2 = VK_NULL_HANDLE;
+    if (c->d.vkCreateRenderPass(c->dev, &rpi, NULL, &rp) != VK_SUCCESS) return -1;
+    track(c, O_RP, H(rp));
+    if (split) {
+        ad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        ad.initialLayout = ad.finalLayout;
+        if (c->d.vkCreateRenderPass(c->dev, &rpi, NULL, &rp2) != VK_SUCCESS) return -1;
+        track(c, O_RP, H(rp2));
+    }
+    VkFramebufferCreateInfo fi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &att, FB_W, FB_W, FB_CNT};
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    if (c->d.vkCreateFramebuffer(c->dev, &fi, NULL, &fb) != VK_SUCCESS) return -1;
+    track(c, O_FB, H(fb));
+    VkPipeline p1 = fb_pipe(c, rp, pl, 0, 0, 0), p2 = fb_pipe(c, rp, pl, 1, is3d, 1);
+    if (!p1 || !p2) return -1;
+    vkb_pv3d_fns fns = {c->d.vkCmdPipelineBarrier, c->d.vkCmdCopyImage};
+    vkb_pv3d_pair pair = {im, sh, 0, FB_BASE, FB_CNT, {{0, 0}, {FB_W, FB_W}}, lay, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, lay,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, FB_CNT};
+    VkCommandBuffer cb = cmd(c);
+    if (!cb) return -1;
+    img_barrier(c, cb, im, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, is3d ? 1 : FB_CNT);
+    VkClearColorValue c0 = {{0x11 / 255.0f, 0x11 / 255.0f, 0x11 / 255.0f, 0x11 / 255.0f}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, is3d ? 1u : FB_CNT};
+    c->d.vkCmdClearColorImage(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c0, 1, &all);
+    img_barrier(c, cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, lay, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, is3d ? 1 : FB_CNT);
+    if (mode == 1) vkb_pv3d_begin(&c->d, cb, &pair, 0); /* loadOp CLEAR: nothing to copy in */
+    VkClearValue cv;
+    cv.color = (VkClearColorValue){{0xcc / 255.0f, 0xcc / 255.0f, 0xcc / 255.0f, 0xcc / 255.0f}};
+    VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {FB_W, FB_W}}, 1, &cv};
+    int32_t base = is3d ? FB_BASE : 0;
+    c->d.vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    c->d.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, NULL);
+    c->d.vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4, &base);
+    c->d.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p1);
+    c->d.vkCmdDraw(cb, 3, FB_CNT, 0, 0);
+    if (split) { /* the split: the pass ended, (the slices copied,) begun again where it was */
+        c->d.vkCmdEndRenderPass(cb);
+        if (mode == 1) vkb_pv3d_copy_sync(&fns, cb, &pair, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, lay, lay);
+        else { /* no copy: what the first part wrote is made visible to the second's loads and reads */
+            VkMemoryBarrier sb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+            c->d.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &sb, 0, NULL, 0, NULL);
+        }
+        bi.renderPass = rp2;
+        c->d.vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        c->d.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, NULL);
+        c->d.vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4, &base);
+    }
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+    c->d.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                              VK_DEPENDENCY_BY_REGION_BIT | VK_DEPENDENCY_FEEDBACK_LOOP_BIT_EXT, 1, &mb, 0, NULL, 0, NULL);
+    c->d.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p2);
+    c->d.vkCmdDraw(cb, 3, FB_CNT, 0, 0);
+    c->d.vkCmdEndRenderPass(cb);
+    if (mode == 1) vkb_pv3d_end(&c->d, cb, &pair, 1);
+    VkBufferImageCopy rg = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, is3d ? 1u : FB_CNT}, {0, 0, 0}, {FB_W, FB_W, is3d ? FB_W : 1u}};
+    c->d.vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ob, 1, &rg);
+    VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    c->d.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+    if (submit(c, cb) != VK_SUCCESS) return -1;
+    const uint32_t *o = out;
+    int ok = 1;
+    for (int z = 0; z < nsl; z++) {
+        int l = is3d ? z - FB_BASE : z;
+        int drawn = l >= 0 && l < FB_CNT;
+        uint32_t want = drawn ? fb_swap(fb_col((uint32_t)l)) : 0x11111111u, got_bad = 0;
+        for (int k = 0; k < FB_W * FB_W; k++) got_bad += o[z * FB_W * FB_W + k] != want;
+        sl[z] = !got_bad ? (drawn ? 'b' : '-') : '?';
+        if (got_bad) ok = 0;
+    }
+    sl[nsl] = 0;
+    return ok;
+}
+
+static void p_view3d_layers(pctx *c)
+{
+    /* the five sub-cases on PowerVR (and under PV-04's or PV-06's host imitation, which needs them to show the pattern); every other
+     * driver keeps the one sub-case it had */
+    const char *imi = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE");
+    if (!c->pvr && !(imi && (strstr(imi, "pv_view3d_base") || strstr(imi, "pv_fbloop_split")))) {
+        p_view3d_layers_one(c);
+        return;
+    }
+    if (c->api < VK_API_VERSION_1_1) {
+        say(c, "Vulkan 1.0: no 2D array views of 3D images");
+        outcome(c, PS_SKIP);
+        return;
+    }
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT, VK_IMAGE_TYPE_3D,
+                            VK_FORMAT_R8G8B8A8_UNORM, {4, 4, 4}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkResult r;
+    VkImage i = img(c, &ci, &r);
+    void *out = NULL;
+    VkBuffer ob = buf(c, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &out);
+    if (!i || !ob) {
+        say(c, "3D image refused (%d)", r);
+        outcome(c, PS_ERROR);
+        return;
+    }
+    /* 0 the app's form, 1 view_counts' form; 2 and 3 (one slice) say what else the driver gets right, for pv_view3d_base's
+     * one-slice forms; 4 renders the slices of 1 through a 2D-array image of the bridge's own (its copy form) */
+    static const struct {
+        const char *how, *want;
+        VkImageViewType vt;
+        uint32_t layers, fb;
+        int copy;
+    } v3[5] = {{"VK_REMAINING_ARRAY_LAYERS", "-WWW", VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_REMAINING_ARRAY_LAYERS, 3, 0},
+               {"explicit count 3 (view_counts' form)", "-WWW", VK_IMAGE_VIEW_TYPE_2D_ARRAY, 3, 3, 0},
+               {"one-slice 2D-array view", "-W--", VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 1, 0},
+               {"2D view of slice 1", "-W--", VK_IMAGE_VIEW_TYPE_2D, 1, 1, 0},
+               {"3 slices through a copied image", "-WWW", VK_IMAGE_VIEW_TYPE_2D_ARRAY, 3, 3, 1}};
+    char sl[5][8];
+    int res[5];
+    for (int k = 0; k < 5; k++) {
+        res[k] = view3d_run(c, i, ob, out, v3[k].vt, v3[k].layers, v3[k].fb, v3[k].want, sl[k], v3[k].copy);
+        if (res[k] < 0) {
+            outcome(c, PS_ERROR);
+            return;
+        }
+        sub(c, k, k == 4 ? res[k] || res[0] || res[1] : res[k]); /* the copy form only matters where the pattern is */
+        say(c, "%s%s: slices %s (want %s)", k ? "; " : "", v3[k].how, sl[k], v3[k].want);
+    }
+    say(c, " (W cleared by the view, - untouched)");
+    /* 5-8: feedback loops into the 3-slice view (PowerVR CXTP 25.3), raw, through the copy form, the control into a plain
+     * 2D-array image, and the control's loop with the pass split at the barrier (no copy: pv_fbloop_split's form) */
+    int fbr[4] = {-1, -1, -1, -1};
+    char fsl[4][8] = {"", "", "", ""};
+    if (c->fbloop && (c->layer_vs || c->gs)) {
+        release(c); /* the first sub-cases' objects (the probe keeps 96) */
+        static const int order[4] = {0, 2, 3, 1};
+        for (int k = 0; k < 4; k++) {
+            fbr[order[k]] = fb_run(c, order[k], fsl[order[k]]);
+            release(c);
+            if (fbr[order[k]] < 0) break;
+        }
+    }
+    int fb_ran = fbr[0] >= 0 && fbr[1] >= 0 && fbr[2] >= 0 && fbr[3] >= 0;
+    if (fb_ran) {
+        sub(c, 5, fbr[0]);
+        sub(c, 6, fbr[1] || fbr[0]); /* the copy form only matters where the 3D view's loop is wrong */
+        sub(c, 7, fbr[2]);           /* the plain control: wrong is PV-06's pattern (the flags are in force only for a failed probe) */
+        sub(c, 8, fbr[3] || fbr[2]); /* the split form only matters where the plain loop is wrong */
+        say(c, "; feedback loop: 3D view %s, copied %s, 2D array %s, 2D array split %s (want -bbb -bbb bbb bbb: b read and swapped)", fsl[0], fsl[1], fsl[2],
+            fsl[3]);
+        if (!fbr[2] && fbr[3]) { /* PV-06: the plain loop is wrong and the pass ended at the barrier and begun again is right */
+            c->want_flags |= VKB_PROBE_FLAG_PV_FBLOOP;
+            say(c, " - pv_fbloop_split (PV-06): feedback-loop passes are split at their barriers");
+        } else if (!fbr[2])
+            say(c, " - plain loop wrong, split form wrong too: no form of PV-06 proven");
+        if (!fbr[0] && fbr[2] && res[1]) { /* (not where the base layer bug explains it: that one's fix copies those views) */
+            c->want_flags |= VKB_PROBE_FLAG_PV_V3D_FB;
+            if (fbr[1]) c->want_flags |= VKB_PROBE_FLAG_PV_V3D_FBCOPY;
+            say(c, " - pv_view3d_base (PV-04): feedback loops in such views are %s", fbr[1] ? "copied" : "wrong with the copy too: no form proven");
+        }
+    } else if (c->fbloop)
+        say(c, "; feedback loop: %s", c->layer_vs || c->gs ? "not run (could not be set up)" : "no layered rendering here");
+    if (!res[0]) {
+        c->want_flags |= VKB_PROBE_FLAG_MK_VIEW3D;
+        say(c, res[1] ? " - the explicit count is right: view_counts fixes it" : " - the explicit count is wrong too: view_counts does not fix it here");
+    }
+    if (!res[0] && !res[1]) {
+        /* PV-04: the pattern, and the forms of its fix the same run proved (server_errata_view3d.c goes by these flags) */
+        c->want_flags |= VKB_PROBE_FLAG_PV_VIEW3D;
+        if (res[2]) c->want_flags |= VKB_PROBE_FLAG_PV_V3D_ARRAY1;
+        if (res[3]) c->want_flags |= VKB_PROBE_FLAG_PV_V3D_2D1;
+        if (res[4]) c->want_flags |= VKB_PROBE_FLAG_PV_V3D_COPY;
+        say(c, " - pv_view3d_base (PV-04): %s; %s", res[2] ? "one-slice views need nothing" : res[3] ? "one-slice views are rendered through a 2D view of the slice"
+                                                    : res[4] ? "one-slice views are copied" : "one-slice views: no form proven",
+            res[4] ? "multi-slice views are copied" : "multi-slice views: no form proven");
+    }
+    outcome(c, c->failed ? PS_FAIL : PS_PASS);
 }
 
 /* MK-06 (record only; view_quarantine goes by the driver's version, nothing probes it reliably):
@@ -2876,11 +3526,334 @@ static void p_wait_eintr(pctx *c)
 
 /* ------------------------------------------------------------------ the list */
 
+/* PV-mutable-linear (PowerVR; PV-02): the image-format query for a LINEAR, dma-buf shareable,
+ * mutable-format RGBA8 / BGRA8 image (a UNORM and an sRGB view format listed, the form gamescope
+ * makes its flippable images in) is answered NOT_SUPPORTED, yet the image is made, exported,
+ * imported and viewed. Per format (case 0: RGBA8, case 1: BGRA8) the query, then the same image:
+ * created with the LINEAR modifier, its memory exported as a dma-buf, a second image made with the
+ * exporter's layout (the explicit modifier) importing that dma-buf in a type the fd allows, bound
+ * and viewed in both formats. The bug's flag only for query no, everything else works; a driver
+ * that refuses both honestly passes; the query saying yes and the image failing is a fail without
+ * the flag (the fix could not help). Not sampled from: the views are made, not drawn through. */
+static VkResult pv_query(pctx *c, const VkPhysicalDeviceImageFormatInfo2 *ii)
+{
+    VkExternalImageFormatProperties ep = {VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+    VkImageFormatProperties2 ip = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &ep};
+    if (vkb_errata_pvmutable_probe_refuses(ii)) return VK_ERROR_FORMAT_NOT_SUPPORTED; /* the bug imitated */
+    return c->idt->vkGetPhysicalDeviceImageFormatProperties2(c->pd, ii, &ip);
+}
+
+/* The image made, exported, imported, bound and viewed: 0 when it all worked, else which step failed (1 + step) */
+static int pv_image_roundtrip(pctx *c, VkFormat f, VkFormat view_f, VkResult *res)
+{
+    const VkFormat list[2] = {f, view_f};
+    const uint64_t linear = 0;
+    VkImageFormatListCreateInfo fl = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, list};
+    VkImageDrmFormatModifierListCreateInfoEXT ml = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT, &fl, 1, &linear};
+    VkExternalMemoryImageCreateInfo emi = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, &ml, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &emi, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, VK_IMAGE_TYPE_2D, f, {16, 16, 1}, 1, 1,
+                            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                            VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage a = VK_NULL_HANDLE;
+    *res = c->d.vkCreateImage(c->dev, &ci, NULL, &a);
+    if (*res != VK_SUCCESS) return 1;
+    track(c, O_IMG, H(a));
+    VkMemoryRequirements mr;
+    c->d.vkGetImageMemoryRequirements(c->dev, a, &mr);
+    VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, a, VK_NULL_HANDLE};
+    VkExportMemoryAllocateInfo ex = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &ded, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkDeviceMemory m = alloc(c, &mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ex);
+    if (!m) return *res = VK_ERROR_OUT_OF_DEVICE_MEMORY, 2;
+    if ((*res = c->d.vkBindImageMemory(c->dev, a, m, 0)) != VK_SUCCESS) return 3;
+    VkMemoryGetFdInfoKHR gi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, NULL, m, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    int fd = -1;
+    if ((*res = c->d.vkGetMemoryFdKHR(c->dev, &gi, &fd)) != VK_SUCCESS || fd < 0) return 4;
+    /* the exporter's layout, imported as an explicit modifier image */
+    VkImageDrmFormatModifierPropertiesEXT mp = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT};
+    VkImageSubresource sr = {VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, 0, 0};
+    VkSubresourceLayout lay;
+    if (!c->d.vkGetImageDrmFormatModifierPropertiesEXT || !c->d.vkGetImageSubresourceLayout) {
+        close(fd);
+        return *res = VK_ERROR_EXTENSION_NOT_PRESENT, 5;
+    }
+    c->d.vkGetImageDrmFormatModifierPropertiesEXT(c->dev, a, &mp);
+    c->d.vkGetImageSubresourceLayout(c->dev, a, &sr, &lay);
+    VkImageDrmFormatModifierExplicitCreateInfoEXT xi = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT, &fl, mp.drmFormatModifier, 1, &lay};
+    emi.pNext = &xi;
+    VkImage b = VK_NULL_HANDLE;
+    *res = c->d.vkCreateImage(c->dev, &ci, NULL, &b);
+    if (*res != VK_SUCCESS) {
+        close(fd);
+        return 6;
+    }
+    track(c, O_IMG, H(b));
+    c->d.vkGetImageMemoryRequirements(c->dev, b, &mr);
+    VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    uint32_t bits = mr.memoryTypeBits;
+    if (c->d.vkGetMemoryFdPropertiesKHR &&
+        c->d.vkGetMemoryFdPropertiesKHR(c->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) == VK_SUCCESS && fp.memoryTypeBits)
+        bits &= fp.memoryTypeBits;
+    ded.image = b;
+    VkImportMemoryFdInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, &ded, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd};
+    uint32_t type = mem_type(c, bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX) type = mem_type(c, bits, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, mr.size, type};
+    VkDeviceMemory im = VK_NULL_HANDLE;
+    *res = type == UINT32_MAX ? VK_ERROR_INVALID_EXTERNAL_HANDLE : c->d.vkAllocateMemory(c->dev, &ai, NULL, &im);
+    if (*res != VK_SUCCESS) {
+        close(fd);
+        return 7;
+    }
+    track(c, O_MEM, H(im));
+    if ((*res = c->d.vkBindImageMemory(c->dev, b, im, 0)) != VK_SUCCESS) return 8;
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, b, VK_IMAGE_VIEW_TYPE_2D, f, {0, 0, 0, 0},
+                                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    for (int k = 0; k < 2; k++) {
+        vi.format = list[k];
+        VkImageView v;
+        if ((*res = c->d.vkCreateImageView(c->dev, &vi, NULL, &v)) != VK_SUCCESS) return 9;
+        track(c, O_VIEW, H(v));
+    }
+    return 0;
+}
+
+static void p_pv_mutable_linear(pctx *c)
+{
+    if (!c->drm_mod || !c->dmabuf || !c->d.vkGetMemoryFdKHR || !c->idt->vkGetPhysicalDeviceImageFormatProperties2) {
+        say(c, "no VK_EXT_image_drm_format_modifier with dma-bufs");
+        outcome(c, PS_SKIP);
+        return;
+    }
+    static const struct {
+        VkFormat f, view;
+        const char *what;
+    } cases[2] = {{VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, "RGBA8"}, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB, "BGRA8"}};
+    static const char *const stage[10] = {"", "image", "export memory", "bind", "export fd", "layout", "import image", "import memory", "import bind", "view"};
+    int bug = 0;
+    for (int k = 0; k < 2; k++) {
+        const VkFormat list[2] = {cases[k].f, cases[k].view};
+        VkImageFormatListCreateInfo fl = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, list};
+        VkPhysicalDeviceImageDrmFormatModifierInfoEXT mi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, &fl,
+                                                            0 /* DRM_FORMAT_MOD_LINEAR */, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+        VkPhysicalDeviceExternalImageFormatInfo ei = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &mi,
+                                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        VkPhysicalDeviceImageFormatInfo2 ii = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &ei, cases[k].f, VK_IMAGE_TYPE_2D,
+                                               VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+                                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                               VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT};
+        VkResult q = pv_query(c, &ii), cr = VK_SUCCESS;
+        /* gamescope's own form of the query too (its flippable image: usage TRANSFER_DST | SAMPLED, 0x6; a player log
+         * session.log:99): the query counts as refused when either form is */
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        VkResult qg = pv_query(c, &ii);
+        if (q == VK_SUCCESS && qg != VK_SUCCESS) q = qg;
+        int step = pv_image_roundtrip(c, cases[k].f, cases[k].view, &cr);
+        int q_ok = q == VK_SUCCESS, ok_img = step == 0;
+        /* agree (both or neither) is fine; the query's no beside a working image is the bug */
+        sub(c, k, q_ok == ok_img);
+        bug |= !q_ok && ok_img;
+        say(c, "%s%s: query %d, image %s", k ? "; " : "", cases[k].what, q, ok_img ? "made, exported, imported, viewed" : stage[step]);
+        if (!ok_img) say(c, " (%d)", cr);
+    }
+    if (bug) {
+        c->want_flags |= VKB_PROBE_FLAG_PV_MUTABLE;
+        say(c, " - the query refuses an image the driver makes and shares: answered with the base format's");
+    } else if (c->failed)
+        say(c, " - the query says yes and the image fails: not the refusal pattern, pv_mutable_linear stays off");
+    outcome(c, c->failed ? PS_FAIL : PS_PASS);
+}
+
+/* PV-07 (PowerVR): a B8G8R8A8 image written by storage writes holds R8G8B8A8 byte order (gamescope composites into
+ * such an image and its dma-buf reaches the screen: red and blue exchanged). Steam's blue (26,159,255) written by an
+ * rgba8-declared compute store (pvstore.comp, gamescope's form) through a B8G8R8A8_UNORM view of a 4x4 B8G8R8A8 image
+ * with STORAGE | TRANSFER_SRC, OPTIMAL and LINEAR, copied to a buffer: right = bytes FF 9F 1A FF; the bug = 1A 9F FF FF
+ * exactly. PowerVR has no STORAGE feature on B8G8R8A8; the image is made anyway, as gamescope makes it, and a refusal
+ * is nothing to fix. Sub-case 2 writes the same through an R8G8B8A8 image (the fix's form): it must read 1A 9F FF FF.
+ * The bug's pattern: a B8G8R8A8 case exactly swapped and the R8G8B8A8 case right. */
+static int pvb_write(pctx *c, VkFormat f, VkImageTiling tiling, VkDescriptorSetLayout l, VkPipelineLayout pl, VkPipeline p, unsigned char px[4],
+                     VkResult *res)
+{
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {4, 4, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, tiling,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage i = img(c, &ci, res);
+    if (!i) return 1; /* not made */
+    VkImageView v = view(c, i, VK_IMAGE_VIEW_TYPE_2D, f, 1);
+    void *out = NULL;
+    VkBuffer ob = buf(c, 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &out);
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 1, &ps};
+    VkDescriptorPool dp = VK_NULL_HANDLE;
+    if (!v || !ob || (*res = c->d.vkCreateDescriptorPool(c->dev, &dpi, NULL, &dp)) != VK_SUCCESS) return 2;
+    track(c, O_DPOOL, H(dp));
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, 1, &l};
+    VkDescriptorSet s = VK_NULL_HANDLE;
+    if ((*res = c->d.vkAllocateDescriptorSets(c->dev, &ai, &s)) != VK_SUCCESS) return 2;
+    VkDescriptorImageInfo ii = {VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, s, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii, NULL, NULL};
+    c->d.vkUpdateDescriptorSets(c->dev, 1, &w, 0, NULL);
+    VkCommandBuffer cb = cmd(c);
+    if (!cb) return 2;
+    img_barrier(c, cb, i, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 1);
+    c->d.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    c->d.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &s, 0, NULL);
+    c->d.vkCmdDispatch(cb, 1, 1, 1);
+    img_barrier(c, cb, i, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
+    VkBufferImageCopy rg = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {4, 4, 1}};
+    c->d.vkCmdCopyImageToBuffer(cb, i, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ob, 1, &rg);
+    if ((*res = submit(c, cb)) != VK_SUCCESS) return 3;
+    const unsigned char *b = out;
+    for (int k = 4; k < 64; k++)
+        if (b[k] != b[k & 3]) return 4; /* not every texel the same: not a byte-order question */
+    memcpy(px, b, 4);
+    return 0;
+}
+
+/* The PowerVR-only probes (pv_bgra_store PV-07, pv_names PV-01) run on PowerVR's driver, under their own host imitation, or
+ * with VKBRIDGE_PV_PROBES=1; every other GPU skips them, so its startup is test49's (no extra pipelines, the same profile
+ * results). */
+static int pv_probe_skipped(pctx *c, const char *erratum)
+{
+    const char *imi = vkb_srv_env("VKBRIDGE_ERRATA_IMITATE");
+    if (c->pvr || (imi && strstr(imi, erratum)) || env_on("VKBRIDGE_PV_PROBES", 0)) return 0;
+    say(c, "not a PowerVR driver: not run");
+    outcome(c, PS_SKIP);
+    return 1;
+}
+
+static void p_pv_bgra_store(pctx *c)
+{
+    if (pv_probe_skipped(c, "pv_bgra_store")) return;
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayout l = dsl(c, &b, 1, 0, NULL);
+    VkPipelineLayout pl = l ? layout_push(c, 0, 0, 1, &l) : VK_NULL_HANDLE;
+    VkResult r = VK_SUCCESS;
+    VkPipeline p = pl ? comp(c, spv_probe_pvstore, sizeof(spv_probe_pvstore), pl, NULL, &r) : VK_NULL_HANDLE;
+    if (!p) {
+        say(c, "pipeline failed (%d)", r);
+        outcome(c, PS_ERROR);
+        return;
+    }
+    static const unsigned char right_bgra[4] = {0xff, 0x9f, 0x1a, 0xff}, right_rgba[4] = {0x1a, 0x9f, 0xff, 0xff};
+    static const struct {
+        VkFormat f;
+        VkImageTiling t;
+        const char *what;
+    } cases[3] = {{VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, "BGRA8 optimal"},
+                  {VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_TILING_LINEAR, "BGRA8 linear"},
+                  {VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, "RGBA8"}};
+    static const char *const stage[5] = {"", "not made", "set up failed", "submit failed", "texels differ"};
+    int swapped = 0, rgba_ok = 0;
+    for (int k = 0; k < 3; k++) {
+        unsigned char px[4] = {0};
+        VkResult cr = VK_SUCCESS;
+        int st = pvb_write(c, cases[k].f, cases[k].t, l, pl, p, px, &cr);
+        int bgra = k < 2;
+        const unsigned char *right = bgra ? right_bgra : right_rgba;
+        int ok = st == 0 && !memcmp(px, right, 4);
+        int swap = bgra && st == 0 && !memcmp(px, right_rgba, 4);
+        swapped |= swap;
+        if (!bgra) rgba_ok = ok;
+        /* a B8G8R8A8 storage image the driver will not make is nothing to fix (gamescope's own image would fail first) */
+        sub(c, k, ok || (bgra && st == 1));
+        if (st == 0)
+            say(c, "%s%s: %02X %02X %02X %02X%s", k ? "; " : "", cases[k].what, px[0], px[1], px[2], px[3],
+                ok ? " right" : swap ? " (R and B exchanged)" : " (wrong)");
+        else
+            say(c, "%s%s: %s (%d)", k ? "; " : "", cases[k].what, stage[st], cr);
+    }
+    if (swapped && rgba_ok) {
+        c->want_flags |= VKB_PROBE_FLAG_PV_BGRA_STORE;
+        say(c, " - B8G8R8A8 storage writes land in R8G8B8A8 order: such images made R8G8B8A8");
+    } else if (c->failed)
+        say(c, " - wrong, but not the exchanged pattern with R8G8B8A8 right: pv_bgra_store stays off");
+    outcome(c, c->failed ? PS_FAIL : PS_PASS);
+}
+
+/* PV-names (PowerVR DXT 25.3, Android 17): a vertex input and the output that passes it on share an
+ * OpName (DXVK names a passed-through attribute and its varying alike, "TEXCOORD") and the input
+ * reads zero. pvnames.vert draws one triangle whose colour is that attribute, (64, 128, 191).
+ *   shared    the module as DXVK writes it
+ *   stripped  the same module without its names (vkb_spv_strip_names: what the fix sends): a
+ *             failure here is no bug of this kind, and the fix could not help
+ * The flag only for shared wrong and stripped right: the fix is then known to work on this driver. */
+typedef struct {
+    VkBuffer b;
+} pv_rec;
+
+static void rec_pv(pctx *c, VkCommandBuffer cb, void *arg)
+{
+    pv_rec *v = arg;
+    VkDeviceSize off = 0;
+    c->d.vkCmdBindVertexBuffers(cb, 0, 1, &v->b, &off);
+    c->d.vkCmdDraw(cb, 3, 1, 0, 0);
+}
+
+static void p_pv_names(pctx *c)
+{
+    if (pv_probe_skipped(c, "pv_names")) return;
+    rt t;
+    void *m = NULL;
+    VkBuffer vb = buf(c, 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &m);
+    VkPipelineLayout pl = layout_push(c, 0, 0, 0, NULL);
+    if (!vb || !pl || !rt_make(c, &t, 1)) {
+        outcome(c, PS_ERROR);
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        float *v = (float *)m + 4 * i;
+        v[0] = 0.25f, v[1] = 0.5f, v[2] = 0.75f, v[3] = 1.0f;
+    }
+    VkVertexInputBindingDescription bd = {0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription ad = {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, 1, &bd, 1, &ad};
+    uint32_t *bare = NULL;
+    size_t bare_size = 0;
+    if (vkb_spv_strip_names(spv_probe_pvnames_vs, sizeof(spv_probe_pvnames_vs), &bare, &bare_size) != 1) {
+        say(c, "the stripped module could not be made");
+        outcome(c, PS_ERROR);
+        return;
+    }
+    static const char *const how[2] = {"shared names", "names stripped"};
+    for (int k = 0; k < 2; k++) {
+        gx g = {k ? bare : spv_probe_pvnames_vs, spv_probe_pvnames_fs, k ? bare_size : sizeof(spv_probe_pvnames_vs), sizeof(spv_probe_pvnames_fs),
+                &vi, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 8, 1, 1, NULL, 0, VK_CULL_MODE_NONE, NULL, NULL};
+        VkResult r;
+        VkPipeline p = gfx_ex(c, t.rp, pl, &g, &r);
+        if (!p) {
+            say(c, "%s: pipeline refused (%d)", how[k], r);
+            free(bare);
+            outcome(c, PS_ERROR);
+            return;
+        }
+        pv_rec v = {vb};
+        if (!rt_draw(c, &t, p, rec_pv, &v)) {
+            free(bare);
+            outcome(c, PS_ERROR);
+            return;
+        }
+        const uint8_t *q = pxl(&t, 0, 3);
+        int ok = q[0] >= 62 && q[0] <= 66 && q[1] >= 126 && q[1] <= 130 && q[2] >= 189 && q[2] <= 193 && q[3] == 255;
+        sub(c, k, ok);
+        say(c, "%s%s: %s", k ? "; " : "", how[k], ok ? "right" : "WRONG");
+        if (!ok) say(c, " (%u %u %u %u, want 64 128 191 255)", q[0], q[1], q[2], q[3]);
+    }
+    free(bare);
+    if ((c->failed & 1) && !(c->failed & 2)) {
+        c->want_flags |= VKB_PROBE_FLAG_PV_NAMES;
+        say(c, " - the input reads wrong beside an output of its name, right without names");
+    } else if (c->failed)
+        say(c, " - wrong, but not the shared-name pattern (the stripped module %s): pv_names stays off", (c->failed & 2) ? "fails too" : "is right");
+    outcome(c, c->failed ? PS_FAIL : PS_PASS);
+}
+
 typedef struct probe_def {
     const char *name;
     void (*fn)(pctx *c);
     uint32_t emu;      /* emulation that stands in when it does not pass */
-    uint32_t flags;    /* runtime flags it can set (the probe says which in want_flags) */
+    uint64_t flags;    /* runtime flags it can set (the probe says which in want_flags) */
     int heavy;         /* compiles big shaders: a longer limit, last in line, first to be deferred */
     const char *about; /* the failure class (docs: failure-catalogue) */
     /* the MK probes */
@@ -2921,13 +3894,18 @@ static const probe_def probes[] = {
      "depth_write,cull,stencil_wmask,sample_mask,static_sample_mask"},
     {"vb_strides", p_vb_strides, 0, VKB_PROBE_FLAG_MK_VB | VKB_PROBE_FLAG_MK_VB_SINGLE, 0, "MK-05", 1, VKB_ERRATUM_VB_SPLIT, 0,
      "from_0,from_1,single"},
-    {"view3d_layers", p_view3d_layers, 0, VKB_PROBE_FLAG_MK_VIEW3D, 0, "MK-07", 1, VKB_ERRATUM_VIEW_COUNTS, 0, "slices"},
+    {"view3d_layers", p_view3d_layers, 0, VKB_PROBE_FLAG_MK_VIEW3D | VKB_PROBE_FLAG_PV_VIEW3D | VKB_PROBE_FLAG_PV_V3D_ALL | VKB_PROBE_FLAG_PV_FBLOOP, 0, "MK-07", 1,
+     VKB_ERRATUM_VIEW_COUNTS, 0, "slices,explicit,one_slice_array,one_slice_2d,copy,fb_loop,fb_copy,fb_control,fb_split"},
+    {"pv_mutable_linear", p_pv_mutable_linear, 0, VKB_PROBE_FLAG_PV_MUTABLE, 0, "PV-02", 1, VKB_ERRATUM_PV_MUTABLE_LINEAR, 0, "rgba8,bgra8"},
+    {"pv_bgra_store", p_pv_bgra_store, 0, VKB_PROBE_FLAG_PV_BGRA_STORE, 0, "PV-07", 1, VKB_ERRATUM_PV_BGRA_STORE, 0, "bgra8_optimal,bgra8_linear,rgba8"},
+    {"pv_names", p_pv_names, 0, VKB_PROBE_FLAG_PV_NAMES, 0, "PV-01", 1, VKB_ERRATUM_PV_NAMES, 0, "shared,stripped"},
     {"fp16_math", p_fp16_math, 0, VKB_PROBE_FLAG_MK_FP16, 0, "MK-20", 1, VKB_ERRATUM_FP16_HIDE, 0, "fma,range,convert,relaxed,chain"},
     {"wait_eintr", p_wait_eintr, 0, VKB_PROBE_FLAG_MK_WAIT, 0, "MK-01", 1, VKB_ERRATUM_WAIT_RETRY, 1, "fence,semaphore"},
     {"rendering_churn", p_rendering_churn, 0, VKB_PROBE_FLAG_MK_CHURN, 0, "MK-06", 1, VKB_ERRATUM_VIEW_QUARANTINE, 1, "views"},
     {"compile_lut_standin", p_compile_lut_standin, 0, 0, 1, "F26"},
     {"compile_aces", p_compile_aces, 0, VKB_PROBE_FLAG_LUT_NOW, 1, "F26"},
     {"bc_transcoders", p_bc_transcoders, 0, VKB_PROBE_FLAG_TX_ALL, 1, "F09"},
+    {"bc_variants", p_bc_variants, 0, VKB_PROBE_FLAG_BC_ALL, 1, "F09"},
 };
 #define NPROBES (sizeof(probes) / sizeof(probes[0]))
 
@@ -2955,15 +3933,35 @@ static const char *emu_name(uint32_t bit, const char **env)
     return "?";
 }
 
-static const char *flag_text(uint32_t f)
+static const char *flag_text(uint64_t f)
 {
     if (f & VKB_PROBE_FLAG_MK_FLIP) return "the bug's pattern (MK-02): negative viewport height ignored";
     if (f & VKB_PROBE_FLAG_MK_BITWISE) return "the bug's pattern (MK-03): vector bitwise ops miscompiled";
     if (f & VKB_PROBE_FLAG_MK_DYN) return "the bug's pattern (MK-04): dynamic state lost across a bind";
     if (f & VKB_PROBE_FLAG_MK_VB_SINGLE) return "the bug's pattern (MK-05), single-binding calls too: the split cannot fix it";
     if (f & VKB_PROBE_FLAG_MK_VB) return "the bug's pattern (MK-05): strides by array index";
+    if (f & VKB_PROBE_FLAG_PV_VIEW3D)
+        return f & VKB_PROBE_FLAG_PV_V3D_ARRAY1 ? "the bug's pattern (PV-04): a 3D image's 2D-array view renders from slice 0 with any base layer, explicit counts too; "
+                                                  "one-slice views need nothing, multi-slice views are copied through a 2D-array image of the bridge's own"
+               : f & VKB_PROBE_FLAG_PV_V3D_2D1 ? "the bug's pattern (PV-04): a 3D image's 2D-array view renders from slice 0 with any base layer, explicit counts too; "
+                                                  "one-slice views are rendered through a 2D view of the slice, multi-slice views are copied through a 2D-array image of the bridge's own"
+               : f & VKB_PROBE_FLAG_PV_V3D_COPY ? "the bug's pattern (PV-04): a 3D image's 2D-array view renders from slice 0 with any base layer, explicit counts too; "
+                                                  "such views are copied through a 2D-array image of the bridge's own"
+                                                : "the bug's pattern (PV-04): a 3D image's 2D-array view renders from slice 0 with any base layer, explicit counts too; "
+                                                  "no form of the fix works here";
+    if (f & VKB_PROBE_FLAG_PV_V3D_FB)
+        return f & VKB_PROBE_FLAG_PV_V3D_FBCOPY ? "the bug's pattern (PV-04): a feedback loop in a 3D image's 2D-array view reads wrong, in a plain 2D-array image it is right; "
+                                                  "such passes are copied through a 2D-array image of the bridge's own and split at their barriers"
+                                                : "the bug's pattern (PV-04): a feedback loop in a 3D image's 2D-array view reads wrong, in a plain 2D-array image it is right; "
+                                                  "no form of the fix works here";
+    if (f & VKB_PROBE_FLAG_PV_FBLOOP)
+        return "the bug's pattern (PV-06): a feedback loop in a plain 2D-array image reads wrong; right with the pass ended at the barrier and begun again, "
+               "so such passes are split at their barriers";
     if (f & VKB_PROBE_FLAG_MK_VIEW3D) return "the bug's pattern (MK-07): wrong slices";
     if (f & VKB_PROBE_FLAG_MK_WAIT) return "the bug's pattern (MK-01): waits fail after a signal";
+    if (f & VKB_PROBE_FLAG_PV_BGRA_STORE) return "the bug's pattern (PV-07): B8G8R8A8 storage writes land in R8G8B8A8 order; such images made R8G8B8A8";
+    if (f & VKB_PROBE_FLAG_PV_MUTABLE) return "the bug's pattern (PV-02): a mutable-format LINEAR dma-buf image query refused though the image works; answered with the base format's";
+    if (f & VKB_PROBE_FLAG_PV_NAMES) return "the bug's pattern (PV-01): an input reads zero beside an output of its name; shader names stripped";
     if (f & VKB_PROBE_FLAG_MK_FP16) return "the bug's pattern (MK-20): 16-bit float arithmetic wrong; shaderFloat16 hidden from clients";
     if (f & VKB_PROBE_FLAG_MK_CHURN) return "the bug's pattern (MK-06): a re-made view rendered stale";
     if (f & VKB_PROBE_FLAG_LUT_NOW) return "UE4 LUT pipelines get their stand-in at once";
@@ -2971,6 +3969,7 @@ static const char *flag_text(uint32_t f)
     if (f & VKB_PROBE_FLAG_WAIT_LOST) return "timed-out semaphore waits the driver answers with VK_ERROR_DEVICE_LOST are checked, and given as VK_TIMEOUT when the device is fine";
     if (f & VKB_PROBE_FLAG_SPIRV_FIX) return "SPIR-V spec-constant fix on";
     if (f & VKB_PROBE_FLAG_TX_ALL) return "formats of the failed BC transcoder decoded";
+    if (f & VKB_PROBE_FLAG_BC_ALL) return "the BC converters' old variants kept where a new one failed";
     return "?";
 }
 
@@ -3079,7 +4078,7 @@ static void write_profile(pprofile *pf)
         const presult *r = &pf->res[i];
         fprintf(f, "    {\"name\": ");
         json_str(f, r->name);
-        fprintf(f, ", \"status\": \"%s\", \"ms\": %.1f, \"emu\": \"0x%x\", \"flags\": \"0x%x\", \"want\": \"0x%x\", \"cases\": \"0x%x\", \"failed\": \"0x%x\", \"detail\": ",
+        fprintf(f, ", \"status\": \"%s\", \"ms\": %.1f, \"emu\": \"0x%x\", \"flags\": \"0x%" PRIx64 "\", \"want\": \"0x%" PRIx64 "\", \"cases\": \"0x%x\", \"failed\": \"0x%x\", \"detail\": ",
                 ps_name[r->status], r->ms, r->emu, r->flags, r->want, r->cases, r->failed);
         json_str(f, r->detail);
         fprintf(f, "}%s\n", i + 1 < pf->n ? "," : "");
@@ -3105,6 +4104,7 @@ static void write_profile(pprofile *pf)
 /* ------------------------------------------------------------------ how a process ended in a probe */
 
 #define BEAT_MARK_AT 64 /* the end mark's place in the .beat file, after the beat line */
+#define BEAT_BOOT_AT 96 /* "boot <boot_id>\n": the boot the probe started in (a reboot is not a kill, judge_end) */
 static int crash_marks_all; /* every fatal signal but SIGKILL reaches vkb_probe_mark_end (the separate server) */
 static pthread_once_t beat_once = PTHREAD_ONCE_INIT;
 
@@ -3118,9 +4118,23 @@ static double sub_limit_s(void);
 /* A probe's own time limit in s (< 0: none - the transcoders arm each build themselves). */
 static double probe_limit_s(const probe_def *p)
 {
-    if (p->fn == p_bc_transcoders) return -1;
+    if (p->fn == p_bc_transcoders || p->fn == p_bc_variants) return -1;
     if (p->fn == p_wait_eintr) return sub_limit_s() + 2.0 * EINTR_WAIT_MS / 1000.0; /* it waits by design */
     return p->heavy ? 2 * sub_limit_s() : sub_limit_s();
+}
+
+/* How long this thread has waited for a CPU while runnable, ms (/proc/thread-self/schedstat, second field); -1: not known. */
+static double rq_wait_ms(void)
+{
+    char b[96];
+    int fd = open("/proc/thread-self/schedstat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    unsigned long long run, wait;
+    return sscanf(b, "%llu %llu", &run, &wait) == 2 ? wait / 1e6 : -1;
 }
 
 /* With plock held. */
@@ -3175,7 +4189,6 @@ static void beat_start(void)
  * kill came inside the background "bc_transcoders" probe three times, and it was recorded as died:
  * BC transcoding off and its MK-20 line wrong. A probe ended so is run again instead. Only after a
  * client has been: a process that dies before any client connects is judged as before. */
-static int clients_gone;
 
 static void idle_write(int fd, int idle)
 {
@@ -3190,6 +4203,32 @@ void vkb_probe_clients_gone(int gone)
     pthread_mutex_unlock(&plock);
 }
 
+/* This boot's id (/proc/sys/kernel/random/boot_id; VKBRIDGE_BOOT_ID imitates another boot, host
+ * tests); "" where it cannot be read, which makes a reboot unknowable and the judging as before. */
+static char boot_id_buf[48];
+static pthread_once_t boot_once = PTHREAD_ONCE_INIT;
+
+static void boot_id_read(void)
+{
+    const char *e = vkb_srv_env_global("VKBRIDGE_BOOT_ID");
+    if (e && *e) snprintf(boot_id_buf, sizeof(boot_id_buf), "%.40s", e);
+    else {
+        FILE *f = fopen("/proc/sys/kernel/random/boot_id", "re");
+        if (f) {
+            if (!fgets(boot_id_buf, sizeof(boot_id_buf), f)) boot_id_buf[0] = 0;
+            fclose(f);
+        }
+    }
+    for (char *q = boot_id_buf; *q; q++)
+        if (*q == '\n' || *q == ' ') *q = 0;
+}
+
+static const char *boot_id(void)
+{
+    pthread_once(&boot_once, boot_id_read);
+    return boot_id_buf;
+}
+
 /* After the profile names pf->running: its heartbeat starts. */
 static void probe_begin(pprofile *pf)
 {
@@ -3200,6 +4239,7 @@ static void probe_begin(pprofile *pf)
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0 && errno == ENOENT && vkb_cache_dir_ensure()) fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) vkb_cache_write_failed("a probe heartbeat", errno); /* without it the probe is judged as before (judge_end) */
+    const char *boot = boot_id();
     pthread_mutex_lock(&plock);
     pf->beat_last = mono_ms();
     pf->beat_active = pf->beat_gap = 0;
@@ -3207,6 +4247,11 @@ static void probe_begin(pprofile *pf)
     if (fd >= 0) {
         __atomic_store_n(&pf->beat_fd, fd, __ATOMIC_RELEASE);
         beat_write(pf);
+        if (*boot) {
+            char bl[56];
+            int bn = snprintf(bl, sizeof(bl), "boot %.40s\n", boot);
+            if (bn > 0 && pwrite(fd, bl, (size_t)bn, BEAT_BOOT_AT) < 0) {}
+        }
         if (__atomic_load_n(&clients_gone, __ATOMIC_ACQUIRE)) idle_write(fd, 1);
     }
     pthread_mutex_unlock(&plock);
@@ -3259,7 +4304,7 @@ enum { END_INTERRUPTED, END_UNEXPLAINED, END_DIED };
  * consumed. *detail: why. */
 static int judge_end(pprofile *pf, const char *name, char *detail, size_t cap)
 {
-    char path[700], buf[160] = "";
+    char path[700], buf[200] = "";
     snprintf(path, sizeof(path), "%s.beat", pf->path);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     ssize_t got = fd >= 0 ? pread(fd, buf, sizeof(buf) - 1, 0) : -1;
@@ -3310,6 +4355,18 @@ static int judge_end(pprofile *pf, const char *name, char *detail, size_t cap)
         snprintf(detail, cap, "ended after %.0f ms, after every client process had left (the session's end)", ms);
         return END_INTERRUPTED;
     }
+    /* Ended without a word and the device rebooted since: the reboot is what ended it (a GPU
+     * reset or hang that took the phone down, a power loss), and a probe that reboots the device is
+     * a failed probe at once, not one to try again: the next start would reboot it the same way, in
+     * a loop. Marks above are read first, so a session that ended on its own before a clean
+     * reboot is not blamed. */
+    char was[48] = "";
+    if (have && got > BEAT_BOOT_AT + 5 && !strncmp(buf + BEAT_BOOT_AT, "boot ", 5)) sscanf(buf + BEAT_BOOT_AT + 5, "%47s", was);
+    const char *now = boot_id();
+    if (have && *was && *now && strcmp(was, now)) {
+        snprintf(detail, cap, "the device rebooted while it ran (boot %.8s, now %.8s), after %.0f ms on an earlier start", was, now, ms);
+        return END_DIED;
+    }
     int n = !strcmp(pf->suspect, name) ? pf->suspect_n + 1 : 1;
     snprintf(pf->suspect, sizeof(pf->suspect), "%s", name);
     pf->suspect_n = n;
@@ -3354,8 +4411,8 @@ static int read_profile(pprofile *pf)
             if (jget(line, "status", v, sizeof(v))) r->status = status_of(v);
             if (jget(line, "ms", v, sizeof(v))) r->ms = atof(v);
             if (jget(line, "emu", v, sizeof(v))) r->emu = (uint32_t)strtoul(v, NULL, 16);
-            if (jget(line, "flags", v, sizeof(v))) r->flags = (uint32_t)strtoul(v, NULL, 16);
-            if (jget(line, "want", v, sizeof(v))) r->want = (uint32_t)strtoul(v, NULL, 16);
+            if (jget(line, "flags", v, sizeof(v))) r->flags = (uint64_t)strtoull(v, NULL, 16);
+            if (jget(line, "want", v, sizeof(v))) r->want = (uint64_t)strtoull(v, NULL, 16);
             if (jget(line, "cases", v, sizeof(v))) r->cases = (uint32_t)strtoul(v, NULL, 16);
             if (jget(line, "failed", v, sizeof(v))) r->failed = (uint32_t)strtoul(v, NULL, 16);
             jget(line, "detail", r->detail, sizeof(r->detail));
@@ -3465,6 +4522,7 @@ static int applies(pctx *c, const probe_def *p)
     if (p->fn == p_layer_vs) return c->layer_vs;
     if (p->fn == p_layer_gs) return c->gs;
     if (p->fn == p_bc_transcoders) return (c->emu & VKB_EMU_BCN) && vkb_emu_bcn_transcode_wanted();
+    if (p->fn == p_bc_variants) return (c->emu & VKB_EMU_BCN) != 0;
     if (p->fn == p_dma_heaps) return 1;
     if (p->fn == p_dmabuf_export) return c->dmabuf;
     if (p->fn == p_dmabuf_linear) return c->dmabuf;
@@ -3499,6 +4557,10 @@ static int probe_one(pctx *c, const probe_def *p, presult *r, int *dev_lost)
     /* an MK probe sees its erratum's imitation (host builds, VKBRIDGE_ERRATA_IMITATE) */
     vkb_dispatch saved = c->d;
     void *imi = p->mk && app ? vkb_errata_probe_begin(p->erratum, &c->d, c->dev, c->pd, c->api) : NULL;
+    /* view3d_layers also sees pv_view3d_base's imitation (one at a time: view_counts' wins when both are named) */
+    if (!imi && app && p->fn == p_view3d_layers) imi = vkb_errata_probe_begin(VKB_ERRATUM_PV_VIEW3D_BASE, &c->d, c->dev, c->pd, c->api);
+    /* ... and pv_fbloop_split's (plain feedback loops read stale inside the pass) */
+    if (!imi && app && p->fn == p_view3d_layers) imi = vkb_errata_probe_begin(VKB_ERRATUM_PV_FBLOOP_SPLIT, &c->d, c->dev, c->pd, c->api);
     /* waits sees VKBRIDGE_WAIT_FAKE_LOST's imitation (a timed-out wait answered VK_ERROR_DEVICE_LOST) */
     if (!imi && app && p->fn == p_waits && vkb_wait_fake_lost())
         imi = vkb_errata_probe_begin(VKB_ERRATUM_WAIT_RETRY, &c->d, c->dev, c->pd, c->api);
@@ -3530,7 +4592,8 @@ static int probe_one(pctx *c, const probe_def *p, presult *r, int *dev_lost)
         if (a.fake == 1 && r->status != PS_SKIP) {
             r->status = PS_FAIL;
             /* an MK probe failed as if it had seen its bug (VKB_PROBE_FLAG_MK_VB_SINGLE: no) */
-            if (p->mk) c->want_flags |= p->flags & ~VKB_PROBE_FLAG_MK_VB_SINGLE;
+            if (p->mk) c->want_flags |= p->flags & ~(VKB_PROBE_FLAG_MK_VB_SINGLE | VKB_PROBE_FLAG_PV_V3D_ALL | VKB_PROBE_FLAG_PV_VIEW3D | VKB_PROBE_FLAG_PV_FBLOOP);
+            if (p->fn == p_bc_variants) c->want_flags |= VKB_PROBE_FLAG_BC_ALL;
             say(c, " [failure imitated: VKBRIDGE_PROBE_FAKE]");
         }
         release(c);
@@ -3579,10 +4642,11 @@ static int safe_gated(const probe_def *p, uint32_t missing, int mode)
 static void decide(const probe_def *p, presult *r, uint32_t *emu, uint32_t possible, uint32_t missing, int mode, int log)
 {
     int bad = r->status == PS_FAIL || r->status == PS_CRASH || r->status == PS_HANG || r->status == PS_DIED;
-    uint32_t flags = r->want & p->flags;
+    uint64_t flags = r->want & p->flags;
     if (p->fn == p_compile_aces) flags = (r->status == PS_HANG || r->status == PS_DIED) ? VKB_PROBE_FLAG_LUT_NOW : 0;
     else if (!bad) flags = 0;
     if (p->fn == p_bc_transcoders && r->status == PS_DIED) flags = VKB_PROBE_FLAG_TX_ALL;
+    if (p->fn == p_bc_variants && (r->status == PS_DIED || r->status == PS_HANG || r->status == PS_CRASH)) flags = VKB_PROBE_FLAG_BC_ALL;
     r->flags = flags;
     r->emu = 0;
     int unverified = !bad && r->status == PS_ERROR && safe_gated(p, missing, mode);
@@ -3636,9 +4700,10 @@ static uint32_t decide_unrun(pprofile *pf, uint32_t *emu, int mode, int log)
 /* The decisions of every result in pf in a mode, on copies (the raw results stay): the emulation
  * mask from what the GPU had before the probe and the runtime flags; out (pf->n entries, may be
  * NULL) gets each result as decided. */
-static void decide_all(pprofile *pf, int mode, uint32_t *emu, uint32_t *flags, presult *out)
+static void decide_all(pprofile *pf, int mode, uint32_t *emu, uint64_t *flags, presult *out)
 {
-    uint32_t e = pf->emu_before, f = 0;
+    uint32_t e = pf->emu_before;
+    uint64_t f = 0;
     for (int k = 0; k < pf->n; k++) {
         presult r = pf->res[k];
         const probe_def *p = NULL;
@@ -3653,11 +4718,17 @@ static void decide_all(pprofile *pf, int mode, uint32_t *emu, uint32_t *flags, p
     if (flags) *flags = f;
 }
 
-static uint32_t apply_flags(pprofile *pf)
+static uint64_t apply_flags(pprofile *pf)
 {
-    uint32_t f = 0;
-    for (int i = 0; i < pf->n; i++) f |= pf->res[i].flags;
+    uint64_t f = 0;
+    int bcv = 0;
+    for (int i = 0; i < pf->n; i++) {
+        f |= pf->res[i].flags;
+        if (!strcmp(pf->res[i].name, "bc_variants")) bcv = pf->res[i].status == PS_SKIP || pf->res[i].status == PS_ERROR ? -1 : 1;
+    }
     __atomic_or_fetch(&pflags, f, __ATOMIC_ACQ_REL);
+    /* after the flags: a reader that sees 1 sees what the probe turned off */
+    if (bcv) __atomic_store_n(&bcv_state, bcv, __ATOMIC_RELEASE);
     return f;
 }
 
@@ -3674,7 +4745,7 @@ static void profile_key(pprofile *pf, const VkPhysicalDeviceProperties *props, c
                                        "VKBRIDGE_PROBE_APPLY", "VKBRIDGE_BC_TRANSCODE", "VKBRIDGE_ERRATA_IMITATE",
                                        "VKBRIDGE_ERRATA_IMITATE_VB", "VKBRIDGE_WAIT_FAKE_ERROR",
                                        /* a transcoder hang imitated, or a shorter limit, records what a real run must not reuse */
-                                       "VKBRIDGE_PROBE_TX_FAKE", "VKBRIDGE_PROBE_TX_TIMEOUT_S"};
+                                       "VKBRIDGE_PROBE_TX_FAKE", "VKBRIDGE_PROBE_TX_TIMEOUT_S", "VKBRIDGE_PROBE_BCV_FAKE"};
     uint64_t h = 0xcbf29ce484222325ull;
     for (size_t i = 0; i < sizeof(envs) / sizeof(envs[0]); i++) h = fnv(h, vkb_srv_env(envs[i]));
     char u[2 * VK_UUID_SIZE + 1];
@@ -3704,10 +4775,14 @@ static double budget_s(void)
 static int run_probes(pctx *c, pprofile *pf, uint32_t *emu, double budget_ms, int log)
 {
     double start = mono_ms();
-    int left = 0;
+    int left = 0, busy = 0;
     for (size_t i = 0; i < NPROBES; i++) {
         const probe_def *p = &probes[i];
         if (find_result(pf, p->name)) continue;
+        if (busy) { /* a probe starved before: the device is busy, and an interrupted compile may hold the driver's lock */
+            left++;
+            continue;
+        }
         double spent = mono_ms() - start;
         double need = (p->heavy ? 2 : 1) * sub_limit_s() * 1000.0;
         if (budget_ms > 0 && (p->bg || spent + (p->heavy ? need : 0) > budget_ms)) {
@@ -3719,13 +4794,30 @@ static int run_probes(pctx *c, pprofile *pf, uint32_t *emu, double budget_ms, in
         c->layer_vs_passed = 0;
         presult *vs = find_result(pf, "layer_vs");
         c->layer_vs_passed = vs && vs->status == PS_PASS;
+        presult *txr = find_result(pf, "bc_transcoders");
+        c->tx_status = txr ? txr->status : -1;
         snprintf(pf->running, sizeof(pf->running), "%s", p->name);
         write_profile(pf);
         probe_begin(pf);
         presult r;
         int lost = 0;
+        double w0 = rq_wait_ms();
+        c->starved = 0;
         probe_one(c, p, &r, &lost);
-        double gap = probe_end(pf);
+        double gap = probe_end(pf), starved = w0 >= 0 ? rq_wait_ms() - w0 : 0;
+        double lim = probe_limit_s(p) * 1000.0; /* < 0: the transcoders time each build themselves (guard_starved) */
+        if (r.status == PS_HANG && gap <= 0 && (c->starved || (lim > 0 && starved >= 1000 && r.ms - starved < 0.75 * lim))) {
+            /* runnable but not run (the background thread is at the lowest priority and the device was busy): without that
+             * wait it would have ended inside its limit, so the limit did not measure the probe */
+            VKB_WARN("probe: %s reached its time limit after %.1f s, %.1f s of them waiting for a CPU; not counted, run again at the next "
+                     "start, with the probes after it", p->name, r.ms / 1000, starved / 1000);
+            pthread_mutex_lock(&plock);
+            pf->running[0] = 0;
+            pthread_mutex_unlock(&plock);
+            left++;
+            busy = 1;
+            continue;
+        }
         if (r.status == PS_HANG && gap > 0) {
             /* the watchdog's clock ran on while the process was stopped (a suspended session) */
             VKB_WARN("probe: %s reached its time limit after %.1f s, %.1f s of them with the process stopped; not counted, run again at the next start",
@@ -3771,6 +4863,7 @@ static void ctx_init(pctx *c, const vkb_dispatch *idt, VkInstance inst, VkPhysic
     if (vkb_global_dt.vkEnumerateInstanceVersion) vkb_global_dt.vkEnumerateInstanceVersion(&api);
     if (api > VK_API_VERSION_1_3) api = VK_API_VERSION_1_3;
     c->api = c->props.apiVersion < api ? c->props.apiVersion : api;
+    c->pvr = vkb_driver_is_powervr(&c->props, vkb_driver_id(idt, pd, c->api));
     c->possible = emu_possible(c);
 }
 
@@ -3781,9 +4874,35 @@ static void ctx_free(pctx *c)
     c->ext = NULL;
 }
 
+/* The background probes' thread at the lowest CPU priority (SCHED_IDLE, and nice 19 where that is refused too): on a weak
+ * phone they took 52-100 s at the first start of a driver build (bc_variants 43-82 s, A35 G68 / A17 G57) and competed
+ * with a game started meanwhile; a game's threads now go first. Threads this one starts inherit it, so the long-lived
+ * helpers it could start first (the probe heartbeat, the compile watchdog the games' compiles use too) are started before.
+ * A probe that reaches its time limit while it mostly waited for a CPU is not counted (run_probes: run again at the next
+ * start), so a busy device never turns a converter off. Logged which one took effect; a warning if neither. */
+static void bg_lowest_priority(void)
+{
+    pthread_once(&beat_once, beat_start);
+    vkb_guard_watch_start();
+    pthread_setname_np(pthread_self(), "vkb-probe-bg");
+    pid_t tid = gettid();
+    struct sched_param sp = {0};
+    int ie = sched_setscheduler(0, SCHED_IDLE, &sp) == 0 ? 0 : errno; /* 0: this thread (Linux: a thread is a task) */
+    int ne = setpriority(PRIO_PROCESS, (id_t)tid, 19) == 0 ? 0 : errno;
+    errno = 0;
+    int nv = getpriority(PRIO_PROCESS, (id_t)tid), pol = sched_getscheduler(0);
+    if (pol == SCHED_IDLE || nv == 19)
+        VKB_INFO("probe: background probes at the lowest CPU priority (%s, nice %d%s%s), a game's threads go first", pol == SCHED_IDLE ? "SCHED_IDLE" : "SCHED_IDLE refused",
+                 nv, ie && pol != SCHED_IDLE ? ": " : "", ie && pol != SCHED_IDLE ? strerror(ie) : "");
+    else
+        VKB_WARN("probe: background probes at normal CPU priority (SCHED_IDLE: %s; nice 19: %s): they compete with a game started meanwhile",
+                 ie ? strerror(ie) : "?", ne ? strerror(ne) : "not kept");
+}
+
 static void *background(void *arg)
 {
     bg_job *j = arg;
+    bg_lowest_priority();
     pprofile *pf = &profiles[j->pf_index];
     double t0 = mono_ms();
     uint32_t api = VK_API_VERSION_1_0;
@@ -3811,6 +4930,7 @@ static void *background(void *arg)
         pctx c;
         ctx_init(&c, &dt, inst, pds[i], j->emu);
         uint32_t emu = j->emu;
+        __atomic_store_n(&bcv_bg, 1, __ATOMIC_RELEASE);
         VKB_INFO("probe: %d probe(s) continue in the background (their emulation decisions apply from the next start)", pf->deferred);
         int left = run_probes(&c, pf, &emu, 0, 1);
         pthread_mutex_lock(&plock);
@@ -3819,9 +4939,9 @@ static void *background(void *arg)
         pf->emu_after = emu; /* for the next start; this one keeps what clients were told */
         pf->bg_ms = mono_ms() - t0;
         pthread_mutex_unlock(&plock);
-        uint32_t fl = apply_flags(pf);
+        uint64_t fl = apply_flags(pf);
         write_profile(pf);
-        VKB_INFO("probe: background probes done (%.0f ms background, %.0f ms in all)%s; runtime flags 0x%x", pf->bg_ms, pf->start_ms + pf->bg_ms,
+        VKB_INFO("probe: background probes done (%.0f ms background, %.0f ms in all)%s; runtime flags 0x%" PRIx64, pf->bg_ms, pf->start_ms + pf->bg_ms,
                  left ? "; some left for the next start" : "", fl);
         ctx_free(&c);
         break;
@@ -3851,14 +4971,15 @@ static int errata_source(const char *probe)
     for (int i = 0; i < nprofiles; i++) {
         presult *r = find_result(&profiles[i], probe);
         if (!r) continue;
-        if (r->flags & p->flags & VKB_PROBE_FLAG_MK_ALL) res = VKB_ERRATA_PROBE_FAIL;
+        if (r->flags & p->flags & (VKB_PROBE_FLAG_MK_ALL | VKB_PROBE_FLAG_PV_ALL | VKB_PROBE_FLAG_PV_V3D_FB | VKB_PROBE_FLAG_PV_FBLOOP))
+            res = VKB_ERRATA_PROBE_FAIL; /* (PV-04's loop pattern and PV-06's stand alone) */
         else if (r->status == PS_PASS && res == VKB_ERRATA_PROBE_NOT_RUN) res = VKB_ERRATA_PROBE_PASS;
     }
     pthread_mutex_unlock(&plock);
     return res;
 }
 
-int vkb_probe_decide_mode(const uint8_t uuid[VK_UUID_SIZE], int mode, uint32_t *emu, uint32_t *flags)
+int vkb_probe_decide_mode(const uint8_t uuid[VK_UUID_SIZE], int mode, uint32_t *emu, uint64_t *flags)
 {
     int found = 0;
     pthread_mutex_lock(&plock);
@@ -3877,10 +4998,12 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     const char *mode = vkb_srv_env("VKBRIDGE_PROBE");
     if (mode && !strcmp(mode, "0")) {
         VKB_INFO("probe: off (VKBRIDGE_PROBE=0)");
+        __atomic_store_n(&bcv_state, -1, __ATOMIC_RELEASE);
         return;
     }
     if (!vkb_pcache_dir() && !(mode && !strcmp(mode, "force"))) {
         VKB_INFO("probe: no cache directory to keep a device profile in; not probing (VKBRIDGE_PROBE=force: probe anyway)");
+        __atomic_store_n(&bcv_state, -1, __ATOMIC_RELEASE);
         return;
     }
     if (nprofiles >= VKB_MAX_PDS || !idt->vkGetPhysicalDeviceProperties2) return;
@@ -3930,7 +5053,10 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
         for (int i = 0; i < pf->n; i++) bad += pf->res[i].status != PS_PASS && pf->res[i].status != PS_SKIP;
         VKB_INFO("probe: device profile %s (%d probes, %d not passed; VKBRIDGE_PROBE=force re-runs it)", pf->path, pf->n, bad);
     } else {
-        VKB_INFO("probe: probing %s (driver 0x%08x) once for this driver and bridge build: %s", pf->gpu, pf->driver_version,
+        char dv[40];
+        if (pf->vendor == 0x1010) snprintf(dv, sizeof(dv), "PowerVR driver CL %u", pf->driver_version);
+        else snprintf(dv, sizeof(dv), "driver 0x%08x", pf->driver_version);
+        VKB_INFO("probe: probing %s (%s) once for this driver and bridge build: %s", pf->gpu, dv,
                  pf->n ? "continuing an earlier run" : "a fresh run");
         pf->deferred = run_probes(&c, pf, &emu, budget_s() * 1000.0, 1);
         pf->complete = !pf->deferred;
@@ -3959,8 +5085,8 @@ void vkb_probe_device(vkb_pd_knowledge *k, VkInstance inst, const vkb_dispatch *
     if (added) VKB_WARN("probe: emulations switched on by the probe: 0x%x (emulating 0x%x now, %s mode)", added, k->info.emu, vkb_mode_name(cur));
     if (k->info_mode[!cur].emu != k->info.emu)
         VKB_INFO("probe: %s mode would emulate 0x%x (this mode 0x%x)", vkb_mode_name(!cur), k->info_mode[!cur].emu, k->info.emu);
-    uint32_t fl = apply_flags(pf);
-    if (fl) VKB_INFO("probe: runtime flags 0x%x from the probe", fl);
+    uint64_t fl = apply_flags(pf);
+    if (fl) VKB_INFO("probe: runtime flags 0x%" PRIx64 " from the probe", fl);
     pf->start_ms = mono_ms() - t0;
     if (complete) VKB_INFO("probe: cached profile, %.1f ms at start", pf->start_ms);
     else
@@ -4022,6 +5148,14 @@ static void case_names(const probe_def *p, uint32_t bits, char *out, size_t cap)
 static void mk_result(const pprofile *pf, const char *probe, char *out, size_t cap, uint32_t *failed, int *status)
 {
     const presult *r = NULL;
+    if (!strcmp(probe, "zink_profile")) { /* pv_zink_name's own probe (server_errata_zink.c): not in the profile */
+        int z = vkb_zink_profile_result();
+        *failed = 0;
+        *status = z == VKB_ERRATA_PROBE_FAIL ? PS_FAIL : z == VKB_ERRATA_PROBE_PASS ? PS_PASS : -1;
+        snprintf(out, cap, "%s", z == VKB_ERRATA_PROBE_FAIL ? "fail (the driver's profile for \"mesa zink\" hides features)"
+                                 : z == VKB_ERRATA_PROBE_PASS ? "pass" : "not run (not a PowerVR driver, or it could not run)");
+        return;
+    }
     for (int i = 0; i < pf->n; i++)
         if (!strcmp(pf->res[i].name, probe)) r = &pf->res[i];
     *failed = r ? r->failed : 0;
@@ -4172,7 +5306,7 @@ void vkb_probe_write_json(FILE *f)
             const presult *x = &pf->res[r];
             fprintf(f, "%s\n      {\"name\": ", r ? "," : "");
             json_str(f, x->name);
-            fprintf(f, ", \"status\": \"%s\", \"ms\": %.1f, \"emu\": \"0x%x\", \"flags\": \"0x%x\", \"cases\": \"0x%x\", \"failed\": \"0x%x\", \"detail\": ",
+            fprintf(f, ", \"status\": \"%s\", \"ms\": %.1f, \"emu\": \"0x%x\", \"flags\": \"0x%" PRIx64 "\", \"cases\": \"0x%x\", \"failed\": \"0x%x\", \"detail\": ",
                     ps_name[x->status], x->ms, x->emu, x->flags, x->cases, x->failed);
             json_str(f, x->detail);
             fprintf(f, "}");

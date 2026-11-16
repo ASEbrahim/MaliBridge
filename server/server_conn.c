@@ -6,7 +6,10 @@
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
+#include "vkb_lostlog.h"
 #include "server_emu.h"
+#include "server_cores.h"
+#include "vkb_emu_formats.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -33,6 +36,7 @@ static vkb_srv_proc *procs;
 
 static __thread vkb_srv_table *tls_table;
 static __thread vkb_srv_proc *tls_proc; /* the process this connection thread serves (its preset) */
+static __thread vkb_srv_conn *tls_conn; /* the connection this thread serves (vkb_srv_parked) */
 __thread const char *vkb_srv_current_cmd;
 /* The command buffer being replayed and its last commands, for the crash line (server_main.c). */
 __thread VkCommandBuffer vkb_srv_replay_cb;
@@ -156,7 +160,9 @@ void vkb_srv_close_after_send(vkb_srv_call *c, int fd)
  * would have done, beneath the program. t is off the table list already; the caller frees it. */
 static void device_cleanup(vkb_srv_table *t)
 {
+    vkb_pldedup_device_destroy(t);
     vkb_async_device_destroy(t);
+    vkb_timeline_device_quiesce(t); /* its queues' workers stop before anything of the device goes */
     vkb_vidyn_device_destroy(t); /* as vkDestroyDevice: off the server's list (, PR #39) */
     vkb_emu_device_quiesce(t);
     vkb_cbfail_device_destroy(t);
@@ -182,10 +188,11 @@ static void device_cleanup(vkb_srv_table *t)
     vkb_dab_device_destroy(t); /* as vkDestroyDevice (left here before) */
     vkb_lost_device_destroy(t);
     /* what the process left alive in the driver (pools, pipelines...): destroyed now, or
-     * the driver keeps its memory in the server for the rest of the session */
+     * the driver keeps its memory in the server for the rest of the session (a player log) */
     vkb_children_device_destroy(t, 1);
     t->real.vkDestroyDevice(t->device, NULL);
     vkb_qlock_device_destroy(t); /* server_qlock.c: the device's queue locks */
+    vkb_pvsusp_device_destroy(t); /* server_pvsusp.c: its totals */
 }
 
 void vkb_proc_cleanup(vkb_srv_proc *p)
@@ -204,7 +211,7 @@ void vkb_proc_cleanup(vkb_srv_proc *p)
              * took the last device made, gone once that one was destroyed: the dedicated_import
              * record of the null descriptors' buffer locked a NULL mutex (Tab S10+, v0.5.1 rc1). */
             vkb_srv_set_current_table(t);
-            if (vkb_lost_stopped(t)) {
+            if (t->is_device ? vkb_lost_settle(t) : vkb_lost_stopped(t)) {
                 /* stopped (server_lost.c): a driver thread of it faulted after its loss, a driver fault in its
                  * vkEndCommandBuffer was contained, or the memory fault watchdog ended its program: never touched again */
                 VKB_WARN("process %d exited without destroying %s %u, which is left as it is (it was stopped after a driver fault)",
@@ -262,7 +269,7 @@ int vkb_srv_instance_orphans(vkb_srv_table *inst)
         if (mine) __atomic_store_n(&tables[i], NULL, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&tables_lock);
         if (!mine) continue;
-        if (vkb_syncfd_device_destroy(t)) {
+        if (vkb_lost_settle(t) || vkb_syncfd_device_destroy(t)) {
             /* a sync-fd export still in the driver: the device, and so the instance, are left alive */
             pthread_mutex_lock(&tables_lock);
             __atomic_store_n(&tables[i], t, __ATOMIC_RELEASE);
@@ -320,6 +327,12 @@ static void proc_leave(vkb_srv_proc *p)
         vkb_proc_cleanup(p);
         vkb_hitch_proc_gone(p); /* after its devices: no thread of theirs notes into it any more */
         VKB_INFO("client process %d gone", p->pid);
+        uint64_t wr = __atomic_load_n(&p->wk_rpass, __ATOMIC_RELAXED), wb = __atomic_load_n(&p->wk_b2i, __ATOMIC_RELAXED),
+                 wc = __atomic_load_n(&p->wk_bufs, __ATOMIC_RELAXED), ws = __atomic_load_n(&p->wk_submits, __ATOMIC_RELAXED);
+        if (wr | wb | wc | ws) /* the run's totals (vkb_srv_count_work; the perf lines have them a window) */
+            VKB_INFO("work: pid=%d comm=%s rpasses=%llu b2i_copies=%llu buf_creates=%llu submits=%llu (the whole run)", p->pid,
+                     p->comm[0] ? p->comm : "?", (unsigned long long)wr, (unsigned long long)wb, (unsigned long long)wc,
+                     (unsigned long long)ws);
         vkb_report_gone(p);
         pthread_mutex_destroy(&p->olock);
         pthread_cond_destroy(&p->ocond);
@@ -384,6 +397,42 @@ int vkb_srv_crash_others(char *buf, size_t cap)
     return n;
 }
 
+/* The fault-time copy (vkb_crash_call, server_guard.c vkb_guard_fault): the same markers as vkb_srv_crash_others, read in the signal
+ * handler. Each marker is read twice around its start time; a change between the reads marks the entry torn (never waited for).
+ * A connection read here may be untracked meanwhile; it is freed only after that (as for vkb_srv_crash_others). */
+int vkb_srv_crash_snap(vkb_crash_call *out, int max, int self, int *more)
+{
+    int n = 0;
+    *more = 0;
+    for (int i = 0; i < CONNS_MAX; i++) {
+        const vkb_srv_conn *c = __atomic_load_n(&conns_all[i], __ATOMIC_ACQUIRE);
+        if (!c) continue;
+        uint32_t run = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
+        int tid = __atomic_load_n(&c->tid, __ATOMIC_RELAXED);
+        if (!run || run > VKB_CMD_COUNT || tid == self) continue;
+        uint64_t since = __atomic_load_n(&c->running_ns, __ATOMIC_ACQUIRE);
+        uint32_t run2 = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
+        uint64_t since2 = __atomic_load_n(&c->running_ns, __ATOMIC_RELAXED);
+        if (n >= max) {
+            (*more)++;
+            continue;
+        }
+        vkb_crash_call *o = &out[n++];
+        const vkb_srv_proc *p = conn_proc(c);
+        o->tid = tid;
+        o->pid = p ? p->pid : 0;
+        o->cmd = run;
+        o->device = 0;
+        o->since_ns = since;
+        o->call = o->ctx = NULL;
+        o->torn = run2 != run || since2 != since;
+        size_t k = 0;
+        for (; p && k < sizeof(o->comm) - 1 && k < sizeof(p->comm) && p->comm[k]; k++) o->comm[k] = p->comm[k];
+        o->comm[k] = 0;
+    }
+    return n;
+}
+
 /* Coarse (a few ms): it is read for every request, and only stalls of seconds are reported. */
 static uint64_t mono_now_ns(void)
 {
@@ -410,8 +459,8 @@ static int replay_before(const vkb_srv_conn *c, uint32_t pos, uint32_t want, cha
  * Where a connection's vkEndCommandBuffer is: the command of the recorded stream it is replaying
  * ("inside vkCmdCopyBufferToImage, command 14 of 31 (after: ...)") or the driver's own End after
  * the stream. Written for a stall: the server's "running: vkEndCommandBuffer for 337 s" named the
- * whole request, and Galaxy S24+ and A56, Xclipse 940 and 540, Xwayland, the
- * driver's End not returning could not say which of its commands the Samsung driver sat in.
+ * whole request, and a player log (Galaxy S24+ and A56, Xclipse 940 and 540, Xwayland, the
+ * driver's End not returning) could not say which of its commands the Samsung driver sat in.
  * Returns the length (0: not replaying).
  */
 static int replay_where(const vkb_srv_conn *c, char *buf, size_t cap)
@@ -570,7 +619,7 @@ static void order_stall(vkb_srv_proc *p, uint32_t cmd, int s, uint64_t barrier, 
         if (!r || r - 1 >= VKB_CMD_COUNT) continue;
         double run_s = since && now > since ? (now - since) / 1e9 : 0.0;
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %s for %.1f s", vkb_cmd_names[r - 1], run_s);
-        /* A command buffer's replay: which recorded command it is in, and, once a request has
+        /* A command buffer's replay: which recorded command it is in (a player log), and, once a request has
          * run 5 s, what its thread is doing (futex, ioctl on which file, CPU time) */
         char where[420], probe[300];
         int wn = r - 1 == VKB_CMD_vkEndCommandBuffer ? replay_where(c, where, sizeof(where)) : 0;
@@ -593,7 +642,7 @@ static void order_stall(vkb_srv_proc *p, uint32_t cmd, int s, uint64_t barrier, 
 
 /* The request of process `pid` that has been running longest, on any of its connections: its
  * seconds (0: none running) and its name. The report's line for a call the driver has not
- * returned from (Xwayland's vkGetSemaphoreFdKHR for 400 s on the Galaxy A55, while the
+ * returned from (a player log: Xwayland's vkGetSemaphoreFdKHR for 400 s on the Galaxy A55, while the
  * loading screen said only "Waiting for Steam's first frame"). */
 double vkb_srv_running_longest(int pid, const char **name, char *detail, size_t cap)
 {
@@ -697,8 +746,81 @@ int vkb_srv_end_proc(int pid, const char *why)
     return devs;
 }
 
+void vkb_srv_parked(int on)
+{
+    if (tls_conn) __atomic_store_n(&tls_conn->phase, on ? VKB_CONN_PARKED : VKB_CONN_BUSY, __ATOMIC_RELEASE);
+}
+
+/* 1: a connection of `p` is reading, running or answering a message, other than a request that waits by design
+ * (for the GPU or its own compile, never for a request of the process); `what` names it. A request order_wait
+ * misses can be in such a connection: running there, or arriving. A connection whose thread waits in order_wait
+ * cannot hold it (a connection's messages come in sequence order; what follows a waiting message is later), nor
+ * can an idle one. 2: none, but a request is parked (vkb_srv_parked): it waits for a later request of the
+ * program, which the order holds back behind it; `what` names it. conns_lock: never taken with olock held. */
+static int proc_busy(const vkb_srv_proc *p, char *what, size_t cap)
+{
+    int busy = 0;
+    pthread_mutex_lock(&conns_lock);
+    for (int i = 0; i < CONNS_MAX && busy != 1; i++) {
+        vkb_srv_conn *c = conns_all[i];
+        if (!c || c->proc != p) continue;
+        uint32_t ph = __atomic_load_n(&c->phase, __ATOMIC_ACQUIRE);
+        uint32_t r = __atomic_load_n(&c->running, __ATOMIC_ACQUIRE);
+        int known = r && r - 1 < VKB_CMD_COUNT;
+        if (ph == VKB_CONN_PARKED) {
+            busy = 2;
+            snprintf(what, cap, "%s", known ? vkb_cmd_names[r - 1] : "?");
+            continue;
+        }
+        if (ph != VKB_CONN_BUSY || (known && waits_by_design(r - 1))) continue;
+        busy = 1;
+        snprintf(what, cap, "%s", known ? vkb_cmd_names[r - 1] : "a message being read or answered");
+    }
+    pthread_mutex_unlock(&conns_lock);
+    return busy;
+}
+
+/* A program whose request never came (order_wait): its devices are taken as lost, so that the requests after the
+ * missing one - a submit of a command buffer whose End never ran, a use of an object never made - do not reach the
+ * driver on them (a player log: such a submit faulted inside Mali's vkQueueSubmit2 and took the server down). */
+static int proc_lose(int pid, const char *why)
+{
+    int devs = 0;
+    pthread_mutex_lock(&tables_lock);
+    for (uint32_t i = 1; i < VKB_MAX_TABLES; i++) {
+        vkb_srv_table *t = tables[i];
+        if (t && t->is_device && t->proc && t->proc->pid == pid) {
+            vkb_lost_mark(t, why);
+            devs++;
+        }
+    }
+    pthread_mutex_unlock(&tables_lock);
+    return devs;
+}
+
+/* VKBRIDGE_ORDER_GAP=continue: a missing request is gone past as before 2026-11-05 (its devices not taken as lost,
+ * and without the check that it is still running elsewhere): the A/B of the host test (asyncgap_test.sh). */
+static int order_gap_old(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = vkb_srv_env_global("VKBRIDGE_ORDER_GAP");
+        v = e && !strcmp(e, "continue");
+        if (v) VKB_WARN("VKBRIDGE_ORDER_GAP=continue: a missing asynchronous request is gone past after 3 s, as before 2026-11-05");
+    }
+    return v;
+}
+
 /* Waits until every async request of the process up to `barrier` has run; with `ms` > 0 at most that
- * long (0 returned when it ran out). */
+ * long (0 returned when it ran out).
+ *
+ * A connection of the process that ended may have taken a request's sequence number with it unsent: then the
+ * request never comes and its waiters would wait forever. Such a gap is taken only when, for 3 s in a row, no
+ * connection of the process is reading or running anything that may be it (proc_busy). Until 2026-11-05 any 3 s
+ * wait after any connection of the process had ever ended (a thread that exits ends its own) was taken as one: a player log
+ * (Dying Light, Mali-G1-Ultra) had an asynchronous vkEndCommandBuffer replay waiting over 3 s for its BC
+ * transcoders, the submit of that command buffer was run beside the replay still under way, and Mali's
+ * vkQueueSubmit2 faulted at 0x32, ending every program. A real gap now takes the process's devices as lost. */
 static int order_wait(vkb_srv_proc *p, uint64_t barrier, uint32_t cmd, int ms)
 {
     if (!p || !barrier) return 1;
@@ -712,6 +834,9 @@ static int order_wait(vkb_srv_proc *p, uint64_t barrier, uint32_t cmd, int ms)
         if (until.tv_nsec >= 1000000000L) until.tv_sec++, until.tv_nsec -= 1000000000L;
     }
     p->owaiters++;
+    int gap = 0, held = 0;
+    uint64_t missing = 0;
+    char what[64] = "";
     while (p->watermark < barrier) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -728,17 +853,61 @@ static int order_wait(vkb_srv_proc *p, uint64_t barrier, uint32_t cmd, int ms)
             order_stall(p, cmd, slow, barrier, wm);
             pthread_mutex_lock(&p->olock);
         }
-        if (e != 0 && ++waited >= 3 && p->conn_closed) {
-            /* A connection of this process is gone with requests it never sent: go on. */
+        if (e != 0 && order_gap_old() && ++waited >= 3 && p->conn_closed) {
             VKB_WARN("process %d: async request %llu never arrived; continuing", p->pid, (unsigned long long)(p->watermark + 1));
             p->watermark = barrier;
             memset(p->done, 0, sizeof(p->done));
+            break;
+        }
+        if (e != 0 && p->conn_closed && !order_gap_old()) {
+            /* A connection of this process is gone, perhaps with a request it never sent. */
+            pthread_mutex_unlock(&p->olock);
+            int busy = proc_busy(p, what, sizeof(what));
+            pthread_mutex_lock(&p->olock);
+            if (p->watermark >= barrier) break;
+            if (busy == 1) {
+                if (++held == 3) {
+                    static uint64_t says;
+                    uint64_t k = __atomic_add_fetch(&says, 1, __ATOMIC_RELAXED);
+                    if (k <= 8 || (k & (k - 1)) == 0)
+                        VKB_INFO("process %d (%s): %s waits over 3 s for its asynchronous request %llu while %s runs on another "
+                                 "connection; waiting for it (%llu so far)", p->pid, p->comm,
+                                 cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", (unsigned long long)(p->watermark + 1), what,
+                                 (unsigned long long)k);
+                }
+                waited = 0;
+                continue;
+            }
+            if (++waited < 3) continue;
+            missing = p->watermark + 1;
+            uint64_t span = barrier - p->watermark;
+            for (uint64_t k = 1; k <= span && k <= VKB_SEQ_RING; k++) p->done[(p->watermark + k) % VKB_SEQ_RING] = 0;
+            p->watermark = barrier;
+            while (p->done[(p->watermark + 1) % VKB_SEQ_RING]) { /* later ones that already ran */
+                p->done[(p->watermark + 1) % VKB_SEQ_RING] = 0;
+                p->watermark++;
+            }
+            pthread_cond_broadcast(&p->ocond);
+            gap = busy == 2 ? 2 : 1;
             break;
         }
     }
     p->owaiters--;
     uint64_t wm = p->watermark;
     pthread_mutex_unlock(&p->olock);
+    if (gap == 2) {
+        /* Not a lost request: one parked for a later one (an emulated timeline's wait-before-signal), which the order
+         * held back; gone past as before 2026-11-05, the program's devices kept. */
+        VKB_WARN("process %d (%s): %s waited 3 s for asynchronous request %llu while %s waits on the CPU for a later "
+                 "request (an emulated timeline's wait-before-signal); continuing", p->pid, p->comm,
+                 cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", (unsigned long long)missing, what);
+    } else if (gap) {
+        int devs = proc_lose(p->pid, "an asynchronous request of its program never arrived");
+        VKB_ERR("process %d (%s): asynchronous request %llu never arrived (a connection of the program ended without sending "
+                "it, and nothing of the program ran for 3 s); %s goes on and its %d device(s) are taken as lost, so nothing "
+                "after the missing request reaches the driver on them", p->pid, p->comm, (unsigned long long)missing,
+                cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", devs);
+    }
     if (!reached) {
         static uint64_t ran_out;
         uint64_t n = __atomic_add_fetch(&ran_out, 1, __ATOMIC_RELAXED);
@@ -769,6 +938,136 @@ void vkb_srv_order_finish(void)
 void vkb_srv_order_done(void)
 {
     order_owed.p = NULL;
+}
+
+/*
+ * VKBRIDGE_FAST_CREATE (VKB_F_FAST_CREATE; default on, 0 off - the game's preset, <cache dir>/env, the server's environment).
+ * Every synchronous request waits until all asynchronous requests its process had queued have run (order_wait), so a
+ * vkCreateImage on a game's thread waited for the whole replay queue of every other thread (dxvk-cs's 13-15k calls a second):
+ * NieR's start-up set of ~1330 textures spent 380-490 ms of a 500-600 ms frame in such round trips (11-09),
+ * 0.27-0.36 ms a create on the S11 Ultra, 0.23-1.26 ms on G57/G615 phones. A create depends on queued work only through state a
+ * queued request changes: the bytes the BC rules weigh (budget, small decode) and
+ * the sparse reservations, which queued destroys give back, and the dma-buf/external images' shapes. Every other one names only
+ * its device (made synchronously), gets a handle the driver cannot give out while a queued destroy's image lives, and every
+ * server layer drops its record of an image before the driver's destroy: it runs at once. The rest wait for the barrier first,
+ * before any driver call, exactly as without the bit. vkCreateImage's reply also carries the image's requirements, as
+ * vkGetImageMemoryRequirements2 would answer them right after (an image's requirements never change), so the client asks no
+ * second round trip.
+ */
+static uint64_t mono_ns(void);
+static __thread int fc_owed;  /* the running request is a create taken ahead of its barrier (its order owed in order_owed) */
+static __thread int fc_tail;  /* a vkCreateImage sent with VKB_F_CREATE_REQS: its reply gets the requirements tail */
+static __thread uint64_t fc_wait_ns; /* the order wait it did in vkb_srv_fast_create_pre (it was not of the safe kind) */
+static __thread int fc_ahead;  /* 1: it ran ahead; 2: it waited (not of the safe kind); 3: waited (BC under a live-byte rule) */
+static struct {
+    uint64_t img, img_ahead, img_kind, img_bc, buf, buf_ahead, order_ns, order_max_ns, handler_ns, lines, last_ns;
+} fc_st;
+
+void vkb_srv_fast_create_set(vkb_srv_proc *p, int on)
+{
+    int was = 0;
+    if (!p || !__atomic_compare_exchange_n(&p->fast_create, &was, on, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    static int told[3];
+    if (!__atomic_exchange_n(&told[on], 1, __ATOMIC_RELAXED)) {
+        if (on == 2)
+            VKB_INFO("fast create: on - image and buffer creates run ahead of the program's queued work where nothing queued can change "
+                     "them, and an image's requirements come with its create (VKBRIDGE_FAST_CREATE=0 turns it off)");
+        else
+            VKB_INFO("fast create: off (VKBRIDGE_FAST_CREATE=0): image and buffer creates wait for the program's queued work, as before");
+    }
+}
+
+/* 0: nothing queued can change what the create makes; 2: not of that kind (a pNext the server does not know to be free of
+ * shared state, sparse, not OPTIMAL); 3: a BC image while a live-byte rule is on */
+static int fc_kind(vkb_srv_call *c, const VkImageCreateInfo *ici, const VkBufferCreateInfo *bci)
+{
+    if (bci) {
+        if (bci->flags & (VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT | VK_BUFFER_CREATE_SPARSE_ALIASED_BIT))
+            return 2;
+        for (const VkBaseInStructure *b = bci->pNext; b; b = b->pNext)
+            if (b->sType != VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO && b->sType != VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO)
+                return 2;
+        return 0;
+    }
+    if (!ici || ici->tiling != VK_IMAGE_TILING_OPTIMAL ||
+        (ici->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)))
+        return 2;
+    for (const VkBaseInStructure *b = ici->pNext; b; b = b->pNext)
+        if (b->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO && b->sType != VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO) return 2;
+    vkb_emu_device *e = c->table ? c->table->emu : NULL;
+    if (vkb_is_bc(ici->format) && e && (e->flags & VKB_EMU_BCN) && !vkb_emu_bcn_order_free(e)) return 3;
+    return 0;
+}
+
+void vkb_srv_fast_create_pre(vkb_srv_call *c, const VkImageCreateInfo *ici, const VkBufferCreateInfo *bci)
+{
+    if (!fc_owed) return;
+    fc_owed = 0;
+    int k = fc_kind(c, ici, bci);
+    if (!k) {
+        vkb_srv_order_done();
+        fc_ahead = 1;
+        return;
+    }
+    uint64_t t0 = mono_ns();
+    vkb_srv_order_finish(); /* the whole wait, before the driver's create, as without the bit */
+    fc_wait_ns = mono_ns() - t0;
+    fc_ahead = k;
+}
+
+void vkb_srv_fast_create_reply(vkb_srv_call *c, VkDevice device, VkResult r, const VkImage *image, const VkImageCreateInfo *ci)
+{
+    if (!fc_tail) return;
+    fc_tail = 0;
+    /* the reply's tail: 1, VkMemoryRequirements, prefers and requires dedicated; or 0 (the client asks as before) */
+    VkMemoryDedicatedRequirements ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 req = {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &ded};
+    int have = r == VK_SUCCESS && image && *image && ci && c->table && c->table->api_version >= VK_API_VERSION_1_1 &&
+               c->dt->vkGetImageMemoryRequirements2 &&
+               !(ci->flags & (VK_IMAGE_CREATE_DISJOINT_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT));
+    if (have) {
+        VkImageMemoryRequirementsInfo2 info = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, NULL, *image};
+        c->dt->vkGetImageMemoryRequirements2(device, &info, &req); /* what the app's vkGetImageMemoryRequirements2 reaches */
+    }
+    vkb_enc_u8(&c->r, (uint8_t)have);
+    if (!have) return;
+    vkb_enc_bytes(&c->r, &req.memoryRequirements, sizeof(req.memoryRequirements));
+    vkb_enc_u32(&c->r, ded.prefersDedicatedAllocation);
+    vkb_enc_u32(&c->r, ded.requiresDedicatedAllocation);
+}
+
+/* Both arms: image creates, their order waits and handlers, so far (one line at the 1st, 8th, 64th, 512th image create, then at most
+ * every 10 s while creates come; at most 400 lines) - the split of a create's round trip the hitch lines cannot show. */
+static void fc_note(uint32_t cmd, uint64_t order_ns, uint64_t handler_ns, int on)
+{
+    int ahead = fc_ahead;
+    fc_ahead = 0;
+    if (cmd == VKB_CMD_vkCreateBuffer) {
+        __atomic_add_fetch(&fc_st.buf, 1, __ATOMIC_RELAXED);
+        if (ahead == 1) __atomic_add_fetch(&fc_st.buf_ahead, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    uint64_t n = __atomic_add_fetch(&fc_st.img, 1, __ATOMIC_RELAXED);
+    if (ahead == 1) __atomic_add_fetch(&fc_st.img_ahead, 1, __ATOMIC_RELAXED);
+    if (ahead == 2) __atomic_add_fetch(&fc_st.img_kind, 1, __ATOMIC_RELAXED);
+    if (ahead == 3) __atomic_add_fetch(&fc_st.img_bc, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&fc_st.order_ns, order_ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&fc_st.handler_ns, handler_ns, __ATOMIC_RELAXED);
+    for (uint64_t m = __atomic_load_n(&fc_st.order_max_ns, __ATOMIC_RELAXED);
+         order_ns > m && !__atomic_compare_exchange_n(&fc_st.order_max_ns, &m, order_ns, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
+    uint64_t now = mono_ns(), last = __atomic_load_n(&fc_st.last_ns, __ATOMIC_RELAXED);
+    int due = n == 1 || n == 8 || n == 64 || n == 512 ||
+              (now - last >= 10000000000ull && __atomic_compare_exchange_n(&fc_st.last_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    if (!due || __atomic_add_fetch(&fc_st.lines, 1, __ATOMIC_RELAXED) > 400) return;
+    if (n <= 512) __atomic_store_n(&fc_st.last_ns, now, __ATOMIC_RELAXED);
+    uint64_t ahead_n = fc_st.img_ahead, made_wait = fc_st.img_kind + fc_st.img_bc;
+    VKB_INFO("fast create %s, so far: %llu image creates: %llu ran ahead of queued work, %llu sent to wait for it (not of the kind that "
+             "may), %llu the server made wait (%llu not of that kind, %llu BC under a live-byte rule); order waits %.1f ms (longest %.2f), "
+             "handlers %.1f ms (%.3f ms each); %llu buffer creates, %llu ran ahead", on ? "on" : "off", (unsigned long long)n,
+             (unsigned long long)ahead_n, (unsigned long long)(n > ahead_n + made_wait ? n - ahead_n - made_wait : 0),
+             (unsigned long long)made_wait, (unsigned long long)fc_st.img_kind, (unsigned long long)fc_st.img_bc, fc_st.order_ns / 1e6,
+             fc_st.order_max_ns / 1e6, fc_st.handler_ns / 1e6, fc_st.handler_ns / 1e6 / (double)n, (unsigned long long)fc_st.buf,
+             (unsigned long long)fc_st.buf_ahead);
 }
 
 static void order_done(vkb_srv_proc *p, uint64_t seq)
@@ -1152,8 +1451,8 @@ static void test_delay(uint32_t cmd);
 
 /* A draw needs a graphics pipeline, a dispatch a compute one, bound earlier in the same command
  * buffer (pipelines are never inherited; the bridge offers no shader objects). One the app records
- * without is invalid, and Mali's driver reads through the missing pipeline: Mali-G615 MC2
- * r44p1, No Man's Sky - after the third contained compile crash the device's pipelines failed
+ * without is invalid, and Mali's driver reads through the missing pipeline: a player log (Mali-G615 MC2
+ * r44p1, No Man's Sky) - after the third contained compile crash the device's pipelines failed
  * (server_guard.c), the game skipped the binds and drew, and vkCmdDrawIndexed faulted at 0x7a0,
  * taking the one server and every program down. Such a draw or dispatch is left out (it could not
  * have drawn anything) and said; so is a vkCmdBindPipeline of VK_NULL_HANDLE, which RADV crashes on
@@ -1166,7 +1465,7 @@ static uint8_t needs_pipeline[VKB_CMD_COUNT] = {
     [VKB_CMD_vkCmdDrawMultiEXT] = 1, [VKB_CMD_vkCmdDrawMultiIndexedEXT] = 1,
     [VKB_CMD_vkCmdDispatch] = 2, [VKB_CMD_vkCmdDispatchBase] = 2, [VKB_CMD_vkCmdDispatchIndirect] = 2,
     /* the bound pipeline's last vertex stage declares Xfb (a Vulkan rule); Mali reads through a missing one
-     * (a player log 0xe78 0xe60). Its vkCmdEndTransformFeedbackEXT is left out with it. */
+     * (a player log 0xe78, a player log 0xe60). Its vkCmdEndTransformFeedbackEXT is left out with it. */
     [VKB_CMD_vkCmdBeginTransformFeedbackEXT] = 1,
 };
 static uint64_t unbound_left_out;
@@ -1187,6 +1486,28 @@ static inline void replay_at(vkb_srv_conn *conn, uint32_t pos, uint32_t id)
     if (!conn) return;
     __atomic_store_n(&conn->replay_ring[(pos - 1) % VKB_REPLAY_RING], (uint16_t)id, __ATOMIC_RELAXED);
     __atomic_store_n(&conn->replay_pos, pos, __ATOMIC_RELAXED);
+}
+
+/* What a process's frames are made of, for the perf line (server_perf.c): render pass instances begun, buffer-to-image copies,
+ * vkCreateBuffer and queue submits, counted as each request runs (the command stream's replay and the other requests). A GL game
+ * through Zink that writes a texture its frame already drew with gets a copy and a render pass split for each write (Zink ends the
+ * pass for it: zink_get_cmdbuf), and a staging buffer made for it (two vkCreateBuffer): Half-Life's dynamic lightmaps with the
+ * flashlight on (a player log), invisible in every other counter. One relaxed add for the four,
+ * nothing for the rest. */
+static inline void vkb_srv_count_work(vkb_srv_proc *p, uint32_t id)
+{
+    if (!p) return;
+    switch (id) {
+    case VKB_CMD_vkCmdBeginRenderPass:
+    case VKB_CMD_vkCmdBeginRenderPass2:
+    case VKB_CMD_vkCmdBeginRendering: __atomic_add_fetch(&p->wk_rpass, 1, __ATOMIC_RELAXED); break;
+    case VKB_CMD_vkCmdCopyBufferToImage:
+    case VKB_CMD_vkCmdCopyBufferToImage2: __atomic_add_fetch(&p->wk_b2i, 1, __ATOMIC_RELAXED); break;
+    case VKB_CMD_vkCreateBuffer: __atomic_add_fetch(&p->wk_bufs, 1, __ATOMIC_RELAXED); break;
+    case VKB_CMD_vkQueueSubmit:
+    case VKB_CMD_vkQueueSubmit2: __atomic_add_fetch(&p->wk_submits, 1, __ATOMIC_RELAXED); break;
+    default: break;
+    }
 }
 
 static inline void replay_end(vkb_srv_conn *conn)
@@ -1220,6 +1541,9 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
     vkb_enc_init(&scratch);
     uint32_t ncmds = 0;
     int xfb_left_out = 0; /* a vkCmdBeginTransformFeedbackEXT left out: its end is too */
+    /* the loss record's summary of this command buffer (server_lostlog.c): counts, and the last pipelines bound */
+    uint32_t ll_draws = 0, ll_disp = 0, ll_copies = 0, ll_np = 0;
+    uint64_t ll_pl[VKB_LL_PIPES], ll_g = 0, ll_c = 0;
     if (vkb_emu_bc_batch_open) vkb_emu_bcn_batch_drop(); /* never left open by a stream; to be sure */
     vkb_srv_replay_cb = cb;
     vkb_srv_replay_n = 0;
@@ -1267,6 +1591,7 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         vkb_srv_replay_ring[ncmds % VKB_REPLAY_RING] = vkb_cmd_names[id];
         vkb_srv_replay_n = ncmds + 1;
         replay_at(c->conn, ncmds + 1, id);
+        vkb_srv_count_work(c->conn ? c->conn->proc : NULL, id);
         uint8_t need = needs_pipeline[id];
         if (need && !(need == 1 ? vkb_srv_replay_gfx : vkb_srv_replay_comp)) {
             unbound_say(c, cb, id, need == 2);
@@ -1282,12 +1607,27 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
             continue;
         }
         test_delay(id);
+        ll_draws += need == 1 && id != VKB_CMD_vkCmdBeginTransformFeedbackEXT;
+        ll_disp += need == 2;
+        ll_copies += id == VKB_CMD_vkCmdCopyBufferToImage || id == VKB_CMD_vkCmdCopyBufferToImage2;
         /* BC uploads back to back share one barrier pair (server_emu_bcn.c): any other command first
          * gets the batch's copies */
         if (vkb_emu_bc_batch_open && id != VKB_CMD_vkCmdCopyBufferToImage && id != VKB_CMD_vkCmdCopyBufferToImage2)
             vkb_emu_bcn_batch_flush();
         vkb_srv_handlers[id](&sub);
         vkb_srv_current_cmd = vkb_cmd_names[VKB_CMD_vkEndCommandBuffer];
+        if (id == VKB_CMD_vkCmdBindPipeline && (vkb_srv_replay_gfx != ll_g || vkb_srv_replay_comp != ll_c)) {
+            uint64_t p = vkb_srv_replay_gfx != ll_g ? (ll_g = vkb_srv_replay_gfx) : (ll_c = vkb_srv_replay_comp);
+            uint32_t k = 0;
+            while (p && k < ll_np && ll_pl[k] != p) k++;
+            if (!p) k = VKB_LL_PIPES + 1; /* a VK_NULL_HANDLE bind: not named */
+            if (k == ll_np && ll_np < VKB_LL_PIPES) ll_np++;
+            if (k == VKB_LL_PIPES) k = VKB_LL_PIPES - 1;
+            if (p) {
+                for (; k > 0; k--) ll_pl[k] = ll_pl[k - 1]; /* last bound first */
+                ll_pl[0] = p;
+            }
+        }
         scratch = sub.r;
         if (sub.status != VKB_ST_OK) {
             VKB_ERR("command stream: %s failed (status %u)", vkb_cmd_names[id], sub.status);
@@ -1343,6 +1683,7 @@ void vkb_sv_vkEndCommandBuffer(vkb_srv_call *c)
         VKB_WARN("VKBRIDGE_TEST_END_FAIL: vkEndCommandBuffer failed on purpose");
     }
     if (begin_r != VK_SUCCESS) r = begin_r;
+    if (r == VK_SUCCESS) vkb_ll_cb_recorded(cb, ncmds, len, ll_draws, ll_disp, ll_copies, ll_pl, ll_np);
     if (r != VK_SUCCESS)
         VKB_ERR("command buffer %p: the driver's vkEndCommandBuffer failed (%d); submits leave it out", (void *)cb, r);
     failed_set(cb, r != VK_SUCCESS); /* recorded this time, or not */
@@ -1498,6 +1839,8 @@ static int srv_recv(vkb_srv_conn *conn, vkb_msg_hdr *h, uint8_t **payload, int *
             conn->rb = nb;
             conn->rcap = nc;
         }
+        /* idle only with nothing of a message in hand (order_wait's gap check) */
+        __atomic_store_n(&conn->phase, conn->rlen ? VKB_CONN_BUSY : VKB_CONN_IDLE, __ATOMIC_RELEASE);
         union {
             char buf[CMSG_SPACE(sizeof(int) * VKB_MAX_FDS)];
             struct cmsghdr align;
@@ -1514,6 +1857,7 @@ static int srv_recv(vkb_srv_conn *conn, vkb_msg_hdr *h, uint8_t **payload, int *
             r = recvmsg(conn->sock, &msg, MSG_CMSG_CLOEXEC);
         } while (r < 0 && errno == EINTR);
         if (r <= 0) return -1;
+        __atomic_store_n(&conn->phase, VKB_CONN_BUSY, __ATOMIC_RELEASE);
         for (struct cmsghdr *cmh = CMSG_FIRSTHDR(&msg); cmh; cmh = CMSG_NXTHDR(&msg, cmh)) {
             if (cmh->cmsg_level != SOL_SOCKET || cmh->cmsg_type != SCM_RIGHTS) continue;
             int n = (int)((cmh->cmsg_len - CMSG_LEN(0)) / sizeof(int));
@@ -1536,6 +1880,7 @@ static int srv_recv(vkb_srv_conn *conn, vkb_msg_hdr *h, uint8_t **payload, int *
  * and "driver-end" holds the driver's own End after the stream: the stall lines' replay position. */
 static int test_want = -2; /* the command id held next, VKB_CMD_COUNT for the driver's End, -1 none */
 static uint32_t test_ms;
+static int test_repeat;
 
 static void test_delay(uint32_t cmd)
 {
@@ -1547,14 +1892,22 @@ static void test_delay(uint32_t cmd)
         for (uint32_t i = 0; n && v && i < VKB_CMD_COUNT; i++)
             if (vkb_cmd_names[i] && !strcmp(vkb_cmd_names[i], n)) w = (int)i;
         test_ms = v ? (uint32_t)atoi(v) : 0;
+        /* VKBRIDGE_TEST_DELAY_REPEAT=1: every such request, not only the first (a server that is slow on every
+         * frame: host/present_path_test.sh) */
+        const char *rp = getenv("VKBRIDGE_TEST_DELAY_REPEAT");
+        test_repeat = rp && !strcmp(rp, "1");
         __atomic_store_n(&test_want, w, __ATOMIC_RELEASE);
     }
     int want = __atomic_load_n(&test_want, __ATOMIC_ACQUIRE);
     if (want < 0 || cmd != (uint32_t)want) return;
+    static int said;
+    int repeat = test_repeat;
     int expected = (int)cmd;
-    if (!__atomic_compare_exchange_n(&test_want, &expected, -1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
-    if (cmd == VKB_CMD_COUNT) VKB_INFO("test: the driver's End held %u ms (VKBRIDGE_TEST_DELAY_CMD)", test_ms);
-    else VKB_INFO("test: %s held %u ms (VKBRIDGE_TEST_DELAY_CMD)", vkb_cmd_names[cmd], test_ms);
+    if (!repeat && !__atomic_compare_exchange_n(&test_want, &expected, -1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    if (repeat && __atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) {
+        /* said once */
+    } else if (cmd == VKB_CMD_COUNT) VKB_INFO("test: the driver's End held %u ms (VKBRIDGE_TEST_DELAY_CMD)%s", test_ms, repeat ? ", every time" : "");
+    else VKB_INFO("test: %s held %u ms (VKBRIDGE_TEST_DELAY_CMD)%s", vkb_cmd_names[cmd], test_ms, repeat ? ", every time" : "");
     struct timespec ts = {test_ms / 1000, (long)(test_ms % 1000) * 1000000L};
     while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
 }
@@ -1604,7 +1957,11 @@ static void run_request(vkb_srv_conn *conn, vkb_srv_call *c, uint32_t cmd, uint3
     __atomic_store_n(&conn->running_ns, mono_now_ns(), __ATOMIC_RELAXED);
     __atomic_store_n(&conn->running, cmd + 1, __ATOMIC_RELEASE);
     test_delay(cmd);
+    vkb_srv_count_work(conn->proc, cmd);
+    uint8_t hk = vkb_hk_cmd[cmd]; /* server_heapkind.c: a create/destroy is counted, a rare kind's growth measured */
+    long hk0 = hk ? vkb_hk_begin(hk) : 0;
     vkb_srv_handlers[cmd](c);
+    if (hk) vkb_hk_end(hk, conn->proc, hk0);
     __atomic_store_n(&conn->running, 0, __ATOMIC_RELEASE);
     vkb_srv_current_cmd = NULL;
     vkb_srv_set_current_table(NULL);
@@ -1615,13 +1972,19 @@ static void run_request(vkb_srv_conn *conn, vkb_srv_call *c, uint32_t cmd, uint3
 static void async_report(const vkb_srv_call *c, uint32_t cmd)
 {
     if (c->status != VKB_ST_OK) {
+        /* a stopped lost device's refusals (run_request) are counted with its lost answers (server_lost.c) */
+        if (c->status == VKB_ST_BAD_TABLE && cmd < VKB_CMD_COUNT && c->table && c->conn && c->table->proc == c->conn->proc &&
+            vkb_lost_async(c->table, vkb_cmd_names[cmd]))
+            return;
         VKB_ERR("asynchronous %s failed (status %u)", cmd < VKB_CMD_COUNT ? vkb_cmd_names[cmd] : "?", c->status);
     } else if (cmd < VKB_CMD_COUNT && vkb_cmd_result[cmd] && c->r.len >= sizeof(int32_t)) {
         /* The client already told the app VK_SUCCESS. */
         int32_t vr;
         memcpy(&vr, c->r.buf, sizeof(vr));
-        /* only VK_SUCCESS or an error is legal for these; a positive code is the driver's bug */
-        if (vr != VK_SUCCESS) VKB_ERR("asynchronous %s returned %d", vkb_cmd_names[cmd], vr);
+        /* only VK_SUCCESS or an error is legal for these; a positive code is the driver's bug. A lost device's
+         * lost answers are counted, not one line each (a player log: 42867 lines). */
+        if (vr != VK_SUCCESS && !(vr == VK_ERROR_DEVICE_LOST && vkb_lost_async(c->table, vkb_cmd_names[cmd])))
+            VKB_ERR("asynchronous %s returned %d", vkb_cmd_names[cmd], vr);
     }
 }
 
@@ -1675,6 +2038,30 @@ typedef struct conn_state {
     int ended;         /* the connection is gone: the loop returned for good */
 } conn_state;
 
+/* VKBRIDGE_TEST_PRESENT_QUEUE_MS=<ms> (host tests, the server's environment): the swapchain's fence waits held that
+ * long in their queue phase, for the present wait split's PRESENT verdict (host/perfdiag_test.sh). */
+static int test_present_queue_ms(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_TEST_PRESENT_QUEUE_MS");
+        v = e && atoi(e) > 0 && atoi(e) < 1000 ? atoi(e) : 0;
+    }
+    return v;
+}
+
+/* VKBRIDGE_TEST_PRESENT_DRIVER_MS=<ms>: the same in the handler phase (the driver's wait, driver_ms): with the GPU's busy
+ * file unreadable, the GPU-or-latency verdict (host/perfdiag_test.sh step 12). */
+static int test_present_driver_ms(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VKBRIDGE_TEST_PRESENT_DRIVER_MS");
+        v = e && atoi(e) > 0 && atoi(e) < 1000 ? atoi(e) : 0;
+    }
+    return v;
+}
+
 static void conn_loop(void *arg)
 {
     conn_state *st = arg;
@@ -1687,14 +2074,34 @@ static void conn_loop(void *arg)
         vkb_msg_hdr h = st->h;
         tls_proc = conn->proc; /* set by its hello */
         uint64_t wait_ns = 0;
+        /* an image or buffer create (VKBRIDGE_FAST_CREATE): timed in both arms; with VKB_F_FAST_CREATE from a process told the
+         * switch is on, its order wait is left to its handler (vkb_srv_fast_create_pre) */
+        int fc_cmd = h.cmd == VKB_CMD_vkCreateImage || h.cmd == VKB_CMD_vkCreateBuffer;
+        int fc_take = fc_cmd && (h.flags & VKB_F_FAST_CREATE) && h.barrier && conn->proc &&
+                      __atomic_load_n(&conn->proc->fast_create, __ATOMIC_ACQUIRE) == 2;
+        fc_tail = h.cmd == VKB_CMD_vkCreateImage && (h.flags & VKB_F_CREATE_REQS);
+        fc_owed = 0, fc_ahead = 0, fc_wait_ns = 0;
+        uint64_t fc_t0 = fc_cmd ? mono_ns() : 0, fc_t1 = 0;
+        /* the swapchain's own wait for a frame (VKB_F_PRESENT_WAIT): its queue wait and its handler timed for the
+         * present wait split (server_perf.c); three clock reads, on the bridge's present thread's connection only */
+        int pw = (h.flags & VKB_F_PRESENT_WAIT) && conn->proc && h.cmd < VKB_CMD_COUNT;
+        uint64_t pw_t0 = pw ? mono_ns() : 0, pw_t1 = 0;
         if (conn->proc && h.cmd < VKB_CMD_COUNT && h.cmd != VKB_CMD_vkbHello) {
             uint64_t t0 = st_period ? mono_ns() : 0;
             int oms = vkb_syncfd_order_ms(h.table, h.cmd); /* server_syncfd.c: a sync-fd export's deadline */
-            if (!order_wait(conn->proc, h.barrier, h.cmd, oms)) {
+            __atomic_store_n(&conn->phase, VKB_CONN_ORDER, __ATOMIC_RELEASE);
+            if (fc_take) {
+                /* owed, for its handler to take or leave before the driver's create */
+                order_owed.p = conn->proc;
+                order_owed.barrier = h.barrier;
+                order_owed.cmd = h.cmd;
+                fc_owed = 1;
+            } else if (!order_wait(conn->proc, h.barrier, h.cmd, oms)) {
                 order_owed.p = conn->proc;
                 order_owed.barrier = h.barrier;
                 order_owed.cmd = h.cmd;
             }
+            __atomic_store_n(&conn->phase, VKB_CONN_BUSY, __ATOMIC_RELEASE);
             if (st_period) wait_ns = mono_ns() - t0;
         }
         if (h.cmd == VKB_CMD_vkbBatch && (h.flags & VKB_F_NOREPLY) && !nfds && conn->proc) {
@@ -1704,8 +2111,27 @@ static void conn_loop(void *arg)
             continue;
         }
         st->busy = 1;
+        if (pw) {
+            int qms = test_present_queue_ms();
+            if (qms) usleep((useconds_t)qms * 1000);
+            pw_t1 = mono_ns();
+            int dms = test_present_driver_ms();
+            if (dms) usleep((useconds_t)dms * 1000);
+        }
         vkb_dec_init(&st->c.d, payload, h.size, &conn->arena, st->fds, nfds);
+        if (fc_cmd) fc_t1 = mono_ns();
         run_request(conn, &st->c, h.cmd, h.table, wait_ns);
+        if (fc_cmd) {
+            fc_owed = 0, fc_tail = 0;
+            uint64_t t2 = mono_ns();
+            fc_note(h.cmd, fc_t1 - fc_t0 + fc_wait_ns, t2 - fc_t1 - fc_wait_ns, conn->proc && __atomic_load_n(&conn->proc->fast_create, __ATOMIC_RELAXED) == 2);
+        }
+        if (pw) {
+            uint64_t pw_t2 = mono_ns();
+            __atomic_add_fetch(&conn->proc->pw_order_ns, pw_t1 - pw_t0, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&conn->proc->pw_srv_ns, pw_t2 - pw_t1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&conn->proc->pw_n, 1, __ATOMIC_RELAXED);
+        }
         vkb_srv_order_finish(); /* not taken by the handler (an error before the driver's call): owed still */
         vkb_dec_close_untaken(&st->c.d);
         order_done(conn->proc, h.seq);
@@ -1788,7 +2214,9 @@ static void *conn_main(void *arg)
 {
     vkb_srv_conn *conn = arg;
     __atomic_store_n(&conn->tid, (int)syscall(SYS_gettid), __ATOMIC_RELAXED);
+    vkb_cores_conn_thread(); /* the fast cores: a game waits on this thread (server_cores.c) */
     conns_track(conn, 1);
+    tls_conn = conn;
     conn_state *st = calloc(1, sizeof(*st));
     if (st) {
         st->conn = conn;

@@ -1,16 +1,16 @@
 #!/bin/bash
-# Pixel 9, Mali-G715 r54p3, WoW Classic: the game's device was lost, the game submitted four
+# a player log (Pixel 9, Mali-G715 r54p3, WoW Classic): the game's device was lost, the game submitted four
 # more times, and the driver's own thread (mali-event-hand, in its device-fault recording) faulted;
 # the one server died with every program. server_lost.c: a lost device's submissions and waits
 # answer VK_ERROR_DEVICE_LOST without reaching the driver (the latch), and a "mali-*" driver thread
 # that faults while a device is lost is stopped instead of taking the server down (the park).
-# VKBRIDGE_TEST_LOST=3:after imitates E6ZA (lost_check's 3rd submission loses its device; every
+# VKBRIDGE_TEST_LOST=3:after imitates a player log (lost_check's 3rd submission loses its device; every
 # submission that reaches the lost device after it makes a thread named mali-event-hand fault
 # inside the driver); =3:loss makes that thread fault at the loss itself (the latch cannot help).
 #   1  latch: lost_check sees the loss and -4 after it, nothing faults, the server lives;
 #   2  another program (vkbridge-smoke) then works on the same server;
 #   3  A/B: with VKBRIDGE_LOST_LATCH=0 the imitated driver thread takes the server down, and the
-#      crash line names the thread (mali-event-hand) - E6ZA's fingerprint;
+#      crash line names the thread (mali-event-hand) - a player log's fingerprint;
 #   4  park: with the fault at the loss the thread is stopped, the server lives and says so;
 #      lost_check still ends, its device and instance are left as they are at its exit;
 #   5  another program then works on the same server;
@@ -21,12 +21,12 @@
 #      old one-answer latch every call after it answered -4 for good);
 #   9  a loss seen only through waits (=3:wait): the first lost answer is a suspicion, the next wait
 #      600 ms later confirms it and the device is latched (its device wait answers -4 without the driver);
-#  10  E6ZA's own order (=3:wait:evt): the loss is first answered by a fence wait (a suspicion only since
+#  10  a player log's own order (=3:wait:evt): the loss is first answered by a fence wait (a suspicion only since
 #      cf541d5), 51 ms later the game submits 4 times and every submission reaching the lost device makes
 #      the imitated mali-event-hand thread fault: the first submission's -4 latches the device, the other
 #      3 never reach the driver (one imitated fault), the faulting thread is stopped, the server lives;
 #  11  another program then works on the same server;
-#  12  A/B: with VKBRIDGE_LOST_PARK=0 the same order takes the server down with E6ZA's fingerprint
+#  12  A/B: with VKBRIDGE_LOST_PARK=0 the same order takes the server down with a player log's fingerprint
 #      (signal 11 at 0x101 in (no Vulkan call), thread "mali-event-hand").
 #  13  a suspicion nothing confirmed expires (=3:blip:again, test11 audit P3, ledger 166): a fence wait and its
 #      poll answer -4, nothing reaches the driver for 2.5 s, then the next fence wait and its poll answer -4
@@ -118,7 +118,7 @@ nf=$(grep -c "the imitated driver's event thread faults" "$work/evt.log")
   grep -q "vkWaitForFences answered VK_ERROR_DEVICE_LOST, and so did a poll right after: not taken as lost" "$work/evt.log" &&
   grep -q "is lost (vkQueueSubmit returned VK_ERROR_DEVICE_LOST)" "$work/evt.log" && [ "$nf" = 1 ] &&
   grep -q 'driver thread [0-9]* "mali-event-hand" faulted .* after device [0-9]* (pid [0-9]*) was lost: the thread is stopped' "$work/evt.log"
-step $? "10 E6ZA order (wait first, then 4 submissions): latched at the first submission, $nf imitated fault(s), thread stopped, server alive (lost_check: $(tail -1 "$work/evt.out")): $(grep -m1 ' is lost ' "$work/evt.log" | sed 's/.*vkbridge-server E //' | cut -c1-90)"
+step $? "10 a player log order (wait first, then 4 submissions): latched at the first submission, $nf imitated fault(s), thread stopped, server alive (lost_check: $(tail -1 "$work/evt.out")): $(grep -m1 ' is lost ' "$work/evt.log" | sed 's/.*vkbridge-server E //' | cut -c1-90)"
 client "$out/vkbridge-smoke" >"$work/evt.smoke" 2>&1
 step $? "11 another program works after it ($(tail -1 "$work/evt.smoke"))"
 stop
@@ -128,7 +128,7 @@ start evtnopark VKBRIDGE_TEST_LOST=3:wait:evt VKBRIDGE_LOST_PARK=0
 gone; dead=$?
 line=$(grep -m1 "crashed with signal" "$work/evtnopark.log")
 [ $dead = 0 ] && echo "$line" | grep -q "crashed with signal 11 (code 1, address 0x101) in (no Vulkan call)" && grep -q '  thread [0-9]* "mali-event-hand"' "$work/evtnopark.log"
-step $? "12 A/B: with VKBRIDGE_LOST_PARK=0 the E6ZA order kills the server: ${line#*E }"
+step $? "12 A/B: with VKBRIDGE_LOST_PARK=0 the a player log order kills the server: ${line#*E }"
 srv=
 
 start again VKBRIDGE_TEST_LOST=3:blip:again

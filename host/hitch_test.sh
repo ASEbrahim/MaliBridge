@@ -7,9 +7,9 @@
 #      one; the compile and the allocation have timing lines; the process's summary counts them;
 #   2  VKBRIDGE_HITCH_MS from the server's environment, a GPU queue held 400 ms with one small BC
 #      upload in it (256x256, as a Mali-G615 MC6): the conversion cannot take a fifth of the wait, so
-#      the cause is wait (bc_recent_n=1, its estimate in bc_gpu_est_ms; the summary counts it as a
+#      the cause is wait (bc_recent_n=1, its estimate in bc_gpu_est_ms and, still in flight, in bc_inflight_est_ms; the summary counts it as a
 #      wait after conversions too small to explain it) - before 2026-11-05 any texel made it bc
-#; 2b the same upload as 80 conversions' GPU work (VKBRIDGE_TEST_BC_SLOW=1,80, the
+#      (a player log); 2b the same upload as 80 conversions' GPU work (VKBRIDGE_TEST_BC_SLOW=1,80, the
 #      decoder's dispatch recorded 80 times): its estimate passes a fifth of the wait -> bc;
 #   3  on by default (2026-11-04): nothing set -> 100 ms, the slow frame's line and a frames line;
 #      VKBRIDGE_HITCH_MS=0 in <cache dir>/env: no hitch or frames line, nothing turned on; =0 in the
@@ -106,8 +106,9 @@ f=$(frame_of gatebc gatebc); c=$(cause_of "$slog" "$f"); hl=$(grep "hitch: frame
 est=$(echo "$hl" | grep -o "bc_gpu_est_ms=[0-9]*" | cut -d= -f2)
 [ $res = 0 ] && [ "$c" = wait ] && echo "$hl" | grep -qE "bc_recent_mtex=0\.[1-9]" && echo "$hl" | grep -q "bc_recent_n=1 " &&
   [ -n "$est" ] && [ "$est" -lt 20 ] && echo "$hl" | grep -qE "wait_ms=(3[5-9][0-9]|4[0-9][0-9])" &&
+  echo "$hl" | grep -qE "bc_inflight_est_ms=([1-9][0-9.]*|0\.[1-9])" &&
   grep -q "hitches over 150 ms in process [0-9]* (hitch_check): .*wait 1, .*; 1 of the waits came after BC conversions too small to explain them" "$slog"
-step $? "2 server environment HITCH_MS=150: a held queue with one small BC upload -> ${c:-none} ($(echo "$hl" | grep -o "wait_ms=[0-9]*\|bc_recent_mtex=[0-9.]*\|bc_recent_n=[0-9]*\|bc_gpu_est_ms=[0-9]*\|wait_max=[^ ]*" | tr '\n' ' '))"
+step $? "2 server environment HITCH_MS=150: a held queue with one small BC upload -> ${c:-none} ($(echo "$hl" | grep -o "wait_ms=[0-9]*\|bc_recent_mtex=[0-9.]*\|bc_recent_n=[0-9]*\|bc_gpu_est_ms=[0-9]*\|bc_inflight_est_ms=[0-9.]*\|wait_max=[^ ]*" | tr '\n' ' '))"
 [ "$c" = wait ] || dump gatebc
 
 # 2b the same with the conversion's GPU work 80 times over: its estimate passes a fifth of the wait -> bc
@@ -117,9 +118,10 @@ gone; stop
 f=$(frame_of gatebc80 gatebc); c=$(cause_of "$slog" "$f"); hl=$(grep "hitch: frame=$f " "$slog")
 est=$(echo "$hl" | grep -o "bc_gpu_est_ms=[0-9]*" | cut -d= -f2)
 w=$(echo "$hl" | grep -o " wait_ms=[0-9]*" | cut -d= -f2)
-[ $res = 0 ] && [ "$c" = bc ] && [ -n "$est" ] && [ -n "$w" ] && [ $((est * 5)) -ge "$w" ] &&
+inf=$(echo "$hl" | grep -o "bc_inflight_est_ms=[0-9.]*" | cut -d= -f2)
+[ $res = 0 ] && [ "$c" = bc ] && [ -n "$est" ] && [ -n "$w" ] && [ $((est * 5)) -ge "$w" ] && awk -v i="${inf:-0}" 'BEGIN { exit !(i > 0) }' &&
   ! grep -q "too small to explain them" "$slog"
-step $? "2b the same upload as 80 conversions' GPU work -> ${c:-none} (bc_gpu_est_ms=${est:-?} wait_ms=${w:-?})"
+step $? "2b the same upload as 80 conversions' GPU work -> ${c:-none} (bc_gpu_est_ms=${est:-?} bc_inflight_est_ms=${inf:-?} wait_ms=${w:-?})"
 [ "$c" = bc ] || dump gatebc80
 
 # 3 on by default; off by <cache dir>/env or by the guest

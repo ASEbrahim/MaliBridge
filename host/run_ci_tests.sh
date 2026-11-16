@@ -53,6 +53,10 @@ run_mode() {
     grep -q "imitating Mali's memory types" "$VKB_SERVER_LOG" && ! grep -q "lazily allocated, imitated" "$VKB_SERVER_LOG" &&
       ! grep -q "no ordinary device-local type" out/ci-smoke.log
     result $? "smoke, Mali's memory types: images in ordinary memory ($(grep -m1 -o 'first allocation in memory type [0-9]* (flags 0x[0-9a-f]*, heap [0-9]*): [0-9]* bytes, plain' "$VKB_SERVER_LOG"))"
+    # The BC small-image rule's decision logged at device creation, not first at a small BC image (smoke makes none); OFF by
+    # default since test29 (PERF, S10+ Bright Memory: +477-665 ms of re-encodes and more >=300 ms hitches, no gain); =1 turns it on
+    ! grep -v "BC small decode: " "$VKB_SERVER_LOG" | grep -q "BC upload: \|BC image" && grep -q "BC small decode: off (by default; VKBRIDGE_BC_SMALL_DECODE=1 turns it on)" "$VKB_SERVER_LOG"
+    result $? "smoke, the BC small decode line at device creation: off by default, no BC image made ($(grep -m1 -o 'up to [0-9]* MB more memory on this device\|BC small decode: off ([^)]*)' "$VKB_SERVER_LOG"))"
     # The XRing O3's memory table (xringmem), as measured on r56p0: 22 types; images
     # allow 0x1040, buffers 0x4100, shareable indirect buffers 0x1040 and staging buffers 0x3;
     # dma-heap pages only in type 14. v0.5 had one device-local type (type 6's) and one shared
@@ -100,6 +104,12 @@ run_mode() {
     # ETC2/ASTC, which lavapipe does not: it is left to the full suite.
     VKB_BC_TRANSCODE=0 . ./mali_env.sh >/dev/null
     timeout 600 ./out/bcn_check upload >out/ci-bcn-decode.log 2>&1; result $? "bcn_check, BC decoded, Zink uploads through a pixel buffer too ($(tail -1 out/ci-bcn-decode.log))"
+    # The converters' variants against each other, run as compute (any GPU): one dispatch a run of regions
+    # (VKBRIDGE_BC_ONE_DISPATCH) gives the same bytes as a dispatch a region, every 4x4 decoder and transcoder. BC7 -> ASTC fast
+    # is float code: where a driver's FMA contraction makes its bytes differ from today's variant it is judged by quality
+    # against the BC7 texels instead, and each such set is a NOTE line with the numbers (Mesa 26.0.8 lavapipe, the runner's)
+    timeout 300 ./out/bcn_check shaders >out/ci-bcn-shaders.log 2>&1
+    result $? "bcn_check shaders, converter variants byte for byte, BC7 -> ASTC fast by quality where not ($(grep -c '^PASS' out/ci-bcn-shaders.log) passed, $(grep -c '^NOTE' out/ci-bcn-shaders.log) NOTE; $(tail -1 out/ci-bcn-shaders.log))"
     # The texture cap (VKBRIDGE_TEX_MAXDIM): BC textures over 512 created without their top levels
     # (memory, every level's colour through views at each LOD, barriers, copies, textureSize); with
     # ",all" a sampled-only RGBA8 one too (clears, blits and readbacks across the cut); with
@@ -255,6 +265,10 @@ run_mode() {
     mp_test r44 # steps 1-2 need a driver with dynamic rendering at 1.2+
     timeout 300 ./dynrend_test.sh >out/ci-dynrend.log 2>&1; result $? "dynrend_test ($(tail -1 out/ci-dynrend.log))" "out/ci-dynrend.log"
     mp_test -
+    # Pass profiler (VKBRIDGE_GPU_PROF): vkd3d-style frames (fresh/freed command buffers, indirect-count draws, dispatch base) report on a timer
+    mp_test r44 # needs Vulkan 1.3 (dynamic rendering, drawIndirectCount)
+    timeout 300 ./gpuprof_report_test.sh >out/ci-gpuprof.log 2>&1; result $? "gpuprof_report_test ($(tail -1 out/ci-gpuprof.log))" "out/ci-gpuprof.log"
+    mp_test -
     # Imageless framebuffers made by the bridge (Mali r18-r26: Zink requires them); the test picks its profiles
     timeout 600 ./imageless_test.sh >out/ci-imageless.log 2>&1; result $? "imageless_test ($(tail -1 out/ci-imageless.log))" "out/ci-imageless.log"
     # The G715 r54p3's robustness2 (nullDescriptor only): both robust-access features taken off
@@ -267,22 +281,61 @@ run_mode() {
     mp_test -
     # Asynchronous pipeline compiles with a slow compiler imitated
     timeout 300 ./asyncpipe_test.sh >out/ci-asyncpipe.log 2>&1; result $? "asyncpipe_test ($(tail -1 out/ci-asyncpipe.log))" "out/ci-asyncpipe.log"
-    # A lost device stays its program's; driver faults in allocations and binds contained
+    # A lost device stays its program's (a player log); driver faults in allocations and binds contained (a player log)
     timeout 300 ./lost_test.sh >out/ci-lost.log 2>&1; result $? "lost_test ($(tail -1 out/ci-lost.log))" "out/ci-lost.log"
+    # After a loss (a player log): the lost device's pipeline cache never saved or merged, its asynchronous lost answers counted
+    timeout 300 ./losthygiene_test.sh >out/ci-losthygiene.log 2>&1; result $? "losthygiene_test ($(tail -1 out/ci-losthygiene.log))" "out/ci-losthygiene.log"
+    # What the log says at a loss (a player log): the last submissions and the driver's fault report, contained (a player log)
+    timeout 300 ./lostcause_test.sh >out/ci-lostcause.log 2>&1; result $? "lostcause_test ($(tail -1 out/ci-lostcause.log))" "out/ci-lostcause.log"
+    # The black box: the last seconds survive a killed server or a restarted phone (a player log)
+    timeout 120 ./blackbox_test.sh >out/ci-blackbox.log 2>&1; result $? "blackbox_test ($(tail -1 out/ci-blackbox.log))" "out/ci-blackbox.log"
     timeout 300 ./memfault_test.sh >out/ci-memfault.log 2>&1; result $? "memfault_test ($(tail -1 out/ci-memfault.log))" "out/ci-memfault.log"
     timeout 300 ./endcb_test.sh >out/ci-endcb.log 2>&1; result $? "endcb_test ($(tail -1 out/ci-endcb.log))" "out/ci-endcb.log"
     timeout 300 ./xfb_bind_test.sh >out/ci-xfb-bind.log 2>&1; result $? "xfb_bind_test ($(tail -1 out/ci-xfb-bind.log))" "out/ci-xfb-bind.log"
-    # One guard around a connection's driver calls (No Man's Sky's draw fault's submit fault) and the
+    # One guard around a connection's driver calls (No Man's Sky's draw fault, a player log's submit fault) and the
     # capability check before the driver (ULTRAKILL / No Man's Sky: a clip distance built-in Mali's compiler died on)
     timeout 300 ./reqguard_test.sh >out/ci-reqguard.log 2>&1; result $? "reqguard_test ($(tail -1 out/ci-reqguard.log))" "out/ci-reqguard.log"
     timeout 60 ./out/capgate_unit ../tests/corpus >out/ci-capgate-unit.log 2>&1; result $? "capgate_unit ($(tail -1 out/ci-capgate-unit.log))" "out/ci-capgate-unit.log"
+    # The server's hot threads stay where the system puts them unless VKBRIDGE_HOT_CORES=1 (S10+ Portal in-game -8% with them placed)
+    timeout 60 ./out/cores_unit >out/ci-cores-unit.log 2>&1; result $? "cores_unit ($(tail -1 out/ci-cores-unit.log))" "out/ci-cores-unit.log"
+    # The per-thread CPU evidence of the perf diagnostics (cpu-threads line), the client's async-send timer, and the format
+    # properties asked once each while emulated formats are described
+    timeout 60 ./out/cpuprof_unit >out/ci-cpuprof-unit.log 2>&1; result $? "cpuprof_unit ($(tail -1 out/ci-cpuprof-unit.log))" "out/ci-cpuprof-unit.log"
+    timeout 120 ./asynctimer_test.sh >out/ci-asynctimer.log 2>&1; result $? "asynctimer_test ($(tail -1 out/ci-asynctimer.log))" "out/ci-asynctimer.log"
+    timeout 300 ./fmtcache_test.sh >out/ci-fmtcache.log 2>&1; result $? "fmtcache_test ($(tail -1 out/ci-fmtcache.log))" "out/ci-fmtcache.log"
+    # The background startup probes at the lowest CPU priority (read back), starved ones run again, real hangs still hangs
+    timeout 300 ./probe_prio_test.sh >out/ci-probe-prio.log 2>&1; result $? "probe_prio_test ($(tail -1 out/ci-probe-prio.log))" "out/ci-probe-prio.log"
     timeout 300 ./capgate_test.sh >out/ci-capgate.log 2>&1; result $? "capgate_test ($(tail -1 out/ci-capgate.log))" "out/ci-capgate.log"
-    # What a process gone without destroying its device leaves in the server: destroyed, the heap flat
+    # What a process gone without destroying its device leaves in the server (a player log): destroyed, the heap flat
     timeout 300 ./exitheap_test.sh >out/ci-exitheap.log 2>&1; result $? "exitheap_test ($(tail -1 out/ci-exitheap.log))" "out/ci-exitheap.log"
+    # A device ended with render objects alive on a PowerVR-like driver that blocks on it (a player log): the next device still made
+    timeout 300 ./pvrdestroy_test.sh >out/ci-pvrdestroy.log 2>&1; result $? "pvrdestroy_test ($(tail -1 out/ci-pvrdestroy.log))" "out/ci-pvrdestroy.log"
+    # The present path under a fake gamescope (memfd stand-ins for gralloc: lavapipe exports no dma-bufs here):
+    # VKBRIDGE_PRESENT_RELEASE_THREAD, VKBRIDGE_ASYNC_ACQUIRE, frame order and pixels, recreate, destroy, lost
+    # r44: its emulated GPU is a timeline semaphore (Vulkan 1.2), and the game's frame-fence waits are answered by the
+    # sync mirror as on the G925 (a player log); under the 1.1 common profile each one drains the server's queue first
+    mp_test r44
+    timeout 600 ./present_path_test.sh >out/ci-ppath.log 2>&1; result $? "present_path_test ($(tail -1 out/ci-ppath.log))" "out/ci-ppath.log"
+    # The swapchain's Wayland globals' first events taken in whatever roundtrip they come (wl_shm; dma-bufs from the
+    # memfd stand-ins): present_path's recreate flake (an old swapchain's thread reading the connection meanwhile).
+    # r44: present_late_check's held frame is a timeline semaphore (Vulkan 1.2)
+    timeout 300 ./wlbind_test.sh >out/ci-wlbind.log 2>&1; result $? "wlbind_test ($(tail -1 out/ci-wlbind.log))" "out/ci-wlbind.log"
+    # The frame pacer (VKBRIDGE_PACER=1): a DXVK-shaped game, GPU-bound: queue cut to ~1 frame at the same fps; CPU-bound: never engaged.
+    # r44: the emulated GPU is a timeline semaphore
+    timeout 300 ./pacer_test.sh >out/ci-pacer.log 2>&1; result $? "pacer_test ($(tail -1 out/ci-pacer.log))" "out/ci-pacer.log"
+    mp_test -
+    # What the stuck-pipelines list keeps between runs (server_guard.c): a compile the watchdog cut off that would have
+    # finished gets the real pipeline back in the next run, a hang stays recorded (a player log's follow-up, row 230)
+    timeout 300 ./stuck_retry_test.sh >out/ci-stuck.log 2>&1; result $? "stuck_retry_test ($(tail -1 out/ci-stuck.log))" "out/ci-stuck.log"
     # the wire primitives (inline encoder/decoder fields) against a byte-wise model; no driver
     timeout 300 ./out/wire_check >out/ci-wire.log 2>&1; result $? "wire_check ($(tail -1 out/ci-wire.log))" "out/ci-wire.log"
+    # Always-on perf diagnostics: perf/perf-threads lines, every verdict, the present split, the report section, the cost
+    timeout 600 ./perfdiag_test.sh >out/ci-perfdiag.log 2>&1; result $? "perfdiag_test ($(tail -1 out/ci-perfdiag.log))" "out/ci-perfdiag.log"
     # The bridge's VK_EXT_memory_budget where the driver has none (every Mali): its values per MemAvailable
     timeout 300 ./membudget_test.sh >out/ci-membudget.log 2>&1; result $? "membudget_test ($(tail -1 out/ci-membudget.log))" "out/ci-membudget.log"
+    # The bridge's VK_EXT_image_drm_format_modifier (LINEAR only) where the driver has dma-buf memory and no extension (Mali-G720
+    # r49p1, Xiaomi 17T: Steam's window never showed, a player log); lavapipe is such a driver
+    timeout 300 ./drmmod_test.sh >out/ci-drmmod.log 2>&1; result $? "drmmod_test ($(tail -1 out/ci-drmmod.log))" "out/ci-drmmod.log"
   fi
 }
 # The KHR-only divisor drivers (host/run_tests.sh has them) are left out: they need a driver whose

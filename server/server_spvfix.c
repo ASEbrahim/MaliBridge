@@ -33,6 +33,9 @@
  * of each workgroup (spirv_wgzero.h): Mali's own initialization of them cost Crash Bandicoot 4's
  * DXVK 3.x compute shaders 69 of 186 ms of GPU time a frame. On for ARM GPUs; VKBRIDGE_WG_ZERO=1/0
  * forces it.
+ * It runs after wg_init (spirv_wginit.h), which spreads the zeroing over the invocations, and takes
+ * only the modules wg_init leaves (a workgroup size from specialization constants, arrays too large to
+ * unroll, more than 32 variables).
  *
  * And, with its own switch: an optimization barrier after every left shift by a constant
  * (spirv_shlbarrier.c, Lee Gao's MaliOptimizationBarrierPass): Mali's compiler folds such a shift
@@ -135,6 +138,9 @@ typedef struct vkb_spvfix {
     unsigned shared_limit, hw_subgroup;    /* maxComputeSharedMemorySize, the GPU's subgroup size */
     unsigned long w32_seen, w32_fixed, w32_adapts, w32_anysize, w32_modules, w32_ops, w32_barriers, w32_left;
     char *shm_only, *shm_skip;             /* VKBRIDGE_SHARED_BARRIER_ONLY / _SKIP: app hashes (or their first hex digits) */
+    int shm_only_lock;                     /* "lockstep" in VKBRIDGE_SHARED_BARRIER_ONLY: also every module the lockstep rewrite
+                                            * takes (named by its code's shape, not its hash: another DXVK build gives the same
+                                            * shader another hash; RE3 on Proton Experimental vs DroidDeck-Proton, 11-14) */
     char *shm_lockstep;                    /* VKBRIDGE_SHARED_BARRIER_LOCKSTEP: app hashes whose strided loops get a uniform
                                               trip count first (spirv_lockstep.h), or "all" */
     unsigned long shm_lock_modules, shm_lock_loops;
@@ -373,7 +379,8 @@ static uint32_t *wg_init(vkb_spvfix *f, const uint32_t *code, size_t size, size_
     const char *why = NULL;
     int r = vkb_spv_wg_init(code, size, &out, out_size, &st, &why);
     if (r < 0) {
-        VKB_ONCE(VKB_LOG_WARN, "SPIR-V fix: wg_init: a module's workgroup initializers left as they are (%s)", why);
+        VKB_ONCE(VKB_LOG_WARN, "SPIR-V fix: wg_init: a module's workgroup initializers left as they are (%s)%s", why,
+                 f->wgzero ? "; wg_zero takes it" : "");
         return NULL;
     }
     if (r == 0) return NULL;
@@ -499,7 +506,8 @@ static uint32_t *shm_barrier(vkb_spvfix *f, const uint32_t *code, size_t size, s
     if (f->shm_only || f->shm_skip) {
         /* only some modules (by app hash): the others keep their code, and their stats say 0 */
         uint64_t h = vkb_spv_app_hash(code, size);
-        if ((f->shm_only && !hash_listed(f->shm_only, h)) || (f->shm_skip && hash_listed(f->shm_skip, h))) {
+        int listed = f->shm_only && (hash_listed(f->shm_only, h) || (f->shm_only_lock && nloops));
+        if ((f->shm_only && !listed) || (f->shm_skip && hash_listed(f->shm_skip, h))) {
             __atomic_add_fetch(&f->shm_filtered, 1, __ATOMIC_RELAXED);
             free(out);
             *r = 0;
@@ -552,8 +560,8 @@ static uint32_t *wave32(vkb_spvfix *f, const uint32_t *code, size_t size, const 
     return out;
 }
 
-/* The rewrites of one module's code (wg_zero, per-vertex blocks when pervertex, then shl_barrier, then
- * shm_barrier, then wave32): new
+/* The rewrites of one module's code (per-vertex blocks when pervertex, then wg_init, then wg_zero, then
+ * shl_barrier, then shm_barrier, then wave32): new
  * code (malloc'd) or NULL when nothing changes. shl_barrier's output is named by the code it came
  * from (vkb_errata_spv_origin); the per-vertex rewrite's keeps its own name, as before. */
 static uint32_t *rewrite(vkb_spvfix *f, const uint32_t *code, size_t size, int pervertex, size_t *out_size)
@@ -561,17 +569,19 @@ static uint32_t *rewrite(vkb_spvfix *f, const uint32_t *code, size_t size, int p
     size_t s1 = 0, s2 = 0;
     uint32_t *c1 = subst_code(f, code, size, &s1), *c2;
     if (c1) vkb_errata_spv_origin(c1, s1, code, size);
-    if ((c2 = wg_zero(f, c1 ? c1 : code, c1 ? s1 : size, &s2))) {
-        vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
-        free(c1);
-        c1 = c2, s1 = s2;
-    }
     if (f->fixes && pervertex && (c2 = wrap_pervertex(c1 ? c1 : code, c1 ? s1 : size, &s2))) {
         free(c1);
         c1 = c2, s1 = s2;
     }
     c2 = wg_init(f, c1 ? c1 : code, c1 ? s1 : size, &s2);
     if (c2) {
+        vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
+        free(c1);
+        c1 = c2, s1 = s2;
+    }
+    /* wg_zero after wg_init: what wg_init spread over the invocations has no initializer left, so wg_zero
+     * takes only the modules wg_init declined (spec-constant workgroup sizes, very large arrays, ...) */
+    if ((c2 = wg_zero(f, c1 ? c1 : code, c1 ? s1 : size, &s2))) {
         vkb_errata_spv_origin(c2, s2, c1 ? c1 : code, c1 ? s1 : size);
         free(c1);
         c1 = c2, s1 = s2;
@@ -632,7 +642,7 @@ static void rewrite_stage(vkb_spvfix *f, const VkPipelineShaderStageCreateInfo *
 {
     int pervertex = (st->stage & (VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) != 0;
-    if (!f->shl && !f->shm && !f->wave32 && !f->subst && !f->wgzero && !(f->fixes && pervertex)) return;
+    if (!f->shl && !f->shm && !f->wave32 && !f->subst && !f->wginit && !f->wgzero && !(f->fixes && pervertex)) return;
     for (VkBaseInStructure *b = (VkBaseInStructure *)st->pNext; b; b = (VkBaseInStructure *)b->pNext) {
         if (b->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) continue;
         VkShaderModuleCreateInfo *mi = (VkShaderModuleCreateInfo *)b;
@@ -899,26 +909,69 @@ void vkb_spvfix_compute_failed(vkb_srv_table *t, uint32_t n, const VkComputePipe
  * whose layout holds immutable YCbCr samplers, as the Xclipse 960 (VK_ERROR_UNKNOWN, after its
  * compiler has run). Installed beneath every layer, before the crash guard, so the bridge's
  * report and logs see it as a driver failure; the count is the one the layouts reached the
- * driver with (after the swap). */
+ * driver with (after the swap).
+ * VKBRIDGE_FAKE_MISSING=ycbcrcache: PowerVR's form of it, as the Pixel 10 Pro XL's DXT 25.1@6794074
+ * did (a player log, sessions 04-07): refused (VK_ERROR_UNKNOWN) with an empty pipeline cache, but with a
+ * cache made from saved data the build faults (NULL+0x930, vulkan.powervr.so+0x88704), and the lock
+ * that build held stays held: every later compute pipeline with that cache spins until the compile
+ * watchdog cuts it off (gamescope's composite pipelines, a black screen at every second start). */
+#define FAKE_Y_LOADED 32
 static struct {
     VkDevice device;
     vkb_srv_table *t;
     PFN_vkCreateComputePipelines next;
+    PFN_vkCreatePipelineCache next_cache;
+    int pvr;                                 /* ycbcrcache */
+    VkPipelineCache loaded[FAKE_Y_LOADED];   /* caches made from saved data (ycbcrcache) */
+    unsigned nloaded;
+    VkPipelineCache wedged;                  /* the cache the faulted build held (ycbcrcache) */
 } fake_y[16];
+
+static int fake_slot(VkDevice device)
+{
+    for (int i = 0; i < 16; i++)
+        if (__atomic_load_n(&fake_y[i].device, __ATOMIC_ACQUIRE) == device) return i;
+    return 0;
+}
+
+static int fake_loaded(int s, VkPipelineCache c)
+{
+    unsigned n = __atomic_load_n(&fake_y[s].nloaded, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; c && i < n && i < FAKE_Y_LOADED; i++)
+        if (__atomic_load_n(&fake_y[s].loaded[i], __ATOMIC_RELAXED) == c) return 1;
+    return 0;
+}
+
+static VkResult VKAPI_CALL fake_CreatePipelineCache(VkDevice device, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *a,
+                                                    VkPipelineCache *out)
+{
+    int s = fake_slot(device);
+    VkResult r = fake_y[s].next_cache(device, ci, a, out);
+    if (r == VK_SUCCESS && ci->initialDataSize) {
+        unsigned k = __atomic_fetch_add(&fake_y[s].nloaded, 1, __ATOMIC_ACQ_REL);
+        if (k < FAKE_Y_LOADED) __atomic_store_n(&fake_y[s].loaded[k], *out, __ATOMIC_RELEASE);
+    }
+    return r;
+}
 
 static VkResult VKAPI_CALL fake_CreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
                                                       const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a,
                                                       VkPipeline *out)
 {
-    int s = 0;
-    for (int i = 0; i < 16; i++)
-        if (__atomic_load_n(&fake_y[i].device, __ATOMIC_ACQUIRE) == device) {
-            s = i;
-            break;
-        }
+    int s = fake_slot(device);
     VkResult r = VK_SUCCESS;
     for (uint32_t i = 0; i < n; i++) {
+        if (fake_y[s].pvr && cache && cache == __atomic_load_n(&fake_y[s].wedged, __ATOMIC_ACQUIRE)) {
+            /* the lock the faulted build held: spins until the compile watchdog jumps out */
+            for (volatile unsigned long k = 0;; k++) {
+            }
+        }
         if (layout_ycbcr(fake_y[s].t, ci[i].layout)) {
+            if (fake_y[s].pvr && fake_loaded(s, cache)) {
+                __atomic_store_n(&fake_y[s].wedged, cache, __ATOMIC_RELEASE);
+                volatile uintptr_t at = 0x930; /* through a variable: no array-bounds warning on a constant address */
+                *(volatile int *)at = 1;       /* PowerVR's fault, inside the guarded call */
+            }
             out[i] = VK_NULL_HANDLE;
             r = VK_ERROR_UNKNOWN;
             continue;
@@ -932,16 +985,26 @@ static VkResult VKAPI_CALL fake_CreateComputePipelines(VkDevice device, VkPipeli
 
 void vkb_spvfix_fake_init(vkb_srv_table *t)
 {
-    if (!vkb_emu_faked("ycbcrcompute") || !t->real.vkCreateComputePipelines) return;
+    int pvr = vkb_emu_faked("ycbcrcache");
+    if (!(pvr || vkb_emu_faked("ycbcrcompute")) || !t->real.vkCreateComputePipelines || (pvr && !t->real.vkCreatePipelineCache)) return;
     for (int i = 0; i < 16; i++)
         if (!fake_y[i].device || fake_y[i].device == t->device) {
             fake_y[i].t = t;
             fake_y[i].next = t->real.vkCreateComputePipelines;
+            fake_y[i].pvr = pvr;
+            fake_y[i].nloaded = 0;
+            fake_y[i].wedged = VK_NULL_HANDLE;
+            if (pvr) {
+                fake_y[i].next_cache = t->real.vkCreatePipelineCache;
+                if (t->dt.vkCreatePipelineCache == t->real.vkCreatePipelineCache) t->dt.vkCreatePipelineCache = fake_CreatePipelineCache;
+                t->real.vkCreatePipelineCache = fake_CreatePipelineCache;
+            }
             __atomic_store_n(&fake_y[i].device, t->device, __ATOMIC_RELEASE);
             if (t->dt.vkCreateComputePipelines == t->real.vkCreateComputePipelines) t->dt.vkCreateComputePipelines = fake_CreateComputePipelines;
             t->real.vkCreateComputePipelines = fake_CreateComputePipelines;
-            VKB_INFO("device %u: imitating a driver that cannot build compute pipelines with immutable YCbCr samplers "
-                     "(VKBRIDGE_FAKE_MISSING=ycbcrcompute)", t->id);
+            VKB_INFO("device %u: imitating a driver that cannot build compute pipelines with immutable YCbCr samplers%s "
+                     "(VKBRIDGE_FAKE_MISSING=%s)", t->id, pvr ? ", and faults building one with a reloaded pipeline cache (PowerVR)" : "",
+                     pvr ? "ycbcrcache" : "ycbcrcompute");
             return;
         }
 }
@@ -1010,6 +1073,14 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     f->shared_limit = p.limits.maxComputeSharedMemorySize;
     f->hw_subgroup = sgp.subgroupSize;
     f->shm_only = shm && only_env && *only_env ? strdup(only_env) : NULL;
+    if (f->shm_only) {
+        for (const char *q = f->shm_only; *q;) {
+            while (*q == ',' || *q == ' ') q++;
+            size_t n = strcspn(q, ", ");
+            if (n == 8 && !strncasecmp(q, "lockstep", 8)) f->shm_only_lock = 1;
+            q += n;
+        }
+    }
     f->shm_skip = shm && skip_env && *skip_env ? strdup(skip_env) : NULL;
     const char *lock_env = vkb_srv_env("VKBRIDGE_SHARED_BARRIER_LOCKSTEP");
     f->shm_lockstep = shm >= 2 && lock_env && *lock_env && strcmp(lock_env, "0") ? strdup(lock_env) : NULL;
@@ -1038,14 +1109,19 @@ void vkb_spvfix_device_init(vkb_srv_table *t)
     dt->vkDestroyPipelineLayout = fx_DestroyPipelineLayout;
     t->spvfix = f;
     if (!spv && !ycs && !(yc_env && *yc_env)) return; /* only counting: nothing to say */
-    VKB_INFO("device %u: Mali SPIR-V fixes %s, YCbCr compute samplers %s%s, wg_zero %s%s, shl_barrier %s%s%s", t->id,
-             on ? "on" : "off", ycs ? "swapped" : "kept", yc_env && *yc_env ? " (VKBRIDGE_YCBCR_SWAP)" : "", wgz ? "on" : "off",
-             wgz_env && *wgz_env ? " (VKBRIDGE_WG_ZERO)" : "", shl ? "on" : "off", shl_env && *shl_env ? " (VKBRIDGE_SHL_BARRIER)" : "", shm == 2   ? ", shm_barrier on, level 2 (VKBRIDGE_SHARED_BARRIER)"
+    /* wg_zero last: the line up to shm_barrier reads as it did before PR #36 (tests and log readers match it) */
+    VKB_INFO("device %u: Mali SPIR-V fixes %s, YCbCr compute samplers %s%s, shl_barrier %s%s%s, wg_zero %s%s", t->id,
+             on ? "on" : "off", ycs ? "swapped" : "kept", yc_env && *yc_env ? " (VKBRIDGE_YCBCR_SWAP)" : "", shl ? "on" : "off",
+             shl_env && *shl_env ? " (VKBRIDGE_SHL_BARRIER)" : "", shm == 2   ? ", shm_barrier on, level 2 (VKBRIDGE_SHARED_BARRIER)"
              : shm ? ", shm_barrier on (VKBRIDGE_SHARED_BARRIER)"
-                   : "");
+                   : "", wgz ? "on" : "off", wgz_env && *wgz_env ? " (VKBRIDGE_WG_ZERO)" : "");
     if (f->shm_only || f->shm_skip)
-        VKB_INFO("device %u: shm_barrier only for %s%s%s%s", t->id, f->shm_only ? "VKBRIDGE_SHARED_BARRIER_ONLY=" : "",
-                 f->shm_only ? f->shm_only : "", f->shm_skip ? ", not for VKBRIDGE_SHARED_BARRIER_SKIP=" : "", f->shm_skip ? f->shm_skip : "");
+        VKB_INFO("device %u: shm_barrier only for %s%s%s%s%s", t->id, f->shm_only ? "VKBRIDGE_SHARED_BARRIER_ONLY=" : "",
+                 f->shm_only ? f->shm_only : "",
+                 f->shm_only_lock ? (f->shm_lockstep ? " (lockstep: the modules the lockstep rewrite takes)"
+                                                     : " (lockstep: none, VKBRIDGE_SHARED_BARRIER_LOCKSTEP is off)")
+                                  : "",
+                 f->shm_skip ? ", not for VKBRIDGE_SHARED_BARRIER_SKIP=" : "", f->shm_skip ? f->shm_skip : "");
     if (f->shm_lockstep) VKB_INFO("device %u: shm_barrier lockstep loops for VKBRIDGE_SHARED_BARRIER_LOCKSTEP=%s", t->id, f->shm_lockstep);
     if (subst) VKB_INFO("device %u: SPIR-V subst on (VKBRIDGE_SPIRV_SUBST): modules named in spv-subst/ replaced", t->id);
     if (w32)

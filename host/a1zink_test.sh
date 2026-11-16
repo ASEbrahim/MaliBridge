@@ -1,5 +1,25 @@
 #!/bin/bash
-# server_emu.c's extended dynamic state hiding and render-pass emulation per driver version and client, a server per step.
+# The Steam-mode black screen's fix (server_emu.c a1_decide/#15) on the desktop driver,
+# taken as Arm's (VKBRIDGE_FAKE_DRIVER_VERSION), a server of its own for each step:
+#   1  r38p1 job manager: one "a1:" line, VK_EXT_extended_dynamic_state not listed (its 2 and 3 are),
+#      VK_KHR_dynamic_rendering listed once, dynrend_check passes through the render-pass emulation;
+#   2  the same with VKBRIDGE_A1_ZINK=0: no line, VK_EXT_extended_dynamic_state listed;
+#   3  r40p0 job manager (the RG556): on;
+#   4  r44p1 (CSF, our tablets): off;
+#   5  r38p1 beta on a job manager GPU taken as a Vulkan 1.1 driver (Galaxy S10 / Note10+ phones, G76
+#      r38p1-01bet0, Vulkan 1.1 to apps, the extension offered): on (the cap there: apicap_test step 5b);
+#   6  r54p1 on a job manager GPU (a player log's Redmi G57 MC2, Big Picture shown without the fix): off;
+#   7  r38p0 on a job manager GPU at Vulkan 1.1 without the extension (the Galaxy S21, Big Picture shown):
+#      off (the extension hidden from the server with VKBRIDGE_SERVER_HIDE_EXTS stands in for its driver);
+#   8  unknown release (no version in driverInfo) on a job manager GPU: on;
+#   9  r38p1 on a CSF GPU (Dimensity 9200's Immortalis-G715, a player log): on, the line says CSF,
+#      dynrend_check passes through the render-pass emulation;
+#  10  r43p0 on a CSF GPU: on; unknown release on a CSF GPU: off.
+#  11  r38p1 job manager, a game's process (not Zink, not one of Steam mode's): the line is there, but it keeps
+#      VK_EXT_extended_dynamic_state and the driver's VK_KHR_dynamic_rendering, its device has no render-pass
+#      emulation and dynrend_check passes on the driver's; VKBRIDGE_A1_ZINK=1 gives it the fix too.
+# Steps 1-10 list and draw as "steam" and "Xwayland" (links to the tools), the processes the fix is for.
+# Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
 work=$(mktemp -d)
@@ -79,7 +99,7 @@ start VKBRIDGE_FAKE_DRIVER_VERSION=r54p1:jm
 exts
 stop
 [ "$(line)" = 0 ] && has VK_EXT_extended_dynamic_state && ! grep -q "dynamic rendering emulated on device" "$log"
-step $? "r54p1 job manager (Redmi G57): off"
+step $? "r54p1 job manager (a player log's Redmi G57): off"
 # 7
 start VKBRIDGE_FAKE_DRIVER_VERSION=r38p0:jm VKBRIDGE_FAKE_API=1.1 VKBRIDGE_SERVER_HIDE_EXTS=VK_EXT_extended_dynamic_state
 exts

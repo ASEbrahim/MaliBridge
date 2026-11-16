@@ -6,7 +6,8 @@
 #      r54p3, a job manager GPU, an Arm driver whose version cannot be read; clamp_zero (MK-32) on
 #      r49p1 only for a beta build and only in safe mode, on r51p0, off from r52p0; cull_nontri
 #      (MK-16) always in safe mode, below r52 in performance mode; dedicated_import (MK-39) below
-#      r54p1 and for an unknown version; stencil_layout (MK-11) r41p0-r54p0; dyn_reemit (MK-04) below r44p1 in performance mode;
+#      r54p1 and for an unknown version; stencil_layout (MK-11) r41p0-r54p0; split_varying (MK-47) on every Arm driver; import_serial (MK-48) r44p1 on a Mali-G615 MC6 only; dyn_reemit (MK-04) below r44p1 in performance mode, in safe mode also where its probe has not passed
+#      (off outside every range once it has), the EDS3 states only on r48-r53 CSF;
 #   2  probe-driven ones (VKBRIDGE_ERRATA_PROBE): a failed probe turns its erratum on, a probe that
 #      only records does not;
 #   3  VKBRIDGE_ERRATA=+name,-name forces, an unknown name is warned about; a later device with
@@ -56,63 +57,90 @@ on_set() { echo "$new" | grep -o 'errata: device .*: on [^;]*' | tail -1 | sed '
 
 start
 # 1 the version matrix
-matrix() { # mode version expected
-  device "VKBRIDGE_MODE=$1" "VKBRIDGE_FAKE_DRIVER_VERSION=$2"
+matrix() { # mode version expected [dyn_state probe: pass (default), fail, none]
+  device "VKBRIDGE_MODE=$1" "VKBRIDGE_FAKE_DRIVER_VERSION=$2" "VKBRIDGE_ERRATA_PROBE=dyn_state:${4:-pass}"
   local got; got=$(on_set)
   [ "$got" = "$3" ]
-  step $? "$1 mode, $2: $got$([ "$got" = "$3" ] || echo " (want $3)")"
+  step $? "$1 mode, $2${4:+ (dyn_state $4)}: $got$([ "$got" = "$3" ] || echo " (want $3)")"
 }
-matrix safe r44p1 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix safe v1.r49p1-03bet0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
+matrix safe r44p1 wait_retry,bitwise_scalar,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe v1.r49p1-03bet0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
 echo "$new" | grep -q "driver r49p1 beta (VKBRIDGE_FAKE_DRIVER_VERSION \"v1.r49p1-03bet0\")" &&
   echo "$new" | grep -q "errata: view_quarantine ON (always; safe mode[;)]" &&
   echo "$new" | grep -q "errata: clamp_zero ON (r49p1 in r49p1-r49p1 (a beta build: Arm's fix in r49p1 not confirmed for it); safe mode) - MK-32"
 step $? "the beta driverInfo string decoded, the reasons logged ($(echo "$new" | grep -o 'errata: view_quarantine ON.*'); $(echo "$new" | grep -o 'errata: clamp_zero ON.*' | cut -c1-60)...)"
-matrix safe v1.r49p1-01eac0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix safe r51p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix safe r52p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix safe r54p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix safe r54p2 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri
-matrix safe r54p3 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri
-matrix performance r44p1 wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r44p0 wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r36p0 wait_retry,dyn_reemit,vb_split,view_counts,cull_nontri,dedicated_import
-matrix performance v1.r49p1-03bet0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout
-matrix performance r52p0 wait_retry,dyn_reemit,vb_split,view_counts,dedicated_import,stencil_layout
-matrix performance r54p2 wait_retry,vb_split,view_counts
-matrix performance r54p3 wait_retry,vb_split,view_counts
-matrix performance r46p0:jm wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r46p0:csf wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix performance r50p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
-matrix safe not-a-version wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout
+matrix safe v1.r49p1-01eac0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r51p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r52p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r54p0 wait_retry,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r54p2 wait_retry,vb_split,view_quarantine,view_counts,cull_nontri,split_varying
+matrix safe r54p3 wait_retry,vb_split,view_quarantine,view_counts,cull_nontri,split_varying
+matrix performance r44p1 wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r44p0 wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r36p0 wait_retry,dyn_reemit,vb_split,view_counts,cull_nontri,dedicated_import,split_varying
+matrix performance v1.r49p1-03bet0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r52p0 wait_retry,dyn_reemit,vb_split,view_counts,dedicated_import,stencil_layout,split_varying
+matrix performance r54p2 wait_retry,vb_split,view_counts,split_varying
+matrix performance r54p3 wait_retry,vb_split,view_counts,split_varying
+matrix performance r46p0:jm wait_retry,dyn_reemit,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r46p0:csf wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance r50p0 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe not-a-version wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+# dyn_reemit in safe mode (2026-11-06): off only outside every range with its probe passed
+matrix safe r44p1 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying none
+matrix safe r54p3 wait_retry,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,split_varying fail
+matrix safe r44p0 wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r46p0:jm wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r46p0:csf wait_retry,bitwise_scalar,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe r56p0 wait_retry,vb_split,view_quarantine,view_counts,cull_nontri,split_varying
+# import_serial (MK-48): a player's Mali-G615 MC6 on r44p1 only (VKBRIDGE_FAKE_DRIVER_VERSION=<version>@<deviceName>: the GPU name the gates see);
+# the same r44p1 on the S10+'s G720, the G615 MC2 phones and r44p0 stay off
+matrix safe "r44p1@Mali-G615 MC6" wait_retry,bitwise_scalar,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying,import_serial
+matrix performance "r44p1@Mali-G615 MC6" wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying,import_serial
+matrix safe "r44p1@Mali-G615 MC2" wait_retry,bitwise_scalar,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe "r44p1@Mali-G720-Immortalis MC12" wait_retry,bitwise_scalar,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix performance "r44p1@Mali-G720-Immortalis MC12" wait_retry,vb_split,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe "r44p0@Mali-G615 MC6" wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying
+matrix safe "r49p1@Mali-G615 MC6" wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,view_counts,cull_nontri,dedicated_import,stencil_layout,split_varying
+device VKBRIDGE_MODE=safe VKBRIDGE_ERRATA=+example VKBRIDGE_FAKE_DRIVER_VERSION=v1.r49p1-03bet0 VKBRIDGE_ERRATA_PROBE=dyn_state:pass
+a=$(echo "$new" | grep -o 'errata: dyn_reemit ON.*')
+device VKBRIDGE_MODE=performance VKBRIDGE_ERRATA=+example VKBRIDGE_FAKE_DRIVER_VERSION=r51p0
+b=$(echo "$new" | grep -o 'errata: dyn_reemit ON.*')
+device VKBRIDGE_MODE=safe VKBRIDGE_ERRATA=+example VKBRIDGE_FAKE_DRIVER_VERSION=r49p1:jm VKBRIDGE_ERRATA_PROBE=dyn_state:pass
+c=$(echo "$new" | grep -o 'errata: dyn_reemit ON.*')
+device VKBRIDGE_MODE=safe VKBRIDGE_ERRATA=+example VKBRIDGE_FAKE_DRIVER_VERSION=r38p1 VKBRIDGE_ERRATA_PROBE=dyn_state:pass
+d=$(echo "$new" | grep -o 'errata: dyn_reemit ON.*')
+echo "$a" | grep -q "the EDS3 states only; safe mode" && echo "$b" | grep -q "the EDS3 states only; performance mode" &&
+  [ -n "$c" ] && ! echo "$c" | grep -q "EDS3 states only" && [ -n "$d" ] && ! echo "$d" | grep -q "EDS3 states only"
+step $? "dyn_reemit's part: EDS3 states only on r48-r53 CSF (\"$(echo "$a" | cut -c1-110)\"), the whole fix on r49p1:jm and r38p1"
 
 # 2 probes
 device VKBRIDGE_MODE=performance VKBRIDGE_FAKE_DRIVER_VERSION=r54p3 VKBRIDGE_ERRATA_PROBE=viewport_flip:fail,bitwise_vec:fail,rendering_churn:fail,dyn_state:pass
 got=$(on_set)
-[ "$got" = wait_retry,viewport_flip,bitwise_scalar,vb_split,view_counts ] && echo "$new" | grep -q "errata: viewport_flip ON (probe viewport_flip failed; performance mode"
+[ "$got" = wait_retry,viewport_flip,bitwise_scalar,vb_split,view_counts,split_varying ] && echo "$new" | grep -q "errata: viewport_flip ON (probe viewport_flip failed; performance mode"
 step $? "failed probes turn on viewport_flip and bitwise_scalar, the record-only rendering_churn does not: $got"
 
 # 3 switches
-device VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts,no_such_erratum
+device VKBRIDGE_ERRATA_PROBE=dyn_state:none VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts,no_such_erratum
 got=$(on_set)
-[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,clamp_zero,cull_nontri,dedicated_import,stencil_layout,example ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
+[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying,example ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
   echo "$new" | grep -q "no erratum named no_such_erratum" && echo "$new" | grep -q "errata: example ON (VKBRIDGE_ERRATA=+example)"
 step $? "VKBRIDGE_ERRATA=+example,-view_counts: $got; the unknown name warned about"
 # the same decisions again: one short line, not the reasons again; another mode: in full again
 first=$(echo "$new" | grep -o 'errata: device [0-9]*,' | tail -1 | grep -o '[0-9]*')
-device VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts
+device VKBRIDGE_ERRATA_PROBE=dyn_state:none VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts
 got=$(on_set)
-[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,clamp_zero,cull_nontri,dedicated_import,stencil_layout,example ] && ! echo "$new" | grep -qE "errata: [a-z_]* O(N|FF) \(" &&
+[ "$got" = wait_retry,bitwise_scalar,dyn_reemit,vb_split,view_quarantine,clamp_zero,cull_nontri,dedicated_import,stencil_layout,split_varying,example ] && ! echo "$new" | grep -qE "errata: [a-z_]* O(N|FF) \(" &&
   echo "$new" | grep -q "errata: device [0-9]*: same as device $first (safe mode): on $got\$" &&
   ! echo "$new" | grep -q "clamp_zero gives"
 r=$?; same=$(echo "$new" | grep -o 'errata: device [0-9]*: same as.*' | tail -1)
-device VKBRIDGE_MODE=performance VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts
+device VKBRIDGE_MODE=performance VKBRIDGE_ERRATA_PROBE=dyn_state:none VKBRIDGE_FAKE_DRIVER_VERSION=r44p1 VKBRIDGE_ERRATA=+example,-view_counts
 [ $r = 0 ] && echo "$new" | grep -q "errata: view_counts OFF (VKBRIDGE_ERRATA=-view_counts" &&
   echo "$new" | grep -q "errata: device [0-9]*, .*, performance mode: on $(on_set);" && echo "$new" | grep -q "clamp_zero gives"
 step $? "a later device with the same decisions: \"${same:-no short line}\"; in performance mode in full again (on $(on_set))"
 # the same driver read another way (a Vulkan 1.0/1.1 instance has no driverInfo, so driverVersion
 # is read: "r44p1 (driverVersion)" against "r44p1 (driverInfo ...)"): still the short line
-device VKBRIDGE_FAKE_DRIVER_VERSION=v1.r44p1-01eac0 VKBRIDGE_ERRATA=+example,-view_counts
+device VKBRIDGE_ERRATA_PROBE=dyn_state:none VKBRIDGE_FAKE_DRIVER_VERSION=v1.r44p1-01eac0 VKBRIDGE_ERRATA=+example,-view_counts
 echo "$new" | grep -q "errata: device [0-9]*: same as device $first (safe mode): on $(on_set)\$" && ! echo "$new" | grep -qE "errata: [a-z_]* O(N|FF) \("
 step $? "the same driver from another version string: \"$(echo "$new" | grep -o 'errata: device [0-9]*[:,] [^:]*' | tail -1)\""
 
@@ -129,7 +157,7 @@ fix=$(echo "$calls" | grep -o 'example: [0-9]*' | grep -o '[0-9]*'); imi=$(echo 
 step $? "the bridge's own views through the fix and the imitation beneath: ${fix:-0} and ${imi:-0} ($(tail -1 $work/4.log))"
 
 # 5
-grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0xe88f0e43c2b566b9ULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

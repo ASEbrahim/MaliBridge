@@ -1,7 +1,38 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
+ * Steam mode's own processes at Vulkan 1.1 on Arm job-manager Malis (/#15).
  *
- * Steam mode's own processes (Xwayland, steam, steamwebhelper, gamescope) shown a lower Vulkan version on the gate.
+ * Steam's game mode shows black on Arm job-manager Malis whose driver offers VK_EXT_extended_dynamic_state
+ * (Galaxy A16, Tab S9 FE, F15, A54, Tab S10 Lite: r38p1, Vulkan 1.3; the Anbernic RG556: Unisoc T820,
+ * G57 r40p0, Vulkan 1.3, AHardwareBuffer pages): gamescope's frames reach DroidDeck's compositor, the
+ * bridge logs no error, and the picture is black. The frames on screen are Xwayland's pixmaps, written
+ * by Zink inside Xwayland, and Zink's draws lose their picture on these drivers when it uses that
+ * extension's state (server_emu.c a1_decide.
+ * Where the picture shows: the Galaxy S21 (G78 r38p0, Vulkan 1.1) whose driver has no such extension;
+ * a Redmi (G57 MC2, job manager, r54p1, Vulkan 1.3, the extension offered: a player log, Big Picture and
+ * a game from it), so Arm's r54 drivers are past it. The Galaxy S10 and Note10+ phones (G76 r38p1 beta,
+ * Vulkan 1.1 to apps, the extension offered) died before Big Picture drew (#11, gs_hide); at 1.1 Zink
+ * still takes the extension, so they are inside the gate too.
+ *
+ * vkb_black_gate: Arm's own driver (not PanVK), a job manager GPU below r54 (unknown: inside) or a CSF GPU
+ * on a known release below r44 (, a player log: Dimensity 9200's Immortalis-G715 on the
+ * same r38p1-01eac0 driver as the job-manager devices, black the same way; r44p1 and later CSF drivers
+ * show Steam, an unknown CSF release stays outside), and either the driver offers VK_EXT_extended_dynamic_state (not hidden by VKBRIDGE_SERVER_HIDE_EXTS /
+ * VKBRIDGE_FAKE_MISSING) or apps are shown Vulkan 1.3 or later (where it is core).
+ * There, by default, the processes named Xwayland, steam and steamwebhelper are shown Vulkan 1.1 and
+ * gamescope 1.2 (at 1.1 gamescope finds no device: "failed to find physical device" on the host, as on
+ * r32p1 in #10), where apps are shown more than that. Games and every other process are never capped.
+ * The driver's extensions stay offered (timeline semaphores, dynamic rendering etc. as extensions, like
+ * the S21's): the client caps the apiVersion it reports and its device version (client/physdev.c
+ * cap_api), so core 1.2/1.3 names stay hidden unless their extension is enabled.
+ * CSF Malis on r44 or later (or an unknown release), job-manager ones on r54 and later, drivers without the
+ * extension and other vendors: no change.
+ *
+ * Switches (<cache dir>/env or the server's environment):
+ *   VKBRIDGE_STEAM_API_CAP=0 / off      no cap anywhere (the off switch)
+ *   VKBRIDGE_STEAM_API_CAP=1.1|1.2|1.3  that cap anywhere, the gate or not (gamescope at least 1.2)
+ *   VKBRIDGE_STEAM_API_CAP_GAMESCOPE=1.x  gamescope's own cap (=0: gamescope uncapped)
+ * One line per server process says the cap is on and why ("api cap: ...").
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -49,14 +80,15 @@ static int driver_offers(const vkb_srv_table *t, VkPhysicalDevice pd, const char
     return found;
 }
 
-/* The first release outside the gate (r54p1). */
+/* The first release whose job-manager driver draws Zink's extended dynamic state right (a player log, r54p1). */
 #define BLACK_FIXED_RELEASE 54
 /* CSF GPUs: the oldest release seen drawing it right (r44p1: Galaxy Tab S10+); r38p1 on the Immortalis-G715
  * is black like the job-manager devices on that driver. r32p1 CSF drivers have neither the
  * extension nor Vulkan 1.3, so the rest of the gate keeps them out. */
 #define BLACK_FIXED_RELEASE_CSF 44
 
-/* 1 where the gate is on (the first GPU asked decides; *why: for the log). */
+/* 1 where Steam's game mode shows black: Arm's driver on a job manager GPU below r54 or a CSF one below r44, with
+ * VK_EXT_extended_dynamic_state offered or Vulkan 1.3 to apps (the first GPU asked decides; *why: for the log). */
 int vkb_black_gate(const vkb_srv_table *t, VkPhysicalDevice pd, const char **why)
 {
     pthread_mutex_lock(&gate_lock);
@@ -90,7 +122,7 @@ static int cap_value(const char *v)
     return -2;
 }
 
-/* gamescope's minor for the others' minor m: its own switch, else at least 1.2 */
+/* gamescope's minor for the others' minor m: VKBRIDGE_STEAM_API_CAP_GAMESCOPE, else at least 1.2 (#10) */
 static int gamescope_minor(int m)
 {
     int gm = cap_value(vkb_srv_env_global("VKBRIDGE_STEAM_API_CAP_GAMESCOPE"));
@@ -120,7 +152,7 @@ uint32_t vkb_steam_api_cap(const vkb_srv_table *t, VkPhysicalDevice pd)
             VKB_WARN("api cap: VKBRIDGE_STEAM_API_CAP=%s is not 1.1, 1.2, 1.3, 0 or off; no cap", v);
         return 0;
     }
-    if (minor < 0) minor = vkb_black_gate(t, pd, &why) ? 1 : 0; /* the default: on where the gate is */
+    if (minor < 0) minor = vkb_black_gate(t, pd, &why) ? 1 : 0; /* the default: on where the black screen is */
     if (!minor) return 0;
     int others = minor, gm = gamescope_minor(minor);
     if (gs) {

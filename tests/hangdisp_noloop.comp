@@ -1,0 +1,11 @@
+#version 450
+// hangdisp_test's substitute for hangdisp.comp (VKBRIDGE_HANG_SUBST): the same interface, no loop - the dispatch ends at once and
+// o[i] = pc.base (7), so the check sees the substitute ran
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(push_constant) uniform P { uint base; uint table; } pc;
+layout(set = 1, binding = 2) readonly buffer CBV { vec4 v[256]; } cbv[16];
+layout(set = 0, binding = 0) buffer Out { uint o[]; };
+void main()
+{
+    o[gl_LocalInvocationIndex] = pc.base;
+}

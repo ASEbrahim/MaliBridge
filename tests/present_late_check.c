@@ -1,18 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * present_late_check: a frame whose GPU work takes longer than 10 s is presented late, not turned
- * into a lost device (Watch_Dogs on a Dimensity 8300 lost its device while loading, the
+ * into a lost device (a player log: Watch_Dogs on a Dimensity 8300 lost its device while loading, the
  * bridge client's own 10 s present-fence limit; client/wsi.c vkb_wsi_wait_frame).
  *
- *   present_late_check ok|lost [--wayland] [--delay-ms N] [--frames N] [--sleep-ms N]
+ *   present_late_check ok|lost [--wayland] [--delay-ms N] [--frames N] [--sleep-ms N] [--rgba]
  *
  * The first frame's rendering waits on a timeline semaphore that another thread signals N ms
  * later (default 15000): the GPU queue is held that long, as a queue busy converting textures is.
  * Then two ordinary frames (--frames: that many, --sleep-ms apart; host/latency_test.sh uses them). The surface is headless (the swapchain's synchronous path,
  * vkb_wsi_wait_rendering) or, with --wayland, a Wayland surface of the compositor in
  * WAYLAND_DISPLAY (dma-buf images: the presenting thread, wsi_wayland.c); the Wayland surface has
- * no role, nothing is shown.
+ * no role, nothing is shown. --rgba: an R8G8B8A8_UNORM swapchain instead of B8G8R8A8_UNORM (host/wlbind_test.sh).
  *
  * ok:   every acquire and present succeeds; headless: the slow present returns after N ms, or after
  *       VKBRIDGE_PRESENT_HOLD_MS (500) when N is longer (the frame is then shown by the swapchain's thread);
@@ -132,12 +131,13 @@ int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *expect = argc > 1 ? argv[1] : "ok";
-    int use_wl = 0, extra = 2, sleep_ms = 0;
+    int use_wl = 0, extra = 2, sleep_ms = 0, rgba = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--wayland")) use_wl = 1;
         else if (!strcmp(argv[i], "--delay-ms") && i + 1 < argc) delay_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) extra = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sleep-ms") && i + 1 < argc) sleep_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rgba")) rgba = 1;
     }
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
@@ -229,7 +229,8 @@ int main(int argc, char **argv)
     uint32_t want = caps.minImageCount > 4 ? caps.minImageCount : 4;
     if (caps.maxImageCount && want > caps.maxImageCount) want = caps.maxImageCount;
     VkExtent2D ext = caps.currentExtent.width == 0xFFFFFFFFu ? (VkExtent2D){64, 64} : caps.currentExtent;
-    VkSwapchainCreateInfoKHR sci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, surface, want, VK_FORMAT_B8G8R8A8_UNORM,
+    VkSwapchainCreateInfoKHR sci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, surface, want,
+                                    rgba ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM,
                                     VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, ext, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                     VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
                                     VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, mode, VK_TRUE, VK_NULL_HANDLE};

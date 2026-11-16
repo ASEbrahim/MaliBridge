@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Persistent pipeline cache. Mali compiles every pipeline from scratch in each new process unless
  * it is handed a VkPipelineCache; games through DXVK pass none. With a cache directory set
  * (--cache-dir), each device gets a cache loaded from <dir>/<vendor>-<device>-<cacheUUID>-<key>.vkpc,
@@ -20,9 +19,34 @@
  *   - a game's cache takes in the pre-caching files when it starts, and they go once it is saved
  *     with them, so "Processing Vulkan shaders" warms the cache the game itself loads.
  * The file's header is checked against the GPU before the driver sees it.
+ * A device taken as lost (server_lost.c's latch) has its cache never saved or merged again: the
+ * file stays as it was last saved before the loss (a player log, Mali-G615 r44p1, Resident Evil Village:
+ * the device was lost 25 s into play, the game went on compiling, and its cache was saved twice
+ * after the loss, 68 and 74 MB, over the one from before; the next start loaded that). Whether a
+ * lost device's cache data is bad is not known: nothing of it is kept, as nothing of it runs again.
+ * A cache that wedged the driver is set aside (vkb_pcache_wedged): PowerVR's DXT 25.1@6794074 (Pixel 10
+ * Pro XL, a player log sessions 05 and 07) faulted building gamescope's YCbCr compute pipeline with the
+ * program's saved cache loaded, and every later compute compile of that device spun until the compile
+ * watchdog: a black screen at every second start. A compile that times out on a device after a contained
+ * crash on it, with the device's cache loaded from its file at this start, renames that file to
+ * <name>.wedged.vkpc (the total limit still trims it; no program loads it), and nothing of that run is
+ * saved or merged again (a save would call into the wedged driver too). The next start compiles without
+ * it. Neither a crash alone nor timeouts alone do this: a game's cache is not dropped for one bad shader.
+ * Only on Imagination's driver (p->img), where it acts with VKBRIDGE_PCACHE_RELOAD=1 (by default nothing is
+ * loaded there, below); every other driver, Mali included, keeps its cache and stuck notes as before.
+ * Imagination's driver (driverID IMAGINATION_PROPRIETARY) is handed no saved data at all, and nothing is
+ * saved for it (reload_off): the Pixel 10 Pro XL's DXT 25.1@6794074 failed 3 of 3 reloads of the ~6 MB
+ * cache it wrote for gamescope - a fault in a later build and every compile after it wedged (a player log
+ * sessions 05, 07), and vkCreatePipelineCache allocating until the phone had no memory left (9 GB
+ * in 9 s) - while the small caches it wrote reloaded. That last form cannot be contained, and
+ * the failure depends on the data, so it goes by the driver, not by a startup check a small cache would
+ * pass. Each device keeps a cache in memory for its session (what a process builds twice is found);
+ * every start compiles as a first one. VKBRIDGE_PCACHE_RELOAD=1 hands it back anyway (to try a newer
+ * driver), =0 hands nothing back on any GPU (host tests).
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
+#include "server_cores.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -64,8 +88,8 @@
  * the file keeps what it has, and that is said once per device.
  * Where ours with the file's would be over the limit but ours alone is not, ours alone is written
  * (this run's, the newest) instead of nothing. Steam's pre-caching files get the limit less the
- * game's own file, so that the game can take them in at its start: OPPO, Rise of the Tomb
- * Raider, v0.5.4.2 had an 89 MB game file and a 128 MB .run file, so the .run file was left out
+ * game's own file, so that the game can take them in at its start: a player log (OPPO, Rise of the Tomb
+ * Raider, v0.5.4.2) had an 89 MB game file and a 128 MB .run file, so the .run file was left out
  * at every start and the replays only merged into it. (A cache's data is the driver's own format:
  * single entries cannot be picked out of it, only whole caches kept or replaced.)
  * From 12 GB the limit follows RAM/64 up to 256 MB (about 175 MB on a 12 GB tablet, whose MemTotal reads ~11.2 GB): HL2's file reached 131 MB and was left
@@ -105,6 +129,9 @@
 #define PC_SAVE_PERIOD_MAX_S 60
 #define PC_WARM_SAVE_PERIOD_S 30
 #define PC_WARM_KINDS 2
+/* Files of Steam's pre-caching a game takes in at one start (each replay device writes one of its own, below);
+ * more wait for the next start. */
+#define PC_WARM_FILES 64
 
 static const char *const warm_kinds[PC_WARM_KINDS] = {"run", "dl"}; /* recorded here first */
 
@@ -139,7 +166,15 @@ typedef struct vkb_pcache {
     unsigned reloads;     /* times it went back to the file past the limit (reload) */
     int over_warned;      /* warn_over said for this device */
     int nomerge_warned;   /* a merge skipped for want of memory, said */
+    int lost_warned;      /* a save skipped because the device was lost, said (atomic) */
+    int loaded;           /* its own file's data was handed to the driver at the device's start */
+    int wedged;           /* the driver wedged with it (vkb_pcache_wedged): never saved or merged again (atomic) */
+    int aside;            /* and it came from its file, which was set aside: what times out on the device now is the wedge's doing (atomic) */
+    int memonly;          /* reload_off: nothing loaded, seeded, merged or saved; the cache lives for the session only */
+    int no_session;       /* pipelines the app made without a cache get none of ours either (Imagination's driver; VKBRIDGE_PCACHE_SESSION) */
+    int img;              /* Imagination's driver (driverID): the only one whose wedged cache is set aside (vkb_pcache_wedged) */
     int not_loaded;       /* the file was left unloaded for want of memory: saves only merge into it */
+    size_t started;       /* what its own file (or the program's file by name) handed the driver at the device's start */
     int keep_warned;      /* a save skipped to keep that file, said */
     int alone_warned;     /* a save of ours alone in place of a merge over the limit, said */
     uint64_t beside;      /* Steam's pre-caching: the size of the game's own file, which the limit leaves room for */
@@ -148,11 +183,15 @@ typedef struct vkb_pcache {
     int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
     time_t last_save;     /* CLOCK_MONOTONIC seconds */
-    char warm[PC_WARM_KINDS][512]; /* pre-caching files taken in, removed after the next save */
-    pc_ident warm_id[PC_WARM_KINDS];
+    char (*warm)[512];    /* pre-caching files taken in, removed after the next save (PC_WARM_FILES at most) */
+    pc_ident *warm_id;
     int nwarm;
+    char warm_base[512];  /* Steam's pre-caching: <dir>/<gpu>-<key> (steam<id>.dl / .run), the start of every file of its kind */
+    unsigned warm_saves;  /* its saves that wrote */
+    uint64_t with_app, with_ours; /* pipelines made with a cache of the app's / with ours (atomic; said at a pre-caching device's end) */
     pthread_rwlock_t use; /* merges into `cache` (write) / pipelines compiled with it (read) */
     pthread_mutex_t alock;
+    uint64_t imi_grow;    /* VKBRIDGE_TEST_PCACHE_GROW: pipelines made through it (atomic) */
     pc_app *apps;
     unsigned seeded;
     int seed_logged;
@@ -173,6 +212,11 @@ static unsigned tmp_seq;
 static vkb_pcache *pc_list;
 static int pc_thread_started;
 static uint64_t pc_made; /* pipelines made through the caches (atomic; the server's memory line) */
+/* VKBRIDGE_TEST_PCACHE_GROW=1 (host tests): a driver whose cache grows with every pipeline imitated over one whose
+ * cache data keeps one size (lavapipe: its data is a header, so no save past the first ever happened on it). Each
+ * pipeline made through a device's caches adds a byte to the size its saves see, so they write (the driver's own data)
+ * as on Mali. -1: not read yet. */
+static int imi_grow_on = -1;
 
 const char *vkb_pcache_dir(void) { return pc_dir; }
 
@@ -180,7 +224,7 @@ static void trim(const char *keep, int now);
 
 /* Test toggles without restarting the app (the server lives in it and reads its environment once):
  * <cache dir>/env holds KEY=VALUE lines (# comments), read again at every vkCreateDevice, and
- * vkb_srv_env prefers them to the process environment. Only switches read per device take
+ * vkb_srv_env() prefers them to the process environment. Only switches read per device take
  * effect this way (VKBRIDGE_SPIRV_FIX, VKBRIDGE_EMU_OFF, ... - see their users). A removed file
  * drops the overrides at the next device. Old tables stay allocated: a returned value is never freed. */
 typedef struct env_kv {
@@ -838,6 +882,8 @@ static void warn_over(vkb_pcache *p, const char *path, off_t size)
              (long long)(size >> 10), limit_str(lim, p->max));
 }
 
+static int frozen(const vkb_pcache *p);
+
 /* Merges the app's caches into ours: all of them (the device is going) or those compiled into
  * since the last time, but never the externally synchronized ones (see the top). */
 static int merge_apps(vkb_pcache *p, int all)
@@ -845,10 +891,10 @@ static int merge_apps(vkb_pcache *p, int all)
     vkb_srv_table *t = p->t;
     int n = 0;
     /* Past the limit nothing of ours is saved again, and a merge only grows ours by a copy of what
-     * the app's cache already holds in the driver: Detroit: Become Human (a player log, G925) compiled
+     * the app's cache already holds in the driver: Detroit: Become Human (a player log) compiled
      * into its own caches for 17 minutes and ours grew to 598 MB beside a 179 MB limit, part of the
      * server heap growing by ~110 MB a minute until it aborted. */
-    if (__atomic_load_n(&p->full, __ATOMIC_RELAXED)) return 0;
+    if (__atomic_load_n(&p->full, __ATOMIC_RELAXED) || frozen(p)) return 0;
     pthread_mutex_lock(&p->alock);
     for (pc_app *a = p->apps; a; a = a->next) {
         if (a->extsync || (!all && !a->used)) continue;
@@ -858,6 +904,43 @@ static int merge_apps(vkb_pcache *p, int all)
         pthread_rwlock_unlock(&p->use);
     }
     pthread_mutex_unlock(&p->alock);
+    return n;
+}
+
+/* Steam's pre-caching files of one kind: <base>.vkpc (one file for every replay process, as builds before
+ * 0.5.6 wrote it) and <base>.<pid>.vkpc (one per replay device, see save_warm). Their paths into out (cap
+ * of them, NULL: only counted), all of their sizes added into *bytes but that of skip (a path; NULL: none).
+ * Returns how many there are. */
+static int warm_files(const char *base, char (*out)[512], int cap, const char *skip, uint64_t *bytes)
+{
+    const char *slash = strrchr(base, '/');
+    if (!slash || !pc_dir) return 0;
+    const char *stem = slash + 1;
+    size_t ns = strlen(stem);
+    DIR *d = opendir(pc_dir);
+    if (!d) return 0;
+    int n = 0;
+    for (struct dirent *de; (de = readdir(d));) {
+        const char *nm = de->d_name;
+        size_t len = strlen(nm);
+        if (len < ns + 5 || strncmp(nm, stem, ns) || strcmp(nm + len - 5, ".vkpc")) continue;
+        const char *mid = nm + ns, *end = nm + len - 5;
+        if (mid != end) { /* .<digits> */
+            if (*mid != '.' || mid + 1 == end) continue;
+            const char *c = mid + 1;
+            while (c < end && *c >= '0' && *c <= '9') c++;
+            if (c != end) continue;
+        }
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%s", pc_dir, nm);
+        if (skip && !strcmp(path, skip)) continue;
+        struct stat st;
+        if (fstatat(dirfd(d), nm, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (bytes) *bytes += (uint64_t)st.st_size;
+        if (out && n < cap) snprintf(out[n], sizeof(out[0]), "%s", path);
+        n++;
+    }
+    closedir(d);
     return n;
 }
 
@@ -875,13 +958,34 @@ static void consume_warm(vkb_pcache *p)
 
 static void save_body(vkb_pcache *p, uint64_t t0, const char *when);
 
+/* A lost device's cache is not written or merged again (see the top): 1 when it is lost, said once
+ * per device the first time a save is skipped for it. */
+/* Never saved, merged or read for seeding: wedged (vkb_pcache_wedged) or a session-only cache (reload_off). */
+static int frozen(const vkb_pcache *p)
+{
+    return p->memonly || __atomic_load_n(&p->wedged, __ATOMIC_RELAXED);
+}
+
+static int lost_skip(vkb_pcache *p, const char *when)
+{
+    if (frozen(p)) return 1; /* said by vkb_pcache_wedged / at the device's start */
+    if (!vkb_lost_is(p->t)) return 0;
+    if (!__atomic_exchange_n(&p->lost_warned, 1, __ATOMIC_RELAXED))
+        VKB_WARN("device %u (pid %d): pipeline cache %s not saved %s: the device was lost; the file stays as it was last saved before "
+                 "the loss, and nothing compiled since goes into it", p->t->id, p->t->proc ? p->t->proc->pid : 0, p->path, when);
+    return 1;
+}
+
 /* Called with save_lock held (every save in the server is, so the checks of the file hold). Timed:
  * a save writes the whole cache while the game may be compiling (its line says how long, and the
  * hitch line counts it, server_hitch.c). when: where it was made, for its line. */
-static void save(vkb_pcache *p, const char *when)
+static void save_warm(vkb_pcache *p, uint64_t t0, const char *when, int all);
+
+static void save(vkb_pcache *p, const char *when, int all)
 {
     uint64_t t0 = vkb_hitch_now();
-    save_body(p, t0, when);
+    if (p->warm_role) save_warm(p, t0, when, all);
+    else save_body(p, t0, when);
     vkb_hitch_note(p->t->proc, VKB_HITCH_PCACHE, t0, vkb_hitch_now(), 1, 0);
 }
 
@@ -891,6 +995,7 @@ static void save_body(vkb_pcache *p, uint64_t t0, const char *when)
     __atomic_store_n(&p->dirty, 0, __ATOMIC_RELAXED); /* pipelines from now on make it dirty again */
     size_t own = 0;
     if (t->real.vkGetPipelineCacheData(t->device, p->cache, &own, NULL) != VK_SUCCESS || !own) return;
+    if (__atomic_load_n(&imi_grow_on, __ATOMIC_RELAXED) > 0) own += (size_t)__atomic_load_n(&p->imi_grow, __ATOMIC_RELAXED);
     __atomic_store_n(&p->mem_size, own, __ATOMIC_RELAXED);
     if (own == p->saved_size) {
         /* Nothing new was compiled (merges of what it already had leave the size alone). */
@@ -986,6 +1091,151 @@ static void save_body(vkb_pcache *p, uint64_t t0, const char *when)
     }
 }
 
+/* How long the saver tries for the write lock at a swap (compiles hold the read lock while the
+ * driver works; they are never made to wait for it): tried again at the next save otherwise. */
+#define PC_SWAP_TRY_MS 500
+
+/* An empty cache in place of p->cache, whose pipelines are returned (the caller saves them; nothing compiles into
+ * them any more): VK_NULL_HANDLE when the write lock was not had in time (compiles hold the read lock while the
+ * driver works) or no cache could be made. */
+static VkPipelineCache swap_out(vkb_pcache *p)
+{
+    vkb_srv_table *t = p->t;
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL};
+    VkPipelineCache nc = VK_NULL_HANDLE;
+    if (t->real.vkCreatePipelineCache(t->device, &ci, NULL, &nc) != VK_SUCCESS) return VK_NULL_HANDLE;
+    int locked = 0;
+    for (int i = 0; i < PC_SWAP_TRY_MS && !(locked = pthread_rwlock_trywrlock(&p->use) == 0); i++) {
+        struct timespec ms = {0, 1000000};
+        nanosleep(&ms, NULL);
+    }
+    if (!locked) {
+        t->real.vkDestroyPipelineCache(t->device, nc, NULL);
+        return VK_NULL_HANDLE;
+    }
+    VkPipelineCache old = p->cache;
+    p->cache = nc;
+    pthread_rwlock_unlock(&p->use);
+    return old;
+}
+
+/* Steam's shader pre-caching (p->warm_role). Its replayer runs a process per core, and through the bridge all of
+ * them are devices of this one server, beside Steam, gamescope and the game: a player log (XRing O3, War Thunder,
+ * 207k items) had 8 replay devices, each keeping all it had compiled in its own cache (8 x ~44 MB, 'pipeline
+ * caches 399142K'), and each of them every 30 s loading the whole shared file (up to 231 MB) into the driver to
+ * merge into it and write it back (1.1 s a save, 8 of them a round), until the driver's std::bad_alloc in
+ * vkCreateGraphicsPipelines took the server and every client with it, 0.3 s after such a save. Past the limit
+ * one device's 'ours alone' then wrote its 44 MB over the 231 MB the others had saved. So, for these devices only:
+ *   - each writes a file of its own, <game>.<kind>.<pid>.vkpc, which the game takes in at its start as it takes
+ *     in <game>.<kind>.vkpc: a save loads no other process's work, only its own file (an eighth of it);
+ *   - what a save writes leaves the device's memory: its cache is swapped for an empty one first, then the old
+ *     one (and the replayer's own caches) goes into the file, and is destroyed; a save that fails puts it back.
+ *     The replayer builds each pipeline once, so nothing is lost by not finding it again in this session;
+ *   - the limit counts all of the kind's files (what the game's own file leaves, as before): one that would go
+ *     over it stops this device's saves (full), and its pipelines from then on are built with no cache of ours,
+ *     so they no longer pile up in the driver; nothing another process saved is ever replaced.
+ * What the game takes in is the same pipelines as before. Called with save_lock held. all: every app cache, not
+ * only those compiled into since the last save (the device is going). */
+static void save_warm(vkb_pcache *p, uint64_t t0, const char *when, int all)
+{
+    vkb_srv_table *t = p->t;
+    if (__atomic_load_n(&p->full, __ATOMIC_RELAXED)) return;
+    __atomic_store_n(&p->dirty, 0, __ATOMIC_RELAXED); /* pipelines from now on make it dirty again */
+    VkPipelineCache old = swap_out(p);
+    int swapped = old != VK_NULL_HANDLE;
+    if (!swapped) old = p->cache; /* saved in place this time, and kept (the next save tries the swap again) */
+    /* the replayer's own caches go into what is saved (not into p->cache, where they would stay beside its copies) */
+    pthread_mutex_lock(&p->alock);
+    for (pc_app *a = p->apps; a; a = a->next) {
+        if (a->extsync || (!all && !a->used)) continue;
+        a->used = 0;
+        if (!swapped) pthread_rwlock_wrlock(&p->use);
+        t->real.vkMergePipelineCaches(t->device, old, 1, &a->cache);
+        if (!swapped) pthread_rwlock_unlock(&p->use);
+    }
+    pthread_mutex_unlock(&p->alock);
+    size_t own = 0, empty = 0;
+    VkPipelineCache e0 = swapped ? p->cache : VK_NULL_HANDLE;
+    if (t->real.vkGetPipelineCacheData(t->device, old, &own, NULL) != VK_SUCCESS) own = 0;
+    if (e0) t->real.vkGetPipelineCacheData(t->device, e0, &empty, NULL); /* a header: what an empty cache's data is */
+    if (__atomic_load_n(&imi_grow_on, __ATOMIC_RELAXED) > 0) own += (size_t)__atomic_exchange_n(&p->imi_grow, 0, __ATOMIC_RELAXED);
+    int fresh = own > (swapped ? empty : p->saved_size); /* anything new in it */
+    uint64_t others = 0;
+    warm_files(p->warm_base, NULL, 0, p->path, &others);
+    uint64_t lim = p->max > others ? p->max - others : 0;
+    int rc = 0, merged = 0, e = 0;
+    size_t size = 0;
+    if (fresh) {
+        pc_ident now;
+        int exists = ident_stat(p->path, &now);
+        VkPipelineCache tmp = VK_NULL_HANDLE;
+        uint64_t avail = vkb_memavail_kb(), need = (((uint64_t)own + (uint64_t)(exists ? now.size : 0)) * 3) >> 10;
+        if (exists && (uint64_t)now.size > lim) {
+            rc = 1; /* its own file is at the limit already */
+            size = (size_t)now.size;
+        } else if (exists && avail && avail < need) {
+            rc = 2; /* the memory is not there for it: not saved, and not kept either (below) */
+        } else if (exists) {
+            pc_map f = map_file(p->path, lim, NULL);
+            tmp = cache_from(t, f.data, f.size); /* not this GPU's or unreadable: written over with these alone */
+            unmap_file(&f);
+            if (tmp && t->real.vkMergePipelineCaches(t->device, tmp, 1, &old) != VK_SUCCESS) {
+                t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
+                tmp = VK_NULL_HANDLE;
+            }
+        }
+        merged = tmp != VK_NULL_HANDLE;
+        if (rc == 0) {
+            rc = save_to(&t->real, t->device, merged ? tmp : old, p->path, lim, &size);
+            e = errno;
+        }
+        if (tmp) t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
+    }
+    if (rc == 1) {
+        __atomic_store_n(&p->full, 1, __ATOMIC_RELAXED); /* for good: built with no cache of ours from now on (pc_Create*) */
+        if (!p->full_warned) {
+            p->full_warned = 1;
+            char l1[32];
+            VKB_WARN("device %u: Steam's shader pre-caching file %s would be %zu KB, over the %llu KB left of the %s limit beside the game's own "
+                     "%llu KB and the other pre-caching files' %llu KB (VKBRIDGE_PCACHE_MAX_MB): it keeps what it has, and this device's "
+                     "pipelines are built without a cache of ours from now on", t->id, p->path, size >> 10, (unsigned long long)(lim >> 10),
+                     limit_str(l1, p->max), (unsigned long long)(p->beside >> 10), (unsigned long long)(others >> 10));
+        }
+    } else if (rc == 2) {
+        /* What these hold is a bonus for the game's first start; the phone's memory is not: dropped (swapped out above). */
+        if (!p->nomerge_warned) {
+            p->nomerge_warned = 1;
+            VKB_WARN("device %u: Steam's shader pre-caching: %llu KB of memory free, adding to %s needs about %llu KB: what it compiled since its "
+                     "last save is dropped (said once)", t->id, (unsigned long long)vkb_memavail_kb(), p->path,
+                     (unsigned long long)((((uint64_t)own + (uint64_t)p->file.size) * 3) >> 10));
+        }
+    } else if (rc == 0 && fresh) {
+        p->warm_saves++;
+        VKB_INFO("device %u: pipeline cache saved (%zu KB%s) in %.1f ms, %s", t->id, size >> 10, merged ? ", with what this device saved before" : "",
+                 (vkb_hitch_now() - t0) / 1e6, when);
+        ident_stat(p->path, &p->file);
+        p->save_err = 0;
+        vkb_cache_write_ok();
+    } else if (rc < 0) {
+        if (e != EAGAIN && vkb_cache_write_failed("a pipeline cache", e) && e != p->save_err)
+            VKB_WARN("device %u: pipeline cache not saved to %s: %s (tried again quietly)", t->id, p->path, strerror(e));
+        p->save_err = e;
+        __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
+        if (swapped) { /* what it held goes back, for the next save */
+            pthread_rwlock_wrlock(&p->use);
+            t->real.vkMergePipelineCaches(t->device, p->cache, 1, &old);
+            pthread_rwlock_unlock(&p->use);
+        }
+    }
+    if (swapped) t->real.vkDestroyPipelineCache(t->device, old, NULL);
+    size_t mem = 0;
+    pthread_rwlock_rdlock(&p->use);
+    if (t->real.vkGetPipelineCacheData(t->device, p->cache, &mem, NULL) != VK_SUCCESS) mem = 0;
+    pthread_rwlock_unlock(&p->use);
+    __atomic_store_n(&p->mem_size, mem, __ATOMIC_RELAXED);
+    p->saved_size = mem;
+}
+
 /* Is a save due? Each writes the whole cache: a big one waits longer (PC_SAVE_BIG). */
 static int save_due(const vkb_pcache *p, time_t now)
 {
@@ -1011,9 +1261,6 @@ static time_t mono_s(void)
  * found, only the ones of this session past the limit (never saved anyway) are compiled again if the
  * game makes them again. VKBRIDGE_PCACHE_FULL_RELOAD=0: not (the cache grows as before). */
 #define PC_FULL_SLACK_DIV 2
-/* How long the saver tries for the write lock at a swap (compiles hold the read lock while the
- * driver works; they are never made to wait for it): tried again at the next save otherwise. */
-#define PC_SWAP_TRY_MS 500
 
 static int full_reload_on(void)
 {
@@ -1091,6 +1338,7 @@ static void reload(vkb_pcache *p)
 static void *saver(void *arg)
 {
     (void)arg;
+    vkb_cores_plain_thread();
     for (;;) {
         struct timespec ts = {PC_SAVE_PERIOD_S, 0};
         nanosleep(&ts, NULL);
@@ -1103,9 +1351,9 @@ static void *saver(void *arg)
         vkb_pcache *p = pc_list;
         pthread_mutex_unlock(&pc_lock);
         while (p) {
-            if (__atomic_load_n(&p->dirty, __ATOMIC_RELAXED) && save_due(p, now)) {
-                merge_apps(p, 0);
-                save(p, "in the background");
+            if (__atomic_load_n(&p->dirty, __ATOMIC_RELAXED) && save_due(p, now) && !lost_skip(p, "in the background")) {
+                if (!p->warm_role) merge_apps(p, 0); /* a pre-caching device's go into what it saves (save_warm) */
+                save(p, "in the background", 0);
                 p->last_save = now;
                 if (__atomic_load_n(&p->full, __ATOMIC_RELAXED) && full_reload_on() &&
                     __atomic_load_n(&p->mem_size, __ATOMIC_RELAXED) > full_ceiling(p))
@@ -1142,10 +1390,18 @@ static VkResult VKAPI_CALL pc_CreateGraphicsPipelines(VkDevice device, VkPipelin
 {
     vkb_pcache *p = cur();
     __atomic_add_fetch(&pc_made, n, __ATOMIC_RELAXED);
+    if (__builtin_expect(__atomic_load_n(&imi_grow_on, __ATOMIC_RELAXED) > 0, 0)) __atomic_add_fetch(&p->imi_grow, n, __ATOMIC_RELAXED);
     if (cache) {
+        if (p->warm_role) __atomic_add_fetch(&p->with_app, n, __ATOMIC_RELAXED);
         app_used(p, cache);
         return p->create_gfx(device, cache, n, ci, a, out);
     }
+    if (p->warm_role) {
+        __atomic_add_fetch(&p->with_ours, n, __ATOMIC_RELAXED);
+        /* full: nothing more of it is saved, so nothing more is kept (save_warm) */
+        if (__atomic_load_n(&p->full, __ATOMIC_RELAXED)) return p->create_gfx(device, VK_NULL_HANDLE, n, ci, a, out);
+    }
+    if (p->no_session) return p->create_gfx(device, VK_NULL_HANDLE, n, ci, a, out);
     __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
     pthread_rwlock_rdlock(&p->use);
     VkResult r = p->create_gfx(device, p->cache, n, ci, a, out);
@@ -1159,10 +1415,18 @@ static VkResult VKAPI_CALL pc_CreateComputePipelines(VkDevice device, VkPipeline
 {
     vkb_pcache *p = cur();
     __atomic_add_fetch(&pc_made, n, __ATOMIC_RELAXED);
+    if (__builtin_expect(__atomic_load_n(&imi_grow_on, __ATOMIC_RELAXED) > 0, 0)) __atomic_add_fetch(&p->imi_grow, n, __ATOMIC_RELAXED);
     if (cache) {
+        if (p->warm_role) __atomic_add_fetch(&p->with_app, n, __ATOMIC_RELAXED);
         app_used(p, cache);
         return p->create_compute(device, cache, n, ci, a, out);
     }
+    if (p->warm_role) {
+        __atomic_add_fetch(&p->with_ours, n, __ATOMIC_RELAXED);
+        /* full: nothing more of it is saved, so nothing more is kept (save_warm) */
+        if (__atomic_load_n(&p->full, __ATOMIC_RELAXED)) return p->create_compute(device, VK_NULL_HANDLE, n, ci, a, out);
+    }
+    if (p->no_session) return p->create_compute(device, VK_NULL_HANDLE, n, ci, a, out);
     __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
     pthread_rwlock_rdlock(&p->use);
     VkResult r = p->create_compute(device, p->cache, n, ci, a, out);
@@ -1178,8 +1442,9 @@ static VkResult VKAPI_CALL pc_CreatePipelineCache(VkDevice device, const VkPipel
     if (!app) return VK_ERROR_OUT_OF_HOST_MEMORY;
     app->extsync = (ci->flags & VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT) != 0;
     VkResult r;
-    if (ci->initialDataSize || app->extsync || __atomic_fetch_add(&p->seeded, 1, __ATOMIC_RELAXED) >= PC_SEED_CACHES) {
-        if (!ci->initialDataSize && !__atomic_exchange_n(&p->seed_logged, 1, __ATOMIC_RELAXED))
+    if (ci->initialDataSize || app->extsync || frozen(p) || p->warm_role /* holds only what is not saved yet: nothing to seed */ ||
+        __atomic_fetch_add(&p->seeded, 1, __ATOMIC_RELAXED) >= PC_SEED_CACHES) {
+        if (!ci->initialDataSize && !p->warm_role && !__atomic_exchange_n(&p->seed_logged, 1, __ATOMIC_RELAXED))
             VKB_INFO("device %u: the app makes several pipeline caches; further empty ones start empty", p->t->id);
         r = p->create_cache(device, ci, a, out);
     } else {
@@ -1221,7 +1486,7 @@ static void VKAPI_CALL pc_DestroyPipelineCache(VkDevice device, VkPipelineCache 
             break;
         }
     }
-    if (cache != p->cache && !(app && app->extsync) && !__atomic_load_n(&p->full, __ATOMIC_RELAXED)) {
+    if (cache != p->cache && !(app && app->extsync) && !__atomic_load_n(&p->full, __ATOMIC_RELAXED) && !vkb_lost_is(p->t) && !frozen(p)) {
         pthread_rwlock_wrlock(&p->use);
         if (p->t->real.vkMergePipelineCaches(device, p->cache, 1, &cache) == VK_SUCCESS)
             __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
@@ -1242,6 +1507,25 @@ static void file_name(char *out, size_t cap, const char *s)
     if (out[0] == '.') out[0] = '_';
 }
 
+/* Whether saved data is kept from the driver (see the top). why: what decided, for the line. */
+static int reload_off_env(const char **why)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PCACHE_RELOAD");
+    if (v && *v) {
+        *why = "VKBRIDGE_PCACHE_RELOAD";
+        return !strcmp(v, "0") ? 1 : 0;
+    }
+    return -1;
+}
+
+static int reload_off(vkb_srv_table *t, const char **why)
+{
+    int e = reload_off_env(why);
+    if (e >= 0) return e;
+    *why = "Imagination's driver cannot reload the caches it writes";
+    return vkb_driver_id(&t->real, t->physical, t->api_version) == VK_DRIVER_ID_IMAGINATION_PROPRIETARY;
+}
+
 void vkb_pcache_device_init(vkb_srv_table *t)
 {
     if (!pc_dir || !t->real.vkCreatePipelineCache || !t->real.vkGetPipelineCacheData || !t->real.vkMergePipelineCaches) return;
@@ -1249,6 +1533,12 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     if (off && *off && strcmp(off, "0")) {
         VKB_INFO("device %u: persistent pipeline cache off (VKBRIDGE_NO_PCACHE)", t->id);
         return;
+    }
+    if (__atomic_load_n(&imi_grow_on, __ATOMIC_RELAXED) < 0) {
+        const char *g = getenv("VKBRIDGE_TEST_PCACHE_GROW");
+        int on = g && *g && strcmp(g, "0");
+        if (on) VKB_WARN("VKBRIDGE_TEST_PCACHE_GROW: pipeline caches imitated as growing with every pipeline (host tests)");
+        __atomic_store_n(&imi_grow_on, on, __ATOMIC_RELAXED);
     }
     vkb_pcache *p = calloc(1, sizeof(*p));
     if (!p) return;
@@ -1274,18 +1564,67 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         if (stat(game, &gs) == 0 && gs.st_size > 0) p->beside = (uint64_t)gs.st_size;
         p->max = p->beside < p->max ? p->max - p->beside : 0;
         p->max_ext = p->max; /* a replay's file is what is left beside the game's */
+        /* a file of this device's own, beside the other replay processes' (save_warm); a pid used again (a
+         * later session) finds its file there and adds to it */
+        snprintf(p->warm_base, sizeof(p->warm_base), "%s%s", base, key);
+        snprintf(p->path, sizeof(p->path), "%s.%d.vkpc", p->warm_base, t->proc && t->proc->pid > 0 ? (int)t->proc->pid : (int)t->id);
     }
     p->last_save = mono_s();
     pthread_mutex_lock(&pc_lock);
     trim(p->path, 0);
     pthread_mutex_unlock(&pc_lock);
+    const char *off_why = NULL;
+    p->img = vkb_driver_id(&t->real, t->physical, t->api_version) == VK_DRIVER_ID_IMAGINATION_PROPRIETARY;
+    p->memonly = reload_off(t, &off_why);
+    {
+        /* Imagination's driver: the app process died at every session end in vulkan.powervr.so DestroyShader <- DestroyPipelineCache
+         * called from here (vkb_pcache_device_destroy, Pixel 10 Pro XL 11-13: 6 of 6 sessions; with the session cache not given
+         * to pipelines, 2 of 2 ended clean). Its cache is never saved or reloaded there (memonly), so all it bought was a second
+         * build of the same pipeline in one session being found. VKBRIDGE_PCACHE_SESSION=0/1 forces it off/on on any driver. */
+        const char *ns = vkb_srv_env("VKBRIDGE_PCACHE_SESSION");
+        p->no_session = ns && *ns ? strcmp(ns, "0") == 0 : (p->img && p->memonly);
+        if (p->no_session)
+            VKB_INFO("device %u: its own pipeline cache is not given to pipelines the app makes without one (%s)", t->id,
+                     ns && *ns ? "VKBRIDGE_PCACHE_SESSION=0" : "Imagination's driver frees shaders twice when that cache goes");
+    }
+    if (p->memonly) {
+        VKB_INFO("device %u: saved pipeline caches are not handed to this driver and none is saved (%s; VKBRIDGE_PCACHE_RELOAD=1 to "
+                 "try): this start compiles as a first one, and %s is left as it is", t->id, off_why, p->path);
+        p->warm_role = 0;
+    }
+    if (p->warm_role) {
+        /* The kind's files (the one all replay processes shared before, <game>.<kind>.vkpc, and the replay devices' own)
+         * over what is left beside the game's file would keep every replay device from saving: the oldest go until the
+         * rest fit, as the first save replaced the one file before (a lower limit, or a game file that grew since). */
+        char (*wl)[512] = malloc(PC_WARM_FILES * sizeof(*wl));
+        uint64_t sum = 0;
+        int wn = wl ? warm_files(p->warm_base, wl, PC_WARM_FILES, NULL, &sum) : 0;
+        if (wn > PC_WARM_FILES) wn = PC_WARM_FILES;
+        while (wl && sum > p->max && wn > 0) {
+            int o = -1;
+            struct stat os = {0}, st;
+            for (int i = 0; i < wn; i++)
+                if (wl[i][0] && stat(wl[i], &st) == 0 &&
+                    (o < 0 || st.st_mtim.tv_sec < os.st_mtim.tv_sec ||
+                     (st.st_mtim.tv_sec == os.st_mtim.tv_sec && st.st_mtim.tv_nsec < os.st_mtim.tv_nsec)))
+                    o = i, os = st;
+            if (o < 0) break;
+            if (unlink(wl[o]) == 0) {
+                sum = sum > (uint64_t)os.st_size ? sum - (uint64_t)os.st_size : 0;
+                VKB_INFO("device %u: %s (%lld KB) removed: Steam's shader pre-caching files are over the %s left for them beside the game's own file", t->id,
+                         wl[o], (long long)(os.st_size >> 10), limit_str(lim, p->max));
+            }
+            wl[o][0] = 0;
+        }
+        free(wl);
+    }
     /* Used now: the last the total limit removes (before it is read, so what is read is the file as it is). */
-    if (!p->warm_role) utimensat(AT_FDCWD, p->path, NULL, 0);
+    if (!p->warm_role && !p->memonly) utimensat(AT_FDCWD, p->path, NULL, 0);
 
     uint64_t load_t0 = vkb_hitch_now();
     pc_map fm = {NULL, 0, 0, 0};
     int over_load = 0; /* the file is over the plain limit (a cache that went over it with memory to spare) */
-    if (!p->warm_role) fm = map_file(p->path, p->max, &p->file);
+    if (!p->warm_role && !p->memonly) fm = map_file(p->path, p->max, &p->file);
     if (fm.over && !p->warm_role && p->max_ext > p->max && (uint64_t)fm.over <= p->max_ext) {
         over_load = 1;
         if (over_ok(p)) {
@@ -1304,7 +1643,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     }
     const char *from = p->path;
     char legacy[512];
-    if (!fm.data && !p->file.valid && key[0] && !p->warm_role) {
+    if (!fm.data && !p->file.valid && key[0] && !p->warm_role && !p->memonly) {
         /* Before keys, the program's cache was by process name: start from that one. */
         snprintf(legacy, sizeof(legacy), "%s%s.vkpc", base, prog);
         if ((fm = map_file(legacy, p->max, NULL)).data) from = legacy;
@@ -1342,6 +1681,8 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         return;
     }
     p->saved_size = from == p->path ? size : 0;
+    p->started = size;
+    p->loaded = from == p->path && size;
     p->mem_size = size;
     p->covers = !p->not_loaded;
     if (p->warm_role)
@@ -1358,9 +1699,19 @@ void vkb_pcache_device_init(vkb_srv_table *t)
 
     /* A game takes in what Steam's shader pre-caching compiled for it. */
     size_t total = size;
-    for (int i = 0; key[0] && !p->warm_role && i < PC_WARM_KINDS; i++) {
-        char wpath[512];
-        snprintf(wpath, sizeof(wpath), "%s%s.%s.vkpc", base, key, warm_kinds[i]);
+    /* <game>.<kind>.vkpc and the replay devices' <game>.<kind>.<pid>.vkpc (save_warm), PC_WARM_FILES at most a start */
+    char (*wlist)[512] = NULL;
+    int wn = 0;
+    for (int i = 0; key[0] && !p->warm_role && !p->memonly && i < PC_WARM_KINDS; i++) {
+        char wbase[512];
+        snprintf(wbase, sizeof(wbase), "%s%s.%s", base, key, warm_kinds[i]);
+        if (!wlist && !(wlist = malloc(PC_WARM_FILES * sizeof(*wlist)))) break;
+        int got = warm_files(wbase, wlist + wn, PC_WARM_FILES - wn, NULL, NULL);
+        wn += got < PC_WARM_FILES - wn ? got : PC_WARM_FILES - wn;
+    }
+    if (wn && (!(p->warm = calloc(wn, sizeof(*p->warm))) || !(p->warm_id = calloc(wn, sizeof(*p->warm_id))))) wn = 0;
+    for (int i = 0; i < wn; i++) {
+        const char *wpath = wlist[i];
         pc_ident wid;
         pc_map wm = map_file(wpath, p->max, &wid);
         size_t wsize = wm.data ? wm.size : (size_t)wm.over;
@@ -1389,6 +1740,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         if (tmp) t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
         unmap_file(&wm);
     }
+    free(wlist);
 
     pthread_rwlockattr_t ra;
     pthread_rwlockattr_init(&ra);
@@ -1428,11 +1780,24 @@ VkResult vkb_pcache_create_compute(vkb_srv_table *t, const VkComputePipelineCrea
     vkb_pcache *p = t->pcache;
     if (!p) return t->real.vkCreateComputePipelines(t->device, VK_NULL_HANDLE, 1, ci, NULL, out);
     __atomic_add_fetch(&pc_made, 1, __ATOMIC_RELAXED);
+    if (p->warm_role && __atomic_load_n(&p->full, __ATOMIC_RELAXED)) return t->real.vkCreateComputePipelines(t->device, VK_NULL_HANDLE, 1, ci, NULL, out);
     __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
     pthread_rwlock_rdlock(&p->use);
     VkResult r = t->real.vkCreateComputePipelines(t->device, p->cache, 1, ci, NULL, out);
     pthread_rwlock_unlock(&p->use);
     return r;
+}
+
+int vkb_pcache_started_empty(vkb_srv_table *t)
+{
+    vkb_pcache *p = t ? t->pcache : NULL;
+    return !p || !p->started;
+}
+
+const char *vkb_pcache_file(vkb_srv_table *t)
+{
+    vkb_pcache *p = t ? t->pcache : NULL;
+    return p && !p->memonly && !p->warm_role ? p->path : NULL;
 }
 
 void vkb_pcache_stats(uint64_t *pipelines, uint64_t *bytes)
@@ -1455,6 +1820,11 @@ VkPipelineCache vkb_pcache_own_open(const vkb_dispatch *r, const VkPhysicalDevic
     path[0] = 0;
     const char *off = vkb_srv_env("VKBRIDGE_NO_PCACHE");
     if (!pc_dir || (off && *off && strcmp(off, "0")) || !r->vkCreatePipelineCache || !r->vkGetPipelineCacheData) return VK_NULL_HANDLE;
+    /* Imagination's driver: no saved data handed back (see the top); here by its vendor (no physical device to ask
+     * the driverID of; phones with these GPUs run Imagination's driver), and the build compiles without a cache */
+    const char *why = NULL;
+    int ro = reload_off_env(&why);
+    if (ro > 0 || (ro < 0 && gpu->vendorID == 0x1010)) return VK_NULL_HANDLE;
     const VkPhysicalDeviceProperties props = *gpu;
     char uuid[2 * VK_UUID_SIZE + 1];
     for (int i = 0; i < VK_UUID_SIZE; i++) snprintf(uuid + 2 * i, 3, "%02x", props.pipelineCacheUUID[i]);
@@ -1490,6 +1860,47 @@ void vkb_pcache_own_close(const vkb_dispatch *r, VkDevice d, VkPipelineCache c, 
     r->vkDestroyPipelineCache(d, c, NULL);
 }
 
+/* From the compile watchdog (server_guard.c): a compile on t timed out after a contained crash on t
+ * (call: the timed-out call). Where t's cache came from its file at this start, the driver is taken as
+ * wedged by that data: the file is set aside and nothing of t's cache is saved or merged again (see the
+ * top). Said once per device. No lock is taken: the timed-out call's own thread holds the cache's read
+ * lock, and the saver may be inside the wedged driver. */
+void vkb_pcache_wedged(vkb_srv_table *t, const char *call)
+{
+    vkb_pcache *p = t ? t->pcache : NULL;
+    /* Imagination's driver only (asked at the device's start: no driver call here, the driver may be wedged):
+     * on Mali and every other driver a crash followed by a timeout keeps the cache and the stuck-pipeline
+     * notes exactly as before (a game's cache is not dropped, a spinning shader still gets its stand-in). */
+    if (!p || !p->img) return;
+    if (!p || p->warm_role || __atomic_exchange_n(&p->wedged, 1, __ATOMIC_ACQ_REL)) return;
+    if (!p->loaded) {
+        VKB_WARN("device %u: %s timed out after a contained crash; its pipeline cache started empty, so it is kept (nothing of this run is "
+                 "saved)", t->id, call);
+        return;
+    }
+    __atomic_store_n(&p->aside, 1, __ATOMIC_RELEASE);
+    char aside[600];
+    size_t n = strlen(p->path);
+    if (n > 5 && !strcmp(p->path + n - 5, ".vkpc")) snprintf(aside, sizeof(aside), "%.*s.wedged.vkpc", (int)(n - 5), p->path);
+    else snprintf(aside, sizeof(aside), "%s.wedged.vkpc", p->path);
+    if (rename(p->path, aside) == 0)
+        VKB_WARN("device %u: pipeline cache %s set aside as %s: %s timed out after a contained crash with it loaded (the driver "
+                 "wedged on that data); the next start compiles without it, and nothing of this run is saved",
+                 t->id, p->path, aside, call);
+    else
+        VKB_WARN("device %u: pipeline cache %s could not be set aside (%s) after %s timed out following a contained crash; nothing of "
+                 "this run is saved", t->id, p->path, strerror(errno), call);
+}
+
+/* 1 when t's cache wedged the driver and was set aside (vkb_pcache_wedged): the compile watchdog then
+ * notes no stuck pipelines for t (they wait on the lock the crash left, not on their own code; a later
+ * run without that cache builds them). */
+int vkb_pcache_aside(const vkb_srv_table *t)
+{
+    const vkb_pcache *p = t ? t->pcache : NULL;
+    return p && __atomic_load_n(&p->aside, __ATOMIC_ACQUIRE);
+}
+
 /* Before the device is destroyed (by the app, or after its process went): what the app's caches
  * hold goes into ours, a last save, then the caches go. */
 void vkb_pcache_device_destroy(vkb_srv_table *t)
@@ -1505,9 +1916,16 @@ void vkb_pcache_device_destroy(vkb_srv_table *t)
     }
     pthread_mutex_unlock(&pc_lock);
     pthread_mutex_lock(&save_lock); /* after the saver's save of it, if it is in one */
-    if (merge_apps(p, 1)) p->dirty = 1;
-    if (p->dirty) save(p, "at the device's end");
+    /* lost: nothing merged, nothing saved (said only when there was something to save) */
+    if (!(p->dirty || p->apps) || !lost_skip(p, "at the device's end")) {
+        if (p->warm_role ? p->apps != NULL : merge_apps(p, 1) > 0) p->dirty = 1;
+        if (p->dirty) save(p, "at the device's end", 1);
+    }
     pthread_mutex_unlock(&save_lock);
+    if (p->warm_role)
+        VKB_INFO("device %u: Steam's shader pre-caching made %llu pipelines with caches of its own and %llu with ours; %u saves to %s%s", t->id,
+                 (unsigned long long)__atomic_load_n(&p->with_app, __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&p->with_ours, __ATOMIC_RELAXED),
+                 p->warm_saves, p->path, __atomic_load_n(&p->full, __ATOMIC_RELAXED) ? " (full)" : "");
     t->dt.vkCreateGraphicsPipelines = p->create_gfx;
     t->dt.vkCreateComputePipelines = p->create_compute;
     t->dt.vkCreatePipelineCache = p->create_cache;
@@ -1517,9 +1935,12 @@ void vkb_pcache_device_destroy(vkb_srv_table *t)
         p->destroy_cache(t->device, a->cache, NULL); /* left behind by the app */
         free(a);
     }
-    t->real.vkDestroyPipelineCache(t->device, p->cache, NULL);
+    /* a wedged one is left to the device's end: destroying it may wait on the lock the driver kept */
+    if (!__atomic_load_n(&p->wedged, __ATOMIC_RELAXED)) t->real.vkDestroyPipelineCache(t->device, p->cache, NULL);
     pthread_rwlock_destroy(&p->use);
     pthread_mutex_destroy(&p->alock);
     t->pcache = NULL;
+    free(p->warm);
+    free(p->warm_id);
     free(p);
 }

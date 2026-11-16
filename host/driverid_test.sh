@@ -10,7 +10,11 @@
 #   2  arm (ARM_PROPRIETARY, r44p1): Arm's driver; errata on from the r44p1 ranges; SPIR-V fixes and
 #      shl_barrier on; the client clears the dedicated hint;
 #   3  arm11 (Vulkan 1.1 without VK_KHR_driver_properties): driverID unknown, the vendor ID decides
-#      as before: the same as step 2.
+#      as before: the same as step 2;
+#   4  img-full (PowerVR: vendor 0x1010, IMAGINATION_PROPRIETARY driverID 7, driverVersion a changelist
+#      number, driverInfo "25.3@6908880"): named PowerVR in the log, the errata report and the probe
+#      report; none of Arm's paths on it (no version-gated errata, no Mali SPIR-V fixes, no shl_barrier,
+#      no A1 gate), the same errata as the desktop driver; the dedicated hint passed through.
 # Prints one line per step and "OK: ..." / "FAILED: ..." last.
 cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
@@ -85,5 +89,15 @@ smoke
   grep -q "Mali SPIR-V fixes on, .*shl_barrier on" "$log" &&
   echo "$app" | grep -q "dedicated allocation hint: prefersDedicatedAllocation cleared"
 step $? "arm11, no driverID: the vendor ID decides, as step 2 ($res)"
+# 4
+start VKBRIDGE_FAKE_DRIVER=img-full VKBRIDGE_ZINK_PROFILE_PROBE=0 # (Mesa drivers keep driconf profiles for the engine name "mesa zink" too: on lavapipe the PV-08 probe sees one; zinkname_test covers it)
+smoke
+[ $rc = 0 ] && grep -q "imitating PowerVR (VKBRIDGE_FAKE_DRIVER=img-full): vendor 0x1010, driverID IMAGINATION_PROPRIETARY, 25.3@6908880" "$log" &&
+  grep -q "GPU driver: driverID 7 (IMAGINATION_PROPRIETARY): PowerVR (Imagination's driver); Arm's errata and fixes stay off" "$log" &&
+  summary | grep -q "PowerVR driver 25.3 (CL 6908880), not Arm's: its own CL ranges only" && [ "$(ranged)" = 0 ] && [ "$(on_list)" = "$base_on,pv_view3d_base" ] && # (PV-04: multiview into a 3D image's view faults in PowerVR's driver: on there)
+  grep -q "PowerVR driver CL 6908880 (0x00696bd0)" "$log" &&
+  ! grep -q "Mali SPIR-V fixes on\|shl_barrier on" "$log" && ! grep -q "api cap: " "$log" &&
+  echo "$app" | grep -q "dedicated allocation hint: the driver's answer passed through"
+step $? "img (PowerVR): named, Arm's errata, version gates, fixes and the dedicated-hint clearing off (PowerVR's own pv_view3d_base on for its multiview rule) ($res; on: $(on_list))"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

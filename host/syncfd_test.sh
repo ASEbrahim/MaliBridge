@@ -1,5 +1,5 @@
 #!/bin/bash
-# Galaxy S24+, Xclipse 940, 2026-10-28: Xwayland sat 15 minutes in vkGetSemaphoreFdKHR
+# a player log (Galaxy S24+, Xclipse 940, 2026-10-28): Xwayland sat 15 minutes in vkGetSemaphoreFdKHR
 # (a sync-fd export) and the X server with it. A driver that keeps a batch in user space until its
 # waits are met answers a sync-fd export of what that batch signals only when it goes out; RADV
 # does that on the host (tests/syncfd_check.c: a batch held 3 s on a timeline value). A server of
@@ -12,14 +12,14 @@
 #   3  a submit held 6.5 s in the server (VKBRIDGE_TEST_DELAY_CMD), a vkDeviceWaitIdle on another thread: the
 #      log names the held vkQueueSubmit as what the wait waited for (a stall's cause in a log);
 #   4  nothing set on a driver that is not Samsung's: the bound stays off;
-#   5  Galaxy S24+, v0.5.4.2, the export bound on: a submit held 6.5 s and its export right after on the
+#   5  a player log (Galaxy S24+, v0.5.4.2, the export bound on): a submit held 6.5 s and its export right after on the
 #      same thread, the order deadline off (VKBRIDGE_SYNCFD_ORDER_MS=0): the export waits the whole 6.5 s and the log
 #      has no line about it (the export sits unread behind the held submit on its own connection);
 #   6  the same with VKBRIDGE_SYNCFD_ORDER_MS=500: the export is answered at 0.5 s with fd -1, the log names the held
 #      submit, the driver's export is not called;
 #   7  the same deadline with the client's side flush off (VKBRIDGE_SYNCFD_SIDE=0 in the app): the export waits the
 #      whole 6.5 s again (the client's half is needed: the server never reads the export until the submit is out).
-#   8  X5 (Xwayland's vkEndCommandBuffer never returned on Xclipse 940 and 540): one recorded command of a
+#   8  X5 (a player log: Xwayland's vkEndCommandBuffer never returned on Xclipse 940 and 540): one recorded command of a
 #      replayed stream held 6.5 s (vkCmdSetViewport), a vkDeviceWaitIdle waiting behind the End: the log's line names the
 #      command, its place in the stream (command 4 of 5) and the ones before it, and the thread's state;
 #   9  the same with the driver's own End after the stream held: the line says so and lists the stream's last commands.
@@ -92,7 +92,7 @@ step $? "nothing set, not Samsung's driver: no bound ($c4)"
 start orderoff VKBRIDGE_SYNCFD_ORDER_MS=0 VKBRIDGE_TEST_DELAY_CMD=vkQueueSubmit VKBRIDGE_TEST_DELAY_MS=6500
 c5=$(check orderoff orderoff)
 grep -q "^OK" <<<"$c5" && grep -q "test: vkQueueSubmit held 6500 ms" "$log" && ! grep -q "has waited\|the deadline\|sync-fd export:" "$log"
-step $? "the order deadline off: the export waits behind the held submit with no line in the log ($c5; $(grep -m1 'same thread' "$work/check-orderoff.log" | sed 's/^ *//'))"
+step $? "the order deadline off: the export waits behind the held submit with no line in the log, as in a player log ($c5; $(grep -m1 'same thread' "$work/check-orderoff.log" | sed 's/^ *//'))"
 
 # 6
 start order VKBRIDGE_SYNCFD_ORDER_MS=500 VKBRIDGE_TEST_DELAY_CMD=vkQueueSubmit VKBRIDGE_TEST_DELAY_MS=6500

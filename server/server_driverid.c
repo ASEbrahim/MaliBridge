@@ -23,6 +23,14 @@
  *   samsung  vendorID 0x144D and driverID SAMSUNG_PROPRIETARY, the rest the driver's (Xclipse)
  *   samsung:<driverVersion>  the same with that driverVersion (hex, e.g. samsung:0x06401362, Samsung's
  *            SPAL 25.1.866): the driver-version gates (server_emu.c xclipse_zink) see it
+ *   img    driverID IMAGINATION_PROPRIETARY only (PowerVR's driver as gates by driver read it); the
+ *          vendor, device and pipeline cache UUID stay the GPU's, so pipeline cache files still match it
+ *   img-full  vendorID 0x1010 (Imagination) and driverID IMAGINATION_PROPRIETARY (7), driverInfo
+ *            "25.3@6908880" and driverVersion 6908880 (a changelist number, not Arm's r<<22|p<<12):
+ *            the PowerVR in the Pixel 10 and 11. Arm's errata, version gates and fixes stay off on it.
+ *   powervr  vendorID 0x1010 and driverID IMAGINATION_PROPRIETARY; it also keeps PowerVR's application
+ *            profile: an instance whose engine name is exactly "mesa zink" is shown without
+ *            vertexInputDynamicState, graphicsPipelineLibrary and sparse resources (PV-08, pv_zink_name)
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -33,6 +41,8 @@
 #include <string.h>
 
 #define ARM_VENDOR 0x13B5u
+#define IMG_VENDOR 0x1010u
+#define IMG_FAKE_CL 6908880u
 #define AMBIGUOUS 0xffffffffu
 
 static struct {
@@ -105,6 +115,15 @@ int vkb_driver_is_arm(const VkPhysicalDeviceProperties *p, uint32_t driver_id)
     return id ? id == VK_DRIVER_ID_ARM_PROPRIETARY : p->vendorID == ARM_VENDOR;
 }
 
+/* Imagination's PowerVR driver: driverID IMAGINATION_PROPRIETARY, or vendor 0x1010 where the driver
+ * cannot say. Its driverVersion is a changelist number, so Arm's version decode never applies. */
+int vkb_driver_is_powervr(const VkPhysicalDeviceProperties *p, uint32_t driver_id)
+{
+    if (driver_id) remember(p->vendorID, p->deviceID, p->driverVersion, driver_id);
+    uint32_t id = recall(p->vendorID, p->deviceID, p->driverVersion);
+    return id ? id == VK_DRIVER_ID_IMAGINATION_PROPRIETARY : p->vendorID == IMG_VENDOR;
+}
+
 int vkb_arm_driver(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api)
 {
     VkPhysicalDeviceProperties p;
@@ -123,6 +142,7 @@ const char *vkb_driver_id_name(uint32_t id)
     case VK_DRIVER_ID_MESA_TURNIP: return "MESA_TURNIP";
     case VK_DRIVER_ID_QUALCOMM_PROPRIETARY: return "QUALCOMM_PROPRIETARY";
     case VK_DRIVER_ID_SAMSUNG_PROPRIETARY: return "SAMSUNG_PROPRIETARY";
+    case VK_DRIVER_ID_IMAGINATION_PROPRIETARY: return "IMAGINATION_PROPRIETARY";
     case VK_DRIVER_ID_MESA_VENUS: return "MESA_VENUS";
     default: return "other";
     }
@@ -134,19 +154,21 @@ void vkb_driver_log(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_a
     dt->vkGetPhysicalDeviceProperties(pd, &p);
     uint32_t id = vkb_driver_id(dt, pd, inst_api);
     int arm = vkb_driver_is_arm(&p, id);
+    int pvr = vkb_driver_is_powervr(&p, id);
     if (id)
         VKB_INFO("GPU driver: driverID %u (%s): %s", id, vkb_driver_id_name(id),
                  arm ? "Arm's driver; its errata and fixes apply"
+                 : pvr ? "PowerVR (Imagination's driver); Arm's errata and fixes stay off"
                  : p.vendorID == ARM_VENDOR ? "not Arm's driver although the vendor is Arm; Arm's errata and fixes stay off"
                                             : "not Arm's driver");
     else
         VKB_INFO("GPU driver: driverID unknown (Vulkan %u.%u, no VK_KHR_driver_properties): %s", VK_API_VERSION_MAJOR(p.apiVersion),
-                 VK_API_VERSION_MINOR(p.apiVersion), arm ? "Arm's driver by the vendor ID" : "not Arm's driver by the vendor ID");
+                 VK_API_VERSION_MINOR(p.apiVersion), arm ? "Arm's driver by the vendor ID" : pvr ? "PowerVR by the vendor ID; Arm's errata and fixes stay off" : "not Arm's driver by the vendor ID");
 }
 
 /* ------------------------------------------------------------------ VKBRIDGE_FAKE_DRIVER */
 
-enum { FAKE_OFF, FAKE_PANVK, FAKE_ARM, FAKE_ARM11, FAKE_SAMSUNG };
+enum { FAKE_OFF, FAKE_PANVK, FAKE_ARM, FAKE_ARM11, FAKE_SAMSUNG, FAKE_IMG, FAKE_IMG_FULL, FAKE_POWERVR, FAKE_ARM10 };
 
 static struct {
     int on;
@@ -155,19 +177,38 @@ static struct {
     PFN_vkGetPhysicalDeviceProperties props;
     PFN_vkGetPhysicalDeviceProperties2 props2, props2khr;
     PFN_vkEnumerateDeviceExtensionProperties exts;
-} fk;
+    /* powervr: the profile; physical devices of instances made under the engine name "mesa zink" */
+    PFN_vkCreateInstance create;
+    PFN_vkEnumeratePhysicalDevices enumpd;
+    PFN_vkGetPhysicalDeviceFeatures feats;
+    PFN_vkGetPhysicalDeviceFeatures2 feats2, feats2khr;
+    VkPhysicalDevice prof_pd[64];
+    int prof_hidden[64], prof_n;
+    pthread_mutex_t prof_lock;
+} fk = {.prof_lock = PTHREAD_MUTEX_INITIALIZER};
 
 static void fake_props(VkPhysicalDeviceProperties *p)
 {
+    if (fk.on == FAKE_IMG) return; /* the driverID alone */
+    if (fk.on == FAKE_POWERVR) {
+        p->vendorID = 0x1010;
+        return;
+    }
     if (fk.on == FAKE_SAMSUNG) {
         p->vendorID = 0x144D;
         if (fk.version) p->driverVersion = fk.version;
+        return;
+    }
+    if (fk.on == FAKE_IMG_FULL) {
+        p->vendorID = IMG_VENDOR;
+        p->driverVersion = IMG_FAKE_CL;
         return;
     }
     p->vendorID = ARM_VENDOR;
     if (fk.on == FAKE_PANVK) p->driverVersion = VK_MAKE_VERSION(26, 3, 0);
     else p->driverVersion = (44u << 22) | (1u << 12);
     if (fk.on == FAKE_ARM11 && p->apiVersion > VK_API_VERSION_1_1) p->apiVersion = VK_MAKE_API_VERSION(0, 1, 1, VK_API_VERSION_PATCH(p->apiVersion));
+    if (fk.on == FAKE_ARM10) p->apiVersion = VK_MAKE_API_VERSION(0, 1, 0, 66), p->driverVersion = (12u << 22) | (1u << 12);
 }
 
 static void fake_chain(void *next)
@@ -179,9 +220,21 @@ static void fake_chain(void *next)
                 d->driverID = VK_DRIVER_ID_MESA_PANVK;
                 snprintf(d->driverName, sizeof(d->driverName), "panvk");
                 snprintf(d->driverInfo, sizeof(d->driverInfo), "Mesa 26.3.0");
+            } else if (fk.on == FAKE_POWERVR) {
+                d->driverID = VK_DRIVER_ID_IMAGINATION_PROPRIETARY;
+                snprintf(d->driverName, sizeof(d->driverName), "Imagination Technologies");
             } else if (fk.on == FAKE_SAMSUNG) {
                 d->driverID = VK_DRIVER_ID_SAMSUNG_PROPRIETARY;
                 snprintf(d->driverName, sizeof(d->driverName), "Samsung Proprietary driver");
+            } else if (fk.on == FAKE_IMG || fk.on == FAKE_IMG_FULL) {
+                d->driverID = VK_DRIVER_ID_IMAGINATION_PROPRIETARY;
+                if (fk.on == FAKE_IMG_FULL) {
+                    snprintf(d->driverName, sizeof(d->driverName), "Imagination Technologies");
+                    snprintf(d->driverInfo, sizeof(d->driverInfo), "25.3@%u", IMG_FAKE_CL);
+                } else {
+                    snprintf(d->driverName, sizeof(d->driverName), "PowerVR D-Series Vulkan Driver");
+                    snprintf(d->driverInfo, sizeof(d->driverInfo), "25.1@6794074");
+                }
             } else if (fk.on == FAKE_ARM) {
                 d->driverID = VK_DRIVER_ID_ARM_PROPRIETARY;
                 snprintf(d->driverName, sizeof(d->driverName), "Mali");
@@ -241,10 +294,119 @@ static VKAPI_ATTR VkResult VKAPI_CALL fk_EnumerateDeviceExtensionProperties(VkPh
     return r;
 }
 
+/* ---- powervr's profile */
+static int profile_hidden(VkPhysicalDevice pd)
+{
+    int h = 0;
+    pthread_mutex_lock(&fk.prof_lock);
+    for (int i = 0; i < fk.prof_n; i++)
+        if (fk.prof_pd[i] == pd) h = fk.prof_hidden[i];
+    pthread_mutex_unlock(&fk.prof_lock);
+    return h;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fk_CreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out)
+{
+    const char *en = ci && ci->pApplicationInfo ? ci->pApplicationInfo->pEngineName : NULL;
+    VkResult r = fk.create(ci, a, out);
+    if (r == VK_SUCCESS && out) {
+        /* the instance handle is kept in the same table (handles of instances and devices never meet); its physical devices follow it when listed */
+        pthread_mutex_lock(&fk.prof_lock);
+        if (fk.prof_n < 62) {
+            fk.prof_pd[fk.prof_n] = (VkPhysicalDevice)*out;
+            fk.prof_hidden[fk.prof_n++] = en && !strcmp(en, "mesa zink");
+        }
+        pthread_mutex_unlock(&fk.prof_lock);
+    }
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fk_EnumeratePhysicalDevices(VkInstance inst, uint32_t *count, VkPhysicalDevice *out)
+{
+    VkResult r = fk.enumpd(inst, count, out);
+    if (r < 0 || !out) return r;
+    int h = profile_hidden((VkPhysicalDevice)inst);
+    pthread_mutex_lock(&fk.prof_lock);
+    for (uint32_t i = 0; i < *count; i++) {
+        int k = 0;
+        while (k < fk.prof_n && fk.prof_pd[k] != out[i]) k++;
+        if (k == fk.prof_n && fk.prof_n < 64) fk.prof_n++;
+        if (k < 64) fk.prof_pd[k] = out[i], fk.prof_hidden[k] = h;
+    }
+    pthread_mutex_unlock(&fk.prof_lock);
+    return r;
+}
+
+static void profile_features(VkPhysicalDeviceFeatures2 *f)
+{
+    VkPhysicalDeviceFeatures *c = &f->features;
+    c->sparseBinding = c->sparseResidencyBuffer = c->sparseResidencyImage2D = c->sparseResidencyImage3D = VK_FALSE;
+    c->sparseResidency2Samples = c->sparseResidency4Samples = c->sparseResidency8Samples = c->sparseResidency16Samples = VK_FALSE;
+    c->sparseResidencyAliased = VK_FALSE;
+    for (VkBaseOutStructure *b = f->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT)
+            ((VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT *)b)->vertexInputDynamicState = VK_FALSE;
+        else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT)
+            ((VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *)b)->graphicsPipelineLibrary = VK_FALSE;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL fk_GetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f)
+{
+    fk.feats(pd, f);
+    if (profile_hidden(pd)) {
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, NULL, *f};
+        profile_features(&f2);
+        *f = f2.features;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL fk_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
+{
+    fk.feats2(pd, f);
+    if (profile_hidden(pd)) profile_features(f);
+}
+
+static VKAPI_ATTR void VKAPI_CALL fk_GetPhysicalDeviceFeatures2KHR(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f)
+{
+    fk.feats2khr(pd, f);
+    if (profile_hidden(pd)) profile_features(f);
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fk_GetInstanceProcAddr(VkInstance inst, const char *n)
 {
     PFN_vkVoidFunction f = fk.gipa(inst, n);
     if (!f || !inst) return f;
+    /* arm10 (a player log, Note 8 G71, Android 9): the loader is Vulkan 1.1 but the driver 1.0, so the
+     * loader hands out no 1.1 core physical-device entry point: NULL, as there */
+    if (fk.on == FAKE_ARM10) {
+        static const char *const core11[] = {"vkGetPhysicalDeviceProperties2", "vkGetPhysicalDeviceFeatures2",
+            "vkGetPhysicalDeviceFormatProperties2", "vkGetPhysicalDeviceImageFormatProperties2",
+            "vkGetPhysicalDeviceQueueFamilyProperties2", "vkGetPhysicalDeviceMemoryProperties2",
+            "vkGetPhysicalDeviceSparseImageFormatProperties2", "vkGetPhysicalDeviceExternalBufferProperties",
+            "vkGetPhysicalDeviceExternalFenceProperties", "vkGetPhysicalDeviceExternalSemaphoreProperties",
+            "vkEnumeratePhysicalDeviceGroups"};
+        for (size_t i = 0; i < sizeof(core11) / sizeof(core11[0]); i++)
+            if (!strcmp(n, core11[i])) return NULL;
+    }
+    if (fk.on == FAKE_POWERVR) {
+        if (!strcmp(n, "vkEnumeratePhysicalDevices")) {
+            fk.enumpd = (PFN_vkEnumeratePhysicalDevices)f;
+            return (PFN_vkVoidFunction)fk_EnumeratePhysicalDevices;
+        }
+        if (!strcmp(n, "vkGetPhysicalDeviceFeatures")) {
+            fk.feats = (PFN_vkGetPhysicalDeviceFeatures)f;
+            return (PFN_vkVoidFunction)fk_GetPhysicalDeviceFeatures;
+        }
+        if (!strcmp(n, "vkGetPhysicalDeviceFeatures2")) {
+            fk.feats2 = (PFN_vkGetPhysicalDeviceFeatures2)f;
+            return (PFN_vkVoidFunction)fk_GetPhysicalDeviceFeatures2;
+        }
+        if (!strcmp(n, "vkGetPhysicalDeviceFeatures2KHR")) {
+            fk.feats2khr = (PFN_vkGetPhysicalDeviceFeatures2)f;
+            return (PFN_vkVoidFunction)fk_GetPhysicalDeviceFeatures2KHR;
+        }
+    }
     if (!strcmp(n, "vkGetPhysicalDeviceProperties")) {
         fk.props = (PFN_vkGetPhysicalDeviceProperties)f;
         return (PFN_vkVoidFunction)fk_GetPhysicalDeviceProperties;
@@ -269,18 +431,30 @@ PFN_vkGetInstanceProcAddr vkb_driverid_imitate_gipa(PFN_vkGetInstanceProcAddr gi
     const char *v = vkb_srv_env("VKBRIDGE_FAKE_DRIVER");
     if (!v || !*v) return gipa;
     fk.on = !strcmp(v, "panvk") ? FAKE_PANVK : !strcmp(v, "arm") ? FAKE_ARM : !strcmp(v, "arm11") ? FAKE_ARM11
-            : !strcmp(v, "samsung") ? FAKE_SAMSUNG : FAKE_OFF;
+            : !strcmp(v, "samsung") ? FAKE_SAMSUNG : !strcmp(v, "img") ? FAKE_IMG : !strcmp(v, "img-full") ? FAKE_IMG_FULL : !strcmp(v, "powervr") ? FAKE_POWERVR : !strcmp(v, "arm10") ? FAKE_ARM10 : FAKE_OFF;
     if (!strncmp(v, "samsung:", 8)) {
         char *end = NULL;
         unsigned long ver = strtoul(v + 8, &end, 16);
         if (end && end != v + 8 && !*end && ver && ver <= 0xffffffffu) fk.on = FAKE_SAMSUNG, fk.version = (uint32_t)ver;
     }
     if (!fk.on) {
-        VKB_WARN("VKBRIDGE_FAKE_DRIVER=%s means nothing (panvk, arm, arm11, samsung or samsung:<hex driverVersion>)", v);
+        VKB_WARN("VKBRIDGE_FAKE_DRIVER=%s means nothing (panvk, arm, arm11, arm10, samsung, samsung:<hex driverVersion>, img, img-full or powervr)", v);
         return gipa;
     }
     fk.gipa = gipa;
-    if (fk.on == FAKE_SAMSUNG)
+    if (fk.on == FAKE_POWERVR && vkb_global_dt.vkCreateInstance) { /* loaded before the imitations: patched in place */
+        fk.create = vkb_global_dt.vkCreateInstance;
+        vkb_global_dt.vkCreateInstance = fk_CreateInstance;
+    }
+    if (fk.on == FAKE_POWERVR)
+        VKB_INFO("imitating PowerVR's driver (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x1010, driverID IMAGINATION_PROPRIETARY, the \"mesa zink\" profile", v);
+    else if (fk.on == FAKE_IMG_FULL)
+        VKB_INFO("imitating PowerVR (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x1010, driverID IMAGINATION_PROPRIETARY, 25.3@%u", v, IMG_FAKE_CL);
+    else if (fk.on == FAKE_IMG)
+        VKB_INFO("imitating PowerVR's driver (VKBRIDGE_FAKE_DRIVER=img): driverID IMAGINATION_PROPRIETARY, the GPU's vendor and cache UUID");
+    else if (fk.on == FAKE_ARM10)
+        VKB_INFO("imitating Arm's driver r12p1 as Vulkan 1.0 under a 1.1 loader (VKBRIDGE_FAKE_DRIVER=arm10): no 1.1 core entry points");
+    else if (fk.on == FAKE_SAMSUNG)
         VKB_INFO("imitating Samsung's driver (VKBRIDGE_FAKE_DRIVER=%s): vendor 0x144D, driverID SAMSUNG_PROPRIETARY%s", v,
                  fk.version ? ", driverVersion as given" : "");
     else

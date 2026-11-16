@@ -1,0 +1,14 @@
+#version 450
+// hangdisp_check's shader: the shape of The Witcher 3's light culling (h-96e7965da9ba6414) - a loop whose count
+// comes from a constant-buffer-like storage buffer picked by a push constant (a vkd3d-proton root table index)
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(push_constant) uniform P { uint base; uint table; } pc;
+layout(set = 1, binding = 2) readonly buffer CBV { vec4 v[256]; } cbv[16];
+layout(set = 0, binding = 0) buffer Out { uint o[]; };
+void main()
+{
+    uint n = floatBitsToUint(cbv[pc.table + 3u].v[100].x);
+    uint acc = pc.base;
+    for (uint i = gl_LocalInvocationIndex; i < n; i += 256u) acc = acc * 1664525u + i;
+    o[gl_LocalInvocationIndex] = acc;
+}

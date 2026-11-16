@@ -52,12 +52,12 @@ void vkb_emu_patch_features_chain(vkb_physdev *pd, VkBaseOutStructure *b)
 
 static void get_pd_format_properties(VkPhysicalDevice p, VkFormat format, VkFormatProperties *out, void *user)
 {
-    vkb_wire_vkGetPhysicalDeviceFormatProperties(p, format, out);
+    vkb_pd_raw_format_properties(p, format, out);
 }
 
 static void get_pd_format_properties2(VkPhysicalDevice p, VkFormat format, VkFormatProperties2 *out, void *user)
 {
-    vkb_wire_vkGetPhysicalDeviceFormatProperties2(p, format, out);
+    vkb_pd_raw_format_properties2(p, format, out);
 }
 
 int vkb_emu_format_properties(vkb_physdev *pd, VkFormat format, VkFormatProperties *fp, VkFormatProperties2 *fp2)

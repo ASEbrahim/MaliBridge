@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * VK_KHR_imageless_framebuffer on a driver without it (VKB_EMU_IMAGELESS: Mali r18-r26, Vulkan 1.1,
  * e.g. the HUAWEI P40 Pro's Mali-G76 at 1.1.97). Mesa's Zink requires it (26.0.8, DroidDeck's Ubuntu
  * runtime: zink_device_info.py marks it required, and a release build says nothing but "failed to
- * load driver: zink"), and Zink draws Steam's UI: Steam stopped at "glXChooseVisual failed".
+ * load driver: zink"), and Zink draws Steam's UI: Steam stopped at "glXChooseVisual failed" (a player log).
  *
  *   - vkCreateFramebuffer with VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT: nothing reaches the driver. A record
  *     (render pass, size, layers, attachment count) is made and its address is the handle the app gets:

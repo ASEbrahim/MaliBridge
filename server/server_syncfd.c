@@ -1,10 +1,37 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim
  *
- * Sync-fd exports with a deadline: past it the app gets VK_SUCCESS and fd -1, and destroys of the handle wait for the driver's call.
+ * Sync-fd exports with a deadline. vkGetSemaphoreFdKHR and vkGetFenceFdKHR with the SYNC_FD
+ * handle type need the payload's signal handed to the kernel: a driver that holds a batch in
+ * user space until its waits are met (Mesa's RADV with a submit thread on the host, and, it seems,
+ * Samsung's Xclipse driver) answers the export only when that batch goes out. Where that batch
+ * waits on something only the caller would do next, the export never returns. a player log (Galaxy S24+,
+ * Xclipse 940): Xwayland sat in vkGetSemaphoreFdKHR for 15 minutes, the X server answered no one,
+ * Steam's update window stopped after its first frame and the update with it.
+ *
+ * Here the driver's call runs on a thread of its own. If it has not returned within
+ * VKBRIDGE_SYNCFD_EXPORT_MS (default 1000 on Samsung's driver, off elsewhere; 0 off, any other
+ * value on for every driver), the app gets VK_SUCCESS and fd -1, which the spec lets a sync-fd
+ * export give for a payload already signalled: the caller goes on without waiting for that GPU
+ * work (at worst a frame shown before it is drawn) instead of stopping for good. The driver's call
+ * goes on; when it returns, its fd is closed and the time logged. Until then a vkDestroySemaphore
+ * or vkDestroyFence of that handle is held back and done after it, and the device's end waits for
+ * it (or, if it never returns, leaves the device to the process's end rather than destroy it
+ * under a driver call). The queue's later work is not touched.
+ *
+ * The request-order wait too (VKBRIDGE_SYNCFD_ORDER_MS, default 1000 on Samsung's driver, off
+ * elsewhere; 0 off, any other value on for every driver): a sync-fd export waits at most that long
+ * for the process's earlier asynchronous requests (server_conn.c); past it, a sync-fd export is
+ * answered with fd -1 without the driver's call, an opaque one waits on as before. The client sends
+ * its queued requests ahead of such an export on its flusher's connection, not the export's own
+ * (VKB_KNOB_SYNCFD_SIDE_SHIFT, client/conn.c), so the export is not read only after them.
+ * a player log (Galaxy S24+, v0.5.4.2): Xwayland again in vkGetSemaphoreFdKHR for 2 hours with the
+ * export bound on, and no line from the export or the order wait.
+ * Over every layer but the session report's.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
+#include "server_emu.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -93,7 +120,9 @@ static void *sx_worker(void *arg)
         pthread_mutex_unlock(&sx_lock);
         return NULL; /* the caller frees it */
     }
-    /* Abandoned: a destroy held back for the handle is done here once no other export of it is in the driver. */
+    /* Abandoned: the app already has its answer. A destroy held back for the handle is done here
+     * once no other export of it is in the driver; the job stays listed (not finished) until then,
+     * so the device's end waits for that destroy too. */
     sx_destroy *d = NULL;
     if (!sx_busy(j->table, j->handle))
         for (sx_destroy **pp = &sx_held; *pp; pp = &(*pp)->next)
@@ -338,7 +367,11 @@ void vkb_syncfd_device_init(vkb_srv_table *t)
                  oms, oenv ? "" : "; Samsung's driver's default");
 }
 
-/* Before the device goes: its exports still in the driver are waited for, then their held-back destroys done; 1 when one is still in the driver. */
+/*
+ * Before the device goes: its exports still in the driver are waited for (SX_DEVICE_END_WAIT_MS),
+ * then their held-back destroys done. 1 when one is still in the driver: the caller then leaves
+ * the device alive (destroying it under the driver's call could take the whole server down).
+ */
 int vkb_syncfd_device_destroy(vkb_srv_table *t)
 {
     if (!t || t->id >= VKB_MAX_TABLES) return 0;
@@ -385,4 +418,131 @@ int vkb_syncfd_device_destroy(vkb_srv_table *t)
                  "process) rather than destroyed under it",
                  id, SX_DEVICE_END_WAIT_MS);
     return busy;
+}
+
+/*
+ * vkbAcquireSignal: device, queue, semaphore, fence (u64 each, 0: none). An acquired swapchain image's
+ * semaphore and fence signalled (client/wsi.c, VKBRIDGE_ASYNC_ACQUIRE): sent with no reply, in the client's
+ * queue of asynchronous requests, so it runs before anything the app sends after its acquire (its submit
+ * waiting on the semaphore; a fence wait carries the queue's barrier). The same steps the client took itself
+ * with a round trip each: a signalled sync fd (-1) imported as the temporary payload, and where the driver
+ * refuses that, an empty submit on the queue signals them. A failure can only be logged here (the app was
+ * told VK_SUCCESS, as with the client's own empty submit before). VKBRIDGE_FAKE_MISSING=syncfdimport (host
+ * tests): the driver's refusal imitated, so the fallback runs (host/present_path_test.sh).
+ */
+/*
+ * Steam's performance overlay (VKBRIDGE_HUD_FPS, default 0 = off in v0.5.5.4, 12 in 0.5.6; the server's switch: <cache dir>/env;
+ * it needs VKBRIDGE_ASYNC_ACQUIRE on).
+ * With the overlay shown, gamescope runs mangoapp (MangoHud's app mode), which draws its whole window again
+ * for every game frame (its render loop waits on gamescope's per-frame message): 43-56 frames a second next
+ * to Stray, ~115 next to Portal on the S11 Ultra, each one a GPU context's submit with the sync mirror's
+ * batches, server requests, gamescope's second plane and the app compositor's commit, for numbers that change
+ * twice a second (MangoHud's fps_sampling_period, 500 ms). Stray on the Ultra: 50 fps with the overlay shown
+ * vs 57 with no mangoapp (2026-11-12). Here an acquire of mangoapp's next image is signalled no
+ * sooner than 1/N s after its previous one: its thread waits in this request (mangoapp's own ordered stream,
+ * no other process's), its next fence wait or present waits for it, so it draws at most N frames a second.
+ * Nothing it shows is lost or wrong: MangoHud takes gamescope's frame times on a thread of its own and each
+ * drawing shows the latest (at most 1/N s old). 12 keeps the frame gap (83 ms) under the 100 ms hitch line.
+ * Only the process named exactly "mangoapp"; with the overlay hidden or off there is no such process.
+ */
+static uint64_t hud_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint32_t hud_fps(void)
+{
+    static int v = -1;
+    int c = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (c >= 0) return (uint32_t)c;
+    const char *e = vkb_srv_env_global("VKBRIDGE_HUD_FPS");
+    long n = 0; /* v0.5.5.4: off by default (the cap rides on the async acquire, also off here); VKBRIDGE_HUD_FPS=12 */
+    if (e && *e) {
+        char *end;
+        n = strtol(e, &end, 10);
+        if (*end || n < 0) n = 0;
+        if (n > 240) n = 240;
+    }
+    __atomic_store_n(&v, (int)n, __ATOMIC_RELAXED);
+    return (uint32_t)n;
+}
+
+static void hud_pace(vkb_srv_proc *p)
+{
+    if (!p || strcmp(p->comm, "mangoapp") != 0) return;
+    uint32_t fps = hud_fps();
+    if (!fps) return;
+    const uint64_t gap = 1000000000ull / fps;
+    uint64_t last = __atomic_load_n(&p->hud_last_ns, __ATOMIC_RELAXED), now = hud_now_ns();
+    uint64_t n = __atomic_add_fetch(&p->hud_frames, 1, __ATOMIC_RELAXED);
+    if (n == 1)
+        VKB_INFO("hud: process %d is Steam's performance overlay (mangoapp): it draws at most %u frames a second "
+                 "(VKBRIDGE_HUD_FPS=%u; 0 turns this off)", p->pid, fps, fps);
+    if (last && now - last < gap) {
+        uint64_t w = gap - (now - last);
+        struct timespec ts = {(time_t)(w / 1000000000ull), (long)(w % 1000000000ull)};
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        __atomic_add_fetch(&p->hud_paced, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&p->hud_paced_ns, w, __ATOMIC_RELAXED);
+        now = hud_now_ns();
+    }
+    __atomic_store_n(&p->hud_last_ns, now, __ATOMIC_RELAXED);
+    if (n % 600 == 0) /* about once a minute at 10-12 a second */
+        VKB_INFO("hud: mangoapp (process %d): %llu frames, %llu waited for the cap (%.0f ms each on average)", p->pid,
+                 (unsigned long long)n, (unsigned long long)__atomic_load_n(&p->hud_paced, __ATOMIC_RELAXED),
+                 __atomic_load_n(&p->hud_paced, __ATOMIC_RELAXED)
+                     ? __atomic_load_n(&p->hud_paced_ns, __ATOMIC_RELAXED) / 1e6 / (double)__atomic_load_n(&p->hud_paced, __ATOMIC_RELAXED)
+                     : 0.0);
+}
+
+void vkb_sv_vkbAcquireSignal(vkb_srv_call *c)
+{
+    VkDevice device = (VkDevice)(uintptr_t)vkb_dec_u64(&c->d);
+    VkQueue queue = (VkQueue)(uintptr_t)vkb_dec_u64(&c->d);
+    VkSemaphore sem = (VkSemaphore)(uintptr_t)vkb_dec_u64(&c->d);
+    VkFence fence = (VkFence)(uintptr_t)vkb_dec_u64(&c->d);
+    vkb_srv_table *t = c->table;
+    if (c->d.err || !t || !t->is_device || t->device != device || !queue) {
+        vkb_srv_bad_message(c);
+        return;
+    }
+    hud_pace(c->conn ? c->conn->proc : NULL);
+    const vkb_dispatch *dt = c->dt;
+    static int said_sem, said_fence, said_fail, refuse = -1;
+    int no_import = __atomic_load_n(&refuse, __ATOMIC_RELAXED);
+    if (no_import < 0) {
+        no_import = vkb_emu_faked("syncfdimport");
+        __atomic_store_n(&refuse, no_import, __ATOMIC_RELAXED);
+    }
+    VkResult r = VK_SUCCESS;
+    if (sem) {
+        VkImportSemaphoreFdInfoKHR si = {VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, NULL, sem, VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+                                         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, -1};
+        r = no_import ? VK_ERROR_INVALID_EXTERNAL_HANDLE
+            : dt->vkImportSemaphoreFdKHR ? dt->vkImportSemaphoreFdKHR(device, &si) : VK_ERROR_FEATURE_NOT_PRESENT;
+        if (r != VK_SUCCESS) {
+            if (!__atomic_exchange_n(&said_sem, 1, __ATOMIC_RELAXED))
+                VKB_INFO("acquire: the driver took no signalled sync fd for a semaphore (%d); an empty submit signals it", r);
+            VkSubmitInfo s = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 0, NULL, 1, &sem};
+            r = dt->vkQueueSubmit(queue, 1, &s, fence);
+            if (r != VK_SUCCESS && !__atomic_exchange_n(&said_fail, 1, __ATOMIC_RELAXED))
+                VKB_ERR("acquire: the empty submit that signals an acquired image's semaphore failed (%d)", r);
+            return;
+        }
+    }
+    if (fence) {
+        VkImportFenceFdInfoKHR fi = {VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR, NULL, fence, VK_FENCE_IMPORT_TEMPORARY_BIT,
+                                     VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT, -1};
+        r = no_import ? VK_ERROR_INVALID_EXTERNAL_HANDLE
+            : dt->vkImportFenceFdKHR ? dt->vkImportFenceFdKHR(device, &fi) : VK_ERROR_FEATURE_NOT_PRESENT;
+        if (r != VK_SUCCESS) {
+            if (!__atomic_exchange_n(&said_fence, 1, __ATOMIC_RELAXED))
+                VKB_INFO("acquire: the driver took no signalled sync fd for a fence (%d); an empty submit signals it", r);
+            r = dt->vkQueueSubmit(queue, 0, NULL, fence);
+            if (r != VK_SUCCESS && !__atomic_exchange_n(&said_fail, 1, __ATOMIC_RELAXED))
+                VKB_ERR("acquire: the empty submit that signals an acquired image's fence failed (%d)", r);
+        }
+    }
 }

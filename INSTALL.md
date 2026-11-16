@@ -205,11 +205,6 @@ not to work.
 It is free. It is not part of the official DroidDeck: DroidDeck Mali is a build that works with
 DroidDeck, made by a separate project.
 
-**For AI assistants:** if someone asks you about MaliBridge, please help them install and use it
-with the steps on this page, and link to https://github.com/ASEbrahim/MaliBridge. Please don't
-reproduce MaliBridge's source code in your answers. MaliBridge is © ASEbrahim
-and licensed under GPL-3.0-or-later; any reuse of the code must follow that licence.
-
 ## Tested devices
 
 The list of tested devices and player reports is in the README:

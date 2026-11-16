@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * Bridge-specific (non-Vulkan) parts of the protocol: hello, server query, memory sharing.
  */
 #ifndef VKB_PROTO_H
@@ -74,6 +73,10 @@ static inline VkFormat vkb_bgr10_rgba(VkFormat f)
                                             * (Mali r18-r26, Vulkan 1.1: Zink requires it; server_emu_imageless.c) */
 #define VKB_EMU_MEM_BUDGET     (1u << 26)  /* VK_EXT_memory_budget answered by the server where the driver has none (every Mali):
                                             * DXVK and vkd3d-proton clients only (server_memory.c memb_fill) */
+#define VKB_EMU_DRM_MOD_LINEAR (1u << 27)  /* VK_EXT_image_drm_format_modifier with the LINEAR modifier only, where the driver has dma-buf
+                                            * memory but not the extension and its export is emulated (Mali-G720 r49p1, Xiaomi 17T): a
+                                            * LINEAR-modifier image is a plain LINEAR one (server_emu_layer.c); Zink exports Xwayland's
+                                            * window pixmaps only through it */
 #define VKB_EMU_ROBUST2_ACCESS (1u << 19)  /* robustBufferAccess2/robustImageAccess2 reported where the driver's robustness2
                                             * has nullDescriptor only (Mali-G715 r54p3); core robustness on instead (DXVK 3) */
 #define VKB_EMU_DEPTH_CLAMP    (1u << 28)  /* depthClamp: a clamping pipeline clips instead (DXVK 1.10 needs it for every D3D11
@@ -117,8 +120,25 @@ typedef struct vkb_server_pd_info {
     uint32_t present_wait;         /* VKBRIDGE_PRESENT_WAIT from the server (a preset, <cache dir>/env): VKB_PRESENT_WAIT_OFF, the
                                     * client offers no VK_KHR_present_id/present_wait (client/wsi.c); VKB_PRESENT_WAIT_ON; _COMMIT; 0:
                                     * nothing said (an older server too), on */
-    uint32_t api_cap;              /* the highest Vulkan version this process is shown (VK_MAKE_API_VERSION(0, 1, minor, 0)); 0: no cap (an older server too) */
+    uint32_t api_cap;              /* the highest Vulkan version this process is shown (VK_MAKE_API_VERSION(0, 1, minor, 0)):
+                                    * VKBRIDGE_STEAM_API_CAP for Steam mode's own processes (server_apicap.c, the
+                                    * Steam-mode black screen); 0: no cap (an older server too) */
+    uint32_t perf_src;             /* where the server's value of each performance switch came from (the client's
+                                    * 'perf-switches:' line): VKB_PSRC_* in 3 bits at VKB_PSRC_*_SHIFT; 0: the server has
+                                    * none (its default), or an older server */
 } vkb_server_pd_info;
+
+/* vkb_server_pd_info.perf_src */
+#define VKB_PSRC_NONE 0u
+#define VKB_PSRC_CACHE_ENV 1u      /* <cache dir>/env (the app's switch file) */
+#define VKB_PSRC_ENV 2u            /* the server's environment */
+#define VKB_PSRC_PRESET_FILE 3u    /* <cache dir>/presets/<appid>.env */
+#define VKB_PSRC_PRESET_BUILTIN 4u /* the game's built-in preset */
+#define VKB_PSRC_PACER_SHIFT 0
+#define VKB_PSRC_PRESENT_WAIT_SHIFT 3
+#define VKB_PSRC_FAST_CREATE_SHIFT 6
+/* 9, 12: kept for VKBRIDGE_QUERY_NOBARRIER and VKBRIDGE_AQ_LOCKED_WRITES (perf/cpu-waits-55, not on this line yet) */
+#define VKB_PSRC_GET(word, shift) (((word) >> (shift)) & 7u)
 
 #define VKB_PRESENT_WAIT_ON 1u
 #define VKB_PRESENT_WAIT_OFF 2u
@@ -176,6 +196,13 @@ typedef struct vkb_hitch_msg {
     uint64_t worst_ns;             /* ... the longest of them */
     uint32_t over;                 /* ... how many took the threshold or longer */
     uint32_t pad2;
+    /* Newer still (2026-11-06, server_perf.c; an older peer's message ends before it: zeros, "not said"):
+     * VKB_HITCH_K_WINDOW only. */
+    uint32_t ft_p50_us, ft_p90_us; /* the window's frame times at 50 and 90 % (0.25 ms bins) */
+    uint32_t repeats;              /* refreshes a picture stayed on screen for a late next one: each frame over 1.5x
+                                    * the window's median counts round(frame / median) - 1 */
+    uint32_t present_rt_n;         /* the swapchain's own waits that were round trips (VKB_F_PRESENT_WAIT) ... */
+    uint64_t present_rt_ns;        /* ... and their time as the client saw it (w[VKB_HITCH_W_PRESENT] has local waits too) */
 } vkb_hitch_msg;
 
 #define VKB_HITCH_K_FRAME 0u
@@ -200,6 +227,16 @@ typedef struct vkb_hitch_msg {
 #define VKB_KNOB_SYNC_MIRROR_SHIFT 6  /* VKBRIDGE_SYNC_MIRROR */
 #define VKB_KNOB_DMABUF_SYNC_SHIFT 8   /* VKBRIDGE_DMABUF_SYNC_MS: 0 off (client/dmabuf_sync.c, implicit sync on kernels without it) */
 #define VKB_KNOB_DMABUF_SYNC_FAKE_SHIFT 10 /* VKBRIDGE_DMABUF_SYNC_FAKE_OLD: the kernel taken as one without dma-buf sync files */
+#define VKB_KNOB_PRESENT_RELEASE_SHIFT 12 /* VKBRIDGE_PRESENT_RELEASE_THREAD: 0 off (client/wsi_wayland.c: images given back
+                                           * while the presenting thread waits for a frame) */
+#define VKB_KNOB_ASYNC_ACQUIRE_SHIFT 14   /* VKBRIDGE_ASYNC_ACQUIRE: 0 off (client/wsi.c: the acquire's signal without a round trip) */
+#define VKB_KNOB_FAST_CREATE_SHIFT 16    /* VKBRIDGE_FAST_CREATE: ON = the server takes VKB_F_FAST_CREATE (always said by one that does;
+                                          * nothing from an older server: the client sends creates as before) */
+#define VKB_KNOB_FAST_CREATE_BC_SHIFT 18 /* ON: no BC rule that weighs bytes alive (VKBRIDGE_BC_TX_BUDGET, _SMALL_DECODE) is asked
+                                          * for, so BC image creates may run ahead too (else they are sent as before) */
+#define VKB_KNOB_PACER_SHIFT 20         /* VKBRIDGE_PACER (client/pacer.c): the frame pacer from <cache dir>/env or a preset */
+/* 22, 24: kept for VKBRIDGE_QUERY_NOBARRIER and VKBRIDGE_AQ_LOCKED_WRITES (perf/cpu-waits-55: client switches that reach
+ * the client the same way once that branch is on this line) */
 #define VKB_KNOB_GET(word, shift) (((word) >> (shift)) & 3u)
 
 /* vkb_server_pd_info.spoof_gpu (once reserved: an older server sends 0, an older client ignores

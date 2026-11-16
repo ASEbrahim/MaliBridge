@@ -15,6 +15,9 @@ void vkb_emu_patch_features(vkb_physdev *pd, VkPhysicalDeviceFeatures *f);
 void vkb_emu_patch_features_chain(vkb_physdev *pd, VkBaseOutStructure *b);
 /* 1 = handled (format is emulated). fp2 may be NULL. */
 int vkb_emu_format_properties(vkb_physdev *pd, VkFormat format, VkFormatProperties *fp, VkFormatProperties2 *fp2);
+/* physdev.c: the driver's answers (no emulation applied), kept per physical device + format (v2: for no chain and one VkFormatProperties3) */
+void vkb_pd_raw_format_properties(VkPhysicalDevice pd, VkFormat format, VkFormatProperties *out);
+void vkb_pd_raw_format_properties2(VkPhysicalDevice pd, VkFormat format, VkFormatProperties2 *out);
 /* The format the server really uses for an emulated one (usage/flags adjusted); else format. */
 VkFormat vkb_emu_real_format(vkb_physdev *pd, VkFormat format, VkImageUsageFlags *usage, VkImageCreateFlags *flags);
 int vkb_emu_is_emulated_format(vkb_physdev *pd, VkFormat format);

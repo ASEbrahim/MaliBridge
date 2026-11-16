@@ -36,6 +36,24 @@ shader() {
       grep -q "$pat" "$tmp/$name.txt" || { echo "fp16.comp: no $pat in the SPIR-V" >&2; exit 1; }
     done
   fi
+  if [ "$name" = pvnames_vs ]; then
+    # PV-names: the vertex input TEXCOORD and the output TEXCOORE get one OpName (the last letter
+    # of the output's name made a D), as DXVK names a passed-through attribute and its varying
+    python3 - "$tmp/$name.spv" <<'PY'
+import struct, sys
+p = sys.argv[1]
+w = list(struct.unpack("<%dI" % (len(open(p, "rb").read()) // 4), open(p, "rb").read()))
+i, n = 5, 0
+while i < len(w):
+    op, wc = w[i] & 0xffff, w[i] >> 16
+    if op == 5 and bytes(struct.pack("<%dI" % (wc - 2), *w[i + 2:i + wc])).startswith(b"TEXCOORE\0"):
+        w[i + 3] = (w[i + 3] & 0x00ffffff) | (ord("D") << 24)  # the name's 8th byte, the high byte of its 2nd word
+        n += 1
+    i += wc
+assert n == 1, n
+open(p, "wb").write(struct.pack("<%dI" % len(w), *w))
+PY
+  fi
   if [ "$name" = spec ]; then
     # DXVK's form: the composite of specialization constants declared OpConstantComposite (44)
     # instead of OpSpecConstantComposite (51) - what server_spvfix.c undoes for the driver.
@@ -81,4 +99,13 @@ shader face face.frag vulkan1.0
 shader vbs vbs.vert vulkan1.0
 shader bitwise bitwise.comp vulkan1.0 -O0
 shader fp16 fp16.comp vulkan1.2 -O0
+shader pvstore pvstore.comp vulkan1.0
+shader pvnames_vs pvnames.vert vulkan1.0 -O0
+shader pvnames_fs pvnames.frag vulkan1.0
+shader fbl_vs fbl.vert vulkan1.2
+shader fbl_gsvs fbl_gs.vert vulkan1.0
+shader fbl_gs fbl.geom vulkan1.0
+shader fbl_col fbl_col.frag vulkan1.0
+shader fbl_rd3 fbl_rd3.frag vulkan1.0
+shader fbl_rd2a fbl_rd2a.frag vulkan1.0
 echo "wrote $out"

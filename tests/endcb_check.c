@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
- * endcb_check: the command buffer of Animal Well through vkd3d-proton, Mali-G2-Ultra r56p0
- * beta: vkd3d-proton's "Query Resets" command buffer (d3d12_command_list_batch_reset_query_pools)
+ * endcb_check: the command buffer of a player log (Animal Well through vkd3d-proton, Mali-G2-Ultra r56p0
+ * beta): vkd3d-proton's "Query Resets" command buffer (d3d12_command_list_batch_reset_query_pools)
  * is a begin, one vkCmdResetQueryPool per range and an end; the bridge's query mirror
  * (client/query.c) adds its barrier and vkCmdFillBuffer after the reset. The driver's
  * vkEndCommandBuffer of that stream faulted (address 0x18) and took the server with it.

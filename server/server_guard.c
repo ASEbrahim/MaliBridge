@@ -27,7 +27,11 @@
  * VKBRIDGE_NO_CRASH_GUARD=1 turns it off (to get debuggerd's tombstone of the first fault).
  *
  * Only faults on the calling thread are caught. The crashes seen so far were there (the handler
- * named the thread's current command); one on a driver worker thread still kills the process.
+ * named the thread's current command); one on a driver worker thread still kills the process
+ * (a player log: the driver's "mali-compiler" thread). What it can still do: the compiles in
+ * flight are written to stuck-pipelines as crash suspects (vkb_guard_crash_suspects, x=1), so the
+ * next start gives them their stand-in at once; a later run asks the driver once more (built: off
+ * the list; crashed again: the stand-in for good).
  *
  * Compiles that never end. The Mali-G925's compiler (Android 16, 2026-10-14) spun at 100% of a
  * core inside vkCreateGraphicsPipelines when Stray (DXVK) created its first ~25 game pipelines;
@@ -53,6 +57,24 @@
  * (delete the file to retry everything). VKBRIDGE_LAYER_GS_FOLD=1 folds every foldable geometry
  * stage up front. The same caveat as for crashes applies: a lock the driver held while it spun
  * stays held.
+ *
+ * A line in that file is a suspect, not a verdict. The watchdog cuts a compile off without knowing
+ * whether it would have finished, and a compile can run out of time without being at fault: 29
+ * compute pipelines of the S11 Ultra's list timed out once and then built in 0.0-2.5 s (a player log),
+ * on a list with a real G925 hang beside them. So what draws wrong or not at all is asked of the
+ * driver again in later runs, and what the driver builds stops being stuck:
+ *   - the constant-colour stand-in (m=2): the real pipeline again with twice, then four times the
+ *     limit (one line per try, written first, so a try that hangs is not repeated for ever); built,
+ *     it is kept as m=5. The first try of a run that runs out of time ends that run's tries of
+ *     these: a true hang costs one interrupt in each of the next two runs, then none;
+ *   - a pipeline with no fallback (m=0), asked again once per run: built, a line m=5 t=1 takes it
+ *     off the list for good (is_stuck): a later run compiles it as any other, the same limit, the
+ *     same fold and LUT checks;
+ *   - a shader module (m=0): refused without a word before; the driver is asked again as a compute
+ *     pipeline is (t=1..3), with the same m=5 t=1 when it builds, and a refusal now says so.
+ * The fallbacks that draw right (m=1, m=3) and the LUT stand-in (m=4, one try, row 113) stay as they
+ * were. No new line format: lines of older builds (v=3) take these tries too, and an older build
+ * reads these lines as it reads its own.
  */
 #define _GNU_SOURCE
 #include "vkb_server.h"
@@ -61,6 +83,7 @@
 #include "spirv_caps.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -70,6 +93,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -94,14 +118,14 @@ typedef struct vkb_guard {
     double limit; /* this device's interrupt (s; < 0: none), chosen at its creation: its game's preset counts */
     int feedback;  /* pipeline creation feedback asked of the driver (cache_feedback) */
     uint64_t built, hits; /* pipelines the driver built with feedback; of those, found in the pipeline cache */
-    /* memory calls: the driver's, and the faults contained in them */
+    /* memory calls (a player log): the driver's, and the faults contained in them */
     PFN_vkAllocateMemory alloc;
     PFN_vkBindImageMemory bind_img;
     PFN_vkBindImageMemory2 bind_img2;
     PFN_vkBindBufferMemory bind_buf;
     PFN_vkBindBufferMemory2 bind_buf2;
     int mem_crashes;
-    /* the driver's vkEndCommandBuffer of a client's replayed command buffer */
+    /* the driver's vkEndCommandBuffer of a client's replayed command buffer (a player log) */
     PFN_vkEndCommandBuffer end;
     int end_crashes;
     /* the capability check (cap_*): decided at the device's creation */
@@ -111,14 +135,18 @@ typedef struct vkb_guard {
     VkDynamicState dyn[24];
 } vkb_guard;
 
+#define GUARD_RA 6
 typedef struct guard_arm {
     sigjmp_buf jb;
     volatile int sig;
     void *volatile addr;
-    volatile int code;        /* si_code of the fault (SEGV_ACCERR 2 for a player log/5PA6), 0 for the watchdog's interrupt */
+    volatile int code;        /* si_code of the fault (SEGV_ACCERR 2 for a player log), 0 for the watchdog's interrupt */
     volatile uintptr_t pc;    /* the faulting pc, 0 when unknown */
     volatile int timed_out; /* set by the watchdog before it signals the thread */
     int base;               /* a connection thread's base arm (vkb_guard_serve): any fault no specific arm took */
+    volatile unsigned snap; /* set by the handler: the calls in flight at the fault (snap_take), 0 none */
+    uintptr_t ra[GUARD_RA];   /* set by the handler: the return addresses of the frame records above the fault, newest first */
+    int nra;
     struct guard_arm *prev;
 } guard_arm;
 
@@ -126,6 +154,17 @@ static __thread guard_arm *volatile tls_arm;
 static __thread int tls_variant; /* inside a fallback compile (float_controls2 stripped / stand-in) */
 static vkb_guard *guards[MAX_TABLES];
 static int process_crashes;
+/* a player log (Maleoon 920): 65 short-lived steamwebhelpers each faulted once in vkGetDeviceQueue over 3.5 min; every
+ * fault was contained, but the count only grew, so the 65th ended the server and the session for everyone. Each
+ * contained fault is charged to its device (table id); when the device goes (its program destroyed it or ended),
+ * its charge leaves the count. PROCESS_MAX now limits faults of programs still running (a storm), not the
+ * server's lifetime. A driver lock the fault left held is the memory fault watchdog's to catch, as before. */
+static int charged[MAX_TABLES];
+static int charge(uint32_t id)
+{
+    if (id < MAX_TABLES) __atomic_add_fetch(&charged[id], 1, __ATOMIC_RELAXED);
+    return __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+}
 static int guard_off = -1;
 static int test_crash = -1;
 
@@ -140,17 +179,58 @@ static void guard_env(void)
          * with a geometry stage faults, marked or not ('s r38p1 beta: server_errata_gs.c); =clip:
          * every pipeline a stage of which reaches the driver with a clip or cull distance built-in or
          * capability faults at 0x40, as Mali's compiler did without shaderClipDistance (ULTRAKILL; No
-         * Man's Sky: 0x18 / 0x40) */
+         * Man's Sky, a player log: 0x18 / 0x40); =worker: a marked pipeline's compile has a thread
+         * of the "driver" named "mali-compiler" fault (a read at 0x8 inside libc's strlen: the pc outside the
+         * server, as a player log's was in libGLES_mali.so) while the call waits for it, as Mali's compile waits on
+         * its compiler worker: the guard cannot contain it (no arm on that thread) and the process dies;
+         * =workerself: the same thread faults in the server's own code instead (a server bug, not a compile) */
         s = getenv("VKBRIDGE_TEST_CRASH_PIPELINE");
-        test_crash = s && *s && *s != '0' ? (!strcmp(s, "spin") ? 2 : !strcmp(s, "spinfc2") ? 3 : !strcmp(s, "slow") ? 4 : !strcmp(s, "gs") ? 5 : !strcmp(s, "clip") ? 6 : 1) : 0;
+        test_crash = s && *s && *s != '0' ? (!strcmp(s, "spin") ? 2 : !strcmp(s, "spinfc2") ? 3 : !strcmp(s, "slow") ? 4 : !strcmp(s, "gs") ? 5 : !strcmp(s, "clip") ? 6 : !strcmp(s, "worker") ? 7 : !strcmp(s, "workerself") ? 8 : 1) : 0;
         if (guard_off) VKB_INFO("driver crash containment off (VKBRIDGE_NO_CRASH_GUARD)");
         if (test_crash) VKB_WARN("VKBRIDGE_TEST_CRASH_PIPELINE: marked pipelines fault on purpose");
     }
 }
 
-/* From the crash handler; async-signal-safe up to the jump (TLS reads, plain stores). Returns only
- * when the faulting thread is not inside a guarded call. */
-void vkb_guard_fault(int sig, void *addr, int code, uintptr_t pc)
+static unsigned snap_take(void);
+static int snap_text(char *buf, size_t cap, unsigned snap);
+
+/* From the crash handler; async-signal-safe up to the jump (TLS reads, plain stores, the copy of the calls in
+ * flight). Returns only when the faulting thread is not inside a guarded call. */
+/* In the handler: the return addresses of the frame records above the fault (the caller of the faulting function: the
+ * contained line alone gave only the pc, and a function with two callers - PowerVR's GrabScissorDepthBiasBuffers, a player log
+ * and the 11-13 Pixel run - could not be told apart). Plain loads of the thread's own stack only: a record is followed
+ * while it lies above the stack pointer, within 1 MB of it, aligned, and the next one is higher (no read outside the
+ * stack the thread is running on). Pointer-authentication bits are stripped (Android arm64: 39-bit addresses). */
+static int fault_ras(void *ucv, uintptr_t *ra, int max)
+{
+    int n = 0;
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(REG_RBP))
+    if (!ucv) return 0;
+    const ucontext_t *uc = ucv;
+#if defined(__aarch64__)
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29], sp = (uintptr_t)uc->uc_mcontext.sp;
+#else
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP], sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+#endif
+    while (n < max && fp >= sp && fp - sp < (1u << 20) && !(fp & 7)) {
+        uintptr_t next = ((const uintptr_t *)fp)[0], r = ((const uintptr_t *)fp)[1];
+#if defined(__aarch64__) && defined(__ANDROID__)
+        r &= 0x7fffffffffull;
+#endif
+        if (!r) break;
+        ra[n++] = r;
+        if (next <= fp) break;
+        fp = next;
+    }
+#else
+    (void)ucv;
+    (void)ra;
+    (void)max;
+#endif
+    return n;
+}
+
+void vkb_guard_fault(int sig, void *addr, int code, uintptr_t pc, void *uc)
 {
     guard_arm *a = tls_arm;
     if (!a) return;
@@ -161,24 +241,39 @@ void vkb_guard_fault(int sig, void *addr, int code, uintptr_t pc)
     a->addr = addr;
     a->code = code;
     a->pc = pc;
+    a->snap = snap_take();
+    a->nra = fault_ras(uc, a->ra, GUARD_RA);
     siglongjmp(a->jb, 1);
 }
 
 /*
  * After a contained fault (not the watchdog's interrupt): what the uncontained crash line says, which
- * the CONTAINED line alone did not (t12-t15: next RE7/RE8 log would have carried only "signal 11
- * (address ..)" and could not tell which hypothesis of a player log/5PA6 holds): the fault's code and pc as
+ * the CONTAINED line alone did not (t12-t15: the next RE7/RE8 log would have carried only "signal 11
+ * (address ..)" and could not tell which hypothesis of a player log holds): the fault's code and pc as
  * library + offset (the same driver site, libGLES_mali.so+0xa177bc, or another), what the address lies in
  * (/proc/self/maps: scudo's reservation, /dev/mali0, a dma-buf, nothing), the call's arguments (the
  * allocation's path and dma-buf, the bind's image and memory) and the other programs' calls in flight
- * (an import or a destroy racing it). Runs after the jump, in the thread's own context.
+ * (an import or a destroy racing it). Runs after the jump, in the thread's own context: the calls in flight
+ * AT the fault are the handler's copy (snap_take); the list made here, later, is printed after it as
+ * "after recovery" (the only list until then, it named calls that began after the fault).
  */
 static void fault_detail(const char *call, const guard_arm *a)
 {
     if (a->timed_out || (!a->code && !a->pc)) return;
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER; /* vkb_crashctx_where has static buffers */
-    static char buf[2048];
+    static char buf[4096];
     pthread_mutex_lock(&lock);
+    /* VKBRIDGE_TEST_FAULT_LATE_MS=<ms> (host/faultsnap_test.sh): this account waits that long first, as on the phone,
+     * where dladdr, /proc/self/maps and the call's description took 22-30 ms (a player log) */
+    static int late_ms = -1;
+    if (late_ms < 0) {
+        const char *s = getenv("VKBRIDGE_TEST_FAULT_LATE_MS");
+        late_ms = s && *s ? atoi(s) : 0;
+    }
+    if (late_ms > 0) {
+        struct timespec ts = {late_ms / 1000, (long)(late_ms % 1000) * 1000000L};
+        while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
+    }
     Dl_info di;
     memset(&di, 0, sizeof(di));
     int found = a->pc && dladdr((void *)a->pc, &di) && di.dli_fname;
@@ -186,10 +281,22 @@ static void fault_detail(const char *call, const guard_arm *a)
     int n = snprintf(buf, sizeof(buf), "vkbridge-server E   fault: code %d%s, pc %p (%s+0x%lx)\n", a->code,
                      a->sig == SIGSEGV && a->code == SEGV_ACCERR ? " (SEGV_ACCERR)" : a->sig == SIGSEGV && a->code == SEGV_MAPERR ? " (SEGV_MAPERR)" : "",
                      (void *)a->pc, found ? (lib ? lib + 1 : di.dli_fname) : "?", found ? (unsigned long)(a->pc - (uintptr_t)di.dli_fbase) : 0ul);
+    for (int i = 0; i < a->nra && n > 0 && n < (int)sizeof(buf) - 120; i++) {
+        Dl_info ri;
+        memset(&ri, 0, sizeof(ri));
+        int rf = dladdr((void *)a->ra[i], &ri) && ri.dli_fname;
+        const char *rl = rf ? strrchr(ri.dli_fname, '/') : NULL;
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%s+0x%lx%s", i ? " <- " : "vkbridge-server E   called from (frame records, newest first): ",
+                      rf ? (rl ? rl + 1 : ri.dli_fname) : "?", rf ? (unsigned long)(a->ra[i] - (uintptr_t)ri.dli_fbase) : (unsigned long)a->ra[i],
+                      i == a->nra - 1 ? "\n" : "");
+    }
     if (n > 0 && n < (int)sizeof(buf) - 1) n += vkb_crashctx_where(buf + n, sizeof(buf) - (size_t)n, a->addr);
     if (n > 0 && n < (int)sizeof(buf) - 1) n += vkb_crashctx_describe(buf + n, sizeof(buf) - (size_t)n, call);
+    if (n > 0 && n < (int)sizeof(buf) - 1) n += snap_text(buf + n, sizeof(buf) - (size_t)n, a->snap);
+    /* and again now, after the jump and the account above (on the phone 22-30 ms after the fault: a player log): calls that
+     * began after the fault are among these, so this list alone never shows what ran at the fault */
     if (n > 0 && n < (int)sizeof(buf) - 1) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "vkbridge-server E   other calls in flight: ");
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "vkbridge-server E   calls in flight after recovery: ");
         int m = n > 0 && n < (int)sizeof(buf) - 1 ? vkb_srv_crash_others(buf + n, sizeof(buf) - (size_t)n) : 0;
         if (!m && n > 0 && n < (int)sizeof(buf) - 1) m = snprintf(buf + n, sizeof(buf) - (size_t)n, "none");
         n += m;
@@ -229,7 +336,7 @@ static int armable(void)
 static void contained(vkb_guard *g, const char *call, const guard_arm *a)
 {
     int mine = __atomic_add_fetch(&g->crashes, 1, __ATOMIC_RELAXED);
-    int total = __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+    int total = charge(g->t->id);
     if (mine >= POISON_AT) g->poisoned = 1;
     VKB_ERR("CONTAINED driver crash: signal %d (address %p) in %s on device %u - the call fails, the session lives "
             "(%d on this device, %d in the process%s%s)",
@@ -259,9 +366,29 @@ static double mono_s(void);
 
 static uint32_t stage_needs(const VkPipelineShaderStageCreateInfo *st);
 
+/* =worker / =workerself: the "driver's" compiler thread that faults while the call waits for it */
+static void *worker_fault_main(void *self)
+{
+    pthread_setname_np(pthread_self(), "mali-compiler");
+    if (self) *(volatile int *)(uintptr_t)0x8 = 1; /* in the server's own code */
+    size_t (*volatile sl)(const char *) = (size_t (*)(const char *))dlsym(RTLD_DEFAULT, "strlen");
+    if (sl) sl((const char *)(uintptr_t)0x8); /* in libc: outside the server, as in the driver */
+    return NULL;
+}
+
 static void test_fault(const VkPipelineShaderStageCreateInfo *stages, uint32_t n, size_t stride)
 {
     if (!test_crash) return;
+    if (test_crash == 7 || test_crash == 8) {
+        for (uint32_t i = 0; i < n; i++)
+            if (marked((const VkPipelineShaderStageCreateInfo *)((const char *)stages + i * stride))) {
+                pthread_t th;
+                VKB_WARN("test: the driver's compiler thread faults on purpose (%s) during a %s call", test_crash == 8 ? "in the server's code" : "in libc",
+                         tls_arm ? "guarded" : "UNGUARDED");
+                if (pthread_create(&th, NULL, worker_fault_main, test_crash == 8 ? (void *)1 : NULL) == 0) pthread_join(th, NULL);
+            }
+        return;
+    }
     if (test_crash == 6) {
         for (uint32_t i = 0; i < n; i++)
             if (stage_needs((const VkPipelineShaderStageCreateInfo *)((const char *)stages + i * stride)) & (VKB_SPVCAP_CLIP | VKB_SPVCAP_CULL)) {
@@ -320,6 +447,15 @@ typedef struct watch_slot {
     size_t size[STAGES_MAX];
     int warned;
     double limit; /* vkb_guard_run: its own limit (0: VKBRIDGE_COMPILE_TIMEOUT_S) */
+    /* for the crash handler (vkb_guard_crash_suspects): the pipeline's stuck-list key, set only for the
+     * program's own pipeline compile (not a fallback's, a module's or vkb_guard_run's) */
+    int pipe;   /* 1 graphics, 2 compute, 0 none */
+    int trying; /* a listed pipeline asked of the driver again (tls_limit) */
+    uint64_t key[STAGES_MAX];
+    /* for the fault-time copy (snap_take): the thread's kernel id, and the request it serves (vkb_srv_current_cmd: NULL on the
+     * server's own threads, "... (in the background)" on the async compile's workers) */
+    int tid;
+    const char *ctx;
 } watch_slot;
 
 typedef struct mod_hash {
@@ -343,6 +479,122 @@ static size_t code_bytes;
 
 static pthread_mutex_t watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static watch_slot slots[WATCH_SLOTS];
+/* each slot's change count, outside the slot (watch_begin clears it): odd while watch_begin / watch_end write it under
+ * watch_lock, so the signal handler, which takes no lock, can tell a slot it read half-written */
+static unsigned slot_seq[WATCH_SLOTS];
+static __thread int tls_tid;
+extern __thread const char *vkb_srv_current_cmd; /* server_conn.c */
+
+/*
+ * The calls in flight AT a contained fault (ledger 297). A player's RE8 logs (a player log, Mali-G615 r44p1) listed the
+ * other calls in flight after the fault's jump, 22-30 ms after it, so the calls named had begun after the fault and nothing
+ * showed what was in the driver at it. The handler now copies, before the jump, the markers that already exist: each
+ * connection's running request and its start (conn->running / running_ns, set for every request) and each guarded compile's
+ * watch slot (the async compile's workers, the BC transcoder builds, every pipeline and module). Nothing new on the request
+ * path; a compile's slot gains two plain stores of its change count. In the handler: atomic loads and plain copies into a
+ * static ring of SNAP_RING copies (a fault takes the next one; no lock, no allocation, no stdio); a marker that changes while
+ * it is copied is marked torn, never waited for. fault_detail prints it after the jump.
+ * Ages: a request's start is on CLOCK_MONOTONIC_COARSE (kept: it is read for every request; one tick is 4 ms at HZ=250), a
+ * compile's on CLOCK_MONOTONIC; each is aged against the handler's reading of the same clock.
+ */
+#define SNAP_CALLS 24
+#define SNAP_RING 8
+typedef struct fault_snap {
+    unsigned seq; /* 2k+1 while fault k (0-based) writes it, 2k+2 once written */
+    int n, more;
+    uint64_t at_coarse_ns;
+    double at_mono;
+    vkb_crash_call c[SNAP_CALLS];
+} fault_snap;
+static fault_snap snaps[SNAP_RING];
+static unsigned snap_count;
+
+static unsigned snap_take(void)
+{
+    unsigned k = __atomic_fetch_add(&snap_count, 1, __ATOMIC_RELAXED);
+    fault_snap *s = &snaps[k % SNAP_RING];
+    __atomic_store_n(&s->seq, 2 * k + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    s->at_coarse_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    s->at_mono = (double)ts.tv_sec + ts.tv_nsec / 1e9;
+    int self = (int)syscall(SYS_gettid), more = 0;
+    int n = vkb_srv_crash_snap(s->c, SNAP_CALLS, self, &more), nreq = n;
+    for (int i = 0; i < WATCH_SLOTS; i++) {
+        unsigned q1 = __atomic_load_n(&slot_seq[i], __ATOMIC_ACQUIRE);
+        if (!__atomic_load_n(&slots[i].used, __ATOMIC_RELAXED)) continue;
+        int tid = __atomic_load_n(&slots[i].tid, __ATOMIC_RELAXED);
+        if (tid == self) continue; /* the faulting call's own */
+        int listed = 0;            /* a connection thread's compile: its request is listed already */
+        for (int j = 0; j < nreq && !listed; j++) listed = s->c[j].tid == tid;
+        if (listed) continue;
+        double start = slots[i].start;
+        const char *call = slots[i].call, *ctx = slots[i].ctx;
+        uint32_t dev = slots[i].device;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        unsigned q2 = __atomic_load_n(&slot_seq[i], __ATOMIC_RELAXED);
+        if (n >= SNAP_CALLS) {
+            more++;
+            continue;
+        }
+        vkb_crash_call *o = &s->c[n++];
+        o->tid = tid;
+        o->pid = 0;
+        o->cmd = 0;
+        o->device = dev;
+        o->since_ns = start > 0 ? (uint64_t)(start * 1e9) : 0;
+        o->call = call;
+        o->ctx = ctx;
+        o->comm[0] = 0;
+        o->torn = (q1 & 1) || q1 != q2;
+    }
+    s->n = n;
+    s->more = more;
+    __atomic_store_n(&s->seq, 2 * k + 2, __ATOMIC_RELEASE);
+    return k + 1;
+}
+
+/* After the jump: the copy as one line, "vkbridge-server E   calls in flight at the fault: ...\n". */
+static int snap_text(char *buf, size_t cap, unsigned snap)
+{
+    int n = snprintf(buf, cap, "vkbridge-server E   calls in flight at the fault: ");
+    if (n < 0 || (size_t)n >= cap) return n < 0 ? 0 : (int)cap - 1;
+#define SNAP_ADD(...)                                                                         \
+    do {                                                                                      \
+        if (n >= 0 && (size_t)n < cap) n += snprintf(buf + n, cap - (size_t)n, __VA_ARGS__); \
+    } while (0)
+    const fault_snap *s = snap ? &snaps[(snap - 1) % SNAP_RING] : NULL;
+    unsigned seq = s ? __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) : 0;
+    if (!s) SNAP_ADD("not copied");
+    else if (seq != 2 * (snap - 1) + 2) SNAP_ADD("not kept (written over by a later fault's copy)");
+    else if (!s->n && !s->more) SNAP_ADD("none");
+    else {
+        int reqs = 0;
+        for (int i = 0; i < s->n; i++) {
+            const vkb_crash_call *c = &s->c[i];
+            if (c->cmd) {
+                reqs++;
+                SNAP_ADD("%s%s (pid %d, thread %d) %s %llu ms%s", i ? "; " : "", c->comm[0] ? c->comm : "?", c->pid, c->tid,
+                         vkb_cmd_names[c->cmd - 1],
+                         (unsigned long long)(s->at_coarse_ns > c->since_ns ? (s->at_coarse_ns - c->since_ns) / 1000000ull : 0),
+                         c->torn ? " (changing as it was read)" : "");
+            } else {
+                double ms = c->since_ns ? (s->at_mono - c->since_ns / 1e9) * 1e3 : 0;
+                SNAP_ADD("%scompile %s on device %u (thread %d, %s) %.0f ms%s", i ? "; " : "", c->call ? c->call : "?", c->device, c->tid,
+                         c->ctx ? c->ctx : "the server's own", ms > 0 ? ms : 0, c->torn ? " (changing as it was read)" : "");
+            }
+        }
+        if (s->more) SNAP_ADD("; %d more", s->more);
+        if (reqs) SNAP_ADD(" (a request's age on the coarse clock: a few ms)");
+    }
+    SNAP_ADD("\n");
+#undef SNAP_ADD
+    if (n < 0) n = 0;
+    if ((size_t)n >= cap) n = (int)cap - 1;
+    return n;
+}
 /* The G925's normal compiles of Stray's shaders took < 2 s. Performance mode waits longer before
  * it gives a pipeline a fallback (a slow compile there is more likely to finish than to spin). */
 #define WARN_S 5.0
@@ -354,6 +606,13 @@ static mod_hash mods[MOD_BUCKETS];
 static uint64_t stuck[STUCK_MAX][STAGES_MAX];
 static uint32_t stuck_n[STUCK_MAX], nstuck;
 static int stuck_mode[STUCK_MAX]; /* FB_*: what this pipeline gets instead */
+/* Crash suspects (x= in the file; older builds read past it): 1 = in flight when the driver crashed on a
+ * thread the guard cannot contain (written by the crash handler): its stand-in (a compute pipeline: a failed
+ * one) at once, not asked of the driver in that run; 2 = given that in a run: a later run asks the driver
+ * again once (written first, as every try); built, it leaves the list (m=5 t=1); 3 = crashed the driver again
+ * while asked: the stand-in for good (t=RETRY_MAX). 0 = not from a crash. */
+static unsigned char stuck_crash[STUCK_MAX];
+static char crash_path[700]; /* <cache dir>/stuck-pipelines for the crash handler, set when the list is loaded */
 
 enum { FB_FAIL = 0, FB_RELAXED = 1, FB_STANDIN = 2, FB_NOGS = 3, FB_LUT = 4, FB_SLOW = 5, FB_COUNT };
 static const char *const fb_names[] = {"fails", "float_controls2 stripped", "constant-colour stand-in fragment shader",
@@ -368,7 +627,19 @@ static const char *const fb_names[] = {"fails", "float_controls2 stripped", "con
 #define RETRY_MAX 3
 static int stuck_tries[STUCK_MAX];
 static unsigned char stuck_retried[STUCK_MAX]; /* tried again in this run already */
+static int retry_cut;                          /* a try of a listed pipeline ran out of time in this run */
+static int retry_busy;                         /* a stand-in's try is running (they go one at a time: at most one interrupt) */
 static __thread double tls_limit;              /* a retry's own limit (armed_compute) */
+static __thread int tls_trying;                /* a listed pipeline is asked of the driver again (for the crash handler) */
+/* This driver's compiler spins on UE4's colour-grading LUT shape, not just compiles it slowly: a LUT
+ * pipeline's retry with twice the limit ran out of time too (a stuck-pipelines line m=4 t=2, and no
+ * graphics stand-in ever built with a longer limit, m=5 t>=2). From then on every LUT pipeline gets
+ * its stand-in at once: no further retries, no timeout for a variant not seen before. Stray on the
+ * Mali-G925 r49p1 (a player log-11-10): each new CombineLUTs variant froze the game 10 s,
+ * and each one's retry in the next run 20 s more - 7 of 7 retries spun to the end, none built.
+ * lut_cut: a LUT pipeline ran out of time in this run; other LUT pipelines of this run get the
+ * stand-in at once too (each is retried once in a later run until lut_spins is known). */
+static int lut_spins, lut_spins_blocked, lut_cut;
 /* stuck-pipelines lines carry the version of the fallback list that chose them: a line from an
  * older list is tried again (2117ebc's constant colour whited out Stray's picture). */
 #define STUCK_VERSION 3
@@ -572,7 +843,8 @@ static int is_stuck(const uint64_t *h, uint32_t n)
         if (stuck_n[k] != n) continue;
         uint32_t same = 0;
         for (uint32_t i = 0; i < n; i++) same += stuck[k][i] == h[i] && h[i];
-        if (same == n && n) hit = stuck_mode[k] + 1;
+        /* m=5 t=1: built when the driver was asked again with the ordinary limit: no longer stuck */
+        if (same == n && n) hit = stuck_mode[k] == FB_SLOW && stuck_tries[k] <= 1 ? 0 : stuck_mode[k] + 1;
     }
     pthread_mutex_unlock(&watch_lock);
     return hit;
@@ -589,9 +861,14 @@ static int stuck_tries_take(const uint64_t *key, uint32_t n, int mode)
         uint32_t same = 0;
         for (uint32_t i = 0; i < n; i++) same += stuck[k][i] == key[i];
         if (same != n || !n) continue;
+        if (stuck_crash[k] == 1) break; /* the run after the crash: its stand-in, no try */
         if (mode == FB_FAIL && (stuck_retried[k] || stuck_tries[k] >= RETRY_MAX)) break;
         /* a graphics pipeline that got the LUT stand-in (UE4 CombineLUTs): one try in a later run, with twice the limit */
         if (mode == FB_LUT && (stuck_retried[k] || stuck_tries[k] >= 2)) break;
+        /* the constant-colour stand-in draws wrong: up to the compute limit; one that ran out of time ends this run's */
+        if (mode == FB_STANDIN && (stuck_retried[k] || stuck_tries[k] >= RETRY_MAX || __atomic_load_n(&retry_cut, __ATOMIC_RELAXED) ||
+                                   __atomic_exchange_n(&retry_busy, 1, __ATOMIC_ACQ_REL)))
+            break;
         stuck_retried[k] = 1;
         tries = stuck_tries[k] > 0 ? stuck_tries[k] : 1;
     }
@@ -632,6 +909,7 @@ static void heal(const uint64_t *key, uint32_t nh)
     pthread_mutex_unlock(&retried_lock);
 }
 static __thread int tls_retrying; /* inside the one retry: the stuck list is not read */
+static __thread int tls_retry_cut; /* the watchdog cut the retry off: what came back is a fallback */
 
 /* 1: not tried this run (now marked); a pipeline that got stuck in this run counts as tried */
 static int retry_once(const uint64_t *key, uint32_t nh)
@@ -648,9 +926,63 @@ static int retry_once(const uint64_t *key, uint32_t nh)
     return fresh;
 }
 
+/* The crash-suspect state of a listed pipeline (stuck_crash), 0 if none */
+static int crash_of(const uint64_t *key, uint32_t n)
+{
+    int x = 0;
+    pthread_mutex_lock(&watch_lock);
+    for (uint32_t k = 0; k < nstuck && n; k++) {
+        if (stuck_n[k] != n) continue;
+        uint32_t same = 0;
+        for (uint32_t i = 0; i < n; i++) same += stuck[k][i] == key[i];
+        if (same == n) {
+            x = stuck_crash[k];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&watch_lock);
+    return x;
+}
+
+static void add_stuck_x(const uint64_t *key, uint32_t n, int mode, int tries, int crash, const char *note);
 static void add_stuck(const uint64_t *key, uint32_t n, int mode, int tries, const char *note)
 {
+    add_stuck_x(key, n, mode, tries, 0, note);
+}
+
+/* A crash suspect (x=1) given its stand-in or failure in this run: x=2 (written once), a later run asks again */
+static void crash_given(const uint64_t *key, uint32_t n, int mode, const uint64_t *h, const uint32_t *stg, const char *call)
+{
+    int first = 0;
+    pthread_mutex_lock(&watch_lock);
+    for (uint32_t k = 0; k < nstuck && n; k++) {
+        if (stuck_n[k] != n) continue;
+        uint32_t same = 0;
+        for (uint32_t i = 0; i < n; i++) same += stuck[k][i] == key[i];
+        if (same == n) {
+            if (stuck_crash[k] == 1) stuck_crash[k] = 2, stuck_retried[k] = 1, first = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&watch_lock);
+    if (!first) return;
+    char st[400], note[480];
+    stages_text(h, stg, n, st, sizeof(st));
+    snprintf(note, sizeof(note), "%s, stages %s, given at once after the driver's crash; asked again in a later run", call, st);
+    add_stuck_x(key, n, mode, 1, 2, note);
+}
+
+static void add_stuck_x(const uint64_t *key, uint32_t n, int mode, int tries, int crash, const char *note)
+{
     if (!n) return;
+    /* the device's cache wedged the driver (a contained crash, then this): not this pipeline's doing, nothing noted
+     * (server_pcache.c set the cache aside; the next run builds it as any other) */
+    if (note && vkb_pcache_aside(vkb_srv_current_table())) {
+        static int told;
+        if (!__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED))
+            VKB_WARN("compile watchdog: pipelines that time out on a device whose pipeline cache wedged the driver are not noted as stuck (%s)", note);
+        return;
+    }
     if (note) retry_once(key, n); /* stuck in this run: not asked again before the next */
     pthread_mutex_lock(&watch_lock);
     int k;
@@ -665,7 +997,7 @@ static void add_stuck(const uint64_t *key, uint32_t n, int mode, int tries, cons
         stuck_retried[nstuck] = note != NULL; /* one that failed in this run waits for the next */
         stuck_n[nstuck++] = n;
     }
-    if (k < (int)nstuck) stuck_mode[k] = mode, stuck_tries[k] = tries; /* the last word wins (a later line in the file too) */
+    if (k < (int)nstuck) stuck_mode[k] = mode, stuck_tries[k] = tries, stuck_crash[k] = (unsigned char)crash; /* the last word wins (a later line in the file too) */
     pthread_mutex_unlock(&watch_lock);
     const char *dir = vkb_pcache_dir();
     if (!note || !dir) return;
@@ -685,13 +1017,16 @@ static void add_stuck(const uint64_t *key, uint32_t n, int mode, int tries, cons
         for (int j = 0; j < (int)nstuck; j++) {
             if (j == k) continue;
             for (uint32_t i = 0; i < stuck_n[j]; i++) fprintf(f, "%sk-%016llx", i ? "," : "", (unsigned long long)stuck[j][i]);
-            fprintf(f, " m=%d v=%d t=%d # %s: known before the file was removed\n", stuck_mode[j], STUCK_VERSION, stuck_tries[j],
-                    fb_names[stuck_mode[j]]);
+            fprintf(f, " m=%d v=%d t=%d", stuck_mode[j], STUCK_VERSION, stuck_tries[j]);
+            if (stuck_crash[j]) fprintf(f, " x=%d", stuck_crash[j]);
+            fprintf(f, " # %s: known before the file was removed\n", fb_names[stuck_mode[j]]);
         }
         pthread_mutex_unlock(&watch_lock);
     }
     for (uint32_t i = 0; i < n; i++) fprintf(f, "%sk-%016llx", i ? "," : "", (unsigned long long)key[i]);
-    fprintf(f, " m=%d v=%d t=%d # %s: %s\n", mode, STUCK_VERSION, tries, fb_names[mode], note);
+    fprintf(f, " m=%d v=%d t=%d", mode, STUCK_VERSION, tries);
+    if (crash) fprintf(f, " x=%d", crash);
+    fprintf(f, " # %s: %s\n", fb_names[mode], note);
     int ok = fflush(f) == 0 && !ferror(f);
     int e = errno;
     if (fclose(f) != 0 && ok) {
@@ -707,14 +1042,16 @@ static void load_stuck(void)
     if (!dir) return;
     char path[700], line[700];
     snprintf(path, sizeof(path), "%s/stuck-pipelines", dir);
+    snprintf(crash_path, sizeof(crash_path), "%s", path);
     FILE *f = fopen(path, "r");
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         char *hash = strchr(line, '#');
         if (hash) *hash = 0;
-        char *m = strstr(line, "m="), *ver = strstr(line, "v="), *t = strstr(line, "t=");
+        char *m = strstr(line, "m="), *ver = strstr(line, "v="), *t = strstr(line, "t="), *x = strstr(line, " x=");
         if (!m || !ver || atoi(ver + 2) < STUCK_VERSION) continue; /* an older fallback list chose it: tried again */
-        int mode = atoi(m + 2), tries = t ? atoi(t + 2) : 1;
+        int mode = atoi(m + 2), tries = t ? atoi(t + 2) : 1, crash = x ? atoi(x + 3) : 0;
+        if (crash < 0 || crash > 3) crash = 0;
         *m = 0;
         if (mode < FB_FAIL || mode >= FB_COUNT) mode = FB_FAIL;
         uint64_t h[STAGES_MAX];
@@ -727,10 +1064,33 @@ static void load_stuck(void)
             h[n++] = v;
             p = end;
         }
-        add_stuck(h, n, mode, tries, NULL);
+        add_stuck_x(h, n, mode, tries, crash, NULL);
     }
     fclose(f);
-    if (nstuck) VKB_WARN("%u pipeline(s) the driver never finished compiling get their fallback at once (%s; delete it to retry them)", nstuck, path);
+    for (uint32_t k = 0; k < nstuck; k++) {
+        if (stuck_crash[k] != 1 && stuck_crash[k] != 3) continue;
+        char keys[200];
+        int o = 0;
+        keys[0] = 0;
+        for (uint32_t i = 0; i < stuck_n[k] && o < (int)sizeof(keys) - 24; i++) o += snprintf(keys + o, sizeof(keys) - (size_t)o, "%sk-%016llx", i ? "," : "", (unsigned long long)stuck[k][i]);
+        const char *what = stuck_mode[k] == FB_FAIL ? "fails at once" : "gets its stand-in at once";
+        if (stuck_crash[k] == 1)
+            VKB_WARN("pipeline %s was being compiled when the driver crashed in an earlier run: it %s in this run (asked of the driver again in a later run)", keys, what);
+        else
+            VKB_WARN("pipeline %s crashed the driver again when it was asked again: it %s for good (delete stuck-pipelines to retry it)", keys, what);
+    }
+    uint32_t unbuilt = 0, lut_spun = 0;
+    for (uint32_t k = 0; k < nstuck; k++) {
+        unbuilt += stuck_mode[k] != FB_SLOW; /* m=5: built, by their longer limit or the ordinary one */
+        if (stuck_n[k] > 1 && stuck_mode[k] == FB_LUT && stuck_tries[k] >= 2) lut_spun++;
+        if (stuck_n[k] > 1 && stuck_mode[k] == FB_SLOW && stuck_tries[k] >= 2) lut_spins_blocked = 1; /* a stand-in's retry built: slow, not spinning */
+    }
+    if (lut_spun && !lut_spins_blocked) {
+        lut_spins = 1;
+        VKB_WARN("UE4 colour-grading LUT pipelines get their neutral stand-in at once: this driver's compiler did not finish %u of "
+                 "them with twice the limit either, none built (delete %s to compile them again)", lut_spun, path);
+    }
+    if (unbuilt) VKB_WARN("%u pipeline(s) the driver never finished compiling get their fallback at once (%s; delete it to retry them)", unbuilt, path);
 }
 
 /* ------------------------------------------------------------------ fallbacks */
@@ -1023,14 +1383,20 @@ static void watch_env(void)
 }
 
 static watch_slot *watch_begin(guard_arm *arm, const char *call, uint32_t device, double limit, const uint64_t *h, const uint32_t *stage,
-                               uint32_t n, const VkPipelineShaderStageCreateInfo *stages, uint32_t nst)
+                               uint32_t n, const VkPipelineShaderStageCreateInfo *stages, uint32_t nst, const uint64_t *key, int pipe)
 {
     watch_slot *w = NULL;
     pthread_mutex_lock(&watch_lock);
     for (int i = 0; i < WATCH_SLOTS && !w; i++)
         if (!slots[i].used) w = &slots[i];
+    unsigned *seq = w ? &slot_seq[w - slots] : NULL;
     if (w) {
+        if (!tls_tid) tls_tid = (int)syscall(SYS_gettid);
+        __atomic_store_n(seq, *seq + 1, __ATOMIC_RELAXED); /* odd: being written (snap_take) */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         memset(w, 0, sizeof(*w));
+        w->tid = tls_tid;
+        w->ctx = vkb_srv_current_cmd;
         w->used = 1;
         w->thread = pthread_self();
         w->arm = arm;
@@ -1041,15 +1407,87 @@ static watch_slot *watch_begin(guard_arm *arm, const char *call, uint32_t device
         w->nstages = n < STAGES_MAX ? n : STAGES_MAX;
         if (h) memcpy(w->hash, h, w->nstages * sizeof(*h));
         if (stage) memcpy(w->stage, stage, w->nstages * sizeof(*stage));
+        if (key && pipe) {
+            memcpy(w->key, key, w->nstages * sizeof(*key));
+            w->trying = tls_trying || tls_limit > 0;
+            __atomic_store_n(&w->pipe, pipe, __ATOMIC_RELEASE); /* last: the handler reads without the lock */
+        }
         for (uint32_t i = 0; stages && i < w->nstages && i < nst; i++)
             for (const VkBaseInStructure *b = stages[i].pNext; b; b = b->pNext)
                 if (b->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
                     w->code[i] = ((const VkShaderModuleCreateInfo *)b)->pCode;
                     w->size[i] = ((const VkShaderModuleCreateInfo *)b)->codeSize;
                 }
+        __atomic_store_n(seq, *seq + 1, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&watch_lock);
     return w;
+}
+
+/*
+ * From the crash handler (server_main.c on_crash), for a fault the guard did not contain: the compiles in flight
+ * go in stuck-pipelines as crash suspects (x=1), so the next start gives them their stand-in at once instead of
+ * dying at the same spot. a player log (Street Fighter 6, Mali-G1-Ultra r54p1) and a player log (POCO X7 Pro): SIGSEGV
+ * on the driver's own "mali-compiler" thread while the game's pipelines compiled; the arm is per thread, so
+ * nothing could catch it. Which faults count: SIGSEGV/SIGBUS/SIGILL/SIGFPE with the pc outside the server's own
+ * code (in that player log libGLES_mali.so; a fault in our code is our bug, not the compile's), on a thread that is
+ * not inside some other Vulkan call (a submit faulting in the driver is not a compile's doing); the faulting
+ * thread's own compile (containment off past the process limit) counts alone. Nothing but plain reads of the
+ * slots and open/write/close: no lock (the dying thread may hold none of ours, another may hold watch_lock),
+ * no fsync (the page cache outlives the process). A slot read half-written gives one wrong suspect, which the
+ * next runs clear (one stand-in run, one try). Nothing is written by a run that does not crash, and a kill
+ * (SIGKILL: low memory, force stop) runs no handler: those leave no suspect.
+ */
+void vkb_guard_crash_suspects(int sig, const char *lib, int in_call)
+{
+    if (sig != SIGSEGV && sig != SIGBUS && sig != SIGILL && sig != SIGFPE) return;
+    if (!crash_path[0] || guard_off > 0) return;
+    if (lib && strstr(lib, "vkbridge")) return;
+    pthread_t self = pthread_self();
+    int own = -1;
+    for (int i = 0; i < WATCH_SLOTS; i++)
+        if (slots[i].used && __atomic_load_n(&slots[i].pipe, __ATOMIC_ACQUIRE) && pthread_equal(slots[i].thread, self)) own = i;
+    if (own < 0 && in_call) return;
+    int fd = -1, marked = 0, again = 0;
+    char said[400];
+    int so = 0;
+    said[0] = 0;
+    for (int i = 0; i < WATCH_SLOTS; i++) {
+        watch_slot *w = &slots[i];
+        if (own >= 0 && i != own) continue;
+        int pipe = __atomic_load_n(&w->pipe, __ATOMIC_ACQUIRE);
+        if (!w->used || !pipe) continue;
+        uint32_t n = w->nstages < STAGES_MAX ? w->nstages : STAGES_MAX;
+        int zero = !n;
+        for (uint32_t k = 0; k < n; k++) zero |= !w->key[k];
+        if (zero) continue; /* a stage whose SPIR-V is not known: the list cannot match it */
+        int confirmed = w->trying;
+        int mode = pipe == 1 ? FB_STANDIN : FB_FAIL;
+        char line[900];
+        int o = 0;
+        for (uint32_t k = 0; k < n && o < (int)sizeof(line) - 24; k++) o += snprintf(line + o, sizeof(line) - (size_t)o, "%sk-%016llx", k ? "," : "", (unsigned long long)w->key[k]);
+        char st[400];
+        stages_text(w->hash, w->stage, n, st, sizeof(st));
+        if (o > 0 && o < (int)sizeof(line))
+            o += snprintf(line + o, sizeof(line) - (size_t)o, " m=%d v=%d t=%d x=%d # %s: %s when the driver crashed (signal %d, pc in %s), %s, stages %s\n", mode,
+                          STUCK_VERSION, confirmed ? RETRY_MAX : 1, confirmed ? 3 : 1, fb_names[mode], confirmed ? "asked again and in flight" : "in flight", sig,
+                          lib ? lib : "?", pipe == 1 ? "vkCreateGraphicsPipelines" : "vkCreateComputePipelines", st);
+        if (o <= 0 || o >= (int)sizeof(line)) continue;
+        if (fd < 0) fd = open(crash_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+        if (fd < 0) break;
+        if (write(fd, line, (size_t)o) != o) break;
+        marked++;
+        again += confirmed;
+        if (so < (int)sizeof(said) - 40) so += snprintf(said + so, sizeof(said) - (size_t)so, "%s%s", so ? "; " : "", st);
+    }
+    if (fd >= 0) close(fd);
+    if (!marked) return;
+    char msg[700];
+    int k = snprintf(msg, sizeof(msg),
+                     "vkbridge-server E   %d pipeline compile(s) in flight at this crash marked as suspects in stuck-pipelines: the next start "
+                     "gives them the stand-in at once%s (stages %s)\n",
+                     marked, again ? "; one asked again after an earlier crash keeps it for good" : "", said);
+    vkb_crash_log_raw(msg, k > 0 && k < (int)sizeof(msg) ? (size_t)k : sizeof(msg) - 1);
 }
 
 /* Before the arm goes out of scope: a signal already on its way finds timed_out unset on the next
@@ -1058,7 +1496,12 @@ static void watch_end(watch_slot *w)
 {
     if (!w) return;
     pthread_mutex_lock(&watch_lock);
+    unsigned *seq = &slot_seq[w - slots];
+    __atomic_store_n(seq, *seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    w->pipe = 0;
     w->used = 0;
+    __atomic_store_n(seq, *seq + 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&watch_lock);
 }
 
@@ -1086,6 +1529,8 @@ static void timed_out(vkb_guard *g, const char *call, const uint64_t *h, const u
     VKB_ERR("TIMED OUT: %s on device %u ran %.1f s in the driver and was interrupted - the session lives "
             "(stages %s; their SPIR-V in stuck-spirv/)", call, g->t->id, el, st);
     VKB_ERR("  driver locks held by the spinning compile stay held: a hang in a later driver call would be this one's doing");
+    /* after a contained crash on this device: the driver may be wedged by its pipeline cache's data */
+    if (__atomic_load_n(&g->crashes, __ATOMIC_RELAXED) > 0) vkb_pcache_wedged(g->t, call);
 }
 
 static void remember(const char *call, const uint64_t *h, const uint64_t *key, const uint32_t *stage, uint32_t nh, int mode)
@@ -1099,7 +1544,7 @@ static void remember(const char *call, const uint64_t *h, const uint64_t *key, c
 /* One guarded driver call; *timed: interrupted by the compile watchdog (the call failed). */
 __attribute__((noinline)) static VkResult armed_gfx(vkb_guard *g, VkDevice device, VkPipelineCache cache, uint32_t n,
                                                     const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *a, VkPipeline *out,
-                                                    const uint64_t *h, const uint32_t *stg, uint32_t nh, int *timed)
+                                                    const uint64_t *h, const uint32_t *stg, uint32_t nh, int *timed, const uint64_t *key)
 {
     guard_arm arm;
     arm.prev = tls_arm;
@@ -1122,11 +1567,13 @@ __attribute__((noinline)) static VkResult armed_gfx(vkb_guard *g, VkDevice devic
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, "vkCreateGraphicsPipelines", g->t->id, tls_limit > 0 ? tls_limit : g->limit, h, stg, nh, n ? infos[0].pStages : NULL, n ? infos[0].stageCount : 0);
+    w = watch_begin(&arm, "vkCreateGraphicsPipelines", g->t->id, tls_limit > 0 ? tls_limit : g->limit, h, stg, nh, n ? infos[0].pStages : NULL, n ? infos[0].stageCount : 0, key, 1);
     for (uint32_t i = 0; i < n; i++) test_fault(infos[i].pStages, infos[i].stageCount, sizeof(*infos[i].pStages));
     VkResult r = g->gfx(device, cache, n, infos, a, out);
     tls_arm = arm.prev;
     watch_end(w);
+    /* the loss record's pipeline table (server_lostlog.c): the stages' hashes, already made */
+    for (uint32_t i = 0; r == VK_SUCCESS && out && i < n; i++) vkb_ll_pipeline(out[i], h, stg, n == 1 ? nh : 0, 0);
     return r;
 }
 
@@ -1143,7 +1590,7 @@ static VkResult try_fallback(vkb_guard *g, VkDevice device, VkPipelineCache cach
     ci.stageCount = ns;
     ci.pStages = b.st;
     tls_variant = 1;
-    VkResult r = armed_gfx(g, device, cache, 1, &ci, a, out, h, stg, nh, timed);
+    VkResult r = armed_gfx(g, device, cache, 1, &ci, a, out, h, stg, nh, timed, NULL);
     tls_variant = 0;
     fb_free(g, device, &b);
     VKB_WARN("compile fallback (%s) for stages h-%016llx...: %s", fb_names[mode], (unsigned long long)(nh ? h[0] : 0),
@@ -1184,7 +1631,7 @@ static int is_lut_pipeline(const VkGraphicsPipelineCreateInfo *info, const uint6
  * A pipeline whose SPIR-V asks for what the driver lacks never reaches the driver's compiler, which
  * has died on such input: ULTRAKILL's Unity vertex shader (gl_ClipDistance in gl_PerVertex, Mali r44p1
  * without shaderClipDistance: SIGSEGV at 0x40) and No Man's Sky's glslang vertex shaders (a player log G925
- * r49p1: 0x18 x3 G615 r44p1: 0x40 x3, the device poisoned, then the server died in a draw).
+ * r49p1: 0x18 x3, a player log G615 r44p1: 0x40 x3, the device poisoned, then the server died in a draw).
  * Both times the bridge's clip rewrite (spirv_clip.c) had not taken the built-in out, and nothing
  * stopped the rest. The check sits here, the last layer before the driver: what reaches it is what the
  * emulations made of the program's pipeline, so anything an emulation takes care of never gets here.
@@ -1374,41 +1821,75 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
          * stand-in as before (m=4, t=2: no third try). */
         double base = g->limit > 0 ? g->limit : g->limit < 0 ? 0 : timeout_s;
         int slow = mode == FB_SLOW;
-        int tries = (mode == FB_LUT || slow) && n == 1 && base > 0 && !tls_retrying ? stuck_tries_take(key, nh, mode) : 0;
+        /* in flight when the driver crashed on its own thread (vkb_guard_crash_suspects): 1 its stand-in, 2 one try */
+        int cx = crash_of(key, nh);
+        int lut_known = mode == FB_LUT && __atomic_load_n(&lut_spins, __ATOMIC_ACQUIRE);
+        int tries = (mode == FB_LUT || mode == FB_STANDIN || slow) && !lut_known && n == 1 && (base > 0 || cx) && !tls_retrying
+                        ? stuck_tries_take(key, nh, mode) : 0;
         if (tries) {
             int step = slow ? tries : tries + 1;
             double lim = base * (double)(1 << (step - 1)), t0 = mono_s();
             char stx[400], note[480];
             stages_text(h, stg, nh, stx, sizeof(stx));
-            if (!slow) {
-                VKB_WARN("UE4 colour-grading LUT pipeline (stages %s) got its neutral stand-in in an earlier run: compiled again with %.0f s",
-                         stx, lim);
+            if (cx && !slow) {
+                VKB_WARN("pipeline (stages %s) was in flight when the driver crashed in an earlier run: asked of the driver again (try %d of %d)",
+                         stx, step, RETRY_MAX);
+                snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, try %d after the driver's crash", stx, step);
+                add_stuck_x(key, nh, mode, step, cx, note); /* first: a try that crashes again is not repeated for ever */
+            } else if (!slow) {
+                if (mode == FB_LUT)
+                    VKB_WARN("UE4 colour-grading LUT pipeline (stages %s) got its neutral stand-in in an earlier run: compiled again with %.0f s",
+                             stx, lim);
+                else
+                    VKB_WARN("pipeline (stages %s) got the constant-colour stand-in in an earlier run: compiled again with %.0f s (try %d of %d)",
+                             stx, lim, step, RETRY_MAX);
                 snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, try %d with %.0f s", stx, step, lim);
-                add_stuck(key, nh, FB_LUT, step, note); /* first: a try that hangs is not repeated */
+                add_stuck(key, nh, mode, step, note); /* first: a try that hangs is not repeated */
             }
             tls_limit = lim;
-            r = armed_gfx(g, device, cache, 1, infos, a, out, h, stg, nh, &timed);
+            tls_trying = 1;
+            r = armed_gfx(g, device, cache, 1, infos, a, out, h, stg, nh, &timed, key);
+            tls_trying = 0;
             tls_limit = 0;
+            if (mode == FB_STANDIN) __atomic_store_n(&retry_busy, 0, __ATOMIC_RELEASE);
+            if (r == VK_SUCCESS && cx && !slow) {
+                VKB_WARN("  built fine, in %.1f s: no longer a crash suspect, off the list (its own fragment shader from now on)", mono_s() - t0);
+                snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, built after the crash", stx);
+                add_stuck(key, nh, FB_SLOW, 1, note); /* m=5 t=1: not stuck (is_stuck) */
+                return r;
+            }
             if (r == VK_SUCCESS) {
                 if (!slow) {
-                    VKB_WARN("  built this time, in %.1f s: built with %.0f s from now on, with its colour grading", mono_s() - t0, lim);
+                    VKB_WARN("  built this time, in %.1f s: built with %.0f s from now on, with its %s", mono_s() - t0, lim,
+                             mode == FB_LUT ? "colour grading" : "own fragment shader");
                     snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, %.1f s of %.0f s", stx, mono_s() - t0, lim);
                     add_stuck(key, nh, FB_SLOW, step, note);
+                    if (mode == FB_LUT) __atomic_store_n(&lut_spins_blocked, 1, __ATOMIC_RELAXED); /* slow here, not spinning */
                 }
                 return r;
             }
             VKB_ERR("  %s with %.0f s: the stand-in again", timed ? "timed out" : "failed", lim);
+            if (timed) __atomic_store_n(&retry_cut, 1, __ATOMIC_RELAXED);
+            if (timed && mode == FB_LUT && !__atomic_load_n(&lut_spins_blocked, __ATOMIC_RELAXED) &&
+                !__atomic_exchange_n(&lut_spins, 1, __ATOMIC_ACQ_REL))
+                VKB_WARN("  this driver's compiler spins on the UE4 LUT shape: every LUT pipeline gets its stand-in at once from now on");
             if (slow) {
+                /* m=5 came from one of the two: the LUT's own stand-in, or the constant colour */
+                mode = is_lut_pipeline(infos, h, nh) ? FB_LUT : FB_STANDIN;
                 snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, timed out with %.0f s", stx, lim);
-                add_stuck(key, nh, FB_LUT, 2, note);
+                add_stuck(key, nh, mode, mode == FB_LUT ? 2 : step, note);
             }
-            mode = FB_LUT;
         }
-        VKB_ONCE(VKB_LOG_WARN, "a pipeline the driver never finished compiling was asked for again: its fallback at once (logged once)");
         r = VK_ERROR_INITIALIZATION_FAILED;
-        if (mode != FB_FAIL && n == 1) r = try_fallback(g, device, cache, infos, a, out, h, stg, nh, mode, &timed);
+        if (cx == 1) crash_given(key, nh, mode, h, stg, "vkCreateGraphicsPipelines");
+        if (mode != FB_FAIL && n == 1) {
+            VKB_ONCE(VKB_LOG_WARN, "a pipeline the driver never finished compiling was asked for again: its fallback at once (logged once)");
+            r = try_fallback(g, device, cache, infos, a, out, h, stg, nh, mode, &timed);
+        }
         if (r == VK_SUCCESS) return r;
         for (uint32_t i = 0; out && i < n; i++) out[i] = VK_NULL_HANDLE;
+        /* a crash suspect is asked of the driver only by its one written-down try above, never again here */
+        if (cx) return r;
         /* No fallback built it: a failed pipeline is worse than a slow one (Zink in Xwayland binds the
          * missing pipeline and the driver faults - the Pixel 6 Pro's G78 at every Steam start, after
          * one hang while Half-Life 2's shaders were pre-compiled beside it). The driver gets it again
@@ -1417,22 +1898,33 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
         if (!retry_once(key, nh)) return r;
         VKB_WARN("a pipeline the driver never finished compiling got no fallback: the driver is asked again (once this run)");
         tls_retrying = 1;
+        tls_retry_cut = 0;
         r = gfx_guarded(device, cache, n, infos, a, out);
         tls_retrying = 0;
-        if (r == VK_SUCCESS) {
+        if (r == VK_SUCCESS && !tls_retry_cut) {
+            char stx[400], note[480];
             heal(key, nh);
             VKB_WARN("  the driver built it this time");
+            stages_text(h, stg, nh, stx, sizeof(stx));
+            snprintf(note, sizeof(note), "vkCreateGraphicsPipelines, stages %s, built when asked again", stx);
+            add_stuck(key, nh, FB_SLOW, 1, note); /* a compile that finished is not stuck: off the list */
         }
         return r;
     }
     /* The startup probe saw this driver's compiler spin on the LUT's shape (server_probe.c): its
      * stand-in at once instead of after a timeout (before the
      * geometry fold: the spin is the worse failure). */
-    if (n == 1 && vkb_probe_flag(VKB_PROBE_FLAG_LUT_NOW) && is_lut_pipeline(infos, h, nh)) {
+    int spins = __atomic_load_n(&lut_spins, __ATOMIC_ACQUIRE), cut = __atomic_load_n(&lut_cut, __ATOMIC_ACQUIRE);
+    if (n == 1 && (vkb_probe_flag(VKB_PROBE_FLAG_LUT_NOW) || spins || cut) && is_lut_pipeline(infos, h, nh)) {
         r = try_fallback(g, device, cache, infos, a, out, h, stg, nh, FB_LUT, &timed);
         if (r == VK_SUCCESS) {
-            VKB_WARN("UE4 colour-grading LUT pipeline built with its neutral stand-in at once: the startup probe saw this "
-                     "driver's compiler spin on the shape (VKBRIDGE_PROBE_APPLY=0: compile it)");
+            if (spins || cut) {
+                VKB_ONCE(VKB_LOG_WARN, "UE4 colour-grading LUT pipeline not seen before built with its neutral stand-in at once: %s (logged once)",
+                         spins ? "this driver's compiler spun on the shape with twice the limit" : "another LUT pipeline timed out in this run");
+                if (!spins) remember("vkCreateGraphicsPipelines", h, key, stg, nh, FB_LUT); /* retried once in a later run, as a timed-out one */
+            } else
+                VKB_WARN("UE4 colour-grading LUT pipeline built with its neutral stand-in at once: the startup probe saw this "
+                         "driver's compiler spin on the shape (VKBRIDGE_PROBE_APPLY=0: compile it)");
             return r;
         }
     }
@@ -1445,8 +1937,9 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
             if (r == VK_SUCCESS) return r;
         }
     }
-    r = armed_gfx(g, device, cache, n, infos, a, out, h, stg, nh, &timed);
+    r = armed_gfx(g, device, cache, n, infos, a, out, h, stg, nh, &timed, key);
     if (!timed) return r;
+    tls_retry_cut = 1;
     /* The driver never finished: the fallbacks. By default only fragment-level ones - on the G925
      * the geometry fold and float_controls2 stripping did not help (each costs a timeout) - the
      * best picture first; VKBRIDGE_COMPILE_FALLBACKS=gsfold,fc2 tries those before them. */
@@ -1464,6 +1957,7 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
                     : order[k] == FB_LUT    ? " (no colour grading; the picture keeps its content)"
                                             : "");
             remember("vkCreateGraphicsPipelines", h, key, stg, nh, order[k]);
+            if (order[k] == FB_LUT) __atomic_store_n(&lut_cut, 1, __ATOMIC_RELEASE);
             return r;
         }
     }
@@ -1475,7 +1969,8 @@ static VkResult gfx_guarded(VkDevice device, VkPipelineCache cache, uint32_t n, 
 
 __attribute__((noinline)) static VkResult armed_compute(vkb_guard *g, VkDevice device, VkPipelineCache cache, uint32_t n,
                                                         const VkComputePipelineCreateInfo *infos, const VkAllocationCallbacks *a,
-                                                        VkPipeline *out, const uint64_t *h, const uint32_t *stg, uint32_t nh, int *timed)
+                                                        VkPipeline *out, const uint64_t *h, const uint32_t *stg, uint32_t nh, int *timed,
+                                                        const uint64_t *key)
 {
     guard_arm arm;
     arm.prev = tls_arm;
@@ -1497,11 +1992,12 @@ __attribute__((noinline)) static VkResult armed_compute(vkb_guard *g, VkDevice d
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, "vkCreateComputePipelines", g->t->id, tls_limit > 0 ? tls_limit : g->limit, h, stg, nh, n ? &infos[0].stage : NULL, 1);
+    w = watch_begin(&arm, "vkCreateComputePipelines", g->t->id, tls_limit > 0 ? tls_limit : g->limit, h, stg, nh, n ? &infos[0].stage : NULL, 1, key, 2);
     if (n) test_fault(&infos[0].stage, n, sizeof(*infos));
     VkResult r = g->compute(device, cache, n, infos, a, out);
     tls_arm = arm.prev;
     watch_end(w);
+    for (uint32_t i = 0; r == VK_SUCCESS && out && i < n; i++) vkb_ll_pipeline(out[i], h, stg, n == 1 ? nh : 0, 1);
     return r;
 }
 
@@ -1515,7 +2011,7 @@ static VkResult compute_relaxed(vkb_guard *g, VkDevice device, VkPipelineCache c
     VkComputePipelineCreateInfo ci = *info;
     ci.stage = b.st[0];
     tls_variant = 1;
-    VkResult r = armed_compute(g, device, cache, 1, &ci, a, out, h, stg, nh, &timed);
+    VkResult r = armed_compute(g, device, cache, 1, &ci, a, out, h, stg, nh, &timed, NULL);
     tls_variant = 0;
     fb_free(g, device, &b);
     VKB_WARN("compile fallback (%s) for compute stage h-%016llx: %s", fb_names[FB_RELAXED], (unsigned long long)h[0],
@@ -1553,23 +2049,37 @@ static VkResult compute_guarded(VkDevice device, VkPipelineCache cache, uint32_t
     int timed = 0;
     VkResult r;
     int known = is_stuck(key, nh);
+    int cx = known ? crash_of(key, nh) : 0; /* in flight when the driver crashed on its own thread: as in gfx_guarded */
     double base = g->limit > 0 ? g->limit : g->limit < 0 ? 0 : timeout_s;
-    int slow = known - 1 == FB_SLOW, tries = (slow || known - 1 == FB_FAIL) && n == 1 && base > 0 ? stuck_tries_take(key, nh, known - 1) : 0;
+    int slow = known - 1 == FB_SLOW, tries = (slow || known - 1 == FB_FAIL) && n == 1 && (base > 0 || cx) ? stuck_tries_take(key, nh, known - 1) : 0;
     if (tries) {
         /* a failed one tries the next limit; a slow one builds with its own */
         int step = slow ? tries : tries + 1;
         double lim = base * (double)(1 << (step - 1)), t0 = mono_s();
         char st[400], note[480];
         stages_text(h, stg, nh, st, sizeof(st));
-        if (!slow) {
+        if (cx && !slow) {
+            VKB_WARN("compute stage h-%016llx was in flight when the driver crashed in an earlier run: asked of the driver again (try %d of %d)",
+                     (unsigned long long)h[0], step, RETRY_MAX);
+            snprintf(note, sizeof(note), "vkCreateComputePipelines, stages %s, try %d after the driver's crash", st, step);
+            add_stuck_x(key, nh, FB_FAIL, step, cx, note); /* first */
+        } else if (!slow) {
             VKB_WARN("compute stage h-%016llx failed to build in an earlier run: tried again with %.0f s (try %d of %d)",
                      (unsigned long long)h[0], lim, step, RETRY_MAX);
             snprintf(note, sizeof(note), "vkCreateComputePipelines, stages %s, try %d with %.0f s", st, step, lim);
             add_stuck(key, nh, FB_FAIL, step, note); /* first: a try that hangs is not repeated */
         }
         tls_limit = lim;
-        r = armed_compute(g, device, cache, n, infos, a, out, h, stg, nh, &timed);
+        tls_trying = 1;
+        r = armed_compute(g, device, cache, n, infos, a, out, h, stg, nh, &timed, key);
+        tls_trying = 0;
         tls_limit = 0;
+        if (r == VK_SUCCESS && cx && !slow) {
+            VKB_WARN("  built fine, in %.1f s: no longer a crash suspect, off the list", mono_s() - t0);
+            snprintf(note, sizeof(note), "vkCreateComputePipelines, stages %s, built after the crash", st);
+            add_stuck(key, nh, FB_SLOW, 1, note);
+            return r;
+        }
         if (r == VK_SUCCESS) {
             if (!slow) {
                 VKB_WARN("  built this time, in %.1f s: built with %.0f s from now on", mono_s() - t0, lim);
@@ -1587,13 +2097,14 @@ static VkResult compute_guarded(VkDevice device, VkPipelineCache cache, uint32_t
         return r;
     }
     if (known && !slow) {
+        if (cx == 1) crash_given(key, nh, known - 1, h, stg, "vkCreateComputePipelines");
         VKB_ONCE(VKB_LOG_WARN, "a compute pipeline the driver never finished compiling was asked for again: its fallback at once (logged once)");
         r = known - 1 == FB_RELAXED && n == 1 ? compute_relaxed(g, device, cache, infos, a, out, h, stg, nh) : VK_ERROR_INITIALIZATION_FAILED;
         if (r != VK_SUCCESS)
             for (uint32_t i = 0; out && i < n; i++) out[i] = VK_NULL_HANDLE;
         return r;
     }
-    r = armed_compute(g, device, cache, n, infos, a, out, h, stg, nh, &timed);
+    r = armed_compute(g, device, cache, n, infos, a, out, h, stg, nh, &timed, key);
     if (!timed) return r;
     if (n == 1 && compute_relaxed(g, device, cache, infos, a, out, h, stg, nh) == VK_SUCCESS) {
         VKB_ERR("  the compute pipeline was built with its fallback: %s", fb_names[FB_RELAXED]);
@@ -1606,6 +2117,15 @@ static VkResult compute_guarded(VkDevice device, VkPipelineCache cache, uint32_t
     return VK_ERROR_INITIALIZATION_FAILED;
 }
 
+/* A listed module the driver built when asked again: off the list */
+static void module_built(uint64_t mh)
+{
+    char note[480];
+    VKB_WARN("  the driver built it this time");
+    snprintf(note, sizeof(note), "vkCreateShaderModule, stages 0x0=h-%016llx, built when asked again", (unsigned long long)mh);
+    add_stuck(&mh, 1, FB_SLOW, 1, note);
+}
+
 static VkResult module_guarded(VkDevice device, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out)
 {
     vkb_guard *g = find(device);
@@ -1615,13 +2135,27 @@ static VkResult module_guarded(VkDevice device, const VkShaderModuleCreateInfo *
         return VK_ERROR_DEVICE_LOST;
     }
     uint64_t mh = ci && ci->pCode ? spirv_hash(ci->pCode, ci->codeSize) : 0;
+    double base = g->limit > 0 ? g->limit : g->limit < 0 ? 0 : timeout_s, lim = g->limit;
+    int asked = 0;
     if (mh && is_stuck(&mh, 1)) {
-        if (out) *out = VK_NULL_HANDLE;
-        return VK_ERROR_INITIALIZATION_FAILED;
+        /* as a failed compute pipeline: tried again in later runs, written down first, each time with twice the limit */
+        int tries = base > 0 ? stuck_tries_take(&mh, 1, FB_FAIL) : 0;
+        if (!tries) {
+            VKB_ONCE(VKB_LOG_WARN, "a shader module the driver never finished compiling was asked for again: refused (logged once)");
+            if (out) *out = VK_NULL_HANDLE;
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        char note[480];
+        asked = tries + 1;
+        lim = base * (double)(1 << tries);
+        VKB_WARN("a shader module the driver never finished compiling: the driver is asked again with %.0f s (try %d of %d)", lim, asked, RETRY_MAX);
+        snprintf(note, sizeof(note), "vkCreateShaderModule, stages 0x0=h-%016llx, try %d with %.0f s", (unsigned long long)mh, asked, lim);
+        add_stuck(&mh, 1, FB_FAIL, asked, note);
     }
     if (!armable()) {
         VkResult r = g->module(device, ci, a, out);
         if (r == VK_SUCCESS && out) mod_remember(*out, ci);
+        if (r == VK_SUCCESS && asked) module_built(mh);
         return r;
     }
     guard_arm arm;
@@ -1635,7 +2169,8 @@ static VkResult module_guarded(VkDevice device, const VkShaderModuleCreateInfo *
             uint64_t h = mh;
             uint32_t stg = 0;
             timed_out(g, "vkCreateShaderModule", &h, &h, &stg, 1, 0);
-            remember("vkCreateShaderModule", &h, &h, &stg, 1, FB_FAIL);
+            if (!asked) remember("vkCreateShaderModule", &h, &h, &stg, 1, FB_FAIL); /* a try is on the list already, with its number */
+            else __atomic_store_n(&retry_cut, 1, __ATOMIC_RELAXED);
             if (out) *out = VK_NULL_HANDLE;
             return VK_ERROR_INITIALIZATION_FAILED;
         }
@@ -1657,11 +2192,12 @@ static VkResult module_guarded(VkDevice device, const VkShaderModuleCreateInfo *
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, "vkCreateShaderModule", g->t->id, g->limit, NULL, NULL, 0, NULL, 0);
+    w = watch_begin(&arm, "vkCreateShaderModule", g->t->id, lim, NULL, NULL, 0, NULL, 0, NULL, 0);
     VkResult r = g->module(device, ci, a, out);
     tls_arm = arm.prev;
     watch_end(w);
     if (r == VK_SUCCESS && out) mod_remember(*out, ci);
+    if (r == VK_SUCCESS && asked) module_built(mh);
     return r;
 }
 
@@ -1829,7 +2365,8 @@ static VkResult VKAPI_CALL gd_CreateComputePipelines(VkDevice device, VkPipeline
 /* ------------------------------------------------------------------ memory calls */
 
 /*
- * Faults in the driver's vkAllocateMemory and vkBind*Memory are contained the same way (* Mali-G615 r44p1 faulted in vkBindImageMemory at the same driver pc in vkAllocateMemory,
+ * Faults in the driver's vkAllocateMemory and vkBind*Memory are contained the same way (a player log:
+ * Mali-G615 r44p1 faulted in vkBindImageMemory, a player log at the same driver pc in vkAllocateMemory,
  * SEGV_ACCERR both; the cause inside the driver is not known). The arm is a sigsetjmp without the
  * signal mask (no system call: a few stores per call; these calls are made when resources are
  * made, not per frame), and the signal is unblocked on the way back. What the program then sees:
@@ -1960,7 +2497,7 @@ static void mem_contained(vkb_guard *g, const char *call, const guard_arm *a, ..
     mem_fault_dev = g->t->id;
     mem_watch_start();
     int mine = __atomic_add_fetch(&g->mem_crashes, 1, __ATOMIC_RELAXED);
-    int total = __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+    int total = charge(g->t->id);
     int bind = strncmp(call, "vkBind", 6) == 0;
     const vkb_srv_proc *p = g->t->proc;
     VKB_ERR("CONTAINED driver crash: signal %d (address %p) in %s on device %u (%s, pid %d) - %s, the other programs go on "
@@ -2027,7 +2564,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL gd_BindBufferMemory2(VkDevice device, uint
 
 /*
  * The driver's vkEndCommandBuffer of a client's command buffer, at the end of its replay (server_conn.c).
- * Xiaomi XRing O3, Mali-G2-Ultra r56p0 beta, Animal Well through vkd3d-proton: the server died
+ * a player log (Xiaomi XRing O3, Mali-G2-Ultra r56p0 beta, Animal Well through vkd3d-proton): the server died
  * twice at the same driver pc, a read of address 0x18 in the driver's End of vkd3d-proton's query-reset
  * command buffer (begin, vkCmdResetQueryPool, the query mirror's barrier and fill: valid commands, the
  * cause inside the driver is not known), and took Steam with it. Such a fault is now contained: the end
@@ -2046,7 +2583,7 @@ static void end_contained(vkb_guard *g, const char *call, const guard_arm *a, ..
     mem_fault_dev = g->t->id;
     mem_watch_start();
     int mine = __atomic_add_fetch(&g->end_crashes, 1, __ATOMIC_RELAXED);
-    int total = __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+    int total = charge(g->t->id);
     const vkb_srv_proc *p = g->t->proc;
     VKB_ERR("CONTAINED driver crash: signal %d (address %p) in %s on device %u (%s, pid %d) - the command buffer is not recorded "
             "and the device is stopped (taken as lost, not reached again), its program ends, the other programs go on "
@@ -2083,8 +2620,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL gd_EndCommandBuffer(VkCommandBuffer cb)
 }
 
 /*
- * One guard around every driver call a connection thread makes for its client (Mali-G1-Ultra
- * faulted at 0x32 in vkQueueSubmit2; No Man's Sky's last crash: a near-null read in
+ * One guard around every driver call a connection thread makes for its client (a player log: Mali-G1-Ultra
+ * faulted at 0x32 in vkQueueSubmit2; No Man's Sky's last crash, a player log: a near-null read in
  * the driver's vkCmdDraw / vkCmdDrawIndexed inside a replay; the divisor emulation's call through a
  * missing entry point): each ended the one server with Steam, the compositor and every program. The
  * specific arms above cover the calls whose failure a program can take (a pipeline, an allocation, an
@@ -2129,6 +2666,9 @@ int vkb_guard_serve(void (*loop)(void *), void *arg, vkb_guard_caught *f)
         f->code = arm.code;
         f->addr = arm.addr;
         f->pc = arm.pc;
+        f->snap = arm.snap;
+        f->nra = arm.nra < 6 ? arm.nra : 6;
+        for (int i = 0; i < f->nra; i++) f->ra[i] = arm.ra[i];
         return 1;
     }
     tls_arm = &arm;
@@ -2139,7 +2679,7 @@ int vkb_guard_serve(void (*loop)(void *), void *arg, vkb_guard_caught *f)
 
 int vkb_guard_request_contained(vkb_srv_table *t, const char *call, const char *where, const vkb_guard_caught *f)
 {
-    int total = __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
+    int total = t && t->is_device ? charge(t->id) : __atomic_add_fetch(&process_crashes, 1, __ATOMIC_RELAXED);
     int dev = t && t->is_device;
     const vkb_srv_proc *p = t ? t->proc : vkb_srv_crash_client();
     mem_fault_call = call;
@@ -2170,6 +2710,9 @@ int vkb_guard_request_contained(vkb_srv_table *t, const char *call, const char *
     a.addr = f->addr;
     a.code = f->code;
     a.pc = f->pc;
+    a.snap = f->snap;
+    a.nra = f->nra < GUARD_RA ? f->nra : GUARD_RA;
+    for (int i = 0; i < a.nra; i++) a.ra[i] = f->ra[i];
     fault_detail(call ? call : "?", &a);
     VKB_ERR("  driver locks held at the fault stay held: a hang in a later driver call would be this crash's doing");
     if (dev) vkb_lost_stop(t, "a driver fault in one of its program's calls was contained");
@@ -2180,6 +2723,26 @@ const uint32_t *vkb_guard_lut_standin(size_t *size)
 {
     *size = sizeof(lut_standin_fs);
     return lut_standin_fs;
+}
+
+int vkb_guard_armable(void)
+{
+    guard_env();
+    return armable();
+}
+
+void vkb_guard_contained_elsewhere(const char *call, uint32_t dev)
+{
+    charge(dev);
+    mem_fault_call = call;
+    mem_fault_dev = dev;
+    mem_watch_start();
+}
+
+void vkb_guard_watch_start(void)
+{
+    guard_env();
+    if (!guard_off) watch_env();
 }
 
 int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *arg, int *sig)
@@ -2202,7 +2765,7 @@ int vkb_guard_run(const char *what, double limit_s, void (*fn)(void *), void *ar
         return arm.timed_out ? VKB_GUARD_TIMED_OUT : VKB_GUARD_CRASHED;
     }
     tls_arm = &arm;
-    w = watch_begin(&arm, what, 0, 0, NULL, NULL, 0, NULL, 0);
+    w = watch_begin(&arm, what, 0, 0, NULL, NULL, 0, NULL, 0, NULL, 0);
     if (w) {
         pthread_mutex_lock(&watch_lock);
         w->limit = limit_s;
@@ -2265,9 +2828,22 @@ void vkb_guard_device_init(vkb_srv_table *t)
 #undef MEM_HOOK
 }
 
+int vkb_guard_mem_faults(const vkb_srv_table *t)
+{
+    if (!t || t->id >= MAX_TABLES) return 0;
+    vkb_guard *g = __atomic_load_n(&guards[t->id], __ATOMIC_ACQUIRE);
+    return g && g->t == t ? __atomic_load_n(&g->mem_crashes, __ATOMIC_RELAXED) : 0;
+}
+
 void vkb_guard_device_destroy(vkb_srv_table *t)
 {
     if (t->id >= MAX_TABLES) return;
+    int was = __atomic_exchange_n(&charged[t->id], 0, __ATOMIC_RELAXED);
+    if (was > 0) {
+        int left = __atomic_sub_fetch(&process_crashes, was, __ATOMIC_RELAXED);
+        VKB_INFO("device %u gone: its %d contained crash(es) no longer count toward the limit of %d (%d from programs still running)",
+                 t->id, was, PROCESS_MAX, left);
+    }
     vkb_guard *g = guards[t->id];
     if (!g || g->t != t) return;
     __atomic_store_n(&guards[t->id], NULL, __ATOMIC_RELEASE);

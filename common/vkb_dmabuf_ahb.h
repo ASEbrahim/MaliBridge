@@ -42,4 +42,18 @@ typedef struct vkb_dmabuf_ahb_info {
 
 typedef int (*PFN_vkb_dmabuf_ahb_lookup)(int fd, vkb_dmabuf_ahb_info *out);
 
+/* Any dma-buf the bridge handed out (pv_bgra_store, PV-07, server/server_pvbgra_reg.c):
+ *   uint32_t vkb_dmabuf_content_format(int fd);
+ *     VKB_DMABUF_CONTENT_RGBA8 (37, VK_FORMAT_R8G8B8A8_UNORM): the client made the image B8G8R8A8 but its texels are in
+ *     R8G8B8A8 order (the driver's storage writes go that way; the server made the image R8G8B8A8 for it): a compositor
+ *     reads the buffer as RGBA whatever the wl_buffer's XR24 / AR24 says;
+ *     0: as the client said (or not one of the bridge's). Optional: a compositor without it, or a server without it, keeps
+ *     the client's format. */
+/* The same answer for a compositor in another process than the server (the server is its own process on most builds):
+ * the dma-buf is NAMED (DMA_BUF_SET_NAME) VKB_DMABUF_RGBA8_NAME, which /proc/self/fd/<fd> shows as "/dmabuf:<name>". */
+#define VKB_DMABUF_RGBA8_NAME "vkbridge-rgba8"
+#define VKB_DMABUF_CONTENT_FORMAT "vkb_dmabuf_content_format"
+#define VKB_DMABUF_CONTENT_RGBA8 37u
+typedef uint32_t (*PFN_vkb_dmabuf_content_format)(int fd);
+
 #endif

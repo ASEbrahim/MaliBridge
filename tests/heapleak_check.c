@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
- * heapleak_check: what Detroit: Become Human (native Vulkan 1.1 on a G925) did to the
+ * heapleak_check: what Detroit: Become Human (native Vulkan 1.1, a player log on a G925) did to the
  * server's heap, for host/heapleak_test.sh (which reads the server's log and /proc).
  *   pools   FREE_DESCRIPTOR_SET pools of 45056 sets, still empty, asked for a set bigger than
  *           the pool (more image samplers than it has) 20 times each, six pools: refused every

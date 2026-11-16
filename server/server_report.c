@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
- *
  * The session report: one file a developer reads to know every issue a session hit, with what is
  * needed to reproduce each - <log dir>/malibridge-report.md for people and malibridge-report.json
  * for tools (tools/malibridge_report_diff.py compares two). DroidDeck's "Share logs" zips the
@@ -33,6 +32,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -79,6 +79,7 @@ typedef struct rp_proc {
     int pid;
     char comm[32], key[48];
     char app[64], engine[64];
+    int wine; /* looks like a Wine / Proton program (exe_like at hello); the engine is checked when it is known */
     char preset[400]; /* the game's preset (server_presets.c), "" without one */
     char preset_note[1100]; /* its built-in preset not applied on this GPU (server_presets.c), or "" */
     uint32_t engine_version, api;
@@ -96,6 +97,7 @@ typedef struct rp_proc {
     uint32_t lost, long_waits;
     double long_wait_max_ms;
     char lost_first[200];
+    char lost_cause[760]; /* the loss record's line (server_lostlog.c), the first */
     /* while it ran */
     int64_t gpu_mem_peak;
     long avail_min_kb;
@@ -145,8 +147,31 @@ static int other_presented_after(const rp_proc *p, double since)
         if (&procs[i] != p && procs[i].last_frame_s > since) return 1;
     return 0;
 }
-static int dirty, started_thread;
+/* dirty: set by any logging thread under rlock, cleared by write_report under rlock, and peeked
+ * by report_main (once per 5 s) without it: atomic, relaxed - it is only a "write soon" flag,
+ * the data it announces is read under rlock. rdir_on: rdir[0] != 0, for the unlocked early-outs
+ * (every logging thread, every compile/cache call): stored (release) after rdir is written under
+ * rlock, so a reader that sees it also sees the path. started_thread: vkb_report_session only. */
+static _Atomic int dirty, rdir_on;
+static int started_thread;
+#define DIRTY_SET() atomic_store_explicit(&dirty, 1, memory_order_relaxed)
+#define DIRTY_GET() atomic_load_explicit(&dirty, memory_order_relaxed)
+#define RDIR_ON() atomic_load_explicit(&rdir_on, memory_order_acquire)
 static long avail_min_kb = -1, mem_total_kb;
+
+/* The black box: one BB_REC-byte text record a second into a BB_SLOTS ring file,
+ * vkbridge-blackbox.bin next to the server log (the path from --log, no new argument), so a phone that restarts or a server
+ * that is killed leaves its last seconds: memory, and per live process its compiles in that second, long GPU waits, losses
+ * and a request that has not returned. Written by the report thread with a plain pwrite after rlock is let go: no
+ * sync call here (the app syncs the session folder's top-level files every 2 s), nothing on a request's path, only the
+ * report's own never-freed tables are read. The app renders the newest records to blackbox.txt; the .bin never leaves the phone. */
+#define BB_REC 256
+#define BB_SLOTS 256
+static pthread_mutex_t bblock = PTHREAD_MUTEX_INITIALIZER; /* the ring's fd: the report thread and a session switch only */
+static _Atomic int bb_fd = -1;
+static unsigned bb_slot;
+static long bb_avail_kb = -1, bb_rss_kb;
+static struct { int pid; uint64_t compiles; } bb_prev[RP_PROCS];
 static int64_t rss_peak_kb;
 static unsigned cpu_cap_min, gpu_min_all, gpu_max_all; /* cpu_cap_min 0: no cluster's cap was readable */
 /* the CPU policies by slot (policyN), with the highest and lowest clock each showed this session
@@ -168,7 +193,7 @@ static double now_s(void) { return mono_s() - t0_mono; }
 static int off(void)
 {
     const char *v = vkb_srv_env("VKBRIDGE_REPORT");
-    return (v && !strcmp(v, "0")) || !rdir[0];
+    return (v && !strcmp(v, "0")) || !RDIR_ON();
 }
 
 static rp_proc *proc_find(int pid, int make)
@@ -216,7 +241,7 @@ static int notable(const char *msg)
 
 void vkb_report_log(int level, const char *fmt, const char *msg)
 {
-    if (in_report || level > VKB_LOG_INFO || !rdir[0]) return;
+    if (in_report || level > VKB_LOG_INFO || !RDIR_ON()) return;
     if (level == VKB_LOG_INFO && !notable(msg)) return;
     int pid = cur_pid();
     pthread_mutex_lock(&rlock);
@@ -231,19 +256,49 @@ void vkb_report_log(int level, const char *fmt, const char *msg)
         c->level = level;
         c->first_s = now_s();
         snprintf(c->first, sizeof(c->first), "%s", msg);
-        dirty = 1;
+        DIRTY_SET();
     } else if (!c) {
         dropped_classes++;
     }
     if (c) {
         c->count++;
         c->last_s = now_s();
-        if (level < VKB_LOG_INFO) dirty = 1;
+        if (level < VKB_LOG_INFO) DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
 }
 
 /* ------------------------------------------------------------------ events */
+
+/* ".exe" anywhere in s[0..n) (any case) */
+static int has_exe(const char *s, size_t n)
+{
+    for (size_t i = 0; i + 4 <= n; i++)
+        if (s[i] == '.' && !strncasecmp(s + i, ".exe", 4)) return 1;
+    return 0;
+}
+
+/* A Wine / Proton program: its name or command line names an .exe (Wine puts the Windows path in argv), or it is a
+ * Steam game (a steam<appid> key: Proton, or a Linux game Steam started). A KDE or Linux program is none of these, so
+ * the report does not send its player for a Proton log (a player log: ksplashqml, kup-daemon, ksecretd...). Read once at
+ * hello: the process may be gone when the report names it. */
+static int exe_like(int pid, const char *comm, const char *pkey)
+{
+    if (has_exe(comm, strlen(comm)) || !strncmp(pkey, "steam", 5)) return 1;
+    char path[64], buf[4096];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    int fd = pid > 0 ? open(path, O_RDONLY | O_CLOEXEC) : -1;
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+    return n > 0 && has_exe(buf, (size_t)n);
+}
+
+/* The engine names DXVK and vkd3d(-proton) give their instances: Windows games under Wine. */
+static int wine_engine(const char *engine)
+{
+    return !strncasecmp(engine, "DXVK", 4) || !strncasecmp(engine, "vkd3d", 5);
+}
 
 void vkb_report_hello(vkb_srv_proc *pr)
 {
@@ -252,12 +307,13 @@ void vkb_report_hello(vkb_srv_proc *pr)
     if (p) {
         snprintf(p->comm, sizeof(p->comm), "%s", pr->comm);
         snprintf(p->key, sizeof(p->key), "%s", pr->pkey);
+        p->wine = exe_like(pr->pid, p->comm, p->key);
         vkb_preset_text(pr, p->preset, sizeof(p->preset));
         vkb_preset_note(pr, p->preset_note, sizeof(p->preset_note));
         if (!p->alive) p->t_hello = now_s();
         p->alive = 1;
         p->t_gone = 0;
-        dirty = 1;
+        DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
 }
@@ -272,7 +328,7 @@ void vkb_report_gone(vkb_srv_proc *pr)
     if (p) {
         p->alive = 0;
         p->t_gone = now_s();
-        dirty = 1;
+        DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
     if (p && !off()) {
@@ -294,7 +350,7 @@ void vkb_report_instance(vkb_srv_table *t, const VkInstanceCreateInfo *ci)
             p->engine_version = a->engineVersion;
         }
         if (a->apiVersion > p->api) p->api = a->apiVersion;
-        dirty = 1;
+        DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
 }
@@ -345,14 +401,14 @@ void vkb_report_device(vkb_srv_table *inst, const VkDeviceCreateInfo *ci, VkResu
             size_t len = strlen(p->exts);
             if (!have && len + n + 2 < sizeof(p->exts)) snprintf(p->exts + len, sizeof(p->exts) - len, "%s%s", len ? " " : "", s);
         }
-        dirty = 1;
+        DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
 }
 
 void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, VkResult r, const char *slow)
 {
-    if (!t || !t->proc || !rdir[0]) return;
+    if (!t || !t->proc || !RDIR_ON()) return;
     static const double edges[7] = {10, 50, 200, 1000, 2000, 5000, 10000};
     int b = 0;
     while (b < 7 && ms >= edges[b]) b++;
@@ -367,7 +423,7 @@ void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, Vk
         if (slow && *slow && p->nslow < RP_SLOW) {
             snprintf(p->slow[p->nslow++], sizeof(p->slow[0]), "%s %.0f ms at %.0f s, %s: %s", compute ? "compute" : "graphics", ms, now_s(),
                      r == VK_SUCCESS ? "built" : "failed", slow);
-            dirty = 1;
+            DIRTY_SET();
         }
     }
     pthread_mutex_unlock(&rlock);
@@ -375,13 +431,13 @@ void vkb_report_compile(vkb_srv_table *t, int compute, uint32_t n, double ms, Vk
 
 void vkb_report_cache_hits(vkb_srv_table *t, uint64_t built, uint64_t hits)
 {
-    if (!t || !t->proc || !rdir[0]) return;
+    if (!t || !t->proc || !RDIR_ON()) return;
     pthread_mutex_lock(&rlock);
     rp_proc *p = proc_find(t->proc->pid, 1);
     if (p) {
         p->fb_built += built;
         p->fb_hits += hits;
-        dirty = 1;
+        DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
 }
@@ -417,7 +473,19 @@ static void watch_result(const char *call, VkResult r, double ms)
             p->long_waits++;
             if (ms > p->long_wait_max_ms) p->long_wait_max_ms = ms;
         }
-        dirty = 1;
+        DIRTY_SET();
+    }
+    pthread_mutex_unlock(&rlock);
+}
+
+void vkb_report_lost_cause(int pid, const char *line)
+{
+    if (!RDIR_ON()) return;
+    pthread_mutex_lock(&rlock);
+    rp_proc *p = proc_find(pid, pid != 0);
+    if (p && !p->lost_cause[0]) {
+        snprintf(p->lost_cause, sizeof(p->lost_cause), "%s", line);
+        DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
 }
@@ -445,7 +513,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL rp_QueueSubmit2(VkQueue q, uint32_t n, con
 }
 
 /* A wait that returned VK_TIMEOUT before the app's timeout had passed (on a wait with no timeout,
- * at all): the driver's bug; wait_retry waits on, so this is seen with it off. Once per kind. */
+ * at all): the driver's bug (a player log); wait_retry waits on, so this is seen with it off. Once per kind. */
 static void early_timeout(const char *call, VkResult r, double t, uint64_t timeout, int *said)
 {
     if (r != VK_TIMEOUT || !timeout || __atomic_load_n(said, __ATOMIC_RELAXED)) return;
@@ -691,17 +759,23 @@ static int thermal_status(void)
     return p ? atoi(p + 8) : -1;
 }
 
+int vkb_report_thermal(void) { return thermal_status(); }
+
 /* The client's frame statistics (client/frames.c): one line in <dir>/vkbridge-frames-<pid>.txt. */
 static void read_frames(void)
 {
-    DIR *d = opendir(rdir);
+    char dir[sizeof(rdir)];
+    pthread_mutex_lock(&rlock);
+    snprintf(dir, sizeof(dir), "%s", rdir);
+    pthread_mutex_unlock(&rlock);
+    DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
         int pid = 0;
         if (sscanf(e->d_name, "vkbridge-frames-%d.txt", &pid) != 1) continue;
         char p[900], line[700];
-        snprintf(p, sizeof(p), "%s/%s", rdir, e->d_name);
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
         FILE *f = fopen(p, "re");
         if (!f) continue;
         int got = fgets(line, sizeof(line), f) != NULL;
@@ -725,7 +799,7 @@ static void read_frames(void)
             s = strstr(line, " external=");
             pr->external = s ? atoll(s + 10) : -1;
             if (!pr->comm[0] && (s = strstr(line, "comm="))) sscanf(s + 5, "%31s", pr->comm);
-            dirty = 1;
+            DIRTY_SET();
         }
         pthread_mutex_unlock(&rlock);
     }
@@ -775,6 +849,8 @@ static void sample(void)
         vkb_memstat_query(pids[i], &mem[i], &tot, &im, &bc, &src);
     }
     pthread_mutex_lock(&rlock);
+    bb_avail_kb = avail;
+    bb_rss_kb = rss;
     if (avail >= 0 && (avail_min_kb < 0 || avail < avail_min_kb)) avail_min_kb = avail;
     if (rss > rss_peak_kb) rss_peak_kb = rss;
     if (cap && (!cpu_cap_min || cap < cpu_cap_min)) cpu_cap_min = cap;
@@ -814,7 +890,7 @@ static void sample(void)
         if (gpu > 0 && (unsigned)gpu > p->gpu_max) p->gpu_max = (unsigned)gpu;
         if (!p->samples || th > p->thermal_max) p->thermal_max = th;
         p->samples++;
-        dirty = 1;
+        DIRTY_SET();
     }
     pthread_mutex_unlock(&rlock);
 }
@@ -1053,6 +1129,7 @@ static int list_issues(FILE *f, int json, int notes)
         const rp_proc *p = &procs[i];
         proc_name(p, nm, sizeof(nm));
         if (p->lost) issue(&is, "%s: device lost %u time(s), first in %s", nm, p->lost, p->lost_first);
+        if (p->lost_cause[0]) issue(&is, "%s: %s", nm, p->lost_cause);
         if (p->long_waits) issue(&is, "%s: %u GPU wait(s) longer than 2 s (longest %.1f s)", nm, p->long_waits, p->long_wait_max_ms / 1000.0);
         const char *call;
         char where[800];
@@ -1090,14 +1167,14 @@ static int list_issues(FILE *f, int json, int notes)
             else issue(&is, fmt, nm, end - p->last_frame_s, mid, tail);
         }
         /* A game process that exited soon after creating its device, or with hardly a frame: nothing in the
-         * bridge's log says why (LEGO Indiana Jones exited 104 ms after vkCreateDevice), so the player's
+         * bridge's log says why (LEGO Indiana Jones exited 104 ms after vkCreateDevice, a player log), so the player's
          * Proton log is what shows it. */
         if (!p->alive && p->t_gone > 0 && p->devices && p->t_device > 0 && p->comm[0] && !helper_process(p->comm) && !presents_elsewhere(p)) {
             double life = p->t_gone - p->t_device, quick = quick_exit_s();
             unsigned long long fr = frames_counted(p);
             if ((quick > 0 && life < quick) || (p->frames[0] && fr < 30))
-                issue(&is, "%s: exited %.0f s after its device was created (%llu frames); a Proton log helps: launch options PROTON_LOG=1 %%command%%",
-                      nm, life < 0 ? 0 : life, fr);
+                issue(&is, "%s: exited %.0f s after its device was created (%llu frames)%s", nm, life < 0 ? 0 : life, fr,
+                      p->wine || wine_engine(p->engine) ? "; a Proton log helps: launch options PROTON_LOG=1 %command%" : "");
         }
         if (p->samples && p->cpu_cap_min && p->cpu_cap_min < 70)
             issue(&is, "%s: CPU clocks capped to %u%% of their maximum while it ran (thermal)", nm, p->cpu_cap_min);
@@ -1339,6 +1416,11 @@ static void write_md(FILE *f, int final)
         if (p->lost || p->long_waits)
             fprintf(f, "- GPU: device lost %u time(s)%s%s; %u wait(s) over 2 s (longest %.1f s)\n", p->lost, p->lost ? ", first in " : "", p->lost_first,
                     p->long_waits, p->long_wait_max_ms / 1000.0);
+        if (p->lost_cause[0]) {
+            fprintf(f, "- ");
+            md_text(f, p->lost_cause);
+            fprintf(f, "\n");
+        }
         if (p->samples) {
             fprintf(f, "- while it ran: GPU memory peak %lld MB; system memory available >= %ld MB; fastest CPU cluster %u-%u MHz, ",
                     (long long)(p->gpu_mem_peak >> 20), p->avail_min_kb / 1024, p->cpu_top_min, p->cpu_top_max);
@@ -1362,6 +1444,7 @@ static void write_md(FILE *f, int final)
         }
         fprintf(f, "\n");
     }
+    vkb_perf_report(f, 0); /* the Performance section (server_perf.c), when any process had a window */
     fprintf(f, "## Server (not tied to a process)\n\n");
     int header = 0;
     for (int c = 0; c < nclasses; c++) {
@@ -1496,6 +1579,8 @@ static void write_json(FILE *f, int final)
         js(f, p->exts);
         fprintf(f, ", \"emulated_features\": ");
         js(f, p->features);
+        fprintf(f, ", \"lost_cause\": ");
+        js(f, p->lost_cause);
         fprintf(f, ", \"device_lost\": %u, \"long_waits\": %u, \"long_wait_max_ms\": %.0f, \"gpu_mem_peak_mb\": %lld, \"mem_available_min_mb\": %ld, "
                    "\"cpu_mhz\": [%u, %u], \"cpu_cap_min_pct\": %s, \"gpu_mhz\": [%u, %u], \"thermal_max\": %d, \"cpu_held\": ",
                 p->lost, p->long_waits, p->long_wait_max_ms, (long long)(p->gpu_mem_peak >> 20), p->avail_min_kb / 1024, p->cpu_top_min, p->cpu_top_max,
@@ -1525,9 +1610,11 @@ static void write_json(FILE *f, int final)
         js(f, classes[c].first);
         fprintf(f, "}");
     }
+    fprintf(f, "\n  ],\n");
+    vkb_perf_report(f, 1); /* "performance": [...] (server_perf.c) */
     artefact a[64];
     int na = artefacts(a, 64);
-    fprintf(f, "\n  ],\n  \"artefacts\": [");
+    fprintf(f, "  \"artefacts\": [");
     for (int i = 0; i < na; i++) {
         fprintf(f, "%s{\"path\": ", i ? ", " : "");
         js(f, a[i].path);
@@ -1565,12 +1652,81 @@ static void write_report(int final)
     in_report = 1;
     pthread_mutex_lock(&wlock);
     pthread_mutex_lock(&rlock);
-    dirty = 0;
+    atomic_store_explicit(&dirty, 0, memory_order_relaxed);
     write_file("malibridge-report.md", write_md, final);
     write_file("malibridge-report.json", write_json, final);
     pthread_mutex_unlock(&rlock);
     pthread_mutex_unlock(&wlock);
     in_report = was;
+}
+
+/* One record: "<wall ms> <mono ms> mem <MB available> rss <server MB> | <pid> <comm> c+<compiles this second> w<long waits>
+ * l<losses>[ <call> <s>s running] | ...", space-padded to BB_REC with a newline last. */
+static int bb_record(char *rec)
+{
+    struct timespec w, m;
+    clock_gettime(CLOCK_REALTIME, &w);
+    clock_gettime(CLOCK_MONOTONIC, &m);
+    pthread_mutex_lock(&rlock);
+    int n = snprintf(rec, BB_REC, "%lld %lld mem %ld rss %ld", (long long)w.tv_sec * 1000 + w.tv_nsec / 1000000,
+                     (long long)m.tv_sec * 1000 + m.tv_nsec / 1000000, bb_avail_kb < 0 ? -1 : bb_avail_kb / 1024, bb_rss_kb / 1024);
+    /* Processes with a request running for a second or more go first: the record is cut at BB_REC
+     * bytes, and with eight programs alive the one stuck in a call came last and lost its call name
+     * (Pixel, 2026-11-10: "18680 re3.ex" while the server's heap grew 6 GB). */
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < nprocs && n < BB_REC - 1; i++) {
+            const rp_proc *p = &procs[i];
+            if (!p->alive) continue;
+            const char *call;
+            /* its longest request still running, from 1 s on (the report itself names it from 10 s) */
+            double running = vkb_srv_running_longest(p->pid, &call, NULL, 0);
+            int busy = running >= 1.0 && call;
+            if (busy != (pass == 0)) continue;
+            uint64_t before = p->compiles;
+            for (int k = 0; k < RP_PROCS; k++)
+                if (bb_prev[k].pid == p->pid) { before = bb_prev[k].compiles; break; }
+            n += snprintf(rec + n, (size_t)(BB_REC - n), " | %d %.15s c+%llu w%u l%u", p->pid, p->comm[0] ? p->comm : "?",
+                          (unsigned long long)(p->compiles - before), p->long_waits, p->lost);
+            if (n < BB_REC - 1 && busy) n += snprintf(rec + n, (size_t)(BB_REC - n), " %.40s %.0fs running", call, running);
+        }
+    for (int i = 0, k = 0; i < nprocs && k < RP_PROCS; i++)
+        if (procs[i].alive) { bb_prev[k].pid = procs[i].pid; bb_prev[k].compiles = procs[i].compiles; k++; }
+    pthread_mutex_unlock(&rlock);
+    if (n > BB_REC - 1) n = BB_REC - 1;
+    memset(rec + n, ' ', (size_t)(BB_REC - 1 - n));
+    rec[BB_REC - 1] = '\n';
+    return BB_REC;
+}
+
+static void bb_tick(void)
+{
+    char rec[BB_REC];
+    if (atomic_load_explicit(&bb_fd, memory_order_relaxed) < 0) return; /* the lock is taken for the write */
+    bb_record(rec);
+    pthread_mutex_lock(&bblock);
+    int fd = atomic_load_explicit(&bb_fd, memory_order_relaxed);
+    if (fd >= 0) {
+        ssize_t w = pwrite(fd, rec, BB_REC, (off_t)(bb_slot % BB_SLOTS) * BB_REC);
+        (void)w;
+        bb_slot++;
+    }
+    pthread_mutex_unlock(&bblock);
+}
+
+/* A new session's ring next to its log (the in-app server outlives sessions). */
+static void bb_open(const char *dir)
+{
+    char path[700];
+    int fd = -1;
+    if (dir && *dir) {
+        snprintf(path, sizeof(path), "%s/vkbridge-blackbox.bin", dir);
+        fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    }
+    pthread_mutex_lock(&bblock);
+    int old = atomic_exchange_explicit(&bb_fd, fd, memory_order_relaxed);
+    bb_slot = 0;
+    pthread_mutex_unlock(&bblock);
+    if (old >= 0) close(old);
 }
 
 static void *report_main(void *arg)
@@ -1581,19 +1737,20 @@ static void *report_main(void *arg)
         sleep(1);
         if (off()) continue;
         if (tick % 2 == 0) sample();
+        bb_tick();
         if (tick % 5 == 0) {
             read_frames();
             /* a request still running past the limit: rewritten so the app sees it now (its
              * loading screen says which stage stalled) */
-            if (!dirty) {
+            if (!DIRTY_GET()) {
                 pthread_mutex_lock(&rlock);
-                for (int i = 0; i < nprocs && !dirty; i++) {
+                for (int i = 0; i < nprocs && !DIRTY_GET(); i++) {
                     const char *call;
-                    if (running_stuck(&procs[i], &call, NULL, 0) > 0) dirty = 1;
+                    if (running_stuck(&procs[i], &call, NULL, 0) > 0) DIRTY_SET();
                 }
                 pthread_mutex_unlock(&rlock);
             }
-            if (dirty) write_report(0);
+            if (DIRTY_GET()) write_report(0);
         }
     }
     return NULL;
@@ -1618,9 +1775,10 @@ void vkb_report_session(const char *log_path)
         if (s) *s = 0;
         else snprintf(dir, sizeof(dir), ".");
     }
-    if (rdir[0]) write_report(1); /* the previous session's, final */
+    if (RDIR_ON()) write_report(1); /* the previous session's, final */
     pthread_mutex_lock(&rlock);
     snprintf(rdir, sizeof(rdir), "%s", dir);
+    atomic_store_explicit(&rdir_on, rdir[0] != 0, memory_order_release);
     snprintf(clocks_log, sizeof(clocks_log), "%s/vkbridge-clocks.log", dir);
     t0_mono = mono_s();
     t0_wall = time(NULL);
@@ -1645,8 +1803,11 @@ void vkb_report_session(const char *log_path)
     gpu_min_all = gpu_max_all = 0;
     thermal_max_all = -1;
     mem_total_kb = meminfo_kb("MemTotal");
-    dirty = 1;
+    memset(bb_prev, 0, sizeof(bb_prev));
+    DIRTY_SET();
     pthread_mutex_unlock(&rlock);
+    if (!off()) bb_open(dir);
+    vkb_perf_session();
     if (off()) return;
     if (!started_thread) {
         started_thread = 1;

@@ -26,6 +26,7 @@ typedef struct vkb_surface {
 } vkb_surface;
 
 typedef struct vkb_swapchain vkb_swapchain;
+typedef struct vkb_pacer vkb_pacer; /* the frame pacer (pacer.c) */
 
 typedef struct vkb_swap_image {
     VkImage image;
@@ -83,6 +84,7 @@ struct vkb_swapchain {
     VkResult status;          /* VK_ERROR_OUT_OF_DATE_KHR / SURFACE_LOST once broken */
     pthread_mutex_t lock;
     uint64_t presents;
+    uint64_t acq_waits, acq_wait_ns; /* acquires that found no free image, and how long they waited (atomics; wsi_wayland.c logs them) */
     int retired;
     uint32_t lat_n;           /* the latency log's number of the present being made by the app's call (latency.c), 0 */
     /* Present ids (VK_KHR_present_id/id2) and their waits (present_wait/wait2), wsi.c. With `lock`. */
@@ -104,6 +106,12 @@ struct vkb_swapchain {
     uint32_t late_index, late_lat;
     uint64_t late_pid, late_t0;
     uint64_t late_frames, late_max_ns; /* for the line at the end */
+    /* The frame pacer (VKBRIDGE_PACER=1, a DXVK app, dma-buf images; pacer.c), else NULL. Its present waits are answered by
+     * the pacer: done at the present while not engaged, at the frame's GPU done + the hold while engaged (wsi.c). */
+    vkb_pacer *pacer;
+    uint64_t pq_cur;          /* the app's present call (CLOCK_MONOTONIC ns) for the presenting thread, 0: not paced */
+    struct { uint64_t id, done; } pw_gd[16]; /* (with `lock`) present ids whose GPU work the presenting thread saw done, and when */
+    uint64_t pw_gdone;        /* (with `lock`) the highest of them */
 };
 
 /* Formats every surface offers. */
@@ -128,6 +136,8 @@ extern const vkb_wsi_backend vkb_wsi_headless_backend;
 /* Helpers in wsi.c */
 /* VKBRIDGE_WSI_AHB=0, or the server cannot allocate AHardwareBuffers: no gralloc swapchains. */
 int vkb_wsi_ahb_disabled(void);
+/* The swapchain image sets kept for reuse of one device freed (vkDestroyDevice; wsi.c). */
+void vkb_wsi_pool_drop_device(struct vkb_device *dev);
 uint32_t vkb_drm_format(VkFormat f);
 /* A frame's fence waited for in 10 s steps, a slow frame warned about once, VK_ERROR_DEVICE_LOST
  * only on the server's loss or past VKBRIDGE_PRESENT_TIMEOUT_S (default 120 s); reset after. */
@@ -143,5 +153,24 @@ void vkb_wsi_pw_shown(vkb_swapchain *sc, uint64_t id);
  * thread, which shows it once it is (the caller is done with it); else rendered (or an error). */
 VkResult vkb_wsi_wait_rendering(vkb_swapchain *sc, VkQueue queue, uint32_t index, uint32_t nwait, const VkSemaphore *wait,
                                 uint64_t pid, int *late);
+
+/* The frame pacer (pacer.c). */
+int vkb_pacer_wanted(void);                     /* VKBRIDGE_PACER=1 in the guest's environment, else the server's switch */
+int vkb_pacer_setting(int *from, int *final);   /* the same without a line; *from 0 guest, 1 server, 2 default */
+int vkb_wsi_present_wait_setting(const vkb_physdev *pd, int *from); /* vkb_wsi_present_wait_on without a line; *from VKB_PWF_* */
+#define VKB_PWF_GUEST 0
+#define VKB_PWF_SERVER 1
+#define VKB_PWF_PACER 2
+#define VKB_PWF_DEFAULT_DXVK 3
+#define VKB_PWF_DEFAULT 4
+vkb_pacer *vkb_pacer_create(vkb_swapchain *sc); /* NULL: not paced (off, not DXVK, copy present, DXVK paces itself) */
+void vkb_pacer_destroy(vkb_pacer *p);
+uint64_t vkb_pacer_hold_ns(vkb_pacer *p);       /* 0 while not engaged */
+void vkb_pacer_pw_call(vkb_pacer *p);           /* a vkWaitForPresentKHR on the swapchain */
+/* The presenting thread, per frame in present order: the app's present call, when its GPU work was seen done, how long the
+ * thread waited for it, and the swapchain's acquires that waited so far. */
+void vkb_pacer_frame(vkb_pacer *p, uint64_t present_ns, uint64_t done_ns, uint64_t waited_ns, uint64_t acq_total);
+/* The presenting thread saw the GPU work of the frame with present id `id` done at `t` (paced swapchains). */
+void vkb_wsi_pw_gpu_done(vkb_swapchain *sc, uint64_t id, uint64_t t);
 
 #endif

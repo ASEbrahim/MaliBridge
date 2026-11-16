@@ -14,10 +14,10 @@
 #      fds left to the driver
 #   4  imitated Kirin, VKBRIDGE_DMABUF_VIA_AHB=0: no dma-buf memory offered (the check skips), as before
 #   5  imitated Kirin without host pages: "not possible", no dma-buf memory offered
-# Mali-G52 r18p0 (Kirin 810) refusing LINEAR images with storage usage (VKBRIDGE_FAKE_MISSING=linearstorage):
+# Mali-G52 r18p0 (Kirin 810, a player log) refusing LINEAR images with storage usage (VKBRIDGE_FAKE_MISSING=linearstorage):
 #   6  gamescope's images (gsexport_check) asked, made with the usage the driver takes, exported and imported
 #   7  the same without the refusal: nothing reduced
-# A driver whose start's check fails OPTIMAL images and passes LINEAR ones (OPTIMAL read back 0x00000000;
+# A driver whose start's check fails OPTIMAL images and passes LINEAR ones (a player log: OPTIMAL read back 0x00000000;
 # VKBRIDGE_TEST_DAB_WRONG=optimal imitates it on the host):
 #   8  the path on, LINEAR only: gamescope finds the dma-buf extensions and the LINEAR modifier, Zink's LINEAR image is
 #      exported, imported as gamescope does (made LINEAR) and read back; what cannot be LINEAR is refused
@@ -87,9 +87,9 @@ check "" nopages
 [ "$(cat "$work/check-nopages.rc")" = 77 ] && grep -q "dma-buf over AHardwareBuffer: not possible" "$log"
 step $? "5 imitated Kirin without the buffers: not possible, nothing offered ($(tail -1 "$work/check-nopages.log"))" "$work/check-nopages.log"
 
-# Kirin's Mali-G52 r18p0: the driver refuses a LINEAR image with storage usage (VKBRIDGE_FAKE_MISSING=linearstorage),
+# Kirin's Mali-G52 r18p0 (a player log): the driver refuses a LINEAR image with storage usage (VKBRIDGE_FAKE_MISSING=linearstorage),
 # so gamescope's LINEAR-modifier queries (BGRA8, SAMPLED | STORAGE | TRANSFER_SRC, usage 0xd, MUTABLE_FORMAT with a view list)
-# were refused, it found no modifier and stopped on "modifiers.size > 0" (Steam died 10 s in). The bridge answers
+# were refused, it found no modifier and stopped on "modifiers.size() > 0" (Steam died 10 s in). The bridge answers
 # them for the usage the driver makes and makes the image with it; gsexport_check asks and makes gamescope's images
 # (queries, a list with LINEAR, export, import at the explicit LINEAR modifier) through the path.
 #   6  the refusal imitated: gamescope's images asked, made, exported, imported; the log says which usage they got

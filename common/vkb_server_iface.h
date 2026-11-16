@@ -31,5 +31,8 @@ void vkb_srv_missing(struct vkb_srv_call *c, const char *name);
 int vkb_srv_pd_has_ext(struct vkb_srv_call *c, VkPhysicalDevice pd, const char *list);
 void vkb_srv_unsupported(struct vkb_srv_call *c, const char *name, const char *list);
 void vkb_srv_close_after_send(struct vkb_srv_call *c, int fd);
+/* VKBRIDGE_FAST_CREATE (server/server_conn.c): the create handlers' order decision before the driver, and vkCreateImage's reply tail */
+void vkb_srv_fast_create_pre(struct vkb_srv_call *c, const VkImageCreateInfo *ici, const VkBufferCreateInfo *bci);
+void vkb_srv_fast_create_reply(struct vkb_srv_call *c, VkDevice device, VkResult r, const VkImage *image, const VkImageCreateInfo *ci);
 
 #endif

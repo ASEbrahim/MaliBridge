@@ -48,14 +48,30 @@
  * events / 10 s -> 0, geometry kept, fps the same (50.5). DXVK's forceComputeLdsBarriers also stops the flicker, but its
  * Subgroup-scope barriers inside cs.4605df31's `if (tid < 32)` (f9c93179c84d860f, a frustum/bounds reduction) cull the
  * porch roof, gate pillars and banner for good. The hashes are of DXVK 3.1.1's code for those shaders. */
-{"883710", "Mali-G925", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_SHARED_BARRIER_ONLY=e28ac7ddfa639dc4,2a0debecc286be40 VKBRIDGE_SHARED_BARRIER_LOCKSTEP=e28ac7ddfa639dc4,2a0debecc286be40",
+{"883710", "Mali-G925", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_SHARED_BARRIER_ONLY=lockstep VKBRIDGE_SHARED_BARRIER_LOCKSTEP=all",
  "Resident Evil 2 (DX11): draw-list compaction made for 32-wide waves races on 16-wide subgroups (flicker); barriers after the lockstep rewrite, on the two shaders"},
 {"883710", "", "VKBRIDGE_WAVE32=1",
  "Resident Evil 2 (DX12 builds): wave operations that may count on 32 lanes; untested here"},
+/* Resident Evil 3 (DX11, S11 Ultra G925, 11-09): the same two draw-list compaction shaders as RE2 (the lockstep rewrite
+ * under SHARED_BARRIER_LOCKSTEP=all took exactly 2a0debecc286be40 and e28ac7ddfa639dc4); the hallway boxes flickered
+ * without it and stopped with it (played through, session 2026-11-09-45-steam). Narrowed to the pair like RE2: =all cost
+ * gpu_busy 70-80 -> 87-93 there (barriers on every shared-memory module).
+ * 11-14 (Poco X8 Pro Max G925 MC11, player logs, test58): the flicker was back with this entry applied, '0 of 308
+ * module(s) rewritten, 7 left as they were by ..._ONLY': the game ran on Proton Experimental (Valve's DXVK 3.1.1-209), whose
+ * SPIR-V for the same two shaders has other hashes than DroidDeck-Proton's. So the pair is named by its shape now:
+ * ONLY=lockstep = the modules the lockstep rewrite takes (on DroidDeck-Proton exactly the pair, Ultra 11-14 sessions 07/08:
+ * 'lockstep: 2 module(s)' with 12 shared-memory modules), barriers on those only; no hash, any DXVK build. RE2 the same. */
+{"952060", "Mali-G925", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_SHARED_BARRIER_ONLY=lockstep VKBRIDGE_SHARED_BARRIER_LOCKSTEP=all",
+ "Resident Evil 3 (DX11): RE2's draw-list compaction races on 16-wide subgroups (box flicker); barriers after the lockstep rewrite, on the two shaders"},
 {"952060", "", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_WAVE32=1",
  "Resident Evil 3: RE Engine like RE2 (DXVK's RE2 profile covers it too); untested here"},
 {"418370", "", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_WAVE32=1",
  "Resident Evil 7: RE Engine, subgroup-size quirk in vkd3d-proton like RE2's; untested here"},
+/* Devil May Cry 5 (S11 Ultra G925, test60, 11-14): a building flickered (session 2026-11-14-47-steam, this table had no G925
+ * row, so nothing applied); with RE3's entry the lockstep rewrite took exactly the RE2/RE3 pair (2a0debecc286be40,
+ * e28ac7ddfa639dc4) and no flicker showed at the same building (session 48); fps median 44 vs 46 (not same-spot). */
+{"601150", "Mali-G925", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_SHARED_BARRIER_ONLY=lockstep VKBRIDGE_SHARED_BARRIER_LOCKSTEP=all",
+ "Devil May Cry 5: RE2's draw-list compaction races on 16-wide subgroups (building flicker); barriers after the lockstep rewrite, on the two shaders"},
 {"601150", "", "VKBRIDGE_SHARED_BARRIER=2 VKBRIDGE_WAVE32=1",
  "Devil May Cry 5: RE Engine (DXVK groups it with RE2/RE3); untested here"},
 

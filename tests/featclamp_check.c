@@ -14,6 +14,9 @@
  *   v11         a Vulkan 1.2 instance; VkPhysicalDeviceVulkan11Features queried and printed
  *               ("features: v11 shaderDrawParameters=N multiview=N"), the device made with only
  *               shaderDrawParameters turned on in it and multiview as the query said
+ *   depthclamp  PR #31 (K11MCH1): depthClamp queried with vkGetPhysicalDeviceFeatures and printed
+ *               ("features: depthClamp=N"), the device made with only depthClamp turned on, as
+ *               DXVK 1.10 asks for it at every D3D11 feature level
  * Exit status: 0 the device was made, 1 it was refused, 77 the GPU has no VK_EXT_transform_feedback
  * (no argument only).
  */
@@ -28,7 +31,7 @@
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "";
-    int dp = !strcmp(mode, "drawparams"), v11 = !strcmp(mode, "v11");
+    int dp = !strcmp(mode, "drawparams"), v11 = !strcmp(mode, "v11"), dc = !strcmp(mode, "depthclamp");
     void *lib = dlopen("libvulkan.so.1", RTLD_NOW);
     if (!lib) {
         printf("FAIL loader: %s\n", dlerror());
@@ -62,6 +65,25 @@ int main(int argc, char **argv)
     int xfb_ext = 0;
     for (uint32_t i = 0; i < en; i++) xfb_ext |= !strcmp(e[i].extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     free(e);
+    if (dc) {
+        GI(vkGetPhysicalDeviceFeatures);
+        VkPhysicalDeviceFeatures f1;
+        memset(&f1, 0, sizeof(f1));
+        vkGetPhysicalDeviceFeatures(pd, &f1);
+        printf("features: depthClamp=%u\n", f1.depthClamp);
+        float p1 = 1;
+        VkDeviceQueueCreateInfo q1 = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &p1};
+        VkPhysicalDeviceFeatures w1;
+        memset(&w1, 0, sizeof(w1));
+        w1.depthClamp = VK_TRUE;
+        VkDeviceCreateInfo d1 = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &q1, 0, NULL, 0, NULL, &w1};
+        VkDevice dv = VK_NULL_HANDLE;
+        VkResult r1 = vkCreateDevice(pd, &d1, NULL, &dv);
+        printf("device: %d\n", r1);
+        if (r1 == VK_SUCCESS) ((PFN_vkDestroyDevice)gipa(inst, "vkDestroyDevice"))(dv, NULL);
+        vkDestroyInstance(inst, NULL);
+        return r1 == VK_SUCCESS ? 0 : 1;
+    }
     if (!xfb_ext && !dp && !v11) {
         printf("SKIP: no VK_EXT_transform_feedback\n");
         vkDestroyInstance(inst, NULL);
