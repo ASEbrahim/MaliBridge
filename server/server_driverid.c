@@ -112,6 +112,31 @@ int vkb_arm_driver(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_ap
     return vkb_driver_is_arm(&p, vkb_driver_id(dt, pd, inst_api));
 }
 
+/* Mali-G615 r44p1 ignores gl_ViewportIndex written from a vertex shader (MaliBridge issue #72).
+ * Keep this narrow: it must be Arm's proprietary driver, not a similarly named Mesa/PanVK device,
+ * and the r44p1 build must be identified from driverInfo or the encoded driverVersion. */
+int vkb_mali_g615_r44p1(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api)
+{
+    VkPhysicalDeviceProperties p;
+    if (!dt || !dt->vkGetPhysicalDeviceProperties) return 0;
+    dt->vkGetPhysicalDeviceProperties(pd, &p);
+    if (!strstr(p.deviceName, "Mali-G615")) return 0;
+
+    uint32_t driver_id = vkb_driver_id(dt, pd, inst_api);
+    if (!vkb_driver_is_arm(&p, driver_id)) return 0;
+
+    VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    if (dt->vkGetPhysicalDeviceProperties2 && inst_api >= VK_API_VERSION_1_1) {
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+        dt->vkGetPhysicalDeviceProperties2(pd, &p2);
+    }
+    if (strstr(dp.driverInfo, "r44p1")) return 1;
+
+    uint32_t r = p.driverVersion >> 22;
+    uint32_t patch = (p.driverVersion >> 12) & 0x3ffu;
+    return r == 44 && patch == 1;
+}
+
 const char *vkb_driver_id_name(uint32_t id)
 {
     switch (id) {

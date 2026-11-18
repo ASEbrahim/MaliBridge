@@ -613,6 +613,7 @@ typedef struct promo_gpu {
     uint32_t drv_api;      /* the driver's (or VKBRIDGE_FAKE_API's) */
     uint32_t offered;      /* the version the app sees: drv_api when nothing is promoted */
     uint32_t spv_max;      /* the SPIR-V version the driver takes */
+    int viewport_index_broken; /* Mali-G615 r44p1 ignores VS BuiltIn ViewportIndex */
     int shuffle;           /* subgroup shuffles in the driver: dynamic-id broadcasts lowered to them */
     uint32_t lanes;        /* without shuffles: the largest subgroup, each dynamic-id broadcast a chain over its lanes */
     int active;            /* translation wrappers on (VKBRIDGE_PROMOTE_API not 0, driver below 1.3) */
@@ -682,6 +683,9 @@ static void fill_core_features(const translate *x, const promo_gpu *g, VkBaseOut
         if (r->ext_off == NONE) v = exts_has(x->exts, feat_structs[r->ef].ext);
         else if (x->slots[r->ef].p) v = *(const VkBool32 *)((const uint8_t *)x->slots[r->ef].p + r->ext_off);
         if (r->ef == EF_PRIVATE) v = VK_TRUE; /* the client's own (descriptor.c) */
+        if (g && g->viewport_index_broken && r->ef == EF_VPLAYER &&
+            r->core_off == offsetof(VkPhysicalDeviceVulkan12Features, shaderOutputViewportIndex))
+            v = VK_FALSE;
         *(VkBool32 *)((uint8_t *)c + r->core_off) = v;
     }
     /* A shuffle where the driver has them, else a chain of constant-lane broadcasts (spirv_downgrade.h). */
@@ -753,6 +757,7 @@ static void record_plain(const vkb_dispatch *d, VkPhysicalDevice pd)
     g.drv_api = driver_api(p.apiVersion);
     g.offered = g.drv_api;
     snprintf(g.name, sizeof(g.name), "%s", p.deviceName);
+    g.viewport_index_broken = vkb_mali_g615_r44p1(d, pd, p.apiVersion);
     g.push = p.limits.maxPushConstantsSize;
     g.int64 = f.shaderInt64 != 0;
     pthread_mutex_lock(&gpus_lock);
@@ -771,6 +776,8 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     memset(&g, 0, sizeof(g));
     VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties sg = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &id};
+    VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    id.pNext = &dp;
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sg};
     d->vkGetPhysicalDeviceProperties2(pd, &p2);
     memcpy(g.uuid, id.deviceUUID, VK_UUID_SIZE);
@@ -778,6 +785,7 @@ void vkb_promote_decide(const vkb_dispatch *d, VkPhysicalDevice pd)
     g.drv_api = driver_api(p2.properties.apiVersion);
     g.offered = g.drv_api;
     snprintf(g.name, sizeof(g.name), "%s", p2.properties.deviceName);
+    g.viewport_index_broken = vkb_mali_g615_r44p1(d, pd, p2.properties.apiVersion);
     g.push = p2.properties.limits.maxPushConstantsSize;
     VkPhysicalDeviceFeatures2 base = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     d->vkGetPhysicalDeviceFeatures2(pd, &base);

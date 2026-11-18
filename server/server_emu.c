@@ -810,6 +810,11 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     uint32_t emu = 0;
     VkPhysicalDeviceProperties props;
     idt->vkGetPhysicalDeviceProperties(pd, &props);
+    if (vkb_mali_g615_r44p1(idt, pd, VK_API_VERSION_1_3)) {
+        VKB_ONCE(VKB_LOG_INFO,
+                 "multi-viewport: Mali-G615 r44p1 ignores a vertex shader's ViewportIndex; reporting multiViewport off");
+        f.multiViewport = VK_FALSE;
+    }
     /* vkd3d-proton (every D3D12 game) wants vertexAttributeInstanceRateZeroDivisor too. Mali-G925 on
      * Android 16 has the KHR extension without it (and without supportsNonZeroFirstInstance): such a
      * divisor is taken as missing and emulated whole - the emulation does both, at any firstInstance. */

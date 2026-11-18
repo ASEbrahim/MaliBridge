@@ -593,6 +593,7 @@ uint32_t vkb_steam_api_cap(const vkb_srv_table *t, VkPhysicalDevice pd);
 uint32_t vkb_driver_id(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api);
 int vkb_driver_is_arm(const VkPhysicalDeviceProperties *p, uint32_t driver_id);
 int vkb_arm_driver(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api);
+int vkb_mali_g615_r44p1(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api); /* issue #72 */
 const char *vkb_driver_id_name(uint32_t id);
 void vkb_driver_log(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t inst_api); /* the self-test's line */
 PFN_vkGetInstanceProcAddr vkb_driverid_imitate_gipa(PFN_vkGetInstanceProcAddr gipa); /* VKBRIDGE_FAKE_DRIVER (host tests) */
