@@ -335,6 +335,7 @@ void vkb_caps_patch_features(const vkb_pd_caps *caps, VkPhysicalDeviceFeatures *
     set_feature(caps, VKB_EMU_DUAL_SRC, &f->dualSrcBlend);
     set_feature(caps, VKB_EMU_FILL_MODE, &f->fillModeNonSolid);
     set_feature(caps, VKB_EMU_MULTI_VIEWPORT, &f->multiViewport);
+    if (caps->missing & VKB_CAP_HIDE_MULTI_VIEWPORT) f->multiViewport = VK_FALSE;
     set_feature(caps, VKB_EMU_MULTI_DRAW, &f->multiDrawIndirect);
 }
 

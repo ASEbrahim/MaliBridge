@@ -810,7 +810,8 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     uint32_t emu = 0;
     VkPhysicalDeviceProperties props;
     idt->vkGetPhysicalDeviceProperties(pd, &props);
-    if (vkb_mali_g615_r44p1(idt, pd, VK_API_VERSION_1_3)) {
+    int viewport_index_broken = vkb_mali_g615_r44p1(idt, pd, VK_API_VERSION_1_3);
+    if (viewport_index_broken) {
         VKB_ONCE(VKB_LOG_INFO,
                  "multi-viewport: Mali-G615 r44p1 ignores a vertex shader's ViewportIndex; reporting multiViewport off");
         f.multiViewport = VK_FALSE;
@@ -998,6 +999,7 @@ uint32_t vkb_emu_detect(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t *
     if (!f.dualSrcBlend) miss |= VKB_EMU_DUAL_SRC;
     if (!f.fillModeNonSolid) miss |= VKB_EMU_FILL_MODE;
     if (!f.multiViewport) miss |= VKB_EMU_MULTI_VIEWPORT;
+    if (viewport_index_broken) miss |= VKB_CAP_HIDE_MULTI_VIEWPORT;
     if (!f.multiDrawIndirect) miss |= VKB_EMU_MULTI_DRAW;
     if (emu & VKB_EMU_MAINT6) miss |= VKB_EMU_MAINT6;
     if (emu & VKB_EMU_PUSH_DESC) miss |= VKB_EMU_PUSH_DESC;

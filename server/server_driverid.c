@@ -126,11 +126,14 @@ int vkb_mali_g615_r44p1(const vkb_dispatch *dt, VkPhysicalDevice pd, uint32_t in
     if (!vkb_driver_is_arm(&p, driver_id)) return 0;
 
     VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-    if (dt->vkGetPhysicalDeviceProperties2 && inst_api >= VK_API_VERSION_1_1) {
+    uint32_t api = p.apiVersion < inst_api ? p.apiVersion : inst_api;
+    if (dt->vkGetPhysicalDeviceProperties2 && inst_api >= VK_API_VERSION_1_1 &&
+        (api >= VK_API_VERSION_1_2 || has_driver_properties(dt, pd))) {
         VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
         dt->vkGetPhysicalDeviceProperties2(pd, &p2);
     }
-    if (strstr(dp.driverInfo, "r44p1")) return 1;
+    for (const char *s = dp.driverInfo; (s = strstr(s, "r44p1")); s += 5)
+        if (s[5] < '0' || s[5] > '9') return 1;
 
     uint32_t r = p.driverVersion >> 22;
     uint32_t patch = (p.driverVersion >> 12) & 0x3ffu;

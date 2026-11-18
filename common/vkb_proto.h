@@ -74,6 +74,7 @@ static inline VkFormat vkb_bgr10_rgba(VkFormat f)
                                             * (Mali r18-r26, Vulkan 1.1: Zink requires it; server_emu_imageless.c) */
 #define VKB_EMU_MEM_BUDGET     (1u << 26)  /* VK_EXT_memory_budget answered by the server where the driver has none (every Mali):
                                             * DXVK and vkd3d-proton clients only (server_memory.c memb_fill) */
+#define VKB_CAP_HIDE_MULTI_VIEWPORT (1u << 27) /* report multiViewport and shaderOutputViewportIndex unavailable, even when emulated */
 #define VKB_EMU_ROBUST2_ACCESS (1u << 19)  /* robustBufferAccess2/robustImageAccess2 reported where the driver's robustness2
                                             * has nullDescriptor only (Mali-G715 r54p3); core robustness on instead (DXVK 3) */
 
@@ -87,7 +88,7 @@ typedef struct vkb_server_pd_info {
     uint32_t emu;                  /* VKB_EMU_* the server will perform */
     uint32_t emu_available;        /* VKB_EMU_* the server could perform */
     uint32_t real_api_version;
-    uint32_t missing;              /* VKB_EMU_* features the GPU lacks (emulated or not) */
+    uint32_t missing;              /* VKB_EMU_* features the GPU lacks (emulated or not), plus VKB_CAP_* report masks */
     uint32_t client_knobs;         /* VKB_KNOB_*: the client's switches from the server (per-game presets) */
     uint32_t cached_types;         /* server memory types whose shared pages can be CPU-cached (cached readback); 0: none */
     uint32_t cached_flags;         /* VKB_CACHED_*: who may use them */

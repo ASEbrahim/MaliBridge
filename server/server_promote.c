@@ -737,6 +737,15 @@ static void q_props(void *ctx, void *head)
     q->d->vkGetPhysicalDeviceProperties2(q->pd, head);
 }
 
+static void mask_viewport_index_features(const promo_gpu *g, VkPhysicalDeviceFeatures2 *f)
+{
+    if (!g || !g->viewport_index_broken) return;
+    f->features.multiViewport = VK_FALSE;
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)f->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+            ((VkPhysicalDeviceVulkan12Features *)b)->shaderOutputViewportIndex = VK_FALSE;
+}
+
 static void append(char *buf, size_t cap, const char *s)
 {
     size_t l = strlen(buf);
@@ -1021,6 +1030,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     const promo_gpu *g = gpu_of(t, pd);
     if (!g || !g->active) {
         t->real.vkGetPhysicalDeviceFeatures2(pd, f);
+        mask_viewport_index_features(g, f);
         return;
     }
     ext_list el;
@@ -1029,6 +1039,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     if (!x) {
         free(el.e);
         t->real.vkGetPhysicalDeviceFeatures2(pd, f);
+        mask_viewport_index_features(g, f);
         return;
     }
     x->drv = g->drv_api;
@@ -1036,6 +1047,7 @@ static VKAPI_ATTR void VKAPI_CALL pr_GetPhysicalDeviceFeatures2(VkPhysicalDevice
     query_ctx q = {&t->real, pd};
     chain_query(x, f, q_features, &q);
     fill_core_features(x, g, x->core);
+    mask_viewport_index_features(g, f);
     if (!BELOW(g->offered, V13)) {
         VkBaseOutStructure *pv = find_in_chain(f, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES);
         if (pv) ((VkPhysicalDevicePrivateDataFeatures *)pv)->privateData = VK_TRUE; /* the client's own */
@@ -1050,7 +1062,8 @@ void vkb_promote_instance_install(vkb_srv_table *t)
     int any = 0;
     pthread_mutex_lock(&gpus_lock);
     const promo_gpu *list = t->promote_ui ? gpus_ui : gpus;
-    for (int i = 0; i < ngpus; i++) any |= list[i].offered != list[i].real_api || list[i].active; /* VKBRIDGE_FAKE_API alone too */
+    for (int i = 0; i < ngpus; i++)
+        any |= list[i].offered != list[i].real_api || list[i].active || list[i].viewport_index_broken;
     pthread_mutex_unlock(&gpus_lock);
     if (!any) return;
     t->dt.vkGetPhysicalDeviceProperties = pr_GetPhysicalDeviceProperties;
