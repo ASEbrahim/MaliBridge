@@ -62,4 +62,10 @@ for f in android/arm64-v8a/libvkbridge_server.so android/arm64-v8a/libvkbridge_j
     readelf -h "$f" | grep -q 'Machine:.*AArch64' || fail "$f is not aarch64"
 done
 readelf -d android/arm64-v8a/libvkbridge_jni.so | grep -q 'SONAME.*libvkbridge_jni.so' || fail "jni soname"
-echo "elf ok: ICD GLIBC_$g, self-test GLIBC_$s, 3 vk_icd exports"
+# The device's per-frame instrumentation: an asset built from an older checkout shipped the bridge
+# without VKBRIDGE_LATLOG / VKBRIDGE_STATS, so the knobs did nothing and no latency log existed.
+here=$(cd "$(dirname "$0")" && pwd)
+"$here/check-instrumentation.sh" --server android/arm64-v8a/libvkbridge_server.so android/arm64-v8a/libvkbridge_jni.so >/dev/null &&
+    "$here/check-instrumentation.sh" usr/local/lib/vkbridge/libvulkan_droidbridge.so >/dev/null ||
+    fail "the asset was built without the latency log / VKBRIDGE_STATS (see check-instrumentation.sh)"
+echo "elf ok: ICD GLIBC_$g, self-test GLIBC_$s, 3 vk_icd exports, instrumentation present"
