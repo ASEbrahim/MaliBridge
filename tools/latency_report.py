@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Latency per stage, median and p90, from the latency logs (VKBRIDGE_LATLOG).
+"""Latency per stage, median, p90, p95 and p99, from the latency logs (VKBRIDGE_LATLOG).
 
     tools/latency_report.py [--presses] [--json] [--comm NAME] LOG...
 
@@ -63,6 +63,7 @@ class Stages:
         for n in self.order:
             v = self.vals[n]
             out.append({'stage': n, 'n': len(v), 'median_ms': pct(v, 0.5) / 1e6, 'p90_ms': pct(v, 0.9) / 1e6,
+                        'p95_ms': pct(v, 0.95) / 1e6, 'p99_ms': pct(v, 0.99) / 1e6,
                         'min_ms': min(v) / 1e6, 'max_ms': max(v) / 1e6})
         return out
 
@@ -72,9 +73,10 @@ def table(title, rows, out):
         return
     out.write('\n%s\n' % title)
     w = max(40, max(len(r['stage']) for r in rows) + 2)
-    out.write('  %-*s %6s %10s %8s %8s %8s\n' % (w, 'stage', 'n', 'median ms', 'p90 ms', 'min', 'max'))
+    out.write('  %-*s %6s %10s %8s %8s %8s %8s %8s\n' % (w, 'stage', 'n', 'median ms', 'p90 ms', 'p95 ms', 'p99 ms', 'min', 'max'))
     for r in rows:
-        out.write('  %-*s %6d %10.2f %8.2f %8.2f %8.2f\n' % (w, r['stage'], r['n'], r['median_ms'], r['p90_ms'], r['min_ms'], r['max_ms']))
+        out.write('  %-*s %6d %10.2f %8.2f %8.2f %8.2f %8.2f %8.2f\n' % (w, r['stage'], r['n'], r['median_ms'], r['p90_ms'],
+                                                                       r['p95_ms'], r['p99_ms'], r['min_ms'], r['max_ms']))
 
 
 def ints(parts):
