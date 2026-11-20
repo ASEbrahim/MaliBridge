@@ -26,7 +26,7 @@ featclamp envfile unflagged eventstatus query querystuck gsexport dmabufsize dsh
 submitfail waitlost apicap ycbcr_swap driverid vidyn eds compilegate sparse a1zink envswitch poolfull heapleak lowmem exitheap xclipse_zink syncfd dmabufsync timeline imageless dabreg dmabufahb
 xfb xfb_nofold hotpath wire
 poll reqcache syncmirror stale_frames bcn_budget bcn_mixcopy hitch bcauto bcbudget bcupload latency lagprobe framequeue
-presentwait present_block compileburst querystuck_burst describe dmaheap"
+presentwait present_block compileburst querystuck_burst describe dmaheap instrumentation"
 if [ "${1:-}" = --list ]; then
   printf '%s\n' $VKB_TEST_NAMES
   exit 0
@@ -688,6 +688,13 @@ run_mode() {
     # A hangup does not end the separate server: the app stops it last, after the session's programs
     if want server_hup; then
       timeout 60 ./server_hup_test.sh >out/t-hup.log 2>&1; result $? "server_hup_test ($(tail -1 out/t-hup.log))"
+    fi
+    # The per-frame instrumentation is in the binaries this checkout builds (VKBRIDGE_LATLOG,
+    # VKBRIDGE_STATS; scripts/check-instrumentation.sh, which the Android build and the asset check
+    # also run): a build that lost it cannot answer "where did the frame go"
+    if want instrumentation; then
+      timeout 60 ../scripts/check-instrumentation.sh --server out/vkbridge-server >out/t-instr.log 2>&1 &&
+        timeout 60 ../scripts/check-instrumentation.sh out/libvulkan_droidbridge.so >>out/t-instr.log 2>&1; result $? "instrumentation ($(tail -1 out/t-instr.log))"
     fi
     # A driver crash's line names the client, the bind's image and memory, a draw's bound pipeline
     if want crashline; then

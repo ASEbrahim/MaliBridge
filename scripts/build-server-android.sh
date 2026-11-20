@@ -32,4 +32,7 @@ git=$(git -C "$root" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/n
     "$srv"/*.c "$root/common/vkb_wire.c" "$root/common/vkb_caps.c" "$root/common/gen/vkb_gen_structs.c" "$root/common/gen/vkb_gen_server.c" \
     -ldl -llog -lm
 "$(dirname "$cc")/llvm-strip" --strip-unneeded "$out/libvkbridge_jni.so"
+# The per-frame instrumentation (VKBRIDGE_LATLOG, VKBRIDGE_STATS) is what a "where did the frame go"
+# answer is made of; a checkout that lost it must not ship quietly.
+"$root/scripts/check-instrumentation.sh" --server "$out/libvkbridge_server.so" "$out/libvkbridge_jni.so"
 echo "built $out/libvkbridge_server.so and libvkbridge_jni.so"
